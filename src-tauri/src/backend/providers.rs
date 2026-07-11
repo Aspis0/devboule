@@ -3813,6 +3813,64 @@ fn scaleway_has_next_page(page: u32, item_count: usize, total_count: Option<usiz
     }
 }
 
+struct ScalewayPageFetch<Item> {
+    items: Vec<Item>,
+    /// Total HTTP requests attempted for this resource (one per page fetched).
+    requests: usize,
+    /// Requests that got a successful, parseable envelope back.
+    successes: usize,
+    /// True if pagination stopped early because of a request/status/parse error
+    /// (as opposed to stopping because there was no next page).
+    failed: bool,
+}
+
+async fn fetch_scaleway_paginated<Envelope, Item>(
+    http: &reqwest::Client,
+    token: &str,
+    url_for_page: impl Fn(u32) -> String,
+    extract: impl Fn(Envelope) -> (Vec<Item>, Option<usize>),
+) -> ScalewayPageFetch<Item>
+where
+    Envelope: DeserializeOwned,
+{
+    let mut items = Vec::new();
+    let mut requests = 0usize;
+    let mut successes = 0usize;
+    let mut failed = false;
+
+    for page in 1..=SCW_MAX_PAGES {
+        let url = url_for_page(page);
+        requests += 1;
+        let res = http.get(url).header("X-Auth-Token", token).send().await;
+        let Ok(res) = res else {
+            failed = true;
+            break;
+        };
+        if !res.status().is_success() {
+            failed = true;
+            break;
+        }
+        let Ok(envelope) = res.json::<Envelope>().await else {
+            failed = true;
+            break;
+        };
+        successes += 1;
+        let (page_items, total_count) = extract(envelope);
+        let item_count = page_items.len();
+        items.extend(page_items);
+        if !scaleway_has_next_page(page, item_count, total_count) {
+            break;
+        }
+    }
+
+    ScalewayPageFetch {
+        items,
+        requests,
+        successes,
+        failed,
+    }
+}
+
 fn bytes_to_gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
 }
@@ -6760,226 +6818,138 @@ async fn fetch_scaleway_inner(
     let mut generative_credentials_missing = false;
 
     for zone in SCW_ZONES {
-        for page in 1..=SCW_MAX_PAGES {
-            let url = scaleway_servers_url(zone, &project.id, page);
-            request_count += 1;
-            core_request_count += 1;
-            let res = http.get(url).header("X-Auth-Token", token).send().await;
-            let Ok(res) = res else {
-                failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                failure_count += 1;
-                break;
+        let page_fetch = fetch_scaleway_paginated::<ScwServersEnvelope, ScwServer>(
+            http,
+            token,
+            |page| scaleway_servers_url(zone, &project.id, page),
+            |envelope| (envelope.servers, envelope.total_count),
+        )
+        .await;
+        request_count += page_fetch.requests;
+        core_request_count += page_fetch.requests;
+        success_count += page_fetch.successes;
+        core_success_count += page_fetch.successes;
+        if page_fetch.failed {
+            failure_count += 1;
+        }
+        for server in page_fetch.items {
+            let mut summary = scaleway_server_summary(server, zone, &project);
+            match fetch_scaleway_server_actions(http, token, zone, &summary.id).await {
+                Ok(actions) => summary.available_actions = actions,
+                Err(_) => action_failure_count += 1,
             }
-            let Ok(envelope) = res.json::<ScwServersEnvelope>().await else {
-                failure_count += 1;
-                break;
-            };
-            success_count += 1;
-            core_success_count += 1;
-
-            let item_count = envelope.servers.len();
-            let total_count = envelope.total_count;
-            for server in envelope.servers {
-                let mut summary = scaleway_server_summary(server, zone, &project);
-                match fetch_scaleway_server_actions(http, token, zone, &summary.id).await {
-                    Ok(actions) => summary.available_actions = actions,
-                    Err(_) => action_failure_count += 1,
-                }
-                compute.push(summary);
-            }
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+            compute.push(summary);
         }
     }
 
     for region in SCW_REGIONS {
-        let mut namespaces = Vec::new();
-        for page in 1..=SCW_MAX_PAGES {
-            let namespaces_url = scaleway_namespaces_url(region, &project.id, page);
-            request_count += 1;
-            core_request_count += 1;
-            let res = http
-                .get(namespaces_url)
-                .header("X-Auth-Token", token)
-                .send()
-                .await;
-            let Ok(res) = res else {
-                failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                failure_count += 1;
-                break;
-            }
-            let Ok(envelope) = res.json::<ScwNamespacesEnvelope>().await else {
-                failure_count += 1;
-                break;
-            };
-            success_count += 1;
-            core_success_count += 1;
-
-            let item_count = envelope.namespaces.len();
-            let total_count = envelope.total_count;
-            namespaces.extend(envelope.namespaces);
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let namespaces_fetch = fetch_scaleway_paginated::<ScwNamespacesEnvelope, ScwNamespace>(
+            http,
+            token,
+            |page| scaleway_namespaces_url(region, &project.id, page),
+            |envelope| (envelope.namespaces, envelope.total_count),
+        )
+        .await;
+        request_count += namespaces_fetch.requests;
+        core_request_count += namespaces_fetch.requests;
+        success_count += namespaces_fetch.successes;
+        core_success_count += namespaces_fetch.successes;
+        if namespaces_fetch.failed {
+            failure_count += 1;
         }
+        let namespaces = namespaces_fetch.items;
 
         for namespace in namespaces {
-            for page in 1..=SCW_MAX_PAGES {
-                let functions_url =
-                    scaleway_functions_url(region, &namespace.id, &project.id, page);
-                request_count += 1;
-                core_request_count += 1;
-                let res = http
-                    .get(functions_url)
-                    .header("X-Auth-Token", token)
-                    .send()
-                    .await;
-                let Ok(res) = res else {
-                    failure_count += 1;
-                    break;
-                };
-                if !res.status().is_success() {
-                    failure_count += 1;
-                    break;
-                }
-                let Ok(functions) = res.json::<ScwFunctionsEnvelope>().await else {
-                    failure_count += 1;
-                    break;
-                };
-                success_count += 1;
-                core_success_count += 1;
-                let item_count = functions.functions.len();
-                let total_count = functions.total_count;
-                compute.extend(
-                    functions
-                        .functions
-                        .into_iter()
-                        .map(|function| function.into_summary(region, &project)),
-                );
-                if !scaleway_has_next_page(page, item_count, total_count) {
-                    break;
-                }
+            let functions_fetch = fetch_scaleway_paginated::<ScwFunctionsEnvelope, ScwFunction>(
+                http,
+                token,
+                |page| scaleway_functions_url(region, &namespace.id, &project.id, page),
+                |envelope| (envelope.functions, envelope.total_count),
+            )
+            .await;
+            request_count += functions_fetch.requests;
+            core_request_count += functions_fetch.requests;
+            success_count += functions_fetch.successes;
+            core_success_count += functions_fetch.successes;
+            if functions_fetch.failed {
+                failure_count += 1;
             }
+            compute.extend(
+                functions_fetch
+                    .items
+                    .into_iter()
+                    .map(|function| function.into_summary(region, &project)),
+            );
         }
     }
 
     for region in SCW_REGIONS {
-        for page in 1..=SCW_MAX_PAGES {
-            let containers_url = scaleway_containers_url(region, &project.id, page);
-            request_count += 1;
-            core_request_count += 1;
-            let res = http
-                .get(containers_url)
-                .header("X-Auth-Token", token)
-                .send()
-                .await;
-            let Ok(res) = res else {
-                failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                failure_count += 1;
-                break;
-            }
-            let Ok(containers) = res.json::<ScwContainersEnvelope>().await else {
-                failure_count += 1;
-                break;
-            };
-            success_count += 1;
-            core_success_count += 1;
-            let item_count = containers.containers.len();
-            let total_count = containers.total_count;
-            compute.extend(
-                containers
-                    .containers
-                    .into_iter()
-                    .map(|container| container.into_summary(region, &project)),
-            );
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let containers_fetch = fetch_scaleway_paginated::<ScwContainersEnvelope, ScwContainer>(
+            http,
+            token,
+            |page| scaleway_containers_url(region, &project.id, page),
+            |envelope| (envelope.containers, envelope.total_count),
+        )
+        .await;
+        request_count += containers_fetch.requests;
+        core_request_count += containers_fetch.requests;
+        success_count += containers_fetch.successes;
+        core_success_count += containers_fetch.successes;
+        if containers_fetch.failed {
+            failure_count += 1;
         }
+        compute.extend(
+            containers_fetch
+                .items
+                .into_iter()
+                .map(|container| container.into_summary(region, &project)),
+        );
     }
 
     for zone in SCW_ZONES {
-        for page in 1..=SCW_MAX_PAGES {
-            let url = scaleway_block_volumes_url(zone, &project.id, page);
-            request_count += 1;
-            core_request_count += 1;
-            let res = http.get(url).header("X-Auth-Token", token).send().await;
-            let Ok(res) = res else {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            }
-            let Ok(envelope) = res.json::<ScwBlockVolumesEnvelope>().await else {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            };
-            success_count += 1;
-            core_success_count += 1;
-
-            let item_count = envelope.volumes.len();
-            let total_count = envelope.total_count;
-            storage.extend(
-                envelope
-                    .volumes
-                    .into_iter()
-                    .map(|volume| volume.into_summary(zone, &project)),
-            );
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let volumes_fetch = fetch_scaleway_paginated::<ScwBlockVolumesEnvelope, ScwBlockVolume>(
+            http,
+            token,
+            |page| scaleway_block_volumes_url(zone, &project.id, page),
+            |envelope| (envelope.volumes, envelope.total_count),
+        )
+        .await;
+        request_count += volumes_fetch.requests;
+        core_request_count += volumes_fetch.requests;
+        success_count += volumes_fetch.successes;
+        core_success_count += volumes_fetch.successes;
+        if volumes_fetch.failed {
+            failure_count += 1;
+            storage_failure_count += 1;
         }
+        storage.extend(
+            volumes_fetch
+                .items
+                .into_iter()
+                .map(|volume| volume.into_summary(zone, &project)),
+        );
 
-        for page in 1..=SCW_MAX_PAGES {
-            let url = scaleway_block_snapshots_url(zone, &project.id, page);
-            request_count += 1;
-            core_request_count += 1;
-            let res = http.get(url).header("X-Auth-Token", token).send().await;
-            let Ok(res) = res else {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            }
-            let Ok(envelope) = res.json::<ScwBlockSnapshotsEnvelope>().await else {
-                failure_count += 1;
-                storage_failure_count += 1;
-                break;
-            };
-            success_count += 1;
-            core_success_count += 1;
-
-            let item_count = envelope.snapshots.len();
-            let total_count = envelope.total_count;
-            storage.extend(
-                envelope
-                    .snapshots
-                    .into_iter()
-                    .map(|snapshot| snapshot.into_summary(zone, &project)),
-            );
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let snapshots_fetch = fetch_scaleway_paginated::<ScwBlockSnapshotsEnvelope, ScwBlockSnapshot>(
+            http,
+            token,
+            |page| scaleway_block_snapshots_url(zone, &project.id, page),
+            |envelope| (envelope.snapshots, envelope.total_count),
+        )
+        .await;
+        request_count += snapshots_fetch.requests;
+        core_request_count += snapshots_fetch.requests;
+        success_count += snapshots_fetch.successes;
+        core_success_count += snapshots_fetch.successes;
+        if snapshots_fetch.failed {
+            failure_count += 1;
+            storage_failure_count += 1;
         }
+        storage.extend(
+            snapshots_fetch
+                .items
+                .into_iter()
+                .map(|snapshot| snapshot.into_summary(zone, &project)),
+        );
     }
 
     // File Storage is region-scoped and fr-par-only today. A 404 / other-region
@@ -6988,36 +6958,24 @@ async fn fetch_scaleway_inner(
     // and is NOT counted toward the core tallies, the generic `failure_count`, or
     // the Block-Storage `storage_failure_count`.
     for region in SCW_FR_PAR_ONLY_REGIONS {
-        for page in 1..=SCW_MAX_PAGES {
-            let url = scaleway_filesystems_url(region, &project.id, page);
-            request_count += 1;
-            let res = http.get(url).header("X-Auth-Token", token).send().await;
-            let Ok(res) = res else {
-                file_failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                file_failure_count += 1;
-                break;
-            }
-            let Ok(envelope) = res.json::<ScwFilesystemsEnvelope>().await else {
-                file_failure_count += 1;
-                break;
-            };
-            success_count += 1;
-
-            let item_count = envelope.filesystems.len();
-            let total_count = envelope.total_count;
-            storage.extend(
-                envelope
-                    .filesystems
-                    .into_iter()
-                    .map(|filesystem| filesystem.into_summary(region, &project)),
-            );
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let filesystems_fetch = fetch_scaleway_paginated::<ScwFilesystemsEnvelope, ScwFilesystem>(
+            http,
+            token,
+            |page| scaleway_filesystems_url(region, &project.id, page),
+            |envelope| (envelope.filesystems, envelope.total_count),
+        )
+        .await;
+        request_count += filesystems_fetch.requests;
+        success_count += filesystems_fetch.successes;
+        if filesystems_fetch.failed {
+            file_failure_count += 1;
         }
+        storage.extend(
+            filesystems_fetch
+                .items
+                .into_iter()
+                .map(|filesystem| filesystem.into_summary(region, &project)),
+        );
     }
 
     // Serverless SQL is region-scoped and fr-par-only today. Same non-fatal,
@@ -7025,36 +6983,24 @@ async fn fetch_scaleway_inner(
     // the dedicated `sql_failure_count` (its own risk flag) and never touches the
     // core tallies or the generic `failure_count`.
     for region in SCW_FR_PAR_ONLY_REGIONS {
-        for page in 1..=SCW_MAX_PAGES {
-            let url = scaleway_sql_databases_url(region, &project.id, page);
-            request_count += 1;
-            let res = http.get(url).header("X-Auth-Token", token).send().await;
-            let Ok(res) = res else {
-                sql_failure_count += 1;
-                break;
-            };
-            if !res.status().is_success() {
-                sql_failure_count += 1;
-                break;
-            }
-            let Ok(envelope) = res.json::<ScwSqlDatabasesEnvelope>().await else {
-                sql_failure_count += 1;
-                break;
-            };
-            success_count += 1;
-
-            let item_count = envelope.databases.len();
-            let total_count = envelope.total_count;
-            compute.extend(
-                envelope
-                    .databases
-                    .into_iter()
-                    .map(|database| database.into_summary(region, &project)),
-            );
-            if !scaleway_has_next_page(page, item_count, total_count) {
-                break;
-            }
+        let databases_fetch = fetch_scaleway_paginated::<ScwSqlDatabasesEnvelope, ScwSqlDatabase>(
+            http,
+            token,
+            |page| scaleway_sql_databases_url(region, &project.id, page),
+            |envelope| (envelope.databases, envelope.total_count),
+        )
+        .await;
+        request_count += databases_fetch.requests;
+        success_count += databases_fetch.successes;
+        if databases_fetch.failed {
+            sql_failure_count += 1;
         }
+        compute.extend(
+            databases_fetch
+                .items
+                .into_iter()
+                .map(|database| database.into_summary(region, &project)),
+        );
     }
 
     let clean_object_access_key = object_access_key
@@ -11767,5 +11713,181 @@ mod tests {
         )
         .unwrap();
         assert_eq!(auth, "AWS4-HMAC-SHA256 Credential=SCWACCESSKEY@bio-project/20260527/fr-par/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=382cd491d5d07a1c9b31ae1e333512f0f88874e57cf195c7f7db159f2b6c6004");
+    }
+
+    // ---- fetch_scaleway_paginated tests ----
+
+    #[derive(Deserialize)]
+    struct TestEnvelope {
+        #[serde(default)]
+        items: Vec<TestItem>,
+        #[serde(default)]
+        total_count: Option<usize>,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct TestItem {
+        id: String,
+    }
+
+    /// Spawns a minimal HTTP server on a random port that responds to every
+    /// request with `body`. Returns the base URL (e.g. `http://127.0.0.1:PORT`).
+    fn spawn_mock_server(body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            // Serve exactly one request (the test only makes one).
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{BufRead, BufReader, Write};
+                // Drain the request headers.
+                let _ = BufReader::new(&stream)
+                    .lines()
+                    .map(|l| l.unwrap_or_default())
+                    .take_while(|l| !l.is_empty())
+                    .count();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// Spawns a mock server that returns a non-2xx status.
+    fn spawn_error_server(status: u16) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{BufRead, BufReader, Write};
+                let _ = BufReader::new(&stream)
+                    .lines()
+                    .map(|l| l.unwrap_or_default())
+                    .take_while(|l| !l.is_empty())
+                    .count();
+                let body = "error";
+                let response = format!(
+                    "HTTP/1.1 {} Error\r\nContent-Length: {}\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    #[tokio::test]
+    async fn fetch_scaleway_paginated_stops_when_total_count_says_no_next_page() {
+        // Page 1 has 5 items and total_count=5 → no page 2.
+        let body = r#"{"items": [{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"},{"id":"e"}], "total_count": 5}"#;
+        let base = spawn_mock_server(body);
+        let client = reqwest::Client::new();
+
+        let result = fetch_scaleway_paginated::<TestEnvelope, TestItem>(
+            &client,
+            "test-token",
+            |page| format!("{base}/test?page={page}"),
+            |env| (env.items, env.total_count),
+        )
+        .await;
+
+        assert_eq!(result.items.len(), 5);
+        assert_eq!(result.requests, 1);
+        assert_eq!(result.successes, 1);
+        assert!(!result.failed);
+    }
+
+    #[tokio::test]
+    async fn fetch_scaleway_paginated_stops_when_fewer_than_page_size_and_no_total() {
+        // 3 items, no total_count, 3 < SCW_PAGE_SIZE(100) → stop after page 1.
+        let body = r#"{"items": [{"id":"x"},{"id":"y"},{"id":"z"}]}"#;
+        let base = spawn_mock_server(body);
+        let client = reqwest::Client::new();
+
+        let result = fetch_scaleway_paginated::<TestEnvelope, TestItem>(
+            &client,
+            "test-token",
+            |page| format!("{base}/test?page={page}"),
+            |env| (env.items, env.total_count),
+        )
+        .await;
+
+        assert_eq!(result.items.len(), 3);
+        assert_eq!(result.requests, 1);
+        assert_eq!(result.successes, 1);
+        assert!(!result.failed);
+    }
+
+    #[tokio::test]
+    async fn fetch_scaleway_paginated_stops_at_max_pages_cap() {
+        // Every page returns exactly SCW_PAGE_SIZE items with no total_count,
+        // so `scaleway_has_next_page` always says "more" until the cap.
+        let page_size_item_json: Vec<String> =
+            (0..super::SCW_PAGE_SIZE).map(|i| format!("{{\"id\":\"{i}\"}}")).collect();
+        let body = format!("{{\"items\": [{}], \"total_count\": null}}", page_size_item_json.join(","));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..super::SCW_MAX_PAGES {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::{BufRead, BufReader, Write};
+                    let _ = BufReader::new(&stream)
+                        .lines()
+                        .map(|l| l.unwrap_or_default())
+                        .take_while(|l| !l.is_empty())
+                        .count();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let client = reqwest::Client::new();
+
+        let result = fetch_scaleway_paginated::<TestEnvelope, TestItem>(
+            &client,
+            "test-token",
+            |page| format!("{base}/test?page={page}"),
+            |env| (env.items, env.total_count),
+        )
+        .await;
+
+        assert_eq!(result.requests, super::SCW_MAX_PAGES as usize);
+        assert_eq!(result.successes, super::SCW_MAX_PAGES as usize);
+        assert_eq!(
+            result.items.len(),
+            super::SCW_MAX_PAGES as usize * super::SCW_PAGE_SIZE
+        );
+        assert!(!result.failed);
+    }
+
+    #[tokio::test]
+    async fn fetch_scaleway_paginated_failed_set_on_non_2xx() {
+        let base = spawn_error_server(404);
+        let client = reqwest::Client::new();
+
+        let result = fetch_scaleway_paginated::<TestEnvelope, TestItem>(
+            &client,
+            "test-token",
+            |page| format!("{base}/test?page={page}"),
+            |env| (env.items, env.total_count),
+        )
+        .await;
+
+        assert!(result.failed);
+        assert_eq!(result.requests, 1);
+        assert_eq!(result.successes, 0);
+        assert!(result.items.is_empty());
     }
 }
