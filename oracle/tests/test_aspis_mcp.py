@@ -11646,5 +11646,69 @@ class PigeonFlagOffByteIdenticalTests(unittest.TestCase):
             )
 
 
+class DiscoveryHeartbeatGateTests(unittest.TestCase):
+    """The Rust in-process oracle has no child pid: liveness comes from a
+    heartbeatAt timestamp refreshed every ~10s (PLAN.md P7). Stale heartbeat
+    (>45s) must skip the HTTP target; a fresh one must accept it WITHOUT
+    consulting the pid; discovery files without heartbeat keep the pid gate."""
+
+    def _probe(self, payload):
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        from oracle.server import aspis_mcp
+
+        d = _P(_tf.mkdtemp())
+        (d / aspis_mcp.ORACLE_DISCOVERY_FILENAME).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        return aspis_mcp._resolve_oracle_http_target_uncached(d)
+
+    def test_fresh_heartbeat_accepts_target_without_pid(self):
+        from datetime import datetime, timezone
+
+        fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        target = self._probe(
+            {"baseUrl": "http://127.0.0.1:12345", "authToken": "t", "heartbeatAt": fresh}
+        )
+        self.assertIsNotNone(target)
+
+    def test_stale_heartbeat_rejects_target_even_with_live_pid(self):
+        from datetime import datetime, timedelta, timezone
+
+        stale = (
+            (datetime.now(timezone.utc) - timedelta(seconds=120))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        target = self._probe(
+            {
+                "baseUrl": "http://127.0.0.1:12345",
+                "authToken": "t",
+                "heartbeatAt": stale,
+                "pid": os.getpid(),
+            }
+        )
+        self.assertIsNone(target)
+
+    def test_garbage_heartbeat_falls_back_to_pid_gate(self):
+        target = self._probe(
+            {
+                "baseUrl": "http://127.0.0.1:12345",
+                "authToken": "t",
+                "heartbeatAt": "not-a-timestamp",
+                "pid": 999999,
+            }
+        )
+        self.assertIsNone(target)
+
+    def test_no_heartbeat_keeps_legacy_pid_gate(self):
+        target = self._probe(
+            {"baseUrl": "http://127.0.0.1:12345", "authToken": "t", "pid": os.getpid()}
+        )
+        self.assertIsNotNone(target)
+
+
+
 if __name__ == "__main__":
     unittest.main()

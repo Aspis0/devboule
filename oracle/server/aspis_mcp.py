@@ -4266,9 +4266,33 @@ def _resolve_oracle_http_target_uncached(projects_dir: Path) -> tuple[str, str] 
     # LATENCY (2026-07-02 profiling): a STALE discovery file (server crashed /
     # app rebuilt) pointed the thin-client at a dead-or-hung target and each
     # call burned the full HTTP timeout (measured 20.1s) before falling back to
-    # the in-process engine. When the supervisor recorded its pid, gate on its
-    # liveness — a dead pid means the target is gone, skip it immediately.
-    # A missing/garbage pid field keeps the pre-fix behavior (try the target).
+    # the in-process engine.
+    #
+    # Liveness gates, newest first (2026-07-11, Rust-oracle port PLAN.md P7):
+    # 1. `heartbeatAt` — the in-process Rust server has NO child pid to probe
+    #    (the app process outlives a dead server task, which is exactly the
+    #    bug the pid gate was added to fix). It refreshes this timestamp every
+    #    ~10s instead; a stale heartbeat (>45s) means the server task is gone.
+    # 2. `pid` — legacy gate for the Python child-process server. Kept for
+    #    backward compatibility with discovery files that carry no heartbeat.
+    # A missing/garbage field keeps the pre-fix behavior (try the target).
+    heartbeat = data.get("heartbeatAt")
+    if isinstance(heartbeat, str) and heartbeat.strip():
+        try:
+            from datetime import datetime, timezone
+
+            parsed = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - parsed).total_seconds()
+            if age > 45:
+                logger.info(
+                    "Oracle discovery heartbeat is stale (%.0fs); "
+                    "using in-process engine.",
+                    age,
+                )
+                return None
+            return base, token
+        except (ValueError, OverflowError):
+            pass  # garbage heartbeat → fall through to the pid gate
     # `bool` is an `int` subclass — a corrupt `"pid": true` must not probe pid 1.
     pid = data.get("pid")
     if isinstance(pid, int) and not isinstance(pid, bool) and not _pid_alive(pid):
