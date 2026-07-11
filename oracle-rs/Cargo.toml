@@ -1,0 +1,25 @@
+[package]
+name = "oracle-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+fastembed = { version = "5", features = ["qwen3"] }
+candle-core = "0.10.2"
+lancedb = "0.31"
+arrow-array = "58.3"
+arrow-schema = "58.3"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Metal is macOS-only and OPTIONAL — Windows builds must never see it.
+
+[features]
+default = []
+metal = ["candle-core/metal", "fastembed/metal"]
