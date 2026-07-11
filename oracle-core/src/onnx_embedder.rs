@@ -45,7 +45,7 @@ impl OnnxEmbedder {
         let model_path = model_dir.join("onnx").join(model_file);
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        let mut session_builder = Session::builder()
+        let session_builder = Session::builder()
             .context("failed to create ONNX session builder")?;
         let mut builder = session_builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -100,12 +100,14 @@ impl OnnxEmbedder {
             direction: PaddingDirection::Right,
             ..Default::default()
         }));
-        self.tokenizer.with_truncation(Some(TruncationParams {
-            max_length: 8192,
-            strategy: TruncationStrategy::LongestFirst,
-            stride: 0,
-            ..Default::default()
-        }));
+        self.tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 8192,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("failed to configure tokenizer truncation: {e}"))?;
 
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 

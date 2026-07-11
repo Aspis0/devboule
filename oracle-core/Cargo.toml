@@ -1,8 +1,15 @@
 [package]
-name = "oracle-rs"
+name = "oracle-core"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+
+[lib]
+name = "oracle_core"
+
+[[bin]]
+name = "oracle-cli"
+path = "src/bin/oracle-cli.rs"
 
 [dependencies]
 fastembed = { version = "5", features = ["qwen3"] }
@@ -16,12 +23,15 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-ort = { version = "2.0.0-rc.10", features = ["coreml"] }
 ndarray = "0.16"
 tokenizers = "0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Metal is macOS-only and OPTIONAL — Windows builds must never see it.
+# Metal/CoreML are macOS-only — Windows builds must never see them.
+ort = { version = "2.0.0-rc.10", features = ["coreml"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { version = "2.0.0-rc.10" }
 
 [features]
 default = []

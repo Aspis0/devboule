@@ -1,18 +1,9 @@
-mod embedder;
-mod lance;
-mod onnx_embedder;
-
-use clap::{Parser, Subcommand, ValueEnum};
-use embedder::{DeviceArg, DtypeArg};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum BackendArg {
-    Candle,
-    Onnx,
-}
+use clap::{Parser, Subcommand};
+use oracle_core::embedder::{self, DeviceArg, DtypeArg};
+use oracle_core::{lance, onnx_embedder, BackendArg};
 
 #[derive(Parser)]
-#[command(name = "oracle-rs", about = "Qwen3 embeddings + LanceDB query spike")]
+#[command(name = "oracle-cli", about = "oracle-core dev CLI: embed / query / bench")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

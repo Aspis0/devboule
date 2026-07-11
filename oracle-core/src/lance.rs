@@ -67,7 +67,7 @@ pub async fn cmd_query(
         .await
         .with_context(|| format!("opening table 'nodes' in {}", db.display()))?;
 
-    let mut stream = table
+    let stream = table
         .query()
         .nearest_to(query_vec)?
         .distance_type(DistanceType::Cosine)
