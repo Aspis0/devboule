@@ -1,8 +1,15 @@
 mod embedder;
 mod lance;
+mod onnx_embedder;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use embedder::{DeviceArg, DtypeArg};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendArg {
+    Candle,
+    Onnx,
+}
 
 #[derive(Parser)]
 #[command(name = "oracle-rs", about = "Qwen3 embeddings + LanceDB query spike")]
@@ -19,10 +26,16 @@ enum Command {
         texts_file: std::path::PathBuf,
         #[arg(long)]
         out: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "candle")]
+        backend: BackendArg,
         #[arg(long, value_enum, default_value = "cpu")]
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value = "models/qwen3-onnx")]
+        model_dir: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "cpu")]
+        ep: onnx_embedder::EpArg,
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
     },
@@ -34,10 +47,16 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
+        #[arg(long, value_enum, default_value = "candle")]
+        backend: BackendArg,
         #[arg(long, value_enum, default_value = "cpu")]
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value = "models/qwen3-onnx")]
+        model_dir: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "cpu")]
+        ep: onnx_embedder::EpArg,
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
     },
@@ -47,10 +66,16 @@ enum Command {
         texts_file: std::path::PathBuf,
         #[arg(long, default_value_t = 3)]
         iters: usize,
+        #[arg(long, value_enum, default_value = "candle")]
+        backend: BackendArg,
         #[arg(long, value_enum, default_value = "cpu")]
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value = "models/qwen3-onnx")]
+        model_dir: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "cpu")]
+        ep: onnx_embedder::EpArg,
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
     },
@@ -63,24 +88,70 @@ async fn main() -> anyhow::Result<()> {
         Command::Embed {
             texts_file,
             out,
+            backend,
             device,
             dtype,
+            model_dir,
+            ep,
             batch_size,
-        } => embedder::cmd_embed(texts_file, out, device, dtype, batch_size).await,
+        } => {
+            embedder::cmd_embed(
+                texts_file,
+                out,
+                backend,
+                device,
+                dtype,
+                model_dir,
+                ep,
+                batch_size,
+            )
+            .await
+        }
         Command::Query {
             db,
             query,
             limit,
+            backend,
             device,
             dtype,
+            model_dir,
+            ep,
             batch_size,
-        } => lance::cmd_query(db, query, limit, device, dtype, batch_size).await,
+        } => {
+            lance::cmd_query(
+                db,
+                query,
+                limit,
+                backend,
+                device,
+                dtype,
+                model_dir,
+                ep,
+                batch_size,
+            )
+            .await
+        }
         Command::Bench {
             texts_file,
             iters,
+            backend,
             device,
             dtype,
+            model_dir,
+            ep,
             batch_size,
-        } => embedder::cmd_bench(texts_file, iters, device, dtype, batch_size).await,
+        } => {
+            embedder::cmd_bench(
+                texts_file,
+                iters,
+                backend,
+                device,
+                dtype,
+                model_dir,
+                ep,
+                batch_size,
+            )
+            .await
+        }
     }
 }

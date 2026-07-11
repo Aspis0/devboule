@@ -7,6 +7,10 @@ use clap::ValueEnum;
 use fastembed::Qwen3TextEmbedding;
 use serde::Serialize;
 
+use crate::BackendArg;
+use crate::onnx_embedder::{EpArg, OnnxEmbedder, ONNX_MODEL_ID};
+use std::time::Instant;
+
 pub const MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
 pub const MAX_LENGTH: usize = 8192;
 
@@ -128,13 +132,13 @@ pub struct BenchSummary {
 pub async fn cmd_embed(
     texts_file: std::path::PathBuf,
     out: std::path::PathBuf,
+    backend: BackendArg,
     device_arg: DeviceArg,
     dtype_arg: DtypeArg,
+    model_dir: std::path::PathBuf,
+    ep: EpArg,
     batch_size: usize,
 ) -> Result<()> {
-    let device = resolve_device(device_arg)?;
-    let dtype = dtype_arg.to_dtype();
-
     let raw = std::fs::read_to_string(&texts_file)
         .with_context(|| format!("reading texts file {}", texts_file.display()))?;
     let texts: Vec<String> = serde_json::from_str(&raw)
@@ -142,6 +146,37 @@ pub async fn cmd_embed(
     if texts.is_empty() {
         anyhow::bail!("texts file is empty");
     }
+
+    if matches!(backend, BackendArg::Onnx) {
+        let (mut embedder, load_ms) = OnnxEmbedder::load(model_dir.as_path(), ep)?;
+        eprintln!("model load: {} ms", load_ms);
+        let start = Instant::now();
+        let vectors = embedder.embed_batched(&texts, batch_size)?;
+        let embed_ms = start.elapsed().as_millis();
+        let n = texts.len();
+        let tps = if embed_ms > 0 {
+            n as f64 / (embed_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "embed: {} ms ({} texts, {:.1} texts/sec)",
+            embed_ms, n, tps
+        );
+
+        let dims = vectors.first().map(|v| v.len()).unwrap_or(0);
+        let out_obj = EmbedOut {
+            model: ONNX_MODEL_ID.to_string(),
+            dims,
+            vectors,
+        };
+        let json = serde_json::to_string_pretty(&out_obj)?;
+        std::fs::write(&out, json).with_context(|| format!("writing output {}", out.display()))?;
+        return Ok(());
+    }
+
+    let device = resolve_device(device_arg)?;
+    let dtype = dtype_arg.to_dtype();
 
     let loaded = load_model(&device, dtype)?;
     eprintln!("model load: {} ms", loaded.load_ms);
@@ -169,36 +204,16 @@ pub async fn cmd_embed(
     Ok(())
 }
 
-/// `bench` subcommand: load once, embed the file N times, report throughput.
-pub async fn cmd_bench(
-    texts_file: std::path::PathBuf,
+/// Build the `bench` JSON summary from collected per-iteration timings.
+fn bench_summary(
+    model: String,
+    device: String,
+    dtype: String,
+    n: usize,
     iters: usize,
-    device_arg: DeviceArg,
-    dtype_arg: DtypeArg,
-    batch_size: usize,
-) -> Result<()> {
-    let device = resolve_device(device_arg)?;
-    let dtype = dtype_arg.to_dtype();
-
-    let raw = std::fs::read_to_string(&texts_file)
-        .with_context(|| format!("reading texts file {}", texts_file.display()))?;
-    let texts: Vec<String> = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing texts JSON from {}", texts_file.display()))?;
-    if texts.is_empty() {
-        anyhow::bail!("texts file is empty");
-    }
-
-    let loaded = load_model(&device, dtype)?;
-
-    let n = texts.len();
-    let total_words: usize = texts.iter().map(|t| t.split_whitespace().count()).sum();
-
-    let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let res = embed_texts(&loaded.model, &texts, batch_size)?;
-        per_iter_ms.push(res.embed_ms);
-    }
-
+    per_iter_ms: Vec<u128>,
+    total_words: usize,
+) -> BenchSummary {
     let safe_iters = iters.max(1) as f64;
     let avg_ms = per_iter_ms.iter().sum::<u128>() as f64 / safe_iters;
     let tps = if avg_ms > 0.0 {
@@ -211,11 +226,10 @@ pub async fn cmd_bench(
     } else {
         0.0
     };
-
-    let summary = BenchSummary {
-        model: MODEL_ID.to_string(),
-        device: format!("{:?}", device_arg),
-        dtype: format!("{:?}", dtype_arg),
+    BenchSummary {
+        model,
+        device,
+        dtype,
         texts: n,
         iters,
         per_iter_ms,
@@ -223,7 +237,72 @@ pub async fn cmd_bench(
         texts_per_sec: tps,
         words: total_words,
         words_per_sec: wps,
+    }
+}
+
+/// `bench` subcommand: load once, embed the file N times, report throughput.
+pub async fn cmd_bench(
+    texts_file: std::path::PathBuf,
+    iters: usize,
+    backend: BackendArg,
+    device_arg: DeviceArg,
+    dtype_arg: DtypeArg,
+    model_dir: std::path::PathBuf,
+    ep: EpArg,
+    batch_size: usize,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(&texts_file)
+        .with_context(|| format!("reading texts file {}", texts_file.display()))?;
+    let texts: Vec<String> = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing texts JSON from {}", texts_file.display()))?;
+    if texts.is_empty() {
+        anyhow::bail!("texts file is empty");
+    }
+
+    let n = texts.len();
+    let total_words: usize = texts.iter().map(|t| t.split_whitespace().count()).sum();
+    let device_label = format!("{:?}", device_arg);
+    let dtype_label = format!("{:?}", dtype_arg);
+
+    let summary = if matches!(backend, BackendArg::Onnx) {
+        let (mut embedder, load_ms) = OnnxEmbedder::load(model_dir.as_path(), ep)?;
+        eprintln!("model load: {} ms", load_ms);
+        let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let _ = embedder.embed_batched(&texts, batch_size)?;
+            per_iter_ms.push(start.elapsed().as_millis());
+        }
+        bench_summary(
+            ONNX_MODEL_ID.to_string(),
+            device_label,
+            dtype_label,
+            n,
+            iters,
+            per_iter_ms,
+            total_words,
+        )
+    } else {
+        let device = resolve_device(device_arg)?;
+        let dtype = dtype_arg.to_dtype();
+        let loaded = load_model(&device, dtype)?;
+
+        let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let res = embed_texts(&loaded.model, &texts, batch_size)?;
+            per_iter_ms.push(res.embed_ms);
+        }
+        bench_summary(
+            MODEL_ID.to_string(),
+            device_label,
+            dtype_label,
+            n,
+            iters,
+            per_iter_ms,
+            total_words,
+        )
     };
+
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())
 }

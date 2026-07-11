@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use arrow_array::{Array, Float32Array, RecordBatch, StringArray};
 use crate::embedder::{load_model, resolve_device, DtypeArg, DeviceArg};
+use crate::BackendArg;
+use crate::onnx_embedder::{EpArg, OnnxEmbedder};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
@@ -22,24 +24,38 @@ pub async fn cmd_query(
     db: PathBuf,
     query: String,
     limit: usize,
+    backend: BackendArg,
     device_arg: DeviceArg,
     dtype_arg: DtypeArg,
+    model_dir: PathBuf,
+    ep: EpArg,
     _batch_size: usize,
 ) -> Result<()> {
-    let device = resolve_device(device_arg)?;
-    let dtype = dtype_arg.to_dtype();
+    let query_vec = if matches!(backend, BackendArg::Onnx) {
+        let (mut embedder, load_ms) = OnnxEmbedder::load(model_dir.as_path(), ep)?;
+        eprintln!("model load: {} ms", load_ms);
+        let vectors = embedder
+            .embed_batched(&[query.clone()], 1)
+            .context("embedding query failed")?;
+        vectors
+            .into_iter()
+            .next()
+            .context("query embedding produced no vector")?
+    } else {
+        let device = resolve_device(device_arg)?;
+        let dtype = dtype_arg.to_dtype();
 
-    let loaded = load_model(&device, dtype)?;
-    eprintln!("model load: {} ms", loaded.load_ms);
+        let loaded = load_model(&device, dtype)?;
+        eprintln!("model load: {} ms", loaded.load_ms);
 
-    let q = loaded
-        .model
-        .embed(&[query.clone()])
-        .with_context(|| "embedding query failed")?;
-    let query_vec = q
-        .into_iter()
-        .next()
-        .context("query embedding produced no vector")?;
+        let q = loaded
+            .model
+            .embed(&[query.clone()])
+            .with_context(|| "embedding query failed")?;
+        q.into_iter()
+            .next()
+            .context("query embedding produced no vector")?
+    };
 
     let conn = lancedb::connect(&db.to_string_lossy())
         .execute()
