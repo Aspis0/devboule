@@ -2396,14 +2396,14 @@ mod tests {
     }
 }
 
-static ORACLE_ENABLED: OnceLock<bool> = OnceLock::new();
+static ORACLE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn set_oracle_enabled_flag(enabled: bool) {
-    let _ = ORACLE_ENABLED.set(enabled);
+    ORACLE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn oracle_is_enabled() -> bool {
-    *ORACLE_ENABLED.get().unwrap_or(&true)
+pub(crate) fn oracle_is_enabled() -> bool {
+    ORACLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn oracle_enabled_from_value(v: &serde_json::Value) -> bool {
@@ -2449,6 +2449,7 @@ pub fn set_oracle_enabled(
     let backup = path.with_extension(format!("json.{suffix}.bak"));
     std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
     crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
+    set_oracle_enabled_flag(enabled);
     Ok(enabled)
 }
 
@@ -2467,5 +2468,19 @@ mod oracle_toggle_tests {
     fn reads_explicit_bool() {
         assert!(!oracle_enabled_from_value(&json!({"oracle": {"enabled": false}})));
         assert!(oracle_enabled_from_value(&json!({"oracle": {"enabled": true}})));
+    }
+
+    /// MUTATES PROCESS-GLOBAL STATE: toggles the `ORACLE_ENABLED` AtomicBool
+    /// through true → false → true to prove the flag is runtime-mutable (not
+    /// stuck behind OnceLock's set-once semantics). Restores `true` at the end
+    /// so other tests in the same binary see the default.
+    #[test]
+    fn oracle_enabled_flag_is_mutable_at_runtime() {
+        super::set_oracle_enabled_flag(true);
+        assert!(super::oracle_is_enabled());
+        super::set_oracle_enabled_flag(false);
+        assert!(!super::oracle_is_enabled());
+        super::set_oracle_enabled_flag(true);
+        assert!(super::oracle_is_enabled());
     }
 }

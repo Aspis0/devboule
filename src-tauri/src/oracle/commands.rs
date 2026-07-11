@@ -22,11 +22,34 @@ fn require_graph_auth(auth_state: &BackendState) -> Result<(), String> {
     auth_state.ensure_unlocked()
 }
 
+/// PURE: the actual disabled-gate check, parameterized on the already-read
+/// enabled flag so it's independently testable without depending on
+/// process-global state.
+fn oracle_enabled_gate(enabled: bool) -> Result<(), &'static str> {
+    if !enabled {
+        return Err("Oracle is disabled — enable it in Settings.");
+    }
+    Ok(())
+}
+
+/// Same lock check as [`require_graph_auth`], PLUS the Oracle-disabled gate.
+/// Used by every graph-auth-gated command EXCEPT the setup/install flow
+/// (`get_oracle_runtime_setup`, `install_oracle_runtime`), which must keep
+/// working while Oracle is disabled — that's how a user installs/repairs the
+/// runtime before or while it's turned off.
+fn require_graph_auth_and_enabled(auth_state: &BackendState) -> Result<(), String> {
+    require_graph_auth(auth_state)?;
+    oracle_enabled_gate(crate::backend::oracle_service::oracle_is_enabled())
+        .map_err(|e| e.to_string())
+}
+
 /// Auth gate for the Oracle query/snapshot commands. Same lock check as
 /// [`require_graph_auth`], but maps a locked/auth failure to a typed
 /// [`OracleError`] so these commands keep a single error type end-to-end.
 fn require_oracle_auth(auth_state: &BackendState) -> Result<(), OracleError> {
-    auth_state.ensure_unlocked().map_err(OracleError::internal)
+    auth_state.ensure_unlocked().map_err(OracleError::internal)?;
+    oracle_enabled_gate(crate::backend::oracle_service::oracle_is_enabled())
+        .map_err(OracleError::internal)
 }
 
 /// Report whether the local Oracle retrieval runtime (Python venv + LanceDB +
@@ -918,6 +941,80 @@ mod tests {
             SuspectOutcome::Failed(_) => panic!("a successful retrieval must seed files"),
         }
     }
+
+    // ------------------------------------------------------------------
+    // Oracle-disabled gate tests (Step 4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn oracle_enabled_gate_rejects_when_disabled() {
+        // When Oracle is disabled, the real gate must return the disabled error.
+        let err = super::oracle_enabled_gate(false).expect_err("must error when disabled");
+        assert!(err.contains("Oracle is disabled"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn oracle_enabled_gate_passes_when_enabled() {
+        // When Oracle is enabled, the real gate must not short-circuit.
+        assert!(super::oracle_enabled_gate(true).is_ok());
+    }
+
+
+
+    /// The setup/install flow commands (`get_oracle_runtime_setup`,
+    /// `install_oracle_runtime`) MUST keep calling the plain `require_graph_auth`
+    /// (NOT `require_graph_auth_and_enabled`) so they work even when Oracle is
+    /// disabled — that's how a user installs/repairs the runtime. This is a
+    /// code-verification test: it reads the source to confirm the two setup
+    /// command functions call `require_graph_auth`, not
+    /// `require_graph_auth_and_enabled`. (A runtime test would require mocking
+    //  subprocess/filesystem calls; the re-grep in Step 3 plus this static
+    //  assertion is sufficient.)
+    #[test]
+    fn setup_commands_use_plain_require_graph_auth() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/oracle/commands.rs"),
+        )
+        .expect("must read commands.rs source");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Find a function by name, then search the next 20 lines for its auth call.
+        let find_auth_call = |fn_name: &str| -> Option<&str> {
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(&format!("pub async fn {fn_name}")) {
+                    // Scan the next 20 lines for the first `require_graph_auth` call.
+                    for j in i..(i + 20).min(lines.len()) {
+                        if lines[j].contains("require_graph_auth") {
+                            return Some(lines[j]);
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let setup_call = find_auth_call("get_oracle_runtime_setup")
+            .expect("get_oracle_runtime_setup not found in source");
+        assert!(
+            setup_call.contains("require_graph_auth(&auth_state)?;"),
+            "get_oracle_runtime_setup must call plain require_graph_auth, got: {setup_call}"
+        );
+        assert!(
+            !setup_call.contains("require_graph_auth_and_enabled"),
+            "get_oracle_runtime_setup must NOT call require_graph_auth_and_enabled, got: {setup_call}"
+        );
+
+        let install_call = find_auth_call("install_oracle_runtime")
+            .expect("install_oracle_runtime not found in source");
+        assert!(
+            install_call.contains("require_graph_auth(&auth_state)?;"),
+            "install_oracle_runtime must call plain require_graph_auth, got: {install_call}"
+        );
+        assert!(
+            !install_call.contains("require_graph_auth_and_enabled"),
+            "install_oracle_runtime must NOT call require_graph_auth_and_enabled, got: {install_call}"
+        );
+    }
 }
 
 #[tauri::command]
@@ -1295,7 +1392,7 @@ pub async fn get_oracle_coverage(
 pub async fn get_oracle_runtime(
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<OracleRuntime, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
 
     // P2: this is the "Checking vector runtime…" boot step. Route it through the
     // bounded HTTP-only GET (probe → request): a not-ready server returns the fast
@@ -1311,7 +1408,7 @@ pub async fn get_oracle_runtime(
 pub async fn get_oracle_index_status(
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<serde_json::Value, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the SAME resident server the supervisor and `ask_oracle` use —
     // the one started against the WORKSPACE index root. Passing the package/code
     // root here (the old `require_oracle_root(&state)`) made `ensure_oracle_server`
@@ -1556,7 +1653,7 @@ fn oracle_provider_key_present() -> bool {
 pub async fn sync_oracle_text_chunks(
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<serde_json::Value, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
@@ -1575,7 +1672,7 @@ pub async fn start_oracle_index_job(
     idle: Option<bool>,
     manual: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
@@ -1599,7 +1696,7 @@ pub async fn start_oracle_index_job(
 pub async fn start_oracle_index_watcher(
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<serde_json::Value, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
@@ -1614,7 +1711,7 @@ pub async fn start_oracle_index_watcher(
 pub async fn stop_oracle_index_watcher(
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<serde_json::Value, String> {
-    require_graph_auth(&auth_state)?;
+    require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
