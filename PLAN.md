@@ -114,6 +114,7 @@ Port `aspis_mcp.py` (10 k LOC) to a Rust stdio-MCP sidecar binary (`rmcp`), ship
 | Two engines writing stores concurrently | flag-gated single-indexer invariant enforced in supervisor |
 | ort dylib distribution (win) | `download-binaries` feature at build, bundle with app; verify code-signing on mac |
 | Domain-bonus stack drifts during port | verbatim port + ranking-parity fixtures; NO "improvements" during the port (profile bump = separate future work) |
+| **Frozen production bug** (found in P0 review): `chunk_embedding_text` iterates the JSON-string `symbols_used` char-by-char → garbled `REFERENCES:` lines in every embedded text | live index embedded WITH the bug → Rust port must replicate it byte-for-byte (golden fixture freezes it); fix post-port via embed-profile bump + re-index |
 | aspis_mcp in-process fallback loses venv | gated off in P12; thin-client HTTP is the primary path already |
 
 ## 5. Sizing (rough)

@@ -1,0 +1,182 @@
+{
+ "build/keep.md": {
+  "domains": [
+   "cloudflare_provider_console",
+   "gpu_cpu_lifecycle",
+   "provider_privacy",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "documentation_or_plan_secondary"
+ },
+ "data/config.json": {
+  "domains": [
+   "cloudflare_provider_console",
+   "cloudflare_worker_secret_rotation",
+   "gpu_cpu_lifecycle",
+   "oracle_answering",
+   "oracle_indexing",
+   "oracle_mcp_agents",
+   "projects_mini_notion",
+   "provider_privacy",
+   "rnaseq_browser_upload",
+   "rnaseq_output_release",
+   "rnaseq_scaleway_lifecycle",
+   "scaleway_provider_console",
+   "windows_hello_auth"
+  ],
+  "source_kind": "structured_config"
+ },
+ "data/schema.yaml": {
+  "domains": [
+   "cloudflare_provider_console",
+   "cloudflare_worker_secret_rotation",
+   "gpu_cpu_lifecycle",
+   "oracle_answering",
+   "oracle_indexing",
+   "provider_privacy",
+   "rnaseq_browser_upload",
+   "rnaseq_output_release",
+   "rnaseq_scaleway_lifecycle",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "structured_config"
+ },
+ "docs/architecture.md": {
+  "domains": [
+   "cloudflare_provider_console",
+   "gpu_cpu_lifecycle",
+   "oracle_indexing",
+   "provider_privacy",
+   "rnaseq_output_release",
+   "scaleway_provider_console",
+   "windows_hello_auth"
+  ],
+  "source_kind": "documentation_or_plan_secondary"
+ },
+ "excluded/reincluded/kept.md": {
+  "domains": [],
+  "source_kind": "documentation_or_plan_secondary"
+ },
+ "src/Main.java": {
+  "domains": [],
+  "source_kind": "implementation_primary"
+ },
+ "src/agent_workflow.py": {
+  "domains": [
+   "oracle_answering",
+   "oracle_mcp_agents",
+   "projects_mini_notion",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/app.py": {
+  "domains": [
+   "cloudflare_provider_console",
+   "provider_privacy",
+   "rnaseq_output_release",
+   "scaleway_provider_console",
+   "windows_hello_auth"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/cloudflare_secrets.py": {
+  "domains": [
+   "cloudflare_provider_console",
+   "cloudflare_worker_secret_rotation"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/components/App.tsx": {
+  "domains": [
+   "cloudflare_provider_console",
+   "provider_privacy",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/components/utils.ts": {
+  "domains": [
+   "cloudflare_provider_console",
+   "provider_privacy",
+   "rnaseq_output_release",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/crlf_test.py": {
+  "domains": [
+   "windows_hello_auth"
+  ],
+  "source_kind": "test_regression_secondary"
+ },
+ "src/crlf_twin_lf.py": {
+  "domains": [
+   "windows_hello_auth"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/huge_function.py": {
+  "domains": [
+   "windows_hello_auth"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/lib.rs": {
+  "domains": [
+   "windows_hello_auth"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/oracle_privacy.py": {
+  "domains": [
+   "provider_privacy",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/plain_code.py": {
+  "domains": [
+   "cloudflare_provider_console",
+   "gpu_cpu_lifecycle",
+   "oracle_indexing",
+   "provider_privacy",
+   "rnaseq_output_release",
+   "scaleway_provider_console",
+   "windows_hello_auth"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/rnaseq_output.py": {
+  "domains": [
+   "rnaseq_output_release"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/scaleway_lifecycle.py": {
+  "domains": [
+   "cloudflare_provider_console",
+   "gpu_cpu_lifecycle",
+   "provider_privacy",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/server.js": {
+  "domains": [
+   "cloudflare_provider_console"
+  ],
+  "source_kind": "implementation_primary"
+ },
+ "src/sliding_window_code.py": {
+  "domains": [],
+  "source_kind": "implementation_primary"
+ },
+ "src/unicode_test.py": {
+  "domains": [
+   "provider_privacy",
+   "scaleway_provider_console"
+  ],
+  "source_kind": "test_regression_secondary"
+ }
+}

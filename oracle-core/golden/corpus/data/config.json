@@ -1,0 +1,427 @@
+{
+  "pipeline": {
+    "name": "oracle-ingestion",
+    "version": "2.5.0",
+    "description": "Text chunking and semantic indexing pipeline for the Aspis Management project. Supports multiple programming languages with AST-aware semantic chunking and sliding-window fallback."
+  },
+  "chunking": {
+    "profiles": {
+      "code": {
+        "max_chars": 2500,
+        "overlap": 400,
+        "semantic": true
+      },
+      "doc": {
+        "max_chars": 12000,
+        "overlap": 1200,
+        "semantic": false
+      },
+      "structured": {
+        "max_chars": 8000,
+        "overlap": 900,
+        "semantic": false
+      },
+      "default": {
+        "max_chars": 2200,
+        "overlap": 280,
+        "semantic": false
+      }
+    },
+    "extensions": {
+      "code": [
+        ".py",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".java",
+        ".kt",
+        ".sh",
+        ".ps1",
+        ".r",
+        ".rmd",
+        ".css",
+        ".sql"
+      ],
+      "doc": [
+        ".md",
+        ".txt"
+      ],
+      "structured": [
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".xml",
+        ".html",
+        ".gradle",
+        ".properties"
+      ]
+    },
+    "max_file_bytes": 1200000,
+    "batch_files": 16,
+    "batch_chunks": 8,
+    "batch_chars": 50000,
+    "min_free_ram_gb": 5.0,
+    "gpu_min_free_gb": 1.5,
+    "max_gpu_temp_c": 85,
+    "gpu_cooldown_seconds": 45,
+    "low_memory_retry_seconds": 5,
+    "low_memory_retry_cycles": 6
+  },
+  "embedding": {
+    "model": "Qwen/Qwen3-Embedding-0.6B",
+    "dimensions": 1024,
+    "max_length": 32768,
+    "batch_size": 32,
+    "profiles": {
+      "semantic-prefix-v2": {
+        "version": "semantic-prefix-qwen3-2026-06-02-c2500",
+        "enabled": true
+      },
+      "raw": {
+        "version": "adaptive-qwen3-2026-05-28",
+        "enabled": false
+      }
+    },
+    "prefix_headers": [
+      "TASK",
+      "SOURCE_PATH",
+      "FILE_NAME",
+      "EXTENSION",
+      "SOURCE_KIND",
+      "PRIORITY_HINT",
+      "DOMAIN_TAGS",
+      "CHUNK_KIND",
+      "SYMBOL_NAME",
+      "LANGUAGE",
+      "LINE_RANGE",
+      "SYMBOLS",
+      "REFERENCES",
+      "ROUTES_APIS",
+      "QUESTIONS_THIS_CHUNK_CAN_ANSWER",
+      "RAW_CHUNK"
+    ]
+  },
+  "query_engine": {
+    "max_prompt_chunks": 8,
+    "max_chars_per_chunk": 2800,
+    "max_answer_chars": 3200,
+    "lexical_weight": 1.0,
+    "vector_weight": 0.25,
+    "chunk_weight": 2.5,
+    "stopwords": [
+      "about",
+      "after",
+      "and",
+      "are",
+      "can",
+      "does",
+      "for",
+      "from",
+      "how",
+      "into",
+      "the",
+      "this",
+      "that",
+      "what",
+      "when",
+      "where",
+      "which",
+      "with"
+    ]
+  },
+  "domains": {
+    "rnaseq_output_release": {
+      "source_signals": [
+        "output_renders",
+        "artifact_url",
+        "manifest_url",
+        "downloadrenderedartifact",
+        "outputs/render"
+      ],
+      "bonus_weight": 28.0,
+      "query_terms_required": [
+        "rna-seq",
+        "rnaseq",
+        "rna"
+      ],
+      "output_terms_required": [
+        "output",
+        "outputs",
+        "result",
+        "results",
+        "release",
+        "download",
+        "browser",
+        "successful",
+        "success"
+      ]
+    },
+    "rnaseq_browser_upload": {
+      "source_signals": [
+        "browseruploadsession",
+        "createbrowseruploadsession",
+        "completebrowseruploadfile",
+        "rna_upload_sessions"
+      ],
+      "bonus_weight": 70.0,
+      "query_terms_required": [
+        "rna-seq",
+        "rnaseq",
+        "rna"
+      ],
+      "upload_terms_required": [
+        "upload",
+        "uploads",
+        "session",
+        "sessions",
+        "completion",
+        "complete",
+        "browser"
+      ]
+    },
+    "rnaseq_scaleway_lifecycle": {
+      "source_signals": [
+        "cleanupscalewayinstanceafterterminal",
+        "terminatescalewayinstance",
+        "releasescalewayinstanceslot",
+        "scaleway.mjs"
+      ],
+      "bonus_weight": 34.0,
+      "query_terms_required": [
+        "rna-seq",
+        "rnaseq",
+        "rna",
+        "scaleway"
+      ],
+      "lifecycle_terms_required": [
+        "lifecycle",
+        "terminal",
+        "cleanup",
+        "instance",
+        "instances",
+        "vm",
+        "scaleway"
+      ]
+    },
+    "cloudflare_worker_secret_rotation": {
+      "source_signals": [
+        "rotate_cloudflare_worker_secret",
+        "put_cloudflare_worker_secret",
+        "worker secret",
+        "workers scripts write"
+      ],
+      "bonus_weight": 28.0,
+      "query_terms_required": [
+        "cloudflare",
+        "worker",
+        "workers"
+      ],
+      "secret_terms_required": [
+        "secret",
+        "secrets",
+        "rotation",
+        "rotate"
+      ]
+    },
+    "scaleway_provider_console": {
+      "source_signals": [
+        "scaleway",
+        "instance",
+        "serverless",
+        "commercial_type",
+        "project_id"
+      ],
+      "bonus_weight": 6.0
+    },
+    "cloudflare_provider_console": {
+      "source_signals": [
+        "cloudflare",
+        "workers",
+        "routes",
+        "zone",
+        "account_id"
+      ],
+      "bonus_weight": 6.0
+    },
+    "oracle_indexing": {
+      "source_signals": [
+        "index_file_chunks",
+        "chunk_index_status",
+        "lancedb",
+        "qwen3-embedding",
+        "chunk-profile"
+      ],
+      "bonus_weight": 5.0
+    },
+    "oracle_answering": {
+      "source_signals": [
+        "answer_from_context",
+        "queryengine",
+        "oracle_ask",
+        "oracle_context"
+      ],
+      "bonus_weight": 5.0
+    },
+    "oracle_mcp_agents": {
+      "source_signals": [
+        "mcp",
+        "project_claim_task",
+        "project_update_status",
+        "create_mcp_server"
+      ],
+      "bonus_weight": 5.0
+    },
+    "projects_mini_notion": {
+      "source_signals": [
+        "projectsview",
+        "kanban",
+        "project.md",
+        "project_claim_task",
+        "agent claims"
+      ],
+      "bonus_weight": 5.0
+    },
+    "windows_hello_auth": {
+      "source_signals": [
+        "windows hello",
+        "biometric",
+        "webcam",
+        "pin",
+        "unlock"
+      ],
+      "bonus_weight": 5.0
+    },
+    "provider_privacy": {
+      "source_signals": [
+        "zdr",
+        "gdpr",
+        "infomaniak",
+        "mistral",
+        "openrouter",
+        "scaleway"
+      ],
+      "bonus_weight": 5.0
+    },
+    "gpu_cpu_lifecycle": {
+      "source_signals": [
+        "gpu",
+        "cpu",
+        "vm",
+        "egpu",
+        "terminate",
+        "delete",
+        "scale-to-zero"
+      ],
+      "bonus_weight": 5.0
+    }
+  },
+  "security": {
+    "sensitive_path_components": [
+      ".secrets",
+      "aspis-secrets",
+      ".dev.vars",
+      "node_modules",
+      "oracle-data",
+      "src-tauri/target",
+      "target"
+    ],
+    "sensitive_path_substrings": [
+      "package-lock.json"
+    ],
+    "sensitive_suffixes": [
+      ".key",
+      ".pem",
+      ".pfx",
+      ".p12",
+      ".dev.vars"
+    ],
+    "secret_data_extensions": [
+      ".txt",
+      ".json",
+      ".yaml",
+      ".yml",
+      ".toml",
+      ".ini",
+      ".cfg",
+      ".conf",
+      ".env"
+    ],
+    "secret_content_words": [
+      "secret",
+      "credential",
+      "creds",
+      "vault",
+      "token",
+      "apikey",
+      "api-key",
+      "api_key",
+      "passwd",
+      "password"
+    ],
+    "sensitive_name_parts": [
+      "service-account",
+      "private-key"
+    ],
+    "ignore_files": [
+      ".gitignore",
+      ".oracleignore",
+      ".aspisignore"
+    ]
+  },
+  "server": {
+    "port": 8765,
+    "llm_model": "voxtral-small-24b-2507",
+    "llm_temperature": 0.1,
+    "query_idle_timeout": 30,
+    "watch_debounce": 30,
+    "allowed_providers": [
+      "scaleway",
+      "infomaniak",
+      "mistral"
+    ],
+    "local_providers": [
+      "omlx",
+      "ollama"
+    ]
+  },
+  "watch": {
+    "dirs": [
+      "workers",
+      "containers",
+      "src",
+      "src-tauri/src",
+      "oracle",
+      "projects"
+    ],
+    "extensions": [
+      ".js",
+      ".ts",
+      ".tsx",
+      ".py",
+      ".rs",
+      ".go",
+      ".json",
+      ".yaml",
+      ".yml",
+      ".md"
+    ],
+    "debounce_seconds": 30
+  },
+  "answerer": {
+    "max_prompt_chunks": 8,
+    "max_chars_per_chunk": 2800,
+    "max_answer_chars": 3200,
+    "llm_temperature": 0.1,
+    "not_found_phrase": "not found in corpus",
+    "secret_redaction": "[redacted-secret]"
+  },
+  "stores": {
+    "lance_db": "oracle-data/chunks.lancedb",
+    "sqlite": "oracle-data/metadata.sqlite",
+    "file_vectors": "oracle-data/file_vectors.lancedb",
+    "chunk_manifest": "oracle-data/chunk-index-manifest.json"
+  }
+}

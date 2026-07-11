@@ -1,0 +1,17 @@
+[
+ "How does Scaleway GPU spawning work with limits?",
+ "How does RNA-seq release outputs after a successful run?",
+ "How does RNA-seq browser upload session completion work?",
+ "Where are Scaleway instances terminated after RNA-seq jobs?",
+ "Which files handle paid Scaleway compute cleanup after jobs?",
+ "Where is Cloudflare worker secret rotation implemented?",
+ "Which Oracle providers are privacy-safe for ZDR GDPR?",
+ "How do agents claim tasks and update project status?",
+ "How does Windows Hello unlock work with webcam and PIN?",
+ "Which files control Scaleway GPU VM lifecycle and instances?",
+ "What is the architecture of this project?",
+ "How does the chunk embedding text work?",
+ "What is the current project status and roadmap?",
+ "How do I configure the oracle LLM provider settings?",
+ "What does the split_text function do?"
+]

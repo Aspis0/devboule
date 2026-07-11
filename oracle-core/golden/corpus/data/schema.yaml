@@ -1,0 +1,97 @@
+# Oracle Ingestion Pipeline Configuration Schema
+
+pipeline:
+  name: oracle-ingestion
+  version: "2.5.0"
+  description: >
+    Text chunking and semantic indexing pipeline for the Aspis Management
+    project. Supports multiple programming languages with AST-aware
+    semantic chunking and sliding-window fallback.
+
+chunking:
+  profiles:
+    code:
+      max_chars: 2500
+      overlap: 400
+      semantic: true
+      extensions: [".py", ".rs", ".ts", ".tsx", ".js", ".java", ".kt"]
+    doc:
+      max_chars: 12000
+      overlap: 1200
+      semantic: false
+      extensions: [".md", ".txt"]
+    structured:
+      max_chars: 8000
+      overlap: 900
+      semantic: false
+      extensions: [".json", ".yaml", ".toml", ".xml", ".html"]
+    default:
+      max_chars: 2200
+      overlap: 280
+      semantic: false
+
+embedding:
+  model: Qwen/Qwen3-Embedding-0.6B
+  dimensions: 1024
+  max_length: 32768
+  profile: semantic-prefix-v2
+
+query_engine:
+  max_prompt_chunks: 8
+  max_chars_per_chunk: 2800
+  max_answer_chars: 3200
+  scoring:
+    lexical_weight: 1.0
+    vector_weight: 0.25
+    chunk_weight: 2.5
+
+domains:
+  rnaseq_output_release:
+    signals:
+      - output_renders
+      - artifact_url
+      - manifest_url
+      - downloadrenderedartifact
+    bonus_weight: 28.0
+  rnaseq_browser_upload:
+    signals:
+      - browseruploadsession
+      - createbrowseruploadsession
+      - completebrowseruploadfile
+    bonus_weight: 70.0
+  rnaseq_scaleway_lifecycle:
+    signals:
+      - cleanupscalewayinstanceafterterminal
+      - terminatescalewayinstance
+      - releasescalewayinstanceslot
+    bonus_weight: 34.0
+  cloudflare_worker_secret_rotation:
+    signals:
+      - rotate_cloudflare_worker_secret
+      - put_cloudflare_worker_secret
+    bonus_weight: 28.0
+  scaleway_provider_console:
+    signals:
+      - scaleway
+      - instance
+      - serverless
+    bonus_weight: 6.0
+  oracle_indexing:
+    signals:
+      - index_file_chunks
+      - lancedb
+      - qwen3-embedding
+    bonus_weight: 5.0
+  oracle_answering:
+    signals:
+      - answer_from_context
+      - queryengine
+      - oracle_ask
+    bonus_weight: 5.0
+  provider_privacy:
+    signals:
+      - zdr
+      - gdpr
+      - infomaniak
+      - mistral
+    bonus_weight: 5.0
