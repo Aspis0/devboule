@@ -3,7 +3,7 @@
 //! Port of `answerer.py::build_answer_prompt` — the instruction text is
 //! byte-exact.
 
-use crate::answer::context::{redact_secret_tokens, NOT_FOUND_PHRASE, PreparedChunk};
+use crate::answer::context::{redact_secret_tokens, PreparedChunk, NOT_FOUND_PHRASE};
 
 /// Build the answer prompt from a query and prepared context chunks.
 ///

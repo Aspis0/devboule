@@ -219,11 +219,9 @@ pub fn filter_domain_context(chunks: Vec<RawChunk>, query: &str) -> Vec<RawChunk
     }
 
     let is_rnaseq = q.contains("rna-seq") || q.contains("rnaseq");
-    let has_output_term = [
-        "output", "result", "download", "browser", "release",
-    ]
-    .iter()
-    .any(|t| q.contains(t));
+    let has_output_term = ["output", "result", "download", "browser", "release"]
+        .iter()
+        .any(|t| q.contains(t));
     if is_rnaseq && has_output_term {
         let implementation: Vec<RawChunk> = chunks
             .iter()
@@ -245,10 +243,7 @@ pub fn filter_domain_context(chunks: Vec<RawChunk>, query: &str) -> Vec<RawChunk
 
 /// Extract the file source from a chunk, normalizing path separators.
 fn chunk_file_source(chunk: &RawChunk) -> String {
-    chunk
-        .file_source
-        .replace('\\', "/")
-        .to_lowercase()
+    chunk.file_source.replace('\\', "/").to_lowercase()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -305,20 +300,6 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
     let mut best_score = -1i64;
 
     for &position in &positions {
-        let start = if limit / 3 > position {
-            0
-        } else {
-            position - limit / 3
-        };
-        let mut end = start + limit;
-        if end > text.len() {
-            end = text.len();
-        }
-        let mut adjusted_start = if end >= limit { end - limit } else { 0 };
-        if adjusted_start > start {
-            // Keep the computed start — Python does `start = max(0, end - limit)`.
-            adjusted_start = start.max(0);
-        }
         // Mirror Python exactly:
         // start = max(0, position - limit // 3)
         // end = min(len(text), start + limit)
@@ -339,9 +320,6 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
         }
     }
 
-    let excerpt = text[best_start..best_start.min(text.len())]
-        .min(text.len())
-        .max(best_start);
     let excerpt_end = (best_start + limit).min(text.len());
     let mut result = text[best_start..excerpt_end].trim().to_string();
 
@@ -373,13 +351,7 @@ fn excerpt_token_re() -> &'static Regex {
 fn term_weight(term: &str) -> i64 {
     if matches!(
         term,
-        "gpu"
-            | "min_scale"
-            | "max_scale"
-            | "scaleway"
-            | "cloudflare"
-            | "worker"
-            | "workers"
+        "gpu" | "min_scale" | "max_scale" | "scaleway" | "cloudflare" | "worker" | "workers"
     ) {
         3
     } else {
@@ -420,26 +392,42 @@ pub fn redact_secret_tokens(text: &str) -> String {
     }
 
     // High-entropy base64 runs (40+ chars) with mixed character classes.
-    for m in secret_high_entropy_re().find_iter(&redacted).collect::<Vec<_>>() {
-        let token = m.as_str();
-        let has_lower = token.chars().any(|c| c.is_lowercase());
-        let has_upper = token.chars().any(|c| c.is_uppercase());
-        let has_digit = token.chars().any(|c| c.is_ascii_digit());
-        let classes = has_lower as i32 + has_upper as i32 + has_digit as i32;
-        if classes >= 2 {
-            redacted = redacted.replacen(token, SECRET_REDACTION, 1);
-        }
+    // Collect positions first, then replace in reverse to avoid index shifts.
+    let re = secret_high_entropy_re();
+    let mut entropy_positions: Vec<(usize, usize)> = re
+        .find_iter(&redacted)
+        .map(|m| {
+            let token = m.as_str();
+            let has_lower = token.chars().any(|c| c.is_lowercase());
+            let has_upper = token.chars().any(|c| c.is_uppercase());
+            let has_digit = token.chars().any(|c| c.is_ascii_digit());
+            let classes = has_lower as i32 + has_upper as i32 + has_digit as i32;
+            if classes >= 2 {
+                Some((m.start(), m.end()))
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+    entropy_positions.reverse();
+    for (start, end) in entropy_positions {
+        redacted.replace_range(start..end, SECRET_REDACTION);
     }
 
-    // Rebuild after base64 replacement to avoid index issues.
-    let mut result = redacted;
     // Hex runs (40+ hex chars).
-    for m in secret_hex_re().find_iter(&result).collect::<Vec<_>>() {
-        let token = m.as_str();
-        result = result.replacen(token, SECRET_REDACTION, 1);
+    let re = secret_hex_re();
+    let hex_positions: Vec<(usize, usize)> = re
+        .find_iter(&redacted)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    let mut hex_positions = hex_positions;
+    hex_positions.reverse();
+    for (start, end) in hex_positions {
+        redacted.replace_range(start..end, SECRET_REDACTION);
     }
 
-    result
+    redacted
 }
 
 /// Compile-time secret patterns — byte-exact regexes from Python.
@@ -459,11 +447,7 @@ fn secret_patterns() -> Vec<Regex> {
         // JWT-shaped strings (three base64url segments).
         Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b").unwrap(),
         // Generic key=value secret assignments.
-        Regex::new(
-            r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key)\b\s*[:=]\s*\
-             ['\"]?[A-Za-z0-9/_+\-]{16,}['\"]?",
-        )
-        .unwrap(),
+        Regex::new(r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key)\b\s*[:=]\s*['"]?[A-Za-z0-9/_+\-]{16,}['"]?"#).unwrap(),
     ]
 }
 
@@ -476,3 +460,43 @@ fn secret_hex_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[0-9a-fA-F]{40,}\b").unwrap())
 }
+
+/// Suggest a file path based on the query — mirrors `answerer.py::suggest_path`.
+pub fn suggest_path(query: &str, context: &[PreparedChunk]) -> Option<String> {
+    if let Some(first) = context.first() {
+        if !first.file_source.is_empty() {
+            return Some(first.file_source.clone());
+        }
+    }
+    let q = query.to_lowercase();
+    if q.contains("scaleway") || q.contains("gpu") || q.contains("serverless") {
+        return Some("src-tauri/src/backend/ or Scaleway provider docs".to_string());
+    }
+    if q.contains("cloudflare") || q.contains("worker") {
+        return Some("cloudflare/workers/ or worker source files".to_string());
+    }
+    if q.contains("oracle") || q.contains("mcp") {
+        return Some("oracle/".to_string());
+    }
+    if q.contains("frontend") || q.contains("ui") || q.contains("view") {
+        return Some("src/components/".to_string());
+    }
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public helpers used by guardrails.rs and extractive.rs
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Public re-export of excerpt query terms as a HashSet for guardrails/extractive.
+pub fn excerpt_query_terms_set(query: &str) -> HashSet<String> {
+    excerpt_query_terms(query)
+}
+
+/// Public re-export of term_weight for extractive.rs best_sentence scoring.
+pub fn term_weight_pub(term: &str) -> i64 {
+    term_weight(term)
+}
+
+/// Alias used by guardrails.rs.
+pub use excerpt_query_terms_set as focused_excerpt_query_terms_pub;

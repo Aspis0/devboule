@@ -3189,6 +3189,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5272,12 +5273,14 @@ dependencies = [
  "ndarray 0.16.1",
  "ort",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokenizers 0.21.4",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -6139,6 +6142,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -6176,6 +6180,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]

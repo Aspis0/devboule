@@ -8,7 +8,6 @@ use std::env;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use serde::Serialize;
 
 use crate::answer::AnswerError;
 
@@ -16,26 +15,16 @@ use crate::answer::AnswerError;
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Default LLM model — mirrors `oracle/config.py::LLM_MODEL`.
 const DEFAULT_LLM_MODEL: &str = "voxtral-small-24b-2507";
-
-/// Default LLM temperature — mirrors `oracle/config.py::LLM_TEMPERATURE`.
 pub const LLM_TEMPERATURE: f64 = 0.1;
-
-/// Default max tokens for the answer output.
 const DEFAULT_MAX_TOKENS: u32 = 1500;
-
-/// Providers that run ON THIS MACHINE over loopback (no API key, no egress).
 pub const LOCAL_LLM_PROVIDERS: &[&str] = &["omlx", "ollama"];
-
-/// Remote allowlisted providers.
 const REMOTE_PROVIDERS: &[&str] = &["scaleway", "infomaniak", "mistral"];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// LLM configuration for a single call.
 #[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub provider: String,
@@ -48,7 +37,6 @@ pub struct LlmConfig {
 // Provider allowlist helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// All allowlisted providers (remote + local).
 fn all_allowed_providers() -> HashSet<&'static str> {
     REMOTE_PROVIDERS
         .iter()
@@ -57,7 +45,6 @@ fn all_allowed_providers() -> HashSet<&'static str> {
         .collect()
 }
 
-/// Per-provider allowed HTTPS hosts (byte-exact from Python).
 fn provider_allowed_hosts(provider: &str) -> HashSet<&'static str> {
     match provider {
         "scaleway" => ["api.scaleway.ai"].iter().copied().collect(),
@@ -71,7 +58,6 @@ fn provider_allowed_hosts(provider: &str) -> HashSet<&'static str> {
 // Default base URLs (byte-exact from Python)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Default base URL per provider — mirrors `answerer.py::default_base_url`.
 pub fn default_base_url(provider: &str) -> String {
     match provider {
         "omlx" => "http://127.0.0.1:8000/v1/chat/completions".to_string(),
@@ -85,9 +71,6 @@ pub fn default_base_url(provider: &str) -> String {
     }
 }
 
-/// Ensure the base URL ends with `/chat/completions`.
-///
-/// Mirrors `answerer.py::chat_completions_url`.
 pub fn chat_completions_url(base_url: &str) -> String {
     let url = base_url.trim().trim_end_matches('/');
     if url.is_empty() {
@@ -106,10 +89,6 @@ pub fn chat_completions_url(base_url: &str) -> String {
 // Config normalization
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Normalize an LLM config from optional override + env vars.
-///
-/// Mirrors `answerer.py::normalize_llm_config`.  FAIL-CLOSED on non-allowlisted
-/// provider; missing key/model is NOT an error (consumers degrade to extractive).
 pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, AnswerError> {
     let source = config.cloned().unwrap_or_default();
 
@@ -122,7 +101,6 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
         source.provider.trim().to_lowercase()
     };
 
-    // FAIL-CLOSED: non-allowlisted provider = hard error.
     let allowed = all_allowed_providers();
     if !allowed.contains(provider.as_str()) {
         return Err(AnswerError::PrivacyGate(format!(
@@ -177,9 +155,6 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
 // Validation
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Enforce the remote LLM provider allowlist — FAIL-CLOSED.
-///
-/// Mirrors `answerer.py::enforce_remote_llm_provider_allowlist`.
 pub fn enforce_remote_llm_provider_allowlist(provider: &str) -> Result<(), AnswerError> {
     let provider = provider.trim().to_lowercase();
     if !all_allowed_providers().contains(provider.as_str()) {
@@ -190,16 +165,12 @@ pub fn enforce_remote_llm_provider_allowlist(provider: &str) -> Result<(), Answe
     Ok(())
 }
 
-/// Full strict validation at the actual network call boundary.
-///
-/// Mirrors `answerer.py::validate_remote_llm_config`.
 pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError> {
     enforce_remote_llm_provider_allowlist(&config.provider)?;
 
     let provider = config.provider.trim().to_lowercase();
 
     if LOCAL_LLM_PROVIDERS.contains(&provider.as_str()) {
-        // LOCAL providers: no API key, but FAIL-CLOSED loopback pinning.
         if config.model.is_empty() {
             return Err(AnswerError::Validation(
                 "Local Oracle LLM requires a model name.".to_string(),
@@ -224,7 +195,6 @@ pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError>
         return Ok(());
     }
 
-    // Remote providers.
     if config.api_key.is_empty() {
         return Err(AnswerError::Validation(
             "Remote Oracle LLM requires an API key saved in Devboule.".to_string(),
@@ -236,10 +206,9 @@ pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError>
         ));
     }
     let base_url = chat_completions_url(&config.base_url);
-    let parsed =
-        url::Url::parse(&base_url).map_err(|_| {
-            AnswerError::Validation("Remote Oracle LLM base URL must be HTTPS.".to_string())
-        })?;
+    let parsed = url::Url::parse(&base_url).map_err(|_| {
+        AnswerError::Validation("Remote Oracle LLM base URL must be HTTPS.".to_string())
+    })?;
     if parsed.scheme() != "https" {
         return Err(AnswerError::Validation(
             "Remote Oracle LLM base URL must be HTTPS.".to_string(),
@@ -259,7 +228,6 @@ pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError>
 // LLM call
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Strict JSON schema for Infomaniak responses — byte-exact from Python.
 pub fn answer_json_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -280,9 +248,6 @@ pub fn answer_json_schema() -> serde_json::Value {
     })
 }
 
-/// Generate an answer using an OpenAI-chat-compatible API (blocking).
-///
-/// Mirrors `answerer.py::generate_with_openai_compatible`.
 pub fn generate_with_openai_compatible(
     prompt: &str,
     config: &LlmConfig,
@@ -296,7 +261,6 @@ pub fn generate_with_openai_compatible(
 
     let provider = config.provider.trim().to_lowercase();
 
-    // Build the request body.
     let mut body = serde_json::json!({
         "model": config.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -318,7 +282,6 @@ pub fn generate_with_openai_compatible(
         body["response_format"] = serde_json::json!({"type": "json_object"});
     }
 
-    // Headers.
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Content-Type", "application/json".parse().unwrap());
     headers.insert("HTTP-Referer", "https://aspis-bio.com".parse().unwrap());
@@ -338,11 +301,12 @@ pub fn generate_with_openai_compatible(
 
     let url = chat_completions_url(&config.base_url);
 
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .map_err(|e| AnswerError::Network(format!("LLM request failed: {}", short_error(&e))))?;
+    let response = client.post(&url).json(&body).send().map_err(|e| {
+        AnswerError::Network(format!(
+            "LLM request failed: {}",
+            truncate_err(&e.to_string())
+        ))
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -350,7 +314,7 @@ pub fn generate_with_openai_compatible(
         return Err(AnswerError::Network(format!(
             "LLM request failed ({}): {}",
             status,
-            truncate_to_220(&text)
+            truncate_err(&text)
         )));
     }
 
@@ -358,7 +322,6 @@ pub fn generate_with_openai_compatible(
         .json()
         .map_err(|e| AnswerError::Network(format!("Failed to parse LLM response: {}", e)))?;
 
-    // Try choices[0].message.content (standard chat completion).
     if let Some(content) = payload
         .get("choices")
         .and_then(|c| c.get(0))
@@ -368,8 +331,6 @@ pub fn generate_with_openai_compatible(
     {
         return Ok(content.to_string());
     }
-
-    // Fallback: output_text (some providers use this).
     if let Some(output) = payload.get("output_text").and_then(|o| o.as_str()) {
         return Ok(output.to_string());
     }
@@ -379,15 +340,7 @@ pub fn generate_with_openai_compatible(
     ))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn short_error(e: &impl std::fmt::Display) -> String {
-    truncate_to_220(&e.to_string())
-}
-
-fn truncate_to_220(s: &str) -> String {
+fn truncate_err(s: &str) -> String {
     let cleaned: String = s.split_whitespace().collect::<Vec<&str>>().join(" ");
     if cleaned.len() > 220 {
         cleaned[..220].to_string()

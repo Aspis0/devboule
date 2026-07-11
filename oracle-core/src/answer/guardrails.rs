@@ -8,17 +8,14 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::answer::context::{
-    max_answer_chars, truncate_text, NOT_FOUND_PHRASE,
-};
-use crate::answer::extractive::{extractive_answer, domain_extractive_answer};
-use crate::answer::PreparedChunk;
+use crate::answer::context::{max_answer_chars, truncate_text, NOT_FOUND_PHRASE};
+use crate::answer::extractive::{domain_extractive_answer, extractive_answer};
+use crate::answer::{CitationRef, NormalizedAnswer, PreparedChunk};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants (byte-exact from Python)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Non-English phrase markers.
 const NON_ENGLISH_PHRASES: &[&str] = &[
     " non trovato nel corpus",
     " la risposta ",
@@ -33,23 +30,10 @@ const NON_ENGLISH_PHRASES: &[&str] = &[
     " pourrait ",
 ];
 
-/// Per-language marker word sets (byte-exact from Python).
-/// Index 0 = Italian, 1 = Spanish, 2 = French.
 const NON_ENGLISH_MARKER_SETS: &[&[&str]] = &[
     &[
-        "risposta",
-        "forniti",
-        "fornito",
-        "codice",
-        "agenti",
-        "questo",
-        "questa",
-        "usando",
-        "evita",
-        "limita",
-        "sono",
-        "perche",
-        "perché",
+        "risposta", "forniti", "fornito", "codice", "agenti", "questo", "questa", "usando",
+        "evita", "limita", "sono", "perche", "perché",
     ],
     &[
         "respuesta",
@@ -66,22 +50,11 @@ const NON_ENGLISH_MARKER_SETS: &[&[&str]] = &[
         "sin",
     ],
     &[
-        "réponse",
-        "reponse",
-        "fichier",
-        "agents",
-        "tâche",
-        "tache",
-        "état",
-        "etat",
-        "utilise",
-        "depuis",
-        "parce",
-        "sans",
+        "réponse", "reponse", "fichier", "agents", "tâche", "tache", "état", "etat", "utilise",
+        "depuis", "parce", "sans",
     ],
 ];
 
-/// High-risk claim terms (byte-exact from Python).
 const HIGH_RISK_CLAIM_TERMS: &[&str] = &[
     "all",
     "always",
@@ -102,56 +75,31 @@ const HIGH_RISK_CLAIM_TERMS: &[&str] = &[
     "without",
 ];
 
-/// Claim stopwords (byte-exact from Python).
 const CLAIM_STOPWORDS: &[&str] = &[
-    "about",
-    "after",
-    "also",
-    "and",
-    "are",
-    "before",
-    "both",
-    "but",
-    "can",
-    "does",
-    "for",
-    "from",
-    "into",
-    "that",
-    "the",
-    "then",
-    "they",
-    "this",
-    "through",
-    "when",
-    "where",
-    "which",
-    "with",
+    "about", "after", "also", "and", "are", "before", "both", "but", "can", "does", "for", "from",
+    "into", "that", "the", "then", "they", "this", "through", "when", "where", "which", "with",
 ];
 
-/// Common grounded terms that are NOT flagged as unsupported.
 const COMMON_GROUNDED_TERMS: &[&str] = &[
-    "api", "app", "cpu", "gpu", "http", "https", "json", "llm", "mcp", "oracle", "ui", "url",
-    "vm",
+    "api", "app", "cpu", "gpu", "http", "https", "json", "llm", "mcp", "oracle", "ui", "url", "vm",
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
-// normalize_answer — main guardrail entry point
+// ParsedAnswer — shape returned by parse_json_response
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The parsed LLM JSON response shape.
 #[derive(Debug, Default, Clone)]
 pub struct ParsedAnswer {
     pub answer: Option<String>,
     pub citations: Option<Vec<serde_json::Value>>,
     pub not_found: Option<bool>,
-    pub suggested_path: Option<String>,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// normalize_answer — main guardrail entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Normalize and validate a parsed LLM answer.
-///
-/// Mirrors `answerer.py::normalize_answer`.  Returns an `AnswerPayload`-shaped
-/// dict (as a serde_json::Value for flexibility).
 pub fn normalize_answer(
     query: &str,
     parsed: &ParsedAnswer,
@@ -159,19 +107,12 @@ pub fn normalize_answer(
 ) -> NormalizedAnswer {
     let answer_text = clean_answer(parsed.answer.as_deref().unwrap_or(""));
     let parsed_not_found = parsed.not_found.unwrap_or(false);
-    let not_found_phrase_in_answer = answer_text.to_lowercase().contains(NOT_FOUND_PHRASE);
-    let not_found = parsed_not_found || not_found_phrase_in_answer;
+    let not_found_in_answer = answer_text.to_lowercase().contains(NOT_FOUND_PHRASE);
+    let not_found = parsed_not_found || not_found_in_answer;
 
     if answer_text.is_empty() {
         let ea = extractive_answer(query, context, Some("LLM returned empty or invalid JSON"));
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
+        return ea;
     }
 
     if not_found {
@@ -183,7 +124,7 @@ pub fn normalize_answer(
         if let Some(grounded) = grounded {
             return grounded;
         }
-        let suggested = suggest_path(query, context);
+        let suggested = crate::answer::context::suggest_path(query, context);
         return NormalizedAnswer {
             answer: ensure_not_found_prefix(&answer_text),
             citations: vec![],
@@ -191,72 +132,34 @@ pub fn normalize_answer(
             suggested_path: suggested,
             answer_source: Some("not_found".to_string()),
             fallback_reason: None,
+            llm_provider: None,
+            llm_model: None,
         };
     }
 
     let citations = normalize_citations(parsed.citations.as_deref().unwrap_or(&[]), context);
     if citations.is_empty() {
-        let ea = extractive_answer(query, context, Some("LLM returned no valid citations"));
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
+        return extractive_answer(query, context, Some("LLM returned no valid citations"));
     }
     if answer_is_too_generic(query, &answer_text, context) {
-        let ea = extractive_answer(query, context, Some("LLM returned a generic answer"));
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
+        return extractive_answer(query, context, Some("LLM returned a generic answer"));
     }
     if answer_has_non_english_markers(&answer_text) {
-        let ea = extractive_answer(query, context, Some("LLM returned a non-English answer"));
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
+        return extractive_answer(query, context, Some("LLM returned a non-English answer"));
     }
     if answer_has_unsupported_natural_claims(&answer_text, &citations, context) {
-        let ea = extractive_answer(
+        return extractive_answer(
             query,
             context,
             Some("LLM answer included unsupported natural-language claims"),
         );
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
     }
     if answer_has_unsupported_grounding_terms(&answer_text, &citations, context) {
-        let ea = extractive_answer(
+        return extractive_answer(
             query,
             context,
             Some("LLM answer included unsupported identifiers or paths"),
         );
-        return NormalizedAnswer {
-            answer: ea.answer,
-            citations: ea.citations,
-            not_found: ea.not_found,
-            suggested_path: ea.suggested_path,
-            answer_source: ea.answer_source,
-            fallback_reason: ea.fallback_reason,
-        };
     }
 
     NormalizedAnswer {
@@ -266,56 +169,49 @@ pub fn normalize_answer(
         suggested_path: None,
         answer_source: Some("llm".to_string()),
         fallback_reason: None,
+        llm_provider: None,
+        llm_model: None,
     }
-}
-
-/// Normalized answer result.
-#[derive(Debug, Clone)]
-pub struct NormalizedAnswer {
-    pub answer: String,
-    pub citations: Vec<CitationRef>,
-    pub not_found: bool,
-    pub suggested_path: Option<String>,
-    pub answer_source: Option<String>,
-    pub fallback_reason: Option<String>,
-}
-
-/// A citation reference.
-#[derive(Debug, Clone)]
-pub struct CitationRef {
-    pub ref_id: String,
-    pub file_source: String,
-    pub chunk_id: String,
-    pub chunk_index: Option<i64>,
-    pub start_char: Option<i64>,
-    pub end_char: Option<i64>,
-    pub retrieval: String,
-    pub score: f64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Citation normalization
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Normalize raw LLM citations against prepared context.
-///
-/// Mirrors `answerer.py::normalize_citations`.
 pub fn normalize_citations(
     raw_citations: &[serde_json::Value],
     context: &[PreparedChunk],
 ) -> Vec<CitationRef> {
     let by_ref: HashSet<&str> = context.iter().map(|c| c.r#ref.as_str()).collect();
-    let by_chunk_id: HashSet<&str> = context
-        .iter()
-        .filter(|c| !c.chunk_id.is_empty())
-        .map(|c| c.chunk_id.as_str())
-        .collect();
-
     let mut citations = Vec::new();
     let mut seen = HashSet::new();
 
     for raw in raw_citations {
-        let ref_id = extract_ref_from_json(raw, &by_chunk_id, context);
+        let ref_id = match raw {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(map) => {
+                let ref_val = map
+                    .get("ref")
+                    .or_else(|| map.get("source_ref"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let Some(ref r) = ref_val {
+                    // Try chunk_id resolution.
+                    if let Some(item) = context.iter().find(|c| c.chunk_id == *r) {
+                        Some(item.r#ref.clone())
+                    } else {
+                        Some(r.clone())
+                    }
+                } else {
+                    // Try chunk_id from the dict.
+                    map.get("chunk_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|cid| context.iter().find(|c| c.chunk_id == cid))
+                        .map(|c| c.r#ref.clone())
+                }
+            }
+            _ => None,
+        };
         let ref_id = match ref_id {
             Some(r) => r,
             None => continue,
@@ -323,9 +219,7 @@ pub fn normalize_citations(
         if !by_ref.contains(ref_id.as_str()) {
             continue;
         }
-        // Find the matching prepared chunk.
-        let item = context.iter().find(|c| c.r#ref == ref_id);
-        let item = match item {
+        let item = match context.iter().find(|c| c.r#ref == ref_id) {
             Some(i) => i,
             None => continue,
         };
@@ -347,39 +241,11 @@ pub fn normalize_citations(
     citations
 }
 
-fn extract_ref_from_json(
-    raw: &serde_json::Value,
-    by_chunk_id: &HashSet<&str>,
-    context: &[PreparedChunk],
-) -> Option<String> {
-    match raw {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Object(map) => {
-            let ref_val = map
-                .get("ref")
-                .or_else(|| map.get("source_ref"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(ref r) = ref_val {
-                if by_chunk_id.contains(r.as_str()) {
-                    // Try to resolve via chunk_id.
-                    if let Some(item) = context.iter().find(|c| c.chunk_id == *r) {
-                        return Some(item.r#ref.clone());
-                    }
-                }
-                return Some(r.clone());
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Guardrail checks
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Check if answer is too generic — mirrors `answerer.py::answer_is_too_generic`.
+/// Check if answer is too generic.
 pub fn answer_is_too_generic(query: &str, answer: &str, context: &[PreparedChunk]) -> bool {
     let lower = answer.to_lowercase();
     let meta_prefixes = [
@@ -388,15 +254,12 @@ pub fn answer_is_too_generic(query: &str, answer: &str, context: &[PreparedChunk
         "here is an analysis",
         "this code appears",
     ];
-    if meta_prefixes.iter().any(|p| lower.starts_with(p))
-        || lower.contains("here is an analysis")
-    {
+    if meta_prefixes.iter().any(|p| lower.starts_with(p)) || lower.contains("here is an analysis") {
         return true;
     }
 
-    // Domain-specific generic check for RNA-seq queries.
-    let q_terms = crate::answer::context::focused_excerpt_query_terms_pub(query);
-    let rnaseq_query_terms: HashSet<&str> = [
+    let q_terms = crate::answer::context::excerpt_query_terms_set(query);
+    let _rnaseq_q: HashSet<&str> = [
         "rna-seq", "rnaseq", "output", "outputs", "download", "browser",
     ]
     .iter()
@@ -413,7 +276,12 @@ pub fn answer_is_too_generic(query: &str, answer: &str, context: &[PreparedChunk
             "results ready",
         ];
         if !domain_terms.iter().any(|t| lower.contains(t)) {
-            let context_text: String = context.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n").to_lowercase();
+            let context_text: String = context
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
             if domain_terms.iter().any(|t| context_text.contains(t)) {
                 return true;
             }
@@ -422,34 +290,24 @@ pub fn answer_is_too_generic(query: &str, answer: &str, context: &[PreparedChunk
     false
 }
 
-/// Check if answer has non-English markers — mirrors `answerer.py::answer_has_non_english_markers`.
+/// Check if answer has non-English markers.
 pub fn answer_has_non_english_markers(answer: &str) -> bool {
     let normalized = format!(" {} ", answer.to_lowercase());
-
-    // Check phrase markers.
-    if NON_ENGLISH_PHRASES
-        .iter()
-        .any(|m| normalized.contains(m))
-    {
+    if NON_ENGLISH_PHRASES.iter().any(|m| normalized.contains(m)) {
         return true;
     }
-
-    // Check word-level markers.
     let re = non_english_word_re();
     let words: HashSet<String> = re
         .find_iter(&normalized)
         .map(|m| m.as_str().to_string())
         .collect();
-
-    NON_ENGLISH_MARKER_SETS
-        .iter()
-        .any(|markers| {
-            let matching = markers
-                .iter()
-                .filter(|m| words.contains(*m))
-                .count();
-            matching >= 2
-        })
+    NON_ENGLISH_MARKER_SETS.iter().any(|markers| {
+        markers
+            .iter()
+            .filter(|m| words.contains(*m as &str))
+            .count()
+            >= 2
+    })
 }
 
 fn non_english_word_re() -> &'static Regex {
@@ -458,8 +316,6 @@ fn non_english_word_re() -> &'static Regex {
 }
 
 /// Check if answer has unsupported natural-language claims.
-///
-/// Mirrors `answerer.py::answer_has_unsupported_natural_claims`.
 pub fn answer_has_unsupported_natural_claims(
     answer: &str,
     citations: &[CitationRef],
@@ -477,12 +333,15 @@ pub fn answer_has_unsupported_natural_claims(
         let risky: Vec<&str> = terms
             .iter()
             .filter(|t| HIGH_RISK_CLAIM_TERMS.contains(&t.as_str()))
-            .copied()
+            .map(|s| s.as_str())
             .collect();
-        if !risky.is_empty() && !risky.iter().all(|t| support.contains(t)) {
+        if !risky.is_empty() && !risky.iter().all(|t| support.contains(*t)) {
             return true;
         }
-        let supported_count = terms.iter().filter(|t| support.contains(t.as_str())).count();
+        let supported_count = terms
+            .iter()
+            .filter(|t| support.contains(t.as_str()))
+            .count();
         if terms.len() >= 7 && supported_count < (2).max(terms.len() / 3) {
             return true;
         }
@@ -491,8 +350,6 @@ pub fn answer_has_unsupported_natural_claims(
 }
 
 /// Check if answer has unsupported grounding terms.
-///
-/// Mirrors `answerer.py::answer_has_unsupported_grounding_terms`.
 pub fn answer_has_unsupported_grounding_terms(
     answer: &str,
     _citations: &[CitationRef],
@@ -502,7 +359,6 @@ pub fn answer_has_unsupported_grounding_terms(
     if terms.is_empty() {
         return false;
     }
-    // Ground against FULL retrieved context (not just cited subset).
     let support = normalize_support_text(
         &context
             .iter()
@@ -514,12 +370,10 @@ pub fn answer_has_unsupported_grounding_terms(
         .iter()
         .filter(|t| {
             let norm = normalize_grounding_term(t);
-            !support.contains(&norm)
-                && !support.contains(&norm.replace('/', "/"))
+            !support.contains(&norm) && !support.contains(&norm.replace('/', "/"))
         })
-        .copied()
+        .map(|s| s.as_str())
         .collect();
-    // Tolerance: allow up to 2 stray terms.
     unsupported.len() > 2
 }
 
@@ -549,8 +403,7 @@ fn context_support_text(item: &PreparedChunk) -> String {
 fn normalize_support_text(text: &str) -> String {
     let replaced = text.replace('\\', "/");
     let lower = replaced.to_lowercase();
-    let re = whitespace_re();
-    re.replace_all(&lower, " ").to_string()
+    whitespace_re().replace_all(&lower, " ").to_string()
 }
 
 fn whitespace_re() -> &'static Regex {
@@ -562,47 +415,31 @@ fn whitespace_re() -> &'static Regex {
 // Grounding terms extraction
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Extract grounding terms from answer text.
-///
-/// Mirrors `answerer.py::answer_grounding_terms`.
 pub fn answer_grounding_terms(answer: &str) -> Vec<String> {
     let mut terms: HashSet<String> = HashSet::new();
-
-    // Backtick-delimited code spans.
     for cap in backtick_re().captures_iter(answer) {
         if let Some(m) = cap.get(1) {
             let value = m.as_str().trim();
             if !value.is_empty() {
                 terms.insert(value.to_string());
-                // Split the value into sub-tokens.
                 for piece in grounding_piece_re().find_iter(value) {
                     terms.insert(piece.as_str().to_string());
                 }
             }
         }
     }
-
-    // File path extensions.
     for m in file_ext_re().find_iter(answer) {
         terms.insert(m.as_str().to_string());
     }
-
-    // camelCase identifiers.
     for m in camel_case_re().find_iter(answer) {
         terms.insert(m.as_str().to_string());
     }
-
-    // snake_case identifiers.
     for m in snake_case_re().find_iter(answer) {
         terms.insert(m.as_str().to_string());
     }
-
-    // ALL_CAPS identifiers (>= 4 chars).
     for m in all_caps_re().find_iter(answer) {
         terms.insert(m.as_str().to_string());
     }
-
-    // Normalize and filter.
     let common: HashSet<String> = COMMON_GROUNDED_TERMS
         .iter()
         .map(|s| s.to_string())
@@ -618,50 +455,57 @@ fn backtick_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"`([^`]{2,120})`").unwrap())
 }
-
 fn grounding_piece_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[A-Za-z0-9_./\\:\-]+").unwrap())
 }
-
 fn file_ext_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"[\w./\\\-]+\.(?:rs|py|tsx|ts|jsx|js|mjs|md|json|toml|ya?ml)\b").unwrap()
     })
 }
-
 fn camel_case_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[a-z]+[A-Z][A-Za-z0-9]*\b").unwrap())
 }
-
 fn snake_case_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[a-z][a-z0-9]+_[a-z0-9_]+\b").unwrap())
 }
-
 fn all_caps_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[A-Z][A-Z0-9_]{3,}\b").unwrap())
 }
 
-fn normalize_grounding_term(term: &str) -> String {
-    term.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '.' || c == ','
-        || c == ';' || c == ':' || c == '(' || c == ')' || c == '[' || c == ']'
-        || c == '{' || c == '}' || c == ' ')
-        .replace('\\', "/")
-        .to_lowercase()
+pub fn normalize_grounding_term(term: &str) -> String {
+    term.trim_matches(|c: char| {
+        c == '`'
+            || c == '\''
+            || c == '"'
+            || c == '.'
+            || c == ','
+            || c == ';'
+            || c == ':'
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == '{'
+            || c == '}'
+            || c == ' '
+    })
+    .replace('\\', "/")
+    .to_lowercase()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Sentence splitting and claim term extraction
+// Sentence splitting and claim terms
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Split answer into sentences — mirrors `answerer.py::answer_sentences`.
 pub fn answer_sentences(answer: &str) -> Vec<String> {
-    let re = sentence_split_re();
-    re.split(answer)
+    sentence_split_re()
+        .split(answer)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -669,19 +513,14 @@ pub fn answer_sentences(answer: &str) -> Vec<String> {
 
 fn sentence_split_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?<=[.!?])\s+").unwrap())
+    RE.get_or_init(|| Regex::new(r"[.!?]+\s+").unwrap())
 }
 
-/// Extract natural claim terms from a sentence (excluding code spans).
-///
-/// Mirrors `answerer.py::natural_claim_terms`.
 pub fn natural_claim_terms(sentence: &str) -> Vec<String> {
-    // Remove code spans.
-    let re = backtick_re();
-    let without_code = re.replace_all(sentence, " ");
-    let re = claim_token_re();
+    let without_code = backtick_re().replace_all(sentence, " ");
     let stop: HashSet<&str> = CLAIM_STOPWORDS.iter().copied().collect();
-    re.find_iter(&without_code)
+    claim_token_re()
+        .find_iter(&without_code)
         .map(|m| m.as_str().to_string())
         .filter(|term| term.len() >= 3 && !stop.contains(term.as_str()))
         .collect()
@@ -696,13 +535,11 @@ fn claim_token_re() -> &'static Regex {
 // General helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Clean answer text — mirrors `answerer.py::clean_answer`.
 pub fn clean_answer(value: &str) -> String {
     let text = value.trim().to_string();
     whitespace_re().replace_all(&text, " ").to_string()
 }
 
-/// Ensure answer starts with NOT_FOUND_PHRASE.
 fn ensure_not_found_prefix(answer: &str) -> String {
     if answer.to_lowercase().starts_with(NOT_FOUND_PHRASE) {
         answer.to_string()
@@ -711,49 +548,21 @@ fn ensure_not_found_prefix(answer: &str) -> String {
     }
 }
 
-/// Suggest a file path based on the query — mirrors `answerer.py::suggest_path`.
-pub fn suggest_path(query: &str, context: &[PreparedChunk]) -> Option<String> {
-    if let Some(first) = context.first() {
-        if !first.file_source.is_empty() {
-            return Some(first.file_source.clone());
-        }
-    }
-    let q = query.to_lowercase();
-    if q.contains("scaleway") || q.contains("gpu") || q.contains("serverless") {
-        return Some("src-tauri/src/backend/ or Scaleway provider docs".to_string());
-    }
-    if q.contains("cloudflare") || q.contains("worker") {
-        return Some("cloudflare/workers/ or worker source files".to_string());
-    }
-    if q.contains("oracle") || q.contains("mcp") {
-        return Some("oracle/".to_string());
-    }
-    if q.contains("frontend") || q.contains("ui") || q.contains("view") {
-        return Some("src/components/".to_string());
-    }
-    None
-}
-
-/// Parse a JSON response from the LLM — mirrors `answerer.py::parse_json_response`.
+/// Parse a JSON response from the LLM.
 pub fn parse_json_response(raw: &str) -> ParsedAnswer {
     let text = raw.trim();
     if text.is_empty() {
         return ParsedAnswer::default();
     }
-
-    // Try full parse.
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(obj) = parsed.as_object() {
             return json_value_to_parsed(obj);
         }
     }
-
-    // Try extracting a JSON object from the text.
     if let Some(start) = text.find('{') {
         if let Some(end) = text.rfind('}') {
             if end > start {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[start..=end])
-                {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[start..=end]) {
                     if let Some(obj) = parsed.as_object() {
                         return json_value_to_parsed(obj);
                     }
@@ -761,21 +570,13 @@ pub fn parse_json_response(raw: &str) -> ParsedAnswer {
             }
         }
     }
-
     ParsedAnswer::default()
 }
 
 fn json_value_to_parsed(obj: &serde_json::Map<String, serde_json::Value>) -> ParsedAnswer {
     ParsedAnswer {
         answer: obj.get("answer").and_then(|v| v.as_str()).map(String::from),
-        citations: obj
-            .get("citations")
-            .and_then(|v| v.as_array())
-            .cloned(),
+        citations: obj.get("citations").and_then(|v| v.as_array()).cloned(),
         not_found: obj.get("not_found").and_then(|v| v.as_bool()),
-        suggested_path: obj
-            .get("suggested_path")
-            .and_then(|v| v.as_str())
-            .map(String::from),
     }
 }
