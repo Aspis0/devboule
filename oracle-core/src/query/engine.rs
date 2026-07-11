@@ -491,11 +491,17 @@ impl QueryEngine {
     // ── public API ───────────────────────────────────────────────────────
 
     /// Dense + lexical context retrieval.
+    ///
+    /// `embedder` is REQUIRED: Python always embeds the query with its
+    /// built-in model when the dense path runs (the only Python skip
+    /// conditions are `prefer_lexical` and a missing chunk store, mirrored
+    /// here). Callers that genuinely want lexical-only pass
+    /// `prefer_lexical = true`, never a dummy embedder.
     pub async fn context(
         &self,
         query: &str,
         limit: usize,
-        embedder: Option<&dyn QueryEmbedder>,
+        embedder: &dyn QueryEmbedder,
         allowed_file_ids: Option<&HashSet<String>>,
         prefer_lexical: bool,
         kind: Option<&str>,
@@ -508,29 +514,19 @@ impl QueryEngine {
 
         // ── Dense path ───────────────────────────────────────────────
         if !prefer_lexical {
-            if let Some(ref _cv) = self.chunk_vectors {
-                if let Some(embedder) = embedder {
-                    let query_vec = self.embed_query(embedder, query).await?;
-                    let hits = self
-                        .chunk_vectors
-                        .as_ref()
-                        .unwrap()
-                        .search(&query_vec, limit.max(1))
-                        .await?;
-                    for hit in hits {
-                        if let Some(chunk) = self.sqlite.get_chunk(&hit.id)? {
-                            if allowed_file_ids.map_or(true, |ids| ids.contains(&chunk.file_id))
-                                && chunk_matches_filters(
-                                    &chunk, kind, language, symbols, imports, module,
-                                )
-                            {
-                                let ctx = ContextChunk::from_file_chunk(
-                                    &chunk,
-                                    hit.score as f64,
-                                    "dense",
-                                );
-                                combined.insert(chunk.id.clone(), ctx);
-                            }
+            if let Some(ref chunk_vectors) = self.chunk_vectors {
+                let query_vec = self.embed_query(embedder, query).await?;
+                let hits = chunk_vectors.search(&query_vec, limit.max(1)).await?;
+                for hit in hits {
+                    if let Some(chunk) = self.sqlite.get_chunk(&hit.id)? {
+                        if allowed_file_ids.map_or(true, |ids| ids.contains(&chunk.file_id))
+                            && chunk_matches_filters(
+                                &chunk, kind, language, symbols, imports, module,
+                            )
+                        {
+                            let ctx =
+                                ContextChunk::from_file_chunk(&chunk, hit.score as f64, "dense");
+                            combined.insert(chunk.id.clone(), ctx);
                         }
                     }
                 }
@@ -579,7 +575,7 @@ impl QueryEngine {
         &self,
         query: &str,
         limit: usize,
-        embedder: Option<&dyn QueryEmbedder>,
+        embedder: &dyn QueryEmbedder,
         answerer: Option<&dyn ContextAnswerer>,
         allowed_file_ids: Option<&HashSet<String>>,
         prefer_lexical: bool,
@@ -618,9 +614,7 @@ impl QueryEngine {
         } else {
             let count = self.vectors.count().await?;
             let search_limit = count.max(limit);
-            let qv = self
-                .embed_query(embedder.unwrap_or(&HashQueryEmbedder), query)
-                .await?;
+            let qv = self.embed_query(embedder, query).await?;
             let hits = self.vectors.search(&qv, search_limit).await?;
             hits.into_iter().map(|h| (h.id, h.score as f64)).collect()
         };
@@ -629,9 +623,7 @@ impl QueryEngine {
         let (chunk_scores_map, chunk_preview_map) = if prefer_lexical {
             (HashMap::new(), HashMap::new())
         } else {
-            let qv = self
-                .embed_query(embedder.unwrap_or(&HashQueryEmbedder), query)
-                .await?;
+            let qv = self.embed_query(embedder, query).await?;
             self.chunk_scores(&qv, (30).max(limit * 8), allowed_file_ids)
                 .await?
         };
@@ -795,13 +787,14 @@ impl QueryEngine {
                 cluster: 0,
                 score: hit.score as f64,
                 file_source: hit.id.clone(),
-                function_primary: String::new(),
+                // Python: summarize_chunk({}) fallback message for card-less rows.
+                function_primary: "Chunk-level match from the full-file Oracle index.".to_string(),
                 dependencies: vec![],
                 chunk_id: None,
                 chunk_index: None,
                 start_char: None,
                 end_char: None,
-                chunk_preview: String::new(),
+                chunk_preview: "Chunk-level match from the full-file Oracle index.".to_string(),
                 kind: "text_slice".to_string(),
                 symbol_name: hit.label.clone(),
                 signature: String::new(),
@@ -1155,7 +1148,12 @@ fn chunk_matches_filters(
         }
     }
     if let Some(filter_module) = module {
-        let file_id = chunk.file_id.to_lowercase();
+        // Python: `chunk.get("file_id") or chunk.get("file_sorgente") or ""`.
+        let file_id = if chunk.file_id.is_empty() {
+            chunk.file_sorgente.to_lowercase()
+        } else {
+            chunk.file_id.to_lowercase()
+        };
         if !file_id.contains(&filter_module.to_lowercase()) {
             return false;
         }

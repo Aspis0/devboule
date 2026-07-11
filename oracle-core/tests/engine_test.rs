@@ -287,7 +287,7 @@ async fn test_context_lexical_only() {
         .context(
             "Scaleway GPU serverless",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             true, // prefer_lexical
             None,
@@ -327,7 +327,7 @@ async fn test_context_dense_and_lexical_merge() {
         .context(
             "Scaleway GPU serverless compute",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             false, // prefer_lexical = false → dense + lexical
             None,
@@ -369,7 +369,7 @@ async fn test_ask_with_none_answerer() {
         .ask(
             "Scaleway GPU serverless",
             5,
-            Some(&embedder),
+            &embedder,
             None, // no answerer
             None,
             true,
@@ -434,7 +434,7 @@ async fn test_filters_kind_language() {
         .context(
             "Scaleway GPU",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             true,
             Some("function"), // kind filter
@@ -459,7 +459,7 @@ async fn test_filters_kind_language() {
         .context(
             "Scaleway GPU",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             true,
             None,
@@ -484,7 +484,7 @@ async fn test_filters_kind_language() {
         .context(
             "Scaleway GPU",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             true,
             Some("class"),
@@ -525,7 +525,7 @@ async fn test_group_by_file() {
         .ask(
             "Scaleway GPU serverless",
             10,
-            Some(&embedder),
+            &embedder,
             None,
             None,
             true,
@@ -670,7 +670,7 @@ async fn test_ask_with_answerer() {
         .ask(
             "Scaleway GPU",
             5,
-            Some(&embedder),
+            &embedder,
             Some(&answerer),
             None,
             true,
@@ -705,4 +705,126 @@ async fn test_node_lookup() {
 
     let err = engine.node("nonexistent").unwrap_err();
     assert!(err.to_string().contains("Node not found"));
+}
+
+/// P4-review F5: pin the EXACT serialized key sets so a silent field rename
+/// or removal fails loudly (consumers: src-tauri model.rs + aspis_mcp.py).
+#[tokio::test]
+async fn test_response_exact_key_sets() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let engine = build_engine(&tmp).await;
+    let embedder = HashQueryEmbedder;
+
+    let response = engine
+        .ask(
+            "Scaleway GPU serverless",
+            5,
+            &embedder,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    let json = serde_json::to_value(&response).unwrap();
+    let top_keys: std::collections::BTreeSet<String> =
+        json.as_object().unwrap().keys().cloned().collect();
+    // Optional keys serialize only when Some; with None answerer,
+    // fallback_reason/answer_source are set, llm_provider/llm_model absent.
+    let expected: std::collections::BTreeSet<String> = [
+        "mode",
+        "query",
+        "summary",
+        "answer",
+        "citations",
+        "not_found",
+        "answer_source",
+        "fallback_reason",
+        "results",
+        "grouped",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(top_keys, expected, "AskResponse key set drifted");
+
+    let first = json["results"][0].as_object().unwrap();
+    let result_keys: std::collections::BTreeSet<String> = first.keys().cloned().collect();
+    let expected_result: std::collections::BTreeSet<String> = [
+        "id",
+        "label",
+        "node_type",
+        "cluster",
+        "score",
+        "file_source",
+        "function_primary",
+        "dependencies",
+        "chunk_id",
+        "chunk_index",
+        "start_char",
+        "end_char",
+        "chunk_preview",
+        "kind",
+        "symbol_name",
+        "signature",
+        "language",
+        "line_start",
+        "line_end",
+        "symbols_used",
+    ]
+    .iter()
+    .filter(|k| {
+        first.contains_key(**k)
+            || !matches!(**k, "chunk_id" | "chunk_index" | "start_char" | "end_char")
+    })
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(result_keys, expected_result, "ResultEntry key set drifted");
+
+    let ctx = engine
+        .context(
+            "Scaleway GPU serverless",
+            5,
+            &embedder,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let cjson = serde_json::to_value(&ctx[0]).unwrap();
+    let ctx_keys: std::collections::BTreeSet<String> =
+        cjson.as_object().unwrap().keys().cloned().collect();
+    let expected_ctx: std::collections::BTreeSet<String> = [
+        "chunk_id",
+        "file_source",
+        "chunk_index",
+        "start_char",
+        "end_char",
+        "score",
+        "retrieval",
+        "text",
+        "last_modified",
+        "kind",
+        "symbol_name",
+        "signature",
+        "language",
+        "line_start",
+        "line_end",
+        "symbols_used",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(ctx_keys, expected_ctx, "ContextChunk key set drifted");
 }
