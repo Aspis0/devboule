@@ -332,10 +332,18 @@ fn manifest_legacy_and_load() {
     let m = load_manifest(&path);
     assert!(m.files.is_empty());
 
+    // create=false on an unseen root: Python returns a detached {} and
+    // mutates NOTHING — the legacy root/files mirror must stay untouched.
+    let mut ro = load_manifest(&path);
+    assert!(manifest_files_for_root(&mut ro, dir.path(), false).is_none());
+    assert!(ro.root.is_none());
+    assert!(ro.files.is_empty());
+    assert!(ro.roots.is_empty());
+
     // Round-trip via manifest_files_for_root (create=true).
     let mut manifest = load_manifest(&path);
     {
-        let files = manifest_files_for_root(&mut manifest, dir.path(), true);
+        let files = manifest_files_for_root(&mut manifest, dir.path(), true).unwrap();
         files.insert(
             "a.py".to_string(),
             ManifestFileEntry {
@@ -357,56 +365,8 @@ fn manifest_legacy_and_load() {
         .contains_key("a.py"));
 }
 
-// ── 4. hash_embed parity (mirrors the Python-generated vectors) ───────────
-
-#[test]
-#[allow(clippy::approx_constant)] // frozen Python-parity values
-fn hash_embed_python_parity() {
-    let cases: &[(&str, f32, &[(usize, f32)])] = &[
-        (
-            "hello world",
-            0.9999999999999999,
-            &[(344, -0.70710678), (679, -0.70710678)],
-        ),
-        (
-            "fn compute(x: int) -> int",
-            0.9999999999999999,
-            &[
-                (150, 0.35355339),
-                (227, 0.70710678),
-                (254, 0.35355339),
-                (706, -0.35355339),
-                (842, -0.35355339),
-            ],
-        ),
-        (
-            "SELECT * FROM nodes",
-            1.0,
-            &[(252, -0.57735027), (271, 0.57735027), (833, 0.57735027)],
-        ),
-    ];
-    for (text, exp_norm, nz) in cases {
-        let v = hash_embed(text, 1024);
-        assert_eq!(v.len(), 1024);
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - exp_norm).abs() < 1e-6,
-            "{text}: norm {norm} vs {exp_norm}"
-        );
-        for i in 0..1024 {
-            let expected = nz
-                .iter()
-                .find(|(idx, _)| *idx == i)
-                .map(|(_, val)| *val)
-                .unwrap_or(0.0);
-            assert!(
-                (v[i] - expected).abs() < 1e-6,
-                "{text}: dim {i} got {} want {expected}",
-                v[i]
-            );
-        }
-    }
-}
+// ── 4. hash_embed parity: covered by the unit test in `store::lance::tests`
+//       (`hash_embed_matches_python`) — kept in ONE place on purpose. ────────
 
 // ── 5. LanceStore round-trip ────────────────────────────────────────────
 
@@ -439,8 +399,12 @@ async fn lance_roundtrip() {
         })
         .collect();
 
-    store.add(&records).await.unwrap();
+    store.upsert(&records).await.unwrap();
     assert_eq!(store.count().await.unwrap(), 5);
+
+    // upsert with the same ids must MERGE, not append (Python upsert parity).
+    store.upsert(&records).await.unwrap();
+    assert_eq!(store.count().await.unwrap(), 5, "upsert must dedup by id");
 
     // search by the first vector returns itself first with score ~1.0.
     let hits = store.search(&records[0].vector, 5).await.unwrap();
@@ -475,6 +439,72 @@ async fn lance_roundtrip() {
         .await
         .unwrap();
     assert_eq!(store.count().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn lance_json_backend_roundtrip() {
+    // `.json` path -> Python's deterministic JSON fallback backend.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vectors.json");
+    let store = LanceStore::new(&path);
+
+    let rows: Vec<LanceRow> = (0..3)
+        .map(|i| LanceRow {
+            id: format!("j-{i}"),
+            label: format!("J {i}"),
+            area: "a".into(),
+            cluster_semantic: "c".into(),
+            vector: hash_embed(&format!("json row {i}"), 1024),
+        })
+        .collect();
+    store.upsert(&rows).await.unwrap();
+    store.upsert(&rows).await.unwrap(); // merge, not append
+    assert_eq!(store.count().await.unwrap(), 3);
+
+    let hits = store.search(&rows[2].vector, 2).await.unwrap();
+    assert_eq!(hits[0].id, "j-2");
+    assert!((hits[0].score - 1.0).abs() < 1e-4);
+
+    store.replace_ids(&["j-0".to_string()], &[]).await.unwrap();
+    assert_eq!(store.count().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn lance_non_default_dims_roundtrip() {
+    // file_vectors.lancedb on real installs holds 128-dim vectors: the schema
+    // and batches must take dims from the data, never from EMBED_DIMS.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("file_vectors.lancedb");
+    let store = LanceStore::new(&path);
+
+    let rows: Vec<LanceRow> = (0..4)
+        .map(|i| LanceRow {
+            id: format!("fv-{i}"),
+            label: format!("FV {i}"),
+            area: "files".into(),
+            cluster_semantic: "cluster".into(),
+            vector: hash_embed(&format!("file vector {i}"), 128),
+        })
+        .collect();
+    store.upsert(&rows).await.unwrap();
+    assert_eq!(store.count().await.unwrap(), 4);
+
+    let hits = store.search(&rows[1].vector, 2).await.unwrap();
+    assert_eq!(hits[0].id, "fv-1");
+    assert!((hits[0].score - 1.0).abs() < 1e-4);
+
+    // mixed dims in one batch must fail loudly, not corrupt the table.
+    let bad = vec![
+        rows[0].clone(),
+        LanceRow {
+            id: "bad".into(),
+            label: "bad".into(),
+            area: "a".into(),
+            cluster_semantic: "c".into(),
+            vector: hash_embed("bad", 64),
+        },
+    ];
+    assert!(store.upsert(&bad).await.is_err());
 }
 
 // ── 6. real-store smoke (operator runs manually) ───────────────────────

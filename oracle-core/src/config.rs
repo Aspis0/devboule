@@ -96,10 +96,10 @@ pub fn require_real_embedder() -> bool {
 /// Mirrors the `ORACLE_QUERY_EMBEDDER=hash` debug knob in
 /// `oracle/store/lance_store.py::embed_query_text`.
 pub fn query_embedder_is_hash() -> bool {
-    matches!(
-        env::var(ENV_QUERY_EMBEDDER).as_deref(),
-        Ok("hash") | Ok("HASH")
-    )
+    // Python: `os.getenv(...).lower() == "hash"` — any casing matches.
+    env::var(ENV_QUERY_EMBEDDER)
+        .map(|v| v.trim().to_lowercase() == "hash")
+        .unwrap_or(false)
 }
 
 /// Canonical set of store paths under a workspace root.

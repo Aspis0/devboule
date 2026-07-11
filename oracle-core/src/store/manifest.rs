@@ -104,6 +104,10 @@ pub fn save_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     let text = serde_json::to_string_pretty(manifest).context("serializing manifest")?;
     std::fs::write(&tmp, text)
         .with_context(|| format!("writing manifest tmp {}", tmp.display()))?;
+    // Equivalent to Python's `os.replace` on every platform: on Windows the
+    // std implementation calls MoveFileExW with MOVEFILE_REPLACE_EXISTING,
+    // so an existing manifest is atomically overwritten (verified in
+    // library/std/src/sys/fs/windows.rs).
     std::fs::rename(&tmp, path).with_context(|| format!("renaming manifest {}", path.display()))?;
     Ok(())
 }
@@ -128,11 +132,20 @@ pub fn manifest_roots(manifest: &mut Manifest) -> &mut HashMap<String, RootEntry
 /// Get (creating if requested) the per-file entry map for a root, applying the
 /// verbatim-prefix duplicate-pruning and legacy-mirror side effects. Mirrors
 /// `chunk_index.py::manifest_files_for_root`.
+///
+/// Returns `None` when the root has no entry and `create` is false — Python
+/// returns a DETACHED `{}` there and mutates nothing (the dup-prune above,
+/// however, mutates in both implementations, exactly like Python).
+///
+/// NOTE on the legacy mirror: Python ALIASES `manifest["files"]` to the live
+/// per-root dict, so later mutations show through automatically; Rust clones,
+/// so the mirror goes stale after further mutations — callers must run
+/// [`sync_legacy_manifest_root`] before [`save_manifest`].
 pub fn manifest_files_for_root<'a>(
     manifest: &'a mut Manifest,
     root: &Path,
     create: bool,
-) -> &'a mut HashMap<String, ManifestFileEntry> {
+) -> Option<&'a mut HashMap<String, ManifestFileEntry>> {
     let root_key = strip_verbatim_prefix(&root.to_string_lossy());
 
     // Prune a stale verbatim-prefixed duplicate of THIS root.
@@ -144,10 +157,7 @@ pub fn manifest_files_for_root<'a>(
         .collect();
     for existing_key in dup_keys {
         if let Some(duplicate) = manifest.roots.remove(&existing_key) {
-            let canonical = manifest
-                .roots
-                .entry(root_key.clone())
-                .or_default();
+            let canonical = manifest.roots.entry(root_key.clone()).or_default();
             for (fid, rec) in duplicate.files {
                 canonical.files.entry(fid).or_insert(rec);
             }
@@ -156,26 +166,25 @@ pub fn manifest_files_for_root<'a>(
 
     if !manifest.roots.contains_key(&root_key) {
         if !create {
-            manifest.files = HashMap::new();
-            manifest.root = Some(root_key);
-            return &mut manifest.files;
+            return None;
         }
         manifest
             .roots
             .insert(root_key.clone(), RootEntry::default());
     }
 
-    let entry = manifest.roots.get_mut(&root_key).unwrap();
-    let files = &mut entry.files;
-    manifest.root = Some(root_key);
-    manifest.files = files.clone();
-    files
+    let files_snapshot = manifest.roots.get(&root_key).unwrap().files.clone();
+    manifest.root = Some(root_key.clone());
+    manifest.files = files_snapshot;
+    Some(&mut manifest.roots.get_mut(&root_key).unwrap().files)
 }
 
 /// Keep the legacy `root` / `files` mirror in sync (used after mutations).
 /// Mirrors `chunk_index.py::sync_legacy_manifest_root`.
 pub fn sync_legacy_manifest_root(manifest: &mut Manifest, root: &Path) {
-    let files = manifest_files_for_root(manifest, root, true).clone();
+    let files = manifest_files_for_root(manifest, root, true)
+        .expect("create=true always yields an entry")
+        .clone();
     manifest.root = Some(strip_verbatim_prefix(&root.to_string_lossy()));
     manifest.files = files;
 }
@@ -191,7 +200,14 @@ pub fn file_signature(path: &Path, chunks: Option<u64>) -> Result<ManifestFileEn
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
-    let updated_at = Utc::now().to_rfc3339().replace("+00:00", "Z");
+    // Python `datetime.isoformat()`: 6-digit microseconds when non-zero, no
+    // fractional part at all when the microsecond field is exactly 0.
+    let now = Utc::now();
+    let updated_at = if now.timestamp_subsec_micros() == 0 {
+        now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    };
     let mut entry = ManifestFileEntry {
         size,
         mtime_ns,
@@ -207,13 +223,17 @@ pub fn file_signature(path: &Path, chunks: Option<u64>) -> Result<ManifestFileEn
 }
 
 /// `path.relative_to(root).as_posix()` — POSIX-style relative file id.
-fn relative_posix(path: &Path, root: &Path) -> String {
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    rel
+/// Python raises `ValueError` when `path` is not under `root`; mirror that
+/// with an error instead of silently keying the manifest on an absolute path.
+fn relative_posix(path: &Path, root: &Path) -> Result<String> {
+    let rel = path.strip_prefix(root).map_err(|_| {
+        anyhow!(
+            "path {} is not under root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Whether a file needs re-indexing. Mirrors `chunk_index.py::file_needs_index`.
@@ -223,7 +243,7 @@ pub fn file_needs_index(
     manifest_files: &HashMap<String, ManifestFileEntry>,
     sqlite: &SqliteStore,
 ) -> Result<bool> {
-    let file_id = relative_posix(path, root);
+    let file_id = relative_posix(path, root)?;
     let current = file_signature(path, None)?;
     let Some(previous) = manifest_files.get(&file_id) else {
         return Ok(true);
@@ -250,7 +270,7 @@ pub fn text_chunks_up_to_date(
     manifest_files: &HashMap<String, ManifestFileEntry>,
     sqlite: &SqliteStore,
 ) -> Result<bool> {
-    let file_id = relative_posix(path, root);
+    let file_id = relative_posix(path, root)?;
     let Some(previous) = manifest_files.get(&file_id) else {
         return Ok(false);
     };

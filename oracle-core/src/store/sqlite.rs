@@ -198,6 +198,11 @@ impl SqliteStore {
     /// JSON-encoded before write.
     pub fn upsert_many(&self, cards: &[NodeCard]) -> Result<()> {
         let conn = self.connect()?;
+        // One explicit transaction for the whole batch — the per-row loop
+        // otherwise pays an implicit-commit fsync per card, where Python's
+        // single executemany runs inside one commit.
+        conn.execute_batch("BEGIN")
+            .context("beginning upsert_many transaction")?;
         let sql = "
             INSERT INTO node_cards (
               id, label, area, cluster_semantic, funzione_primaria, espone_api,
@@ -244,6 +249,9 @@ impl SqliteStore {
             stmt.execute(params_from_iter(params))
                 .with_context(|| format!("upserting node card {}", card.id))?;
         }
+        drop(stmt);
+        conn.execute_batch("COMMIT")
+            .context("committing upsert_many transaction")?;
         Ok(())
     }
 
@@ -354,6 +362,11 @@ impl SqliteStore {
         chunks: &[FileChunk],
     ) -> Result<()> {
         let conn = self.connect()?;
+        // Python runs delete + insert inside ONE commit (`with self._connect()`);
+        // an explicit transaction keeps the same crash-atomicity (a failure can
+        // never leave chunks deleted but not re-inserted).
+        conn.execute_batch("BEGIN")
+            .context("beginning replace_chunks_for_files transaction")?;
         {
             let mut del = conn
                 .prepare("DELETE FROM file_chunks WHERE file_id = ?")
@@ -364,6 +377,8 @@ impl SqliteStore {
             }
         }
         if chunks.is_empty() {
+            conn.execute_batch("COMMIT")
+                .context("committing replace_chunks_for_files transaction")?;
             return Ok(());
         }
         let mut stmt = conn
@@ -418,6 +433,9 @@ impl SqliteStore {
             stmt.execute(params_from_iter(params))
                 .with_context(|| format!("upserting chunk {}", c.id))?;
         }
+        drop(stmt);
+        conn.execute_batch("COMMIT")
+            .context("committing replace_chunks_for_files transaction")?;
         Ok(())
     }
 

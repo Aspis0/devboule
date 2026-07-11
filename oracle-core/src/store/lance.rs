@@ -7,11 +7,11 @@
 //!
 //! The connection is cached process-wide, keyed by the path string
 //! (mirroring Python's `_CONNECTION_CACHE`). Vector rows are
-//! `id` / `label` / `area` / `cluster_semantic` / `vector`, where `vector`
-//! is a `FixedSizeList<Float32, 1024>` (see the note in `p1-recon-spec.md` §2:
-//! Python writes a variable `List<Float32>` because it brute-forces the cosine
-//! in Python, but the Rust port uses LanceDB's native nearest-neighbour query,
-//! which requires a fixed-size list vector column).
+//! `id` / `label` / `area` / `cluster_semantic` / `vector`, where `vector` is
+//! a `FixedSizeList<Float32, dims>` with `dims` taken FROM THE DATA — the real
+//! stores are not uniform (chunks/vectors = 1024, file_vectors = 128; verified
+//! live 2026-07-11, and the Python-written tables ARE fixed_size_list too, so
+//! read and write paths agree with what lancedb-python produces).
 
 use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
@@ -51,24 +51,34 @@ fn blake2b_8(data: &[u8]) -> [u8; 8] {
 /// (`+1.0` even / `-1.0` odd), accumulate, then L2-normalize (guarded so a
 /// zero vector stays zero). Returns a unit vector of length `dims`.
 pub fn hash_embed(text: &str, dims: usize) -> Vec<f32> {
-    let mut vector = vec![0.0f32; dims];
+    // All arithmetic in f64 like Python (whose floats are 64-bit); the final
+    // cast to f32 is the only narrowing step.
+    let mut vector = vec![0.0f64; dims];
     for token in token_re().find_iter(&text.to_lowercase()) {
         let digest = blake2b_8(token.as_str().as_bytes());
         let index =
             u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize % dims;
-        let sign = if digest[4].is_multiple_of(2) { 1.0f32 } else { -1.0f32 };
+        let sign = if digest[4].is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
         vector[index] += sign;
     }
-    let sum_sq = vector.iter().map(|v| v * v).sum::<f32>();
-    let norm = sum_sq.sqrt();
+    let norm = vector.iter().map(|v| v * v).sum::<f64>().sqrt();
     let norm = if norm == 0.0 { 1.0 } else { norm };
-    vector.iter().map(|v| v / norm).collect()
+    vector.iter().map(|v| (v / norm) as f32).collect()
 }
 
 /// Cosine similarity as a raw dot product (vectors are pre-normalized).
 /// Mirrors `lance_store.py::cosine`.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    // Accumulate in f64 like Python (its floats are 64-bit); with 1024 terms
+    // pure-f32 accumulation can drift enough to swap near-tie rankings.
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| *x as f64 * *y as f64)
+        .sum::<f64>() as f32
 }
 
 /// One stored vector row (`"nodes"` table / JSON file).
@@ -144,7 +154,12 @@ impl LanceStore {
     /// Mirrors the double-checked locking in `lance_store.py::_connect`.
     async fn connection(&self) -> Result<Arc<lancedb::Connection>> {
         let key = self.path.to_string_lossy().to_string();
-        if let Some(c) = conn_cache().lock().unwrap().get(&key).cloned() {
+        if let Some(c) = conn_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
             return Ok(c);
         }
         let conn = lancedb::connect(&key)
@@ -154,7 +169,7 @@ impl LanceStore {
         let conn = Arc::new(conn);
         conn_cache()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(key)
             .or_insert_with(|| conn.clone());
         Ok(conn)
@@ -193,7 +208,20 @@ impl LanceStore {
 
     /// Build a `RecordBatch` from rows, with `vector` as `FixedSizeList<f32, dims>`.
     fn to_batch(&self, records: &[LanceRow]) -> Result<RecordBatch> {
-        let dims = crate::config::EMBED_DIMS;
+        // Dimension comes FROM THE DATA, mirroring Python's
+        // `dims = len(records[0].get("vector", []))` — the real stores are not
+        // uniform (chunks/vectors = 1024, file_vectors = 128).
+        let dims = records
+            .first()
+            .map(|r| r.vector.len())
+            .unwrap_or(crate::config::EMBED_DIMS);
+        if let Some(bad) = records.iter().find(|r| r.vector.len() != dims) {
+            anyhow::bail!(
+                "inconsistent vector dims in batch: {} has {} dims, expected {dims}",
+                bad.id,
+                bad.vector.len()
+            );
+        }
         let n = records.len();
         let ids: StringArray = records
             .iter()
@@ -320,7 +348,7 @@ impl LanceStore {
                     .try_collect()
                     .await
                     .context("collecting search batches")?;
-                Ok(batches_to_hits(&batches))
+                batches_to_hits(&batches)
             }
         }
     }
@@ -366,7 +394,7 @@ impl LanceStore {
                     .try_collect()
                     .await
                     .context("collecting similar batches")?;
-                let mut hits = batches_to_hits(&batches);
+                let mut hits = batches_to_hits(&batches)?;
                 hits.retain(|h| h.id != id);
                 hits.truncate(limit);
                 Ok(hits)
@@ -374,9 +402,11 @@ impl LanceStore {
         }
     }
 
-    /// Append (or merge by id) rows. Mirrors the incremental write path of
-    /// `lance_store.py::_write_all` / `upsert`.
-    pub async fn add(&self, records: &[LanceRow]) -> Result<()> {
+    /// Merge rows by id (existing rows with the same id are replaced).
+    /// Mirrors `lance_store.py::upsert`: Python reads everything, merges the
+    /// dict by id and overwrites; deleting the incoming ids and re-adding
+    /// reaches the identical end state without rewriting untouched rows.
+    pub async fn upsert(&self, records: &[LanceRow]) -> Result<()> {
         match self.backend {
             Backend::Json => {
                 let mut existing: HashMap<String, LanceRow> = self
@@ -390,27 +420,7 @@ impl LanceStore {
                 }
                 self.write_json(&existing.into_values().collect::<Vec<_>>())
             }
-            Backend::Lance => {
-                if records.is_empty() {
-                    return Ok(());
-                }
-                let batch = self.to_batch(records)?;
-                if let Some(table) = self.open_table().await {
-                    table
-                        .add(batch)
-                        .execute()
-                        .await
-                        .context("adding rows to nodes table")?;
-                } else {
-                    let conn = self.connection().await?;
-                    conn.create_table("nodes", batch)
-                        .mode(lancedb::database::CreateTableMode::Overwrite)
-                        .execute()
-                        .await
-                        .context("creating nodes table")?;
-                }
-                Ok(())
-            }
+            Backend::Lance => self.replace_ids(&[], records).await,
         }
     }
 
@@ -587,9 +597,17 @@ fn batches_to_rows(batches: &[RecordBatch]) -> Vec<LanceRow> {
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>());
         for i in 0..n {
             let id = ids.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let label = labels.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let area = areas.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let cluster = clusters.and_then(|a| str_at(a, i)).unwrap_or_default();
+            // NULL fallbacks mirror `lance_store.py::_normalize_lance_row`:
+            // label -> id, area/cluster_semantic -> "unknown".
+            let label = labels
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| id.clone());
+            let area = areas
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| "unknown".to_string());
+            let cluster = clusters
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| "unknown".to_string());
             let vector = vectors.map(|v| vector_at(v, i)).unwrap_or_default();
             out.push(LanceRow {
                 id,
@@ -605,7 +623,10 @@ fn batches_to_rows(batches: &[RecordBatch]) -> Vec<LanceRow> {
 
 /// Convert scanned batches (with a `_distance` column) into `LanceHit`s.
 /// `score = 1.0 - _distance` for `DistanceType::Cosine`.
-fn batches_to_hits(batches: &[RecordBatch]) -> Vec<LanceHit> {
+///
+/// A missing `_distance` column is an error (Python would KeyError there);
+/// silently scoring everything 0.0 would hide a broken query plan.
+fn batches_to_hits(batches: &[RecordBatch]) -> Result<Vec<LanceHit>> {
     let mut out = Vec::new();
     for batch in batches {
         let n = batch.num_rows();
@@ -623,21 +644,25 @@ fn batches_to_hits(batches: &[RecordBatch]) -> Vec<LanceHit> {
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         let dist = batch
             .column_by_name("_distance")
-            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+            .context("search result is missing the _distance column")?;
         for i in 0..n {
             let id = ids.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let label = labels.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let area = areas.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let cluster = clusters.and_then(|a| str_at(a, i)).unwrap_or_default();
-            let score = dist
-                .map(|a| {
-                    if a.is_null(i) {
-                        0.0
-                    } else {
-                        1.0 - a.value(i) as f64
-                    }
-                })
-                .unwrap_or(0.0) as f32;
+            // NULL fallbacks mirror `lance_store.py::_normalize_lance_row`.
+            let label = labels
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| id.clone());
+            let area = areas
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| "unknown".to_string());
+            let cluster = clusters
+                .and_then(|a| str_at(a, i))
+                .unwrap_or_else(|| "unknown".to_string());
+            let score = if dist.is_null(i) {
+                0.0
+            } else {
+                (1.0 - dist.value(i) as f64) as f32
+            };
             out.push(LanceHit {
                 id,
                 label,
@@ -647,7 +672,7 @@ fn batches_to_hits(batches: &[RecordBatch]) -> Vec<LanceHit> {
             });
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
