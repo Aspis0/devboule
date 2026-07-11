@@ -5,6 +5,7 @@
 //! For now it hosts the proven embedding backends and the LanceDB query path.
 
 pub mod config;
+pub mod embed;
 pub mod embedder;
 pub mod ingest;
 pub mod lance;
