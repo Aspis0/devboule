@@ -4166,42 +4166,7 @@ fn md5_base64(body: &[u8]) -> String {
     base64_encode(&md5_digest(body))
 }
 
-/// S3 SigV4 Authorization for a request that ALSO signs `content-md5` (required
-/// for the lifecycle PUT). Mirrors `scaleway_s3_authorization` exactly but adds
-/// `content-md5` to both the canonical headers and the SignedHeaders list, in
-/// the canonical (alphabetical) header order S3 requires.
-#[allow(clippy::too_many_arguments)]
-fn scaleway_s3_authorization_with_md5(
-    method: &str,
-    canonical_uri: &str,
-    canonical_query: &str,
-    host: &str,
-    content_md5: &str,
-    amz_date: &str,
-    date_stamp: &str,
-    region: &str,
-    payload_hash: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> Result<String, String> {
-    let signed_headers = "content-md5;host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers = format!(
-        "content-md5:{content_md5}\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
-    let canonical_request = format!(
-        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
-    let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
-        hex_sha256(&canonical_request)
-    );
-    let signing_key = aws4_signing_key(secret_key, date_stamp, region, "s3")?;
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-    Ok(format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    ))
-}
+
 
 fn scaleway_namespaces_url(region: &str, project_id: &str, page: u32) -> String {
     format!(
@@ -4481,6 +4446,7 @@ async fn fetch_scaleway_object_buckets(
         "/",
         "",
         &host,
+        None,
         &amz_date,
         &date_stamp,
         region,
@@ -4542,6 +4508,7 @@ async fn fetch_scaleway_object_bucket_usage(
             &canonical_uri,
             &canonical_query,
             &host,
+            None,
             &amz_date,
             &date_stamp,
             region,
@@ -4616,6 +4583,7 @@ fn scaleway_s3_authorization(
     canonical_uri: &str,
     canonical_query: &str,
     host: &str,
+    content_md5: Option<&str>,
     amz_date: &str,
     date_stamp: &str,
     region: &str,
@@ -4623,9 +4591,18 @@ fn scaleway_s3_authorization(
     access_key: &str,
     secret_key: &str,
 ) -> Result<String, String> {
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers =
-        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let (signed_headers, canonical_headers) = match content_md5 {
+        Some(md5) => (
+            "content-md5;host;x-amz-content-sha256;x-amz-date",
+            format!(
+                "content-md5:{md5}\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+            ),
+        ),
+        None => (
+            "host;x-amz-content-sha256;x-amz-date",
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"),
+        ),
+    };
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
@@ -4636,7 +4613,6 @@ fn scaleway_s3_authorization(
     );
     let signing_key = aws4_signing_key(secret_key, date_stamp, region, "s3")?;
     let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
-
     Ok(format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
     ))
@@ -5591,6 +5567,7 @@ pub async fn create_scaleway_object_bucket_request(
         &canonical_uri,
         "",
         &host,
+        None,
         &amz_date,
         &date_stamp,
         region,
@@ -5634,6 +5611,7 @@ pub async fn delete_scaleway_object_bucket_request(
         &canonical_uri,
         "",
         &host,
+        None,
         &amz_date,
         &date_stamp,
         region,
@@ -5753,12 +5731,12 @@ async fn put_scaleway_object_bucket_lifecycle(
     let date = Utc::now();
     let amz_date = date.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = date.format("%Y%m%d").to_string();
-    let authorization = scaleway_s3_authorization_with_md5(
+    let authorization = scaleway_s3_authorization(
         "PUT",
         &canonical_uri,
         canonical_query,
         &host,
-        &content_md5,
+        Some(&content_md5),
         &amz_date,
         &date_stamp,
         region,
@@ -10887,6 +10865,7 @@ mod tests {
             "/",
             "",
             "s3.fr-par.scw.cloud",
+            None,
             "20260527T120000Z",
             "20260527",
             "fr-par",
@@ -11733,12 +11712,12 @@ mod tests {
 
     #[test]
     fn scaleway_s3_lifecycle_authorization_signs_content_md5_without_leaking_secret() {
-        let auth = scaleway_s3_authorization_with_md5(
+        let auth = scaleway_s3_authorization(
             "PUT",
             "/bio-bucket",
             "lifecycle=",
             "s3.fr-par.scw.cloud",
-            "1B2M2Y8AsgTpgAmY7PhCfg==",
+            Some("1B2M2Y8AsgTpgAmY7PhCfg=="),
             "20260527T120000Z",
             "20260527",
             "fr-par",
@@ -11750,5 +11729,43 @@ mod tests {
         assert!(auth.contains("AWS4-HMAC-SHA256"));
         assert!(auth.contains("SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date"));
         assert!(!auth.contains("super-secret-scaleway-key"));
+    }
+
+    #[test]
+    fn scaleway_s3_authorization_golden_canonical_output() {
+        let auth = scaleway_s3_authorization(
+            "GET",
+            "/",
+            "",
+            "s3.fr-par.scw.cloud",
+            None,
+            "20260527T120000Z",
+            "20260527",
+            "fr-par",
+            &hex_sha256(""),
+            "SCWACCESSKEY@bio-project",
+            "super-secret-scaleway-key",
+        )
+        .unwrap();
+        assert_eq!(auth, "AWS4-HMAC-SHA256 Credential=SCWACCESSKEY@bio-project/20260527/fr-par/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=3b522cbaeeb53514084ca1ca21c69f97cbc68db42f0eca8f6ec0e0d0ce89ba24");
+    }
+
+    #[test]
+    fn scaleway_s3_authorization_with_md5_golden_canonical_output() {
+        let auth = scaleway_s3_authorization(
+            "PUT",
+            "/bio-bucket",
+            "lifecycle=",
+            "s3.fr-par.scw.cloud",
+            Some("1B2M2Y8AsgTpgAmY7PhCfg=="),
+            "20260527T120000Z",
+            "20260527",
+            "fr-par",
+            &hex_sha256("<LifecycleConfiguration/>"),
+            "SCWACCESSKEY@bio-project",
+            "super-secret-scaleway-key",
+        )
+        .unwrap();
+        assert_eq!(auth, "AWS4-HMAC-SHA256 Credential=SCWACCESSKEY@bio-project/20260527/fr-par/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=382cd491d5d07a1c9b31ae1e333512f0f88874e57cf195c7f7db159f2b6c6004");
     }
 }
