@@ -783,7 +783,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         verdict_inflight.union(&agentic_inflight).cloned().collect();
 
     let now = Utc::now().to_rfc3339();
-    let plan = mini_coder::plan_tick_excluding(
+    let plan = mini_coder::plan_tick(
         &directives,
         &now,
         DEFAULT_WALL_CLOCK_CAP_SECS,

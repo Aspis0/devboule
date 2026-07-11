@@ -953,35 +953,17 @@ pub(crate) fn files_disjoint_from_active(
 /// running directive with a missing/unparseable `started_at` or a `now` that
 /// won't parse is NOT timed out here (fail-open — the executor's own kill path
 /// remains the backstop; we never time out on a clock we can't read).
-pub fn plan_tick(
-    directives: &[MiniCoderDirective],
-    now: &str,
-    cap_secs: i64,
-    retry_cap_secs: i64,
-    launch_cap_secs: i64,
-    max_concurrent: usize,
-) -> TickPlan {
-    // No deferred-verdict directives to exclude (the common path + every existing test).
-    plan_tick_excluding(
-        directives,
-        now,
-        cap_secs,
-        retry_cap_secs,
-        launch_cap_secs,
-        max_concurrent,
-        &std::collections::HashSet::new(),
-    )
-}
-
-/// BLOCKER 2: [`plan_tick`] but EXCLUDING `verdict_inflight` directive ids from the
-/// wall-clock timeout. A directive whose deferred Censor-verdict thread is in flight is
-/// still `Running` with an OLD `started_at` (its PTY is gone, but we keep it Running so
-/// the verdict thread can apply its decision) — it is NOT stuck, so it must never be
-/// wall-cap-timed-out. The verdict thread is itself bounded (the fine-pass runner
-/// timeouts), so the exclusion can't leak. The executor passes its live in-flight set;
-/// `plan_tick` (and every existing test) passes an empty set.
+///
+/// BLOCKER 2: the `verdict_inflight` parameter EXCLUDES directive ids from the
+/// wall-clock timeout. A directive whose deferred Censor-verdict thread is in
+/// flight is still `Running` with an OLD `started_at` (its PTY is gone, but we
+/// keep it Running so the verdict thread can apply its decision) — it is NOT
+/// stuck, so it must never be wall-cap-timed-out. The verdict thread is itself
+/// bounded (the fine-pass runner timeouts), so the exclusion can't leak. The
+/// executor passes its live in-flight set; callers with no in-flight verdicts
+/// pass an empty `HashSet`.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_tick_excluding(
+pub fn plan_tick(
     directives: &[MiniCoderDirective],
     now: &str,
     cap_secs: i64,
@@ -2537,6 +2519,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan, TickPlan::default());
     }
@@ -2555,6 +2538,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.claims, vec!["d1".to_string()]);
         assert!(plan.timeouts.is_empty());
@@ -2573,6 +2557,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan.claims.is_empty());
     }
@@ -2590,6 +2575,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.timeouts, vec!["d1".to_string()]);
     }
@@ -2607,6 +2593,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan.timeouts.is_empty());
     }
@@ -2624,7 +2611,8 @@ mod tests {
             1,
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
-            MC1
+            MC1,
+            &std::collections::HashSet::new(),
         )
         .timeouts
         .is_empty());
@@ -2637,7 +2625,8 @@ mod tests {
             1,
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
-            MC1
+            MC1,
+            &std::collections::HashSet::new(),
         )
         .timeouts
         .is_empty());
@@ -2658,6 +2647,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan.timeouts.is_empty(), "cap=0 must not instant-timeout");
         let plan_neg = plan_tick(
@@ -2667,6 +2657,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             MC1,
+            &std::collections::HashSet::new(),
         );
         assert!(
             plan_neg.timeouts.is_empty(),
@@ -2692,6 +2683,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan1.claims.is_empty(), "at ceiling -> no claim");
 
@@ -2702,6 +2694,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             2,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             plan2.claims,
@@ -2725,6 +2718,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan.claims.is_empty());
         assert_eq!(plan.timeouts, vec!["d1".to_string()]);
@@ -2748,6 +2742,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             1,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.stuck_launching, vec!["stuck".to_string()]);
         // A launching directive with NO claimed_at anchor is NOT flagged here (the
@@ -2760,6 +2755,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             1,
+            &std::collections::HashSet::new(),
         );
         assert!(plan2.stuck_launching.is_empty());
     }
@@ -2788,6 +2784,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             2,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.claims, vec!["d1".to_string(), "d2".to_string()]);
     }
@@ -2808,6 +2805,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             4,
+            &std::collections::HashSet::new(),
         );
         // d1 (oldest) + d3 (disjoint); d2 skipped (overlaps d1's src/a.rs).
         assert_eq!(plan.claims, vec!["d1".to_string(), "d3".to_string()]);
@@ -2829,6 +2827,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             4,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.claims, vec!["d1".to_string()]);
     }
@@ -3241,6 +3240,7 @@ mod tests {
             DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
             DEFAULT_LAUNCH_CAP_SECS,
             1,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(plan.claims, vec!["d1".to_string()]);
         let claim_id = plan.claims[0].clone();
