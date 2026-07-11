@@ -4,13 +4,16 @@
 //! PLAN.md phases: store/, ingest/, query/, answer/, jobs, server, doctor.
 //! For now it hosts the proven embedding backends and the LanceDB query path.
 
+pub mod cluster;
 pub mod config;
 pub mod embed;
 pub mod embedder;
 pub mod ingest;
+pub mod jobs;
 pub mod lance;
 pub mod onnx_embedder;
 pub mod store;
+pub mod watch;
 
 use clap::ValueEnum;
 
