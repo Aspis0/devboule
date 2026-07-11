@@ -420,13 +420,11 @@ fn run_loop(app: AppHandle, running: Arc<AtomicBool>) {
         eprintln!("mini-coder executor: startup result-file-sweep error: {e}");
     }
 
-    // P6 (crash recovery): an `Failed` directive whose forward-linked retry
-    // directive is ABSENT from the queue (evicted, or never appended after a crash
-    // between the awaiting-retry stamp and the retry append) is stuck in limbo — no
-    // retry will ever propagate a verdict back to it. Fail it (`failed("retry lost")`)
-    // and propagate to its lineage so the ROOT id's poll unblocks. Best-effort.
-    // Phase A Censor injection replaces the old verdict gate sweep
-    let _ = sweep_orphaned_result_files(&app);
+    // NOTE: the P6 "retry-lost" crash-recovery (auto-fail a `Failed` directive whose
+    // forward-linked retry directive is absent from the queue) was originally implemented
+    // via `sweep_orphaned_awaiting_retry`, which was removed during a refactor and never
+    // replaced. A `Failed` directive stuck in this state currently sits unresolved until a
+    // manual retry or cleanup; there is no automatic recovery for it.
 
     // Slice 3 (seam 3d): when Pigeon is enabled, register the `mini-pool` receiver as
     // `loaded` once so the agents row exists (a `/send` to a known-loaded receiver gets
