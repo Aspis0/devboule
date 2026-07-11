@@ -24,6 +24,7 @@ pub async fn cmd_query(
     limit: usize,
     device_arg: DeviceArg,
     dtype_arg: DtypeArg,
+    _batch_size: usize,
 ) -> Result<()> {
     let device = resolve_device(device_arg)?;
     let dtype = dtype_arg.to_dtype();
@@ -92,7 +93,13 @@ pub async fn cmd_query(
                     Some(a.value(row).to_string())
                 }
             });
-            let score = dist.map(|a| 1.0 - a.value(row) as f64);
+            let score = dist.and_then(|a| {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(1.0 - a.value(row) as f64)
+                }
+            });
 
             let out = QueryRow { id, label, score };
             println!("{}", serde_json::to_string(&out)?);

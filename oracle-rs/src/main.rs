@@ -23,6 +23,8 @@ enum Command {
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
     },
     /// Embed a query and run a LanceDB nearest-neighbour search.
     Query {
@@ -36,6 +38,8 @@ enum Command {
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
     },
     /// Benchmark embedding throughput over a texts file.
     Bench {
@@ -47,6 +51,8 @@ enum Command {
         device: DeviceArg,
         #[arg(long, value_enum, default_value = "f32")]
         dtype: DtypeArg,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
     },
 }
 
@@ -59,19 +65,22 @@ async fn main() -> anyhow::Result<()> {
             out,
             device,
             dtype,
-        } => embedder::cmd_embed(texts_file, out, device, dtype).await,
+            batch_size,
+        } => embedder::cmd_embed(texts_file, out, device, dtype, batch_size).await,
         Command::Query {
             db,
             query,
             limit,
             device,
             dtype,
-        } => lance::cmd_query(db, query, limit, device, dtype).await,
+            batch_size,
+        } => lance::cmd_query(db, query, limit, device, dtype, batch_size).await,
         Command::Bench {
             texts_file,
             iters,
             device,
             dtype,
-        } => embedder::cmd_bench(texts_file, iters, device, dtype).await,
+            batch_size,
+        } => embedder::cmd_bench(texts_file, iters, device, dtype, batch_size).await,
     }
 }

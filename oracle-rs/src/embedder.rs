@@ -1,3 +1,6 @@
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("the `metal` feature is macOS-only; build without it on this platform");
+
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use clap::ValueEnum;
@@ -76,11 +79,22 @@ pub struct EmbedResult {
 }
 
 /// Embed `texts` (L2-normalized) and time the call.
-pub fn embed_texts(model: &Qwen3TextEmbedding, texts: &[String]) -> Result<EmbedResult> {
+///
+/// Texts are processed in chunks of `batch_size` to bound per-call memory and
+/// avoid the quadratic blowup of padding the whole input to the longest item.
+pub fn embed_texts(
+    model: &Qwen3TextEmbedding,
+    texts: &[String],
+    batch_size: usize,
+) -> Result<EmbedResult> {
     let start = std::time::Instant::now();
-    let vectors = model
-        .embed(texts)
-        .with_context(|| "embedding texts failed")?;
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(batch_size.max(1)) {
+        let mut v = model
+            .embed(chunk)
+            .with_context(|| "embedding texts failed")?;
+        vectors.append(&mut v);
+    }
     Ok(EmbedResult {
         vectors,
         embed_ms: start.elapsed().as_millis(),
@@ -116,6 +130,7 @@ pub async fn cmd_embed(
     out: std::path::PathBuf,
     device_arg: DeviceArg,
     dtype_arg: DtypeArg,
+    batch_size: usize,
 ) -> Result<()> {
     let device = resolve_device(device_arg)?;
     let dtype = dtype_arg.to_dtype();
@@ -124,11 +139,14 @@ pub async fn cmd_embed(
         .with_context(|| format!("reading texts file {}", texts_file.display()))?;
     let texts: Vec<String> = serde_json::from_str(&raw)
         .with_context(|| format!("parsing texts JSON from {}", texts_file.display()))?;
+    if texts.is_empty() {
+        anyhow::bail!("texts file is empty");
+    }
 
     let loaded = load_model(&device, dtype)?;
     eprintln!("model load: {} ms", loaded.load_ms);
 
-    let res = embed_texts(&loaded.model, &texts)?;
+    let res = embed_texts(&loaded.model, &texts, batch_size)?;
     let n = texts.len();
     let tps = if res.embed_ms > 0 {
         n as f64 / (res.embed_ms as f64 / 1000.0)
@@ -157,6 +175,7 @@ pub async fn cmd_bench(
     iters: usize,
     device_arg: DeviceArg,
     dtype_arg: DtypeArg,
+    batch_size: usize,
 ) -> Result<()> {
     let device = resolve_device(device_arg)?;
     let dtype = dtype_arg.to_dtype();
@@ -165,6 +184,9 @@ pub async fn cmd_bench(
         .with_context(|| format!("reading texts file {}", texts_file.display()))?;
     let texts: Vec<String> = serde_json::from_str(&raw)
         .with_context(|| format!("parsing texts JSON from {}", texts_file.display()))?;
+    if texts.is_empty() {
+        anyhow::bail!("texts file is empty");
+    }
 
     let loaded = load_model(&device, dtype)?;
 
@@ -173,7 +195,7 @@ pub async fn cmd_bench(
 
     let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
     for _ in 0..iters {
-        let res = embed_texts(&loaded.model, &texts)?;
+        let res = embed_texts(&loaded.model, &texts, batch_size)?;
         per_iter_ms.push(res.embed_ms);
     }
 
