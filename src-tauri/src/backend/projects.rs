@@ -1382,25 +1382,6 @@ pub fn set_censor_local_ai(
 
 /// Read the persisted Censor tier-2 (Gemma) local-AI provider config for the Settings UI.
 /// Returns the SAME validate-or-default value the engine uses (`read_censor_local_ai`):
-/// a missing/invalid config resolves to the safe Ollama default. Read-only (no unlock
-/// gate — it exposes no secret; the model/base are user config, not sensitive). The UI
-/// shows the CONFIGURED override (`ollamaModel`, may be absent) plus a hint that, when no
-/// override is set, the effective Ollama model is resolved at runtime via the chain
-/// `gemma4:e4b` → `gemma4:e2b` (upgrade fallback) — the UI cannot know which is live
-/// without the daemon, so it presents the override + the default, not a probed value.
-#[tauri::command]
-pub fn get_censor_local_ai(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-) -> Result<super::censor::gemma::CensorLocalAi, String> {
-    // Unlock-gated like the peer getters (`get_mini_coder_backend` /
-    // `get_design_llm_backend`): the locked state must not expose the persisted config
-    // (defense in depth — the value is user config, but the gate is uniform across the
-    // Settings getters so a locked app surfaces ONE consistent "App is locked" error).
-    state.ensure_unlocked()?;
-    Ok(read_censor_local_ai(&app))
-}
-
 #[tauri::command]
 pub fn launch_project_agent_terminal(
     app: tauri::AppHandle,
@@ -10367,24 +10348,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 ..Default::default()
             }),
             "the override must read back identically (not dropped)"
-        );
-    }
-
-    #[test]
-    fn get_censor_local_ai_is_unlock_gated_when_locked() {
-        // BLOCKER 2 (locked-state leak): get_censor_local_ai must call
-        // `state.ensure_unlocked()?` before reading the config, mirroring its peers
-        // get_mini_coder_backend / get_design_llm_backend. The command needs a Tauri
-        // AppHandle (so it can't be invoked whole in a unit test), but the gate is the
-        // FIRST thing it runs; a freshly-constructed (locked) BackendState must make that
-        // exact gate error — proving a locked app never reaches the config read.
-        let state = BackendState::new();
-        let err = state
-            .ensure_unlocked()
-            .expect_err("a fresh BackendState is locked, so the gate must error");
-        assert!(
-            err.contains("locked"),
-            "the locked-state gate guarding get_censor_local_ai must report a locked app: {err}"
         );
     }
 

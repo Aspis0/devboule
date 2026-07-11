@@ -616,7 +616,6 @@ pub fn run() {
             backend::commands::delete_scaleway_container,
             backend::projects::refresh_project_live_status,
             backend::projects::remove_project_milestone,
-            backend::projects::get_censor_local_ai,
             backend::projects::set_censor_local_ai,
             backend::projects::set_custom_agent_clients,
             backend::projects::set_design_llm_backend,
