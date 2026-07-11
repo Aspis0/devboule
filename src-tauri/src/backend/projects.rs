@@ -1539,6 +1539,51 @@ fn spawn_pi_coder_session(
     })
 }
 
+/// D1 FENCE: when relaunching the STABLE per-project orchestrator id, stop
+/// whatever process still holds it (app PTY, cloud duplex child, external
+/// window, OR a live pi sidecar session — `stop_agent_process_only` routes
+/// to `stop_pi_session` first) so there is at most one live writer
+/// generation, then truncate the stale steer inbox (local orchestrator only
+/// — cloud CLIs take stdin, not a steer file). No-op for any non-orchestrator
+/// role. Called once the launch is COMMITTED (every fallible step before it
+/// has already passed) — see the call sites for why timing matters.
+fn fence_stale_orchestrator(
+    app: &tauri::AppHandle,
+    role: &str,
+    client: &str,
+    agent_id: &str,
+    projects_path: &Path,
+) {
+    if role != "orchestrator" {
+        return;
+    }
+    // PROCESS-ONLY stop of whatever predecessor still holds this id (app PTY,
+    // cloud duplex child, external window, stale ledger entry, pi sidecar).
+    // Deliberately NOT the full stop (max-recall BLOCKER): `record_launch_pending`
+    // already wrote the NEW generation's launch_pending row under this same stable
+    // id, so a row-close here would stamp the fresh launch closed at birth; and the
+    // registry teardown would defeat the new tail's `had_predecessor` detection.
+    // Errors swallowed: a missing/dead predecessor is the normal case, and the
+    // fence must never block a launch.
+    let _ = crate::backend::agents::stop_agent_process_only(app, agent_id);
+    // Truncate the steer inbox ONLY NOW, after the predecessor is dead — the
+    // path is deterministic per (stable) agent_id, so truncating it earlier
+    // (as the old config-build site did) would wipe messages a still-LIVE
+    // predecessor had queued but not yet drained. Local orchestrator only:
+    // cloud CLIs take stdin, not a steer file.
+    if client == "orchestrator" {
+        if let Some(steer) =
+            crate::backend::mini_activity::steer_file_path(projects_path, agent_id)
+        {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(&steer);
+        }
+    }
+}
+
 fn prepare_or_launch_project_agent(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
@@ -1699,6 +1744,21 @@ fn prepare_or_launch_project_agent(
         &client,
         crate::backend::pi_sidecar::pi_sidecar_enabled(),
     ) {
+        // D1 FENCE (pi path): the pi sidecar's stable orchestrator id is the SAME
+        // stable id `agent_id` already holds (generate_agent_id("orchestrator", ..)
+        // resolves to stable_orchestrator_agent_id), so a relaunch here needs the
+        // exact same predecessor-fence treatment as the 3 legacy spawn points below.
+        // stop_agent_process_only's first branch already routes to stop_pi_session
+        // for exactly this purpose — it was just never wired up here. Gated on
+        // role == "orchestrator" at the CALL SITE (not just the callee's internal
+        // guard) so a coder/mini pi launch never pays the ensure_projects_dir cost
+        // or its new failure mode (max-recall: hostile review caught this — a
+        // coder/mini launch that always succeeded before must not gain a new `?`
+        // error path it never had).
+        if role == "orchestrator" {
+            let fence_projects_path = ensure_projects_dir(&app)?;
+            fence_stale_orchestrator(&app, &role, &client, &agent_id, &fence_projects_path);
+        }
         return match pi_role {
             "orchestrator" => spawn_pi_orchestrator_session(
                 &app,
@@ -1718,39 +1778,6 @@ fn prepare_or_launch_project_agent(
         };
     }
     let projects_path = ensure_projects_dir(&app)?;
-    // D1 FENCE (called at the three spawn points below, once the launch is committed):
-    // the stable orchestrator id means a relaunch REUSES the bridge file and steer
-    // inbox — there must be AT MOST ONE live writer generation per project.
-    let fence_stale_orchestrator = |app: &tauri::AppHandle| {
-        if role != "orchestrator" {
-            return;
-        }
-        // PROCESS-ONLY stop of whatever predecessor still holds this id (app PTY,
-        // cloud duplex child, external window, stale ledger entry). Deliberately NOT
-        // the full stop (max-recall BLOCKER): `record_launch_pending` already wrote
-        // the NEW generation's launch_pending row under this same stable id, so a
-        // row-close here would stamp the fresh launch closed at birth; and the
-        // registry teardown would defeat the new tail's `had_predecessor` detection.
-        // Errors swallowed: a missing/dead predecessor is the normal case, and the
-        // fence must never block a launch.
-        let _ = crate::backend::agents::stop_agent_process_only(app, &agent_id);
-        // Truncate the steer inbox ONLY NOW, after the predecessor is dead — the
-        // path is deterministic per (stable) agent_id, so truncating it earlier
-        // (as the old config-build site did) would wipe messages a still-LIVE
-        // predecessor had queued but not yet drained. Local orchestrator only:
-        // cloud CLIs take stdin, not a steer file.
-        if client == "orchestrator" {
-            if let Some(steer) =
-                crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
-            {
-                let _ = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .open(&steer);
-            }
-        }
-    };
     let management_root = management_root_for_mcp(&app, &projects_path);
     // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
     // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
@@ -2104,7 +2131,7 @@ fn prepare_or_launch_project_agent(
         );
         // D1 FENCE: launch is committed (every fallible step above passed) — stop the
         // stable id's predecessor so the bridge file has one writer generation.
-        fence_stale_orchestrator(&app);
+        fence_stale_orchestrator(&app, &role, &client, &agent_id, &projects_path);
         // Build the first turn: Planner's typed goal when present; for non-orchestrator
         // roles fall back to the assembled role prompt so a coder/verifier actually
         // receives its brief. Orchestrator without a goal → None (the planner chat's
@@ -2151,7 +2178,7 @@ fn prepare_or_launch_project_agent(
         // if the child died early.
         // D1 FENCE: committed to spawning — stop the stable orchestrator id's
         // predecessor first (no-op for every other role).
-        fence_stale_orchestrator(&app);
+        fence_stale_orchestrator(&app, &role, &client, &agent_id, &projects_path);
         let prompt_file_label = spawn_agent_terminal_app(
             &app,
             &agent_id,
@@ -2200,7 +2227,7 @@ fn prepare_or_launch_project_agent(
         let window_title = agent_window_title(&agent_id);
         // D1 FENCE: committed to spawning — stop the stable orchestrator id's
         // predecessor first (no-op for every other role).
-        fence_stale_orchestrator(&app);
+        fence_stale_orchestrator(&app, &role, &client, &agent_id, &projects_path);
         let spawned = spawn_agent_terminal(
             &agent_id,
             &root_path,
@@ -11168,5 +11195,90 @@ mod wipe_planner_files_tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod fence_stale_orchestrator_tests {
+    use super::*;
+
+    #[test]
+    fn fence_stale_orchestrator_truncation_logic_empties_a_preexisting_steer_file() {
+        // Mirrors the truncate-on-relaunch branch inside fence_stale_orchestrator
+        // (the only sub-effect testable without a real AppHandle — the process-kill
+        // half routes through stop_agent_process_only, which needs one).
+        let dir = std::env::temp_dir().join(format!("aspis-fence-test-{}", std::process::id()));
+        let agent_id = "orchestrator-test-project";
+        let steer = crate::backend::mini_activity::steer_file_path(&dir, agent_id)
+            .expect("steer path should resolve for a safe agent id");
+        std::fs::write(&steer, b"stale queued message from a dead predecessor\
+").unwrap();
+        assert!(std::fs::metadata(&steer).unwrap().len() > 0);
+
+        // Same truncate-open sequence fence_stale_orchestrator uses.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&steer);
+
+        assert_eq!(
+            std::fs::metadata(&steer).unwrap().len(),
+            0,
+            "the fence's truncate-open must leave the steer inbox at 0 bytes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pi_launch_path_wires_up_the_stale_orchestrator_fence() {
+        // Regression guard (max-recall A3): the pi sidecar orchestrator/coder path
+        // used to return early WITHOUT ever fencing a stale predecessor (the fence
+        // closure was defined only after this early return). Assert the wiring
+        // still calls fence_stale_orchestrator before the pi match returns.
+        let src = include_str!("projects.rs");
+        let pi_route_idx = src
+            .find("crate::backend::pi_sidecar::pi_route_for_launch(")
+            .expect("pi_route_for_launch call must still exist");
+        let match_pi_role_idx = src[pi_route_idx..]
+            .find("match pi_role {")
+            .map(|i| i + pi_route_idx)
+            .expect("match pi_role block must still exist");
+        let between = &src[pi_route_idx..match_pi_role_idx];
+
+        // 1. Structural: the call must appear between the pi_route_for_launch
+        //    entry and the match pi_role dispatch (enforces ordering).
+        assert!(
+            between.contains("fence_stale_orchestrator("),
+            "the pi launch path must call fence_stale_orchestrator BEFORE spawning \
+             the pi orchestrator/coder session, or a relaunch leaks a stale \
+             predecessor + steer inbox"
+        );
+
+        // 2. Exact call shape: require the full 5-argument invocation so any
+        //    mutation of the argument list (wrong variable, missing arg, etc.)
+        //    breaks the test.
+        let exact_call = "fence_stale_orchestrator(&app, &role, &client, &agent_id, &fence_projects_path)";
+        let call_idx = between
+            .find(exact_call)
+            .unwrap_or_else(|| panic!(
+                "expected exact 5-arg call '{}' in pi launch path between \
+                 pi_route_for_launch and match pi_role, but not found",
+                exact_call
+            ));
+
+        // 3. Not commented out: verify the exact call is not inside a line
+        //    comment (// at start of line). Scan the line containing the match.
+        let line_start = between[..call_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = between[call_idx..].find('\n').map(|i| i + call_idx).unwrap_or(between.len());
+        let full_line = &between[line_start..line_end];
+        let trimmed = full_line.trim_start();
+        assert!(
+            !trimmed.starts_with("//"),
+            "fence_stale_orchestrator call in the pi launch path is inside a \
+             line comment — the fence is dead code and the bug would regress: {}",
+            full_line
+        );
     }
 }
