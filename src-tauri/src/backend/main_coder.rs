@@ -1,5 +1,6 @@
-//! Main coder: Tauri command that appends a first-class Main coder directive to the
-//! shared agent ledger.
+//! Main coder: helper that builds and appends a first-class Main coder directive
+//! to the shared agent ledger.  Consumed by `polis_fix_sin`; there is no
+//! standalone Tauri command exposing this directly.
 //!
 //! This is the UI twin of the Python MCP tool `spawn_main_coder` (aspis_mcp.py).
 //! It validates the request, builds a `MiniCoderDirective` with `tier: Main` and
@@ -23,7 +24,7 @@ fn generate_id() -> String {
 /// Pure validation for a main-coder request. Returns the cleaned (task, files)
 /// tuple, or an error string explaining the first failure encountered.
 ///
-/// This is extracted as a pure helper so the Tauri command can stay thin and
+/// This is extracted as a pure helper so `polis_fix_sin` stays thin and
 /// the validation logic is directly testable without an AppHandle.
 fn validate_main_coder_request(
     task: &str,

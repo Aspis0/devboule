@@ -840,6 +840,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     directive.attempt.saturating_add(1),
                     "",
                     Vec::new(),
+                    directive_project(&snapshot, directive),
                 );
                 let _ = app.emit("mini://stuck", report);
             }
@@ -894,6 +895,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     directive.attempt.saturating_add(1),
                     "",
                     Vec::new(),
+                    directive_project(&snapshot, directive),
                 );
                 let _ = app.emit("mini://stuck", report);
             }
@@ -971,6 +973,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     directive.attempt.saturating_add(1),
                     "",
                     Vec::new(),
+                    directive_project(&snapshot, directive),
                 );
                 let _ = app.emit("mini://stuck", report);
             }
@@ -2158,6 +2161,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             directive.attempt.saturating_add(1),
             raw,
             outcome.files_touched.clone(),
+            snapshot.as_ref().and_then(|s| directive_project(s, directive)),
         );
         let _ = app.emit("mini://stuck", report);
     }

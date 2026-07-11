@@ -16,6 +16,8 @@ export interface MiniStuckReport {
   attempts: number;
   lastOutput: string;
   filesTouched: string[];
+  /** The project this mini belongs to (absent on very old reports). */
+  projectId?: string | null;
 }
 
 /** A short, human label for the banner row, e.g. "timeout" -> "timed out". */
@@ -28,4 +30,18 @@ export function stuckReasonLabel(reason: string): string {
     default:
       return reason || "stuck";
   }
+}
+
+/**
+ * Pure filter: show a report if its projectId is absent/null (legacy safety)
+ * or matches the current project.  Reports are never hidden/resurfaced by
+ * session changes — they stay visible until explicitly dismissed.
+ */
+export function filterStuckReports(
+  reports: MiniStuckReport[],
+  currentProjectId: string,
+): MiniStuckReport[] {
+  return reports.filter(
+    (r) => r.projectId == null || r.projectId === currentProjectId,
+  );
 }

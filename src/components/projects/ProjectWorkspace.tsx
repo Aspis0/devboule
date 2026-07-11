@@ -72,6 +72,7 @@ import { SkillsToolsModal } from "../work/SkillsToolsModal";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { useMiniStuckReports } from "../work/useMiniStuckReports";
+import { filterStuckReports } from "../work/miniStuckModel";
 import { MiniStuckBanner } from "../work/MiniStuckBanner";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
@@ -350,20 +351,14 @@ export function ProjectWorkspace({
     }
   }, [sessions, claims, selectBoth]);
 
-  // Stuck-report filter: match against BOTH current and previous sessions so a
-  // parent-gone stuck report (emitted after the parent left `sessions`) is still
-  // visible for one render cycle — prevSessionsRef holds the prior snapshot until
-  // the next effect run advances it.
+  // Stuck-report filter: match by project so only reports for the currently-open
+  // project surface.  Reports with a null/absent projectId are shown as a safety
+  // net.  Reports stay visible until explicitly dismissed (no session coupling, no
+  // pruning — avoids the resurrect bug and the app-user special case).
   const { reports: stuckReports, dismiss: dismissStuck } = useMiniStuckReports();
-  const stuckAgentIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const s of sessions) ids.add(s.agentId);
-    for (const s of prevSessionsRef.current) ids.add(s.agentId);
-    return ids;
-  }, [sessions]);
   const filteredStuckReports = useMemo(
-    () => stuckReports.filter((r) => stuckAgentIds.has(r.agentId)),
-    [stuckReports, stuckAgentIds],
+    () => filterStuckReports(stuckReports, project.metadata.id),
+    [stuckReports, project.metadata.id],
   );
 
   // Auto-unpin the split's second pane when its agent's session disappears (reaped/exited),

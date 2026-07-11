@@ -1380,8 +1380,6 @@ pub fn set_censor_local_ai(
     Ok(normalized)
 }
 
-/// Read the persisted Censor tier-2 (Gemma) local-AI provider config for the Settings UI.
-/// Returns the SAME validate-or-default value the engine uses (`read_censor_local_ai`):
 #[tauri::command]
 pub fn launch_project_agent_terminal(
     app: tauri::AppHandle,

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { stuckReasonLabel } from "./miniStuckModel";
+import { stuckReasonLabel, filterStuckReports } from "./miniStuckModel";
+import type { MiniStuckReport } from "./miniStuckModel";
 
 describe("stuckReasonLabel", () => {
   it("returns 'timed out' for timeout", () => {
@@ -16,5 +17,71 @@ describe("stuckReasonLabel", () => {
 
   it("returns 'stuck' for empty string", () => {
     expect(stuckReasonLabel("")).toBe("stuck");
+  });
+});
+
+function report(overrides: Partial<MiniStuckReport> = {}): MiniStuckReport {
+  return {
+    taskId: "T1",
+    agentId: "agent-1",
+    reason: "timeout",
+    attempts: 1,
+    lastOutput: "",
+    filesTouched: [],
+    ...overrides,
+  };
+}
+
+describe("filterStuckReports", () => {
+  it("shows reports whose projectId matches the current project", () => {
+    const reports = [
+      report({ taskId: "T1", projectId: "p1" }),
+      report({ taskId: "T2", projectId: "p1" }),
+    ];
+    expect(filterStuckReports(reports, "p1")).toHaveLength(2);
+  });
+
+  it("hides reports whose projectId does not match", () => {
+    const reports = [
+      report({ taskId: "T1", projectId: "p1" }),
+      report({ taskId: "T2", projectId: "p2" }),
+    ];
+    expect(filterStuckReports(reports, "p1")).toHaveLength(1);
+    expect(filterStuckReports(reports, "p1")[0].taskId).toBe("T1");
+  });
+
+  it("shows reports with null projectId (legacy safety)", () => {
+    const reports = [
+      report({ taskId: "T1", projectId: null }),
+      report({ taskId: "T2", projectId: "p2" }),
+    ];
+    expect(filterStuckReports(reports, "p1")).toHaveLength(1);
+    expect(filterStuckReports(reports, "p1")[0].taskId).toBe("T1");
+  });
+
+  it("shows reports with undefined projectId (legacy safety)", () => {
+    const reports = [
+      report({ taskId: "T1" }), // projectId omitted → undefined
+      report({ taskId: "T2", projectId: "p2" }),
+    ];
+    expect(filterStuckReports(reports, "p1")).toHaveLength(1);
+    expect(filterStuckReports(reports, "p1")[0].taskId).toBe("T1");
+  });
+
+  it("returns empty array when no reports match", () => {
+    const reports = [
+      report({ taskId: "T1", projectId: "p2" }),
+      report({ taskId: "T2", projectId: "p3" }),
+    ];
+    expect(filterStuckReports(reports, "p1")).toHaveLength(0);
+  });
+
+  it("does not mutate the input array", () => {
+    const reports = [
+      report({ taskId: "T1", projectId: "p1" }),
+      report({ taskId: "T2", projectId: "p2" }),
+    ];
+    filterStuckReports(reports, "p1");
+    expect(reports).toHaveLength(2);
   });
 });

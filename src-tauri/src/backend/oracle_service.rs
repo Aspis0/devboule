@@ -2399,11 +2399,16 @@ mod tests {
 static ORACLE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn set_oracle_enabled_flag(enabled: bool) {
-    ORACLE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    // Release pairs with the Acquire load so a thread observing `true` also sees
+    // every side-effect (config write, etc.) that preceded the store.
+    ORACLE_ENABLED.store(enabled, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn oracle_is_enabled() -> bool {
-    ORACLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    // Acquire pairs with the Release store so we see the latest value and all
+    // preceding side-effects.  Relaxed was incorrect — a reader could see a
+    // stale `true` after another thread already stored `false`.
+    ORACLE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn oracle_enabled_from_value(v: &serde_json::Value) -> bool {

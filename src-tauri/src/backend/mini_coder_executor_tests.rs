@@ -4459,3 +4459,77 @@ fn app_authored_directive_carries_its_own_project_and_never_loses_a_parent() {
     assert_eq!(directive_project(&state, &mcp), None);
     assert!(directive_parent_gone(&state, &mcp));
 }
+
+#[test]
+fn stuck_report_project_id_derived_from_parent_session_for_mcp_directive() {
+    // BLOCKER regression: MCP-dispatched minis have directive.project_id = None
+    // (only append_main_coder_directive sets Some). Without the fix, their stuck
+    // reports carry projectId null and leak into EVERY project workspace. The fix
+    // uses directive_project() which resolves the project from the parent agent's
+    // live session — so the stuck report carries the parent's project.
+    use crate::backend::model::{AgentLiveState, AgentSession};
+    use crate::backend::stuck_report::StuckReport;
+
+    // Snapshot with a parent session whose current_project_id is "proj-parent".
+    let state = AgentLiveState {
+        version: 2,
+        updated_at: String::new(),
+        sessions: vec![AgentSession {
+            agent_id: "coder-1".into(),
+            role: "coder".into(),
+            model: None,
+            status: "online".into(),
+            message: None,
+            client: None,
+            current_project_id: Some("proj-parent".into()),
+            current_task_id: None,
+            current_file_path: None,
+            first_seen_at: None,
+            last_seen_at: None,
+            launch_token_hash: None,
+            launch_token_issued_at: None,
+            session_token_hash: None,
+            session_token_issued_at: None,
+            subagents: Vec::new(),
+            needs_user: None,
+            host: None,
+            parent_agent_id: None,
+            pending_question: None,
+            user_reply: None,
+        }],
+        claims: Vec::new(),
+        events: Vec::new(),
+        rules: Vec::new(),
+        state_path: String::new(),
+        mcp_command: String::new(),
+        mcp_client_config: String::new(),
+        mini_coder_directives: Vec::new(),
+        visual_check_directives: Vec::new(),
+        design_request_directives: Vec::new(),
+        git_push_requests: Vec::new(),
+        plan_approval_requests: Vec::new(),
+        consent_requests: Vec::new(),
+    };
+
+    // MCP directive: project_id = None, parent = "coder-1" (has a session).
+    let mut mcp = directive("mini-mcp-1", "coder-1");
+    // directive_project resolves to the parent's project from the snapshot.
+    let resolved = directive_project(&state, &mcp);
+    assert_eq!(resolved.as_deref(), Some("proj-parent"));
+
+    // A StuckReport built with the resolved project_id must carry it.
+    let report = StuckReport::new(
+        mcp.id.clone(),
+        mcp.parent_agent_id.clone(),
+        "timeout",
+        1,
+        "",
+        vec![],
+        resolved,
+    );
+    assert_eq!(report.project_id.as_deref(), Some("proj-parent"));
+
+    // Verify the report serializes as camelCase with projectId present.
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["projectId"], "proj-parent");
+}

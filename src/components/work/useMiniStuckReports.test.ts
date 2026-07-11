@@ -181,4 +181,51 @@ describe("useMiniStuckReports", () => {
     expect(unlistenFn).toHaveBeenCalledTimes(1);
     container.remove();
   });
+
+  it("report with projectId is received and dismissable", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    let emit: ((e: { payload: MiniStuckReport }) => void) | null = null;
+    let latest = { reports: [] as MiniStuckReport[], dismiss: (_: string) => {} };
+
+    const deps: MiniStuckDeps = {
+      listen: vi.fn(async (_channel, handler) => {
+        emit = handler;
+        return () => {};
+      }),
+    };
+
+    function Harness() {
+      latest = useMiniStuckReports(deps);
+      return null;
+    }
+
+    await act(async () => {
+      root.render(createElement(Harness));
+    });
+
+    // Emit a report carrying a projectId — it must appear like any other report.
+    await act(async () => {
+      emit?.({
+        payload: makeReport({ taskId: "app-T1", agentId: "app-user", projectId: "p42" }),
+      });
+    });
+    expect(latest.reports).toHaveLength(1);
+    expect(latest.reports[0].agentId).toBe("app-user");
+    expect(latest.reports[0].taskId).toBe("app-T1");
+    expect(latest.reports[0].projectId).toBe("p42");
+
+    // Dismiss it — it must be removed.
+    await act(async () => {
+      latest.dismiss("app-T1");
+    });
+    expect(latest.reports).toHaveLength(0);
+
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+  });
 });

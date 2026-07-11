@@ -569,7 +569,11 @@ pub(crate) fn sh_single_quote_portable(value: &str) -> String {
 /// INJECTION-SAFETY: the prompt is read from the file at `$MINI_PROMPT_FILE` (path via
 /// ENV, never argv) and the request body is built with `json.dumps`, so prompt content
 /// is JSON-encoded by the encoder and can never break out of the JSON string. The base
-/// URL, prompt path, and OPTIONAL key file path ALL ride in ENV vars — nothing on argv.
+/// URL and prompt path ride in ENV vars — nothing on argv.
+///
+/// NOTE: an earlier revision also plumbed an OMLX_KEY_FILE env-var and a bearer-token
+/// reader block; that key plumbing has been removed. The generated script is
+/// functionally identical to the pre-cleanup version for the (now-only) no-key path.
 ///
 /// FAILURE = SILENCE: any exception (connection refused, non-2xx → `HTTPError`, missing
 /// field, non-JSON body) prints NOTHING and exits, so the wrapper finds no valid JSON
@@ -982,8 +986,8 @@ pub(crate) fn build_mini_command_impl(
                     .map(str::trim)
                     .filter(|b| !b.is_empty())
                     .ok_or_else(|| "omlx backend requires a base URL".to_string())?;
-                // The prompt path, base URL (+ optional key file path) ride in ENV vars —
-                // NEVER on argv. The token never leaves the 0600 file; python reads it.
+                // The prompt path and base URL ride in ENV vars — NEVER on argv.  (Key
+                // plumbing was removed; this is functionally identical to the old no-key path.)
                 let run = build_omlx_run_macos(
                     base_url,
                     model,
