@@ -692,9 +692,12 @@ fn spawn_pi_session_inner(
     // Pigeon (unified flag): when OFF (default) the sidecar skips all prompt
     // classification/model-routing and runs each turn on the configured model.
     // Restart-scoped, mirrors `pigeon_enabled_cached` used by the transport paths.
+    // Captured once here so the SAME restart-scoped boolean is threaded into the
+    // reader thread (handle_control_line) and sent to the sidecar via the env var.
+    let pigeon_enabled = crate::backend::pigeon_service::pigeon_enabled_cached(app);
     cmd.env(
         "DEVBOULE_PIGEON_ENABLED",
-        pigeon_enabled_env_value(crate::backend::pigeon_service::pigeon_enabled_cached(app)),
+        pigeon_enabled_env_value(pigeon_enabled),
     );
 
     if let Some(role) = role {
@@ -780,6 +783,7 @@ fn spawn_pi_session_inner(
             child_clone,
             timed_out_clone,
             &sid,
+            pigeon_enabled,
         );
     });
 
@@ -2519,6 +2523,7 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
 fn handle_control_line(
     line: &str,
     stdin: &Arc<Mutex<ChildStdin>>,
+    pigeon_enabled: bool,
 ) -> bool {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -2530,7 +2535,13 @@ fn handle_control_line(
     };
     match t {
         "classify_prompt" => {
-            // Pigeon-ON only: classify + return tier/provider/model for the sidecar.
+            // When pigeon is OFF, do NOT classify or reply — the caller
+            // falls through to normal PiEvent parsing (no `classified` line
+            // written to stdin), matching pigeon-OFF semantics everywhere else.
+            if !pigeon_enabled {
+                return false;
+            }
+            // Pigeon-ON: classify + return tier/provider/model for the sidecar.
             let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
             let c = crate::backend::prompt_routing::classify_prompt_full(text);
             let response = serde_json::json!({
@@ -2725,6 +2736,7 @@ fn read_sidecar_events(
     child: Arc<Mutex<Child>>,
     timed_out: Arc<AtomicBool>,
     agent_id: &str,
+    pigeon_enabled: bool,
 ) {
     let gen = generation.load(Ordering::SeqCst);
     let reader = BufReader::new(stdout);
@@ -2745,7 +2757,7 @@ fn read_sidecar_events(
         // Phase 2 Pigeon: intercept control commands BEFORE treating the line as
         // a pi SDK event. `classify_prompt` → respond with `classified` on the
         // sidecar's stdin.
-        if handle_control_line(&line, &stdin) {
+        if handle_control_line(&line, &stdin, pigeon_enabled) {
             continue;
         }
         match serde_json::from_str::<PiEvent>(&line) {
@@ -4733,6 +4745,156 @@ mod tests {
     fn pigeon_enabled_env_value_maps_to_literal_true_false() {
         assert_eq!(pigeon_enabled_env_value(true), "true");
         assert_eq!(pigeon_enabled_env_value(false), "false");
+    }
+
+    // -- handle_control_line: pigeon flag gates classify_prompt ----------------
+
+    #[test]
+    fn pigeon_disabled_ignores_classify_prompt_line() {
+        // When pigeon_enabled=false, a classify_prompt control line must NOT
+        // produce a `classified` reply on stdin — the function must return false
+        // so the caller falls through to normal PiEvent parsing.
+        //
+        // We spawn a real `cat` child process to obtain a live ChildStdin,
+        // wrap it in Arc<Mutex<>>, and verify:
+        //   1) handle_control_line returns false (the primary assertion).
+        //   2) Nothing is written to the child's stdin as a result.
+        //      We prove this by writing a distinguishing echo BEFORE calling
+        //      handle_control_line, then checking that no additional bytes
+        //      appear on stdout after a short window (cat echoes stdin→stdout).
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::unix::io::AsRawFd;
+            let mut child = std::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn cat");
+            let child_stdin = child.stdin.take().unwrap();
+            let mut child_stdout = child.stdout.take().unwrap();
+            let stdin = Arc::new(Mutex::new(child_stdin));
+
+            // Write a distinguishing echo so we can measure "nothing else written".
+            let echo_msg = serde_json::json!({"type": "echo", "id": "pre-classify"});
+            write_jsonl_to_stdin(&stdin, &echo_msg);
+            // Let the echo propagate.
+            std::thread::sleep(Duration::from_millis(50));
+            // Drain everything cat has echoed so far.
+            let mut buf = [0u8; 4096];
+            let n_before = child_stdout.read(&mut buf).unwrap_or(0);
+            assert!(n_before > 0, "cat must have echoed the pre-classify marker");
+
+            let line = r#"{"type":"classify_prompt","text":"hello world"}"#;
+            let result = handle_control_line(line, &stdin, false);
+            assert!(!result, "pigeon OFF must return false for classify_prompt");
+
+            // Wait briefly then check that nothing extra was written to stdin.
+            std::thread::sleep(Duration::from_millis(100));
+            // Set stdout to non-blocking via libc::fcntl so the read below
+            // returns immediately if no bytes are available (instead of blocking
+            // forever on cat's open pipe).
+            let fd = child_stdout.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let mut extra = [0u8; 4096];
+            let n_after = child_stdout.read(&mut extra).unwrap_or(0);
+            assert_eq!(
+                n_after, 0,
+                "no bytes should have been written to stdin by handle_control_line \
+                 when pigeon is disabled"
+            );
+
+            // Clean up.
+            drop(child);
+        }
+    }
+
+    #[test]
+    fn pigeon_enabled_classifies_and_replies() {
+        // When pigeon_enabled=true, a classify_prompt control line must return
+        // true (indicating the line was handled and the caller should continue),
+        // AND a `classified` JSON line must have been written to the child's
+        // stdin (cat echoes stdin→stdout, so we can read it back).
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::unix::io::AsRawFd;
+            let mut child = std::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn cat");
+            let child_stdin = child.stdin.take().unwrap();
+            let mut child_stdout = child.stdout.take().unwrap();
+            let stdin = Arc::new(Mutex::new(child_stdin));
+
+            let line = r#"{"type":"classify_prompt","text":"hello world"}"#;
+            let result = handle_control_line(line, &stdin, true);
+            assert!(result, "pigeon ON must return true for classify_prompt");
+
+            // Let cat echo the classified line back, then read it.
+            std::thread::sleep(Duration::from_millis(50));
+            let fd = child_stdout.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let mut buf = [0u8; 4096];
+            let n = child_stdout.read(&mut buf).unwrap_or(0);
+            assert!(n > 0, "cat must have echoed the classified response");
+            let echoed = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                echoed.contains("\"classified\""),
+                "echoed output must contain a classified JSON line, got: {echoed}"
+            );
+
+            // Clean up.
+            drop(child);
+        }
+    }
+
+    #[test]
+    fn handle_control_line_returns_false_for_non_control_json() {
+        // A non-control JSON line (e.g. a pi SDK event) must return false
+        // regardless of pigeon_enabled, so the caller falls through to event
+        // parsing. No stdin write needed for this path (returns early).
+        #[cfg(unix)]
+        {
+            let mut child = std::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn cat");
+            let child_stdin = child.stdin.take().unwrap();
+            let stdin = Arc::new(Mutex::new(child_stdin));
+
+            let line = r#"{"type":"message_start"}"#;
+            assert!(!handle_control_line(line, &stdin, false));
+            assert!(!handle_control_line(line, &stdin, true));
+
+            drop(child);
+        }
+    }
+
+    #[test]
+    fn handle_control_line_returns_false_for_unparseable_line() {
+        // Garbage input must return false, regardless of pigeon flag.
+        #[cfg(unix)]
+        {
+            let mut child = std::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn cat");
+            let child_stdin = child.stdin.take().unwrap();
+            let stdin = Arc::new(Mutex::new(child_stdin));
+
+            assert!(!handle_control_line("not json at all", &stdin, false));
+            assert!(!handle_control_line("not json at all", &stdin, true));
+
+            drop(child);
+        }
     }
 }
 
