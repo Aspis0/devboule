@@ -4004,24 +4004,31 @@ pub(crate) struct OrchestratorLaunchConfig {
     pub(crate) auto_create: String,
 }
 
-/// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
-/// orchestrator binary. Shared so the macOS line and the PowerShell script can never
-/// drift. `DEVBOULE_APP_BIN` is appended LAST and ONLY when present (so the empty-app-bin
-/// case stays byte-identical to the prior 7-pair output). The SECRETS (launch token, Exa
-/// key) are NEVER here — they ride via `provider_env` (env only, B1 invariant).
-/// Append a LIVE steer message to a running orchestrator's inbox (the reverse bridge).
-/// The orchestrator drains `DEVBOULE_STEER_FILE` between rounds and injects the message
-/// as a human turn — this is how the app "talks to" a planning orchestrator mid-run.
-/// The path is deterministic from (projects dir, agent_id), so no ledger is needed.
-/// Newlines are stripped + the message capped so it stays ONE line the orchestrator
-/// splits cleanly. Best-effort create+append.
+/// Pure fallback for `orchestrator_steer` when no live pi session exists.
+/// The legacy file route silently wrote to a steer inbox drained only by the
+/// now-archived devboule-coder binary (see archived/devboule-coder/). That
+/// path was dead; this loud error replaces it.  Extracted for testability
+/// (`AppHandle<Wry>` has no mock pattern in this crate).
+pub(crate) fn steer_no_session_fallback() -> Result<(), String> {
+    Err("no live orchestrator session — launch the orchestrator first".to_string())
+}
+
+/// Deliver a steer message to a running orchestrator mid-turn. Two routes:
+///   1. **Pi route** — if a live pi sidecar session exists, the message is
+///      delivered via the sidecar's FIFO prompt queue (mid-turn steer).
+///   2. **No-session fallback** — no live session means the message cannot
+///      reach anything; returns an error instead of silently writing to a
+///      dead-end steer file (the old archived-devboule-coder file route).
+///
+/// Newlines are stripped and the message capped to 2000 chars so it stays
+/// ONE line the orchestrator splits cleanly.
 #[tauri::command]
 pub fn orchestrator_steer(
     app: tauri::AppHandle,
     agent_id: String,
     message: String,
 ) -> Result<(), String> {
-    // Newline-flatten + 2000-char cap — applied to BOTH pi and file routes.
+    // Newline-flatten + 2000-char cap — applied before either route below.
     let msg: String = message
         .trim()
         .replace(['\n', '\r'], " ")
@@ -4036,20 +4043,11 @@ pub fn orchestrator_steer(
     if crate::backend::pi_sidecar::pi_session_exists(&app, &agent_id) {
         return crate::backend::pi_sidecar::send_prompt_to_session(&app, &agent_id, &msg);
     }
-    // LEGACY FILE ROUTE: no live pi session — append to the steer file that
-    // the archived devboule-coder binary drains between rounds.
-    let dir = ensure_projects_dir(&app)?;
-    let path = crate::backend::mini_activity::steer_file_path(&dir, &agent_id)
-        .ok_or_else(|| "could not resolve the steer inbox path".to_string())?;
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("open steer inbox: {e}"))?;
-    file.write_all(format!("{msg}\n").as_bytes())
-        .map_err(|e| format!("write steer inbox: {e}"))?;
-    Ok(())
+    // No live pi session for this agent — there is nothing left to deliver to.
+    // (The old fallback silently appended to a steer file that only the
+    // now-archived devboule-coder binary ever drained — see archived/devboule-coder/.
+    // That meant the message vanished with a false "success". Fail loud instead.)
+    steer_no_session_fallback()
 }
 
 /// Best-effort wipe of an agent's bridge + steer files so a "reset chat"
@@ -10963,7 +10961,7 @@ mod broker_gate_projects {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // -- orchestrator_steer: message-trim for both pi and file routes ----------
+    // -- orchestrator_steer: message-trim for the pi route ----------
 
     /// Verify the newline-flatten + 2000-char cap that `orchestrator_steer`
     /// applies BEFORE either the pi route or the file route.
@@ -11005,6 +11003,39 @@ mod broker_gate_projects {
             .take(2000)
             .collect();
         assert!(msg.is_empty(), "whitespace-only message should be empty after trim");
+    }
+
+    /// Verify that the no-session fallback returns a clear error (not Ok)
+    /// and creates NO .steer file — the old bug silently wrote to a dead-end
+    /// file that nothing would ever drain.
+    #[test]
+    fn steer_no_session_fallback_returns_error_and_creates_no_file() {
+        // Set up a temp dir that mimics the projects/activity structure.
+        // The fallback must NOT create any .steer file (the old bug would have).
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-steer-fallback-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = super::steer_no_session_fallback();
+        assert!(result.is_err(), "fallback must return Err when no pi session exists");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no live orchestrator session"),
+            "error must mention 'no live orchestrator session', got: {err}"
+        );
+
+        // Verify no .steer file was silently created
+        if let Some(steer) = crate::backend::mini_activity::steer_file_path(&dir, "fake-agent-id") {
+            assert!(
+                !steer.exists(),
+                "no .steer file should be created by the fallback — the old bug would have created one here"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
