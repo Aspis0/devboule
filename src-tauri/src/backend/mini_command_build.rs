@@ -12,7 +12,7 @@ use portable_pty::CommandBuilder;
 
 use super::mini_coder::{MiniCoderBackend, MiniCoderBackendKind, DEFAULT_WALL_CLOCK_CAP_SECS};
 use super::mini_coder_executor::{
-    omlx_http_timeout_secs, McpRoots, FORBIDDEN_USER_MCP_ENV, MINI_SCRATCH_DIR, OMLX_KEY_FILE_ENV,
+    omlx_http_timeout_secs, McpRoots, FORBIDDEN_USER_MCP_ENV, MINI_SCRATCH_DIR,
     OMLX_TIMEOUT_ENV,
 };
 #[cfg(windows)]
@@ -75,12 +75,6 @@ pub(crate) const MINI_RLIMIT_MAX_PROCS: u64 = 256;
 /// SPAWN itself fails (the in-script wrapper/trap never ran to delete them):
 ///   - `prompt_file`: the 0600 temp file holding the prompt (delivered over STDIN, never
 ///     argv); the wrapper reads it, DELETES it, then pipes it to the backend.
-///   - `key_file`: the OPTIONAL 0600 temp file holding the oMLX bearer token (its PATH
-///     rides in an env var, never argv/logs). max-recall FIX 10: it is returned here too
-///     (it lives in its OWN restricted dir, distinct from the prompt dir) so EVERY
-///     spawn-failure path in `spawn_one_shot_mini` removes BOTH files. Previously only the
-///     prompt file left this fn, so a pre-spawn failure leaked the 0600 token file. `None`
-///     today (no key config field yet — `omlx_api_key` returns None) but wired leak-free.
 ///
 /// Per kind:
 ///   - codex: `codex exec` (prompt over stdin, `-m <model>` if set). The mini
@@ -100,11 +94,10 @@ pub(crate) const MINI_RLIMIT_MAX_PROCS: u64 = 256;
 /// prompt context only (the MINOR 9 status quo, byte-identical).
 /// The result of [`build_mini_command`]: the launch command plus the restricted temp
 /// files the SPAWN caller must clean up on a spawn failure (the in-script cleanup never
-/// ran). Both paths are `Option` because the prompt file is always present once built but
-/// the key file is only present for an oMLX backend with a configured token (none today).
+/// ran). `prompt_file` is always present once built; `profile_file` is `Option` because
+/// only the sandboxed macOS local-loopback path produces a `.sb` temp.
 pub(crate) struct MiniCommandBuild {
     pub(crate) prompt_file: Option<PathBuf>,
-    pub(crate) key_file: Option<PathBuf>,
     /// P5: the per-launch Seatbelt `.sb` profile temp, present ONLY on the sandboxed
     /// local-loopback macOS path. The in-script EXIT trap removes it on success/abort; the
     /// SPAWN caller removes it (via `remove_mini_temp_files`) on a spawn failure (where the
@@ -126,22 +119,6 @@ pub(crate) fn build_mini_command(
     // keeping it off argv matches the agent-launch contract and avoids argv-length
     // / quoting issues with large multi-file prompts.
     let prompt_file = super::projects::write_restricted_prompt_file(prompt)?;
-    // oMLX-P2: OPTIONAL bearer token. There is NO config field for it yet (no P2/P3 UI),
-    // so `omlx_api_key` returns None today — but the full mechanism is wired so a future
-    // field just works: the token (when present) goes to a 0600 RESTRICTED file whose
-    // PATH rides in an env var (never argv/PTY/logs); the launch script reads it and
-    // sends `Authorization: Bearer <token>`; the Windows `finally` / macOS trap remove
-    // the file on every exit path. Absent ⇒ no file ⇒ no env ⇒ no header.
-    let key_file = match omlx_api_key(backend) {
-        Some(token) => match super::projects::write_restricted_prompt_file(&token) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                super::projects::remove_restricted_temp_file(&prompt_file);
-                return Err(e);
-            }
-        },
-        None => None,
-    };
     // MINOR 9 → P3: the roots now flow through. Only the codex arms consume them
     // (ollama/api/omlx are text-only and ignore the parameter), and the caller
     // only resolves roots for `allow_oracle` codex directives, so a text-only or
@@ -151,38 +128,22 @@ pub(crate) fn build_mini_command(
         project_root,
         result_target,
         &prompt_file,
-        key_file.as_deref(),
         mcp_roots,
         fix_pass_thinking,
     );
     match cmd {
         Ok((command, profile_file)) => Ok(MiniCommandBuild {
             prompt_file: Some(prompt_file),
-            key_file,
             profile_file,
             command,
         }),
         Err(e) => {
             super::projects::remove_restricted_temp_file(&prompt_file);
-            if let Some(key_file) = key_file.as_deref() {
-                super::projects::remove_restricted_temp_file(key_file);
-            }
             Err(e)
         }
     }
 }
 
-/// oMLX-P2: resolve the OPTIONAL oMLX bearer token for a backend. Returns `None`
-/// today — there is no config field/UI for an oMLX key yet (the local server is
-/// usually unauthenticated). The mechanism around it (restricted file + env + script
-/// header + cleanup) is fully wired, so adding a config field later only needs to make
-/// this function return the configured token. The token (if any) is NEVER logged or
-/// placed on argv. `backend` is accepted now so the future field read needs no
-/// signature change.
-pub(crate) fn omlx_api_key(backend: &MiniCoderBackend) -> Option<String> {
-    let _ = backend; // no key field yet — see the doc comment.
-    None
-}
 
 #[cfg(windows)]
 pub(crate) fn build_mini_command_impl(
@@ -190,7 +151,6 @@ pub(crate) fn build_mini_command_impl(
     project_root: &Path,
     result_target: &Path,
     prompt_file: &Path,
-    key_file: Option<&Path>,
     mcp_roots: Option<&McpRoots>,
     fix_pass_thinking: bool,
 ) -> Result<(CommandBuilder, Option<PathBuf>), String> {
@@ -309,14 +269,7 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .ok_or_else(|| "omlx backend requires a base URL".to_string())?;
-            // OPTIONAL bearer token (oMLX is usually unauthenticated). There is no
-            // config field for it yet (no UI in P2/P3), so `omlx_api_key` returns None
-            // today — but the whole key-on-a-restricted-file mechanism below is wired so
-            // a future field just works (key absent ⇒ no Authorization header). The key
-            // is NEVER on argv: it rides a 0600 file whose PATH is passed via env, read
-            // inside the script, and removed in the `finally`.
-            let key_env = key_file.map(|_| OMLX_KEY_FILE_ENV);
-            let run = build_omlx_run_windows(base_url, model, key_env, fix_pass_thinking);
+            let run = build_omlx_run_windows(base_url, model, fix_pass_thinking);
             windows_stdout_to_result_wrapper(&run, &result_path, &raw_path)
         }
         MiniCoderBackendKind::AppleFm => {
@@ -332,25 +285,11 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
     // F5: codex does NOT use `windows_stdout_to_result_wrapper`, so it never writes the
     // `.raw` file; guard the removal with `Test-Path` so the cleanup targets a file that
     // actually exists (the wrapper backends still get their raw capture removed).
-    //
-    // F4: the key-dir cleanup is emitted ONLY for a keyed spawn. Non-keyed (and
-    // non-oMLX) scripts no longer carry the `if ($env:OMLX_KEY_FILE) { … }` collateral.
-    // The keyed path still removes the token's restricted parent dir on EVERY exit; the
-    // PATH rides in `$env:OMLX_KEY_FILE` (set on the CommandBuilder below, never argv),
-    // and the script never echoes it.
-    let key_cleanup = if key_file.is_some() {
-        format!(
-            "  if ($env:{OMLX_KEY_FILE_ENV}) {{ Remove-Item -LiteralPath ([System.IO.Path]::GetDirectoryName($env:{OMLX_KEY_FILE_ENV})) -Recurse -Force -ErrorAction SilentlyContinue }}\n"
-        )
-    } else {
-        String::new()
-    };
     let finally = format!(
         "}}\n\
 finally {{\n\
   Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinue\n\
   if (Test-Path -LiteralPath $rawFile) {{ Remove-Item -LiteralPath $rawFile -Force -ErrorAction SilentlyContinue }}\n\
-{key_cleanup}\
 }}\n"
     );
     let script = format!("{preamble}{body}{finally}exit 0");
@@ -366,12 +305,6 @@ finally {{\n\
     // MINI-EXCLUSION (design §6): scrub the orchestrator-only user-MCP env var so the mini
     // child can NEVER inherit it from the host process env (CommandBuilder snapshots it).
     cmd.env_remove(FORBIDDEN_USER_MCP_ENV);
-    // oMLX-P2: pass the OPTIONAL key file PATH via env (never argv/PTY). The script
-    // reads the token from this file and sends `Authorization: Bearer <token>`; if
-    // unset (no key configured) it omits the header entirely.
-    if let Some(key_file) = key_file {
-        cmd.env(OMLX_KEY_FILE_ENV, key_file.as_os_str());
-    }
     // P5: Windows is NOT sandboxed this phase (Seatbelt is macOS-only); no `.sb` profile,
     // so the second tuple element is always `None` — the script/argv are byte-for-byte
     // unchanged vs. pre-P5.
@@ -398,14 +331,10 @@ finally {{\n\
 /// response (Invoke-RestMethod throws) yields the SAME clean fallback, never partial
 /// garbage in the result file.
 ///
-/// `key_env`: when `Some`, the launch script reads the bearer token from the file
-/// pointed to by that env var and sends an `Authorization: Bearer <token>` header;
-/// when `None`, no auth header is emitted. The token never appears on argv.
 #[cfg(windows)]
 pub(crate) fn build_omlx_run_windows(
     base_url: &str,
     model: &str,
-    key_env: Option<&str>,
     fix_pass_thinking: bool,
 ) -> String {
     // P6: $true on fix passes, $false on initial writes (Qwen-only, gated below).
@@ -423,20 +352,6 @@ pub(crate) fn build_omlx_run_windows(
     // of holding the PTY until the wall-clock kill. Derived from the SAME constant as the
     // macOS python timeout (wall-clock cap minus a margin).
     let http_timeout = omlx_http_timeout_secs();
-    // Optional Authorization header. The token is read from the env-passed key FILE
-    // (never argv/log); if the env var is unset we send no header. `$headers` defaults
-    // to an empty hashtable, so `-Headers $headers` is always valid.
-    let header_block = match key_env {
-        Some(env) => format!(
-            "$headers = @{{}}\n\
-if ($env:{env}) {{\n\
-  $omlxKey = (Get-Content -Raw -LiteralPath $env:{env}).Trim()\n\
-  if ($omlxKey) {{ $headers['Authorization'] = 'Bearer ' + $omlxKey }}\n\
-  $omlxKey = $null\n\
-}}\n"
-        ),
-        None => "$headers = @{}\n".to_string(),
-    };
     // The prompt rides as a VALUE (`content = $prompt`) — ConvertTo-Json encodes it;
     // NEVER `'\"content\":\"' + $prompt`. -Compress keeps the body one line.
     //
@@ -448,7 +363,7 @@ if ($env:{env}) {{\n\
     format!(
         "& {{\n\
 try {{\n\
-{header_block}\
+$headers = @{{}}\n\
 $bodyMap = @{{ model = {model_q}; messages = @(@{{ role = 'user'; content = $prompt }}); stream = $false; temperature = 0.1; max_tokens = {max_tokens}; repetition_penalty = {rep_penalty} }}\n\
 if ({model_q} -match 'qwen') {{ $bodyMap['chat_template_kwargs'] = @{{ enable_thinking = {thinking_ps} }} }}\n\
 $body = $bodyMap | ConvertTo-Json -Depth 6 -Compress\n\
@@ -580,16 +495,10 @@ if ($null -eq $out) {{\n\
 /// `set -e`. `_MINI_RAW_FILE` is always set (a non-existent file in `rm -rf` is a
 /// no-op, so the codex backend — which writes no `.raw` — is unaffected).
 ///
-/// oMLX-P2: `key_dir_q` is the OPTIONAL restricted parent dir of the bearer-token
-/// file. When `Some`, it is ALSO removed by the trap on every exit path (success /
-/// error / `set -e` abort) so the token never lingers on disk. The token itself is
-/// NEVER referenced here — only the directory path, which is not secret. `None` (no
-/// key configured) leaves the trap removing only the prompt dir + raw capture.
-///
 /// P5: `profile_dir_q` is the OPTIONAL restricted parent dir of the `.sb` Seatbelt
 /// profile (present ONLY on the sandboxed local-loopback path). When `Some`, the trap
 /// ALSO removes it on every exit path — a leaked `.sb` per launch is a bug — guarded on
-/// a non-empty value exactly like `key_dir`. sandbox-exec reads the profile at parse
+/// a non-empty value. sandbox-exec reads the profile at parse
 /// time (in the PARENT process, before the sandbox is applied), so removing it from the
 /// in-sandbox trap is safe. P5: `sandboxed` gates the `ulimit` rlimit lines, which are
 /// emitted BETWEEN the trap and `set -e` (trap first so cleanup is always armed; the
@@ -603,19 +512,9 @@ if ($null -eq $out) {{\n\
 pub(crate) fn build_macos_trap_preamble(
     prompt_dir_q: &str,
     raw_path_q: &str,
-    key_dir_q: Option<&str>,
     profile_dir_q: Option<&str>,
     sandboxed: bool,
 ) -> String {
-    // `_MINI_KEY_DIR` is always assigned (empty when no key) so the trap body is a single
-    // fixed string. max-recall FIX 9: GUARD the key-dir removal on a non-empty value —
-    // `rm -rf ""` is POSIX-undefined on an empty operand (some shells treat it as the cwd),
-    // so the no-key case (`_MINI_KEY_DIR=''`) must NOT reach `rm`. The prompt-dir and
-    // raw-file removals stay unconditional (those paths are always set).
-    let key_assign = match key_dir_q {
-        Some(q) => format!("_MINI_KEY_DIR={q}\n"),
-        None => "_MINI_KEY_DIR=''\n".to_string(),
-    };
     // P5: BYTE-FOR-BYTE-UNCHANGED guarantee — the codex/api/non-loopback (NON-sandboxed)
     // path must emit the EXACT pre-P5 preamble. So the `.sb` profile machinery (its var
     // assignment, its trap removal clause) AND the rlimit lines are emitted ONLY when
@@ -647,9 +546,8 @@ ulimit -u {} 2>/dev/null || true\n",
     format!(
         "_MINI_PROMPT_DIR={prompt_dir_q}\n\
 _MINI_RAW_FILE={raw_path_q}\n\
-{key_assign}\
 {profile_assign}\
-trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_KEY_DIR\" ] && rm -rf \"$_MINI_KEY_DIR\" 2>/dev/null || true{profile_trap_clause}' EXIT\n\
+trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true{profile_trap_clause}' EXIT\n\
 {rlimits}\
 set -e\n"
     )
@@ -677,9 +575,6 @@ pub(crate) fn sh_single_quote_portable(value: &str) -> String {
 /// field, non-JSON body) prints NOTHING and exits, so the wrapper finds no valid JSON
 /// and writes the clean `{"status":"failed",...}` fallback (no partial garbage).
 ///
-/// `has_key`: when true the script reads the bearer token from the file at
-/// `$OMLX_KEY_FILE` and adds `Authorization: Bearer <token>`; otherwise no auth header.
-///
 /// Kept uncfg'd (platform-agnostic) so it is unit-testable on the Windows dev host,
 /// like `build_macos_trap_preamble`. The inner heredoc uses the `OMLXEOF` delimiter so
 /// it never collides with the wrapper's own `PYEOF` heredoc.
@@ -688,7 +583,7 @@ pub(crate) fn sh_single_quote_portable(value: &str) -> String {
 /// the `\n\` line continuations strip each following line's leading whitespace,
 /// which silently flattens the Python block structure and makes the script die
 /// with `IndentationError` at runtime (found on the first real macOS run).
-/// `@OMLX_KEY_FILE_ENV@` / `@OMLX_TIMEOUT_ENV@` / `@OMLX_TIMEOUT_DEFAULT@` are
+/// `@OMLX_TIMEOUT_ENV@` / `@OMLX_TIMEOUT_DEFAULT@` are
 /// substituted by the builder.
 pub(crate) const OMLX_RUN_MACOS_PY: &str = r#"import os, json
 import urllib.request, urllib.error
@@ -709,12 +604,6 @@ try:
     body = json.dumps(body_dict).encode('utf-8')
     req = urllib.request.Request(os.environ['OMLX_URL'], data=body, method='POST')
     req.add_header('Content-Type', 'application/json')
-    key_path = os.environ.get('@OMLX_KEY_FILE_ENV@')
-    if key_path:
-        with open(key_path, 'r', encoding='utf-8') as kf:
-            token = kf.read().strip()
-        if token:
-            req.add_header('Authorization', 'Bearer ' + token)
     timeout = int(os.environ.get('@OMLX_TIMEOUT_ENV@', '@OMLX_TIMEOUT_DEFAULT@'))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode('utf-8', 'replace'))
@@ -738,20 +627,10 @@ pub(crate) fn build_omlx_run_macos(
     base_url: &str,
     model: &str,
     prompt_path_q: &str,
-    has_key: bool,
     fix_pass_thinking: bool,
 ) -> String {
     let url_q = sh_single_quote_portable(&format!("{base_url}/chat/completions"));
     let model_q = sh_single_quote_portable(model);
-    // python reads OMLX_KEY_FILE only when present; the empty-string default means "no
-    // key" (the `if key_path:` guard below skips the header). Never echo the token.
-    let key_export = if has_key {
-        format!("export {OMLX_KEY_FILE_ENV}\n")
-    } else {
-        // Ensure no stale env leaks in: explicitly clear so an inherited value can't
-        // forge a header. (Belt-and-suspenders; the executor only sets it when keyed.)
-        format!("unset {OMLX_KEY_FILE_ENV}\n")
-    };
     // F2: the HTTP timeout (seconds) is derived from the SAME wall-clock cap as the PTY
     // kill (minus a margin) and rides a non-secret env var, so a stalled request aborts
     // JUST UNDER the cap with a clean `failed` fallback. The python default mirrors the
@@ -761,7 +640,6 @@ pub(crate) fn build_omlx_run_macos(
     // `OMLX_MODEL` carries OUR validated bare tag; still passed via env for symmetry and
     // to keep argv empty.
     let py = OMLX_RUN_MACOS_PY
-        .replace("@OMLX_KEY_FILE_ENV@", OMLX_KEY_FILE_ENV)
         .replace("@OMLX_TIMEOUT_ENV@", OMLX_TIMEOUT_ENV)
         .replace("@OMLX_TIMEOUT_DEFAULT@", &http_timeout.to_string())
         // FIX 2: bound the decode — a hard token budget (includes thinking) plus a
@@ -778,7 +656,6 @@ pub(crate) fn build_omlx_run_macos(
 OMLX_MODEL={model_q}\nexport OMLX_MODEL\n\
 MINI_PROMPT_FILE={prompt_path_q}\nexport MINI_PROMPT_FILE\n\
 {OMLX_TIMEOUT_ENV}={http_timeout}\nexport {OMLX_TIMEOUT_ENV}\n\
-{key_export}\
 python3 - <<'OMLXEOF'\n{py}OMLXEOF\n"
     )
 }
@@ -923,7 +800,6 @@ pub(crate) fn build_mini_command_impl(
     project_root: &Path,
     result_target: &Path,
     prompt_file: &Path,
-    key_file: Option<&Path>,
     mcp_roots: Option<&McpRoots>,
     fix_pass_thinking: bool,
 ) -> Result<(CommandBuilder, Option<PathBuf>), String> {
@@ -968,23 +844,11 @@ pub(crate) fn build_mini_command_impl(
     // variables assigned before the trap, so a path containing whitespace/quotes (e.g.
     // `/Users/the owner/My Project/`) no longer terminates the trap's own single-quoted
     // delimiter and break the trap. See `build_macos_trap_preamble`.
-    //
-    // oMLX-P2: the OPTIONAL bearer-token file's restricted parent dir is added to the
-    // trap so the token is removed on EVERY exit path. `key_file`'s parent is the
-    // per-launch `*.d` restricted dir created by `create_restricted_temp_file`.
-    let key_dir = key_file.map(|p| {
-        sh_single_quote_local(
-            &p.parent()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        )
-    });
-
     // P5: on the sandboxed local-loopback path, generate the TIGHT Seatbelt profile and
     // write it to a per-launch 0600 `.sb` temp (same restricted-dir mechanism as the
-    // prompt/key files). The child does HTTP + prints JSON; Rust applies the edits per
+    // prompt files). The child does HTTP + prints JSON; Rust applies the edits per
     // P4, so the WRITABLE set is scratch/temp ONLY (NO project-file writes). Every path
-    // the in-sandbox trap removes (prompt dir, `.raw` parent, key dir, the `.sb` dir
+    // the in-sandbox trap removes (prompt dir, `.raw` parent, the `.sb` dir
     // itself) MUST be writable or the trap's `rm -rf` would be denied inside the sandbox.
     // The returned `profile_path` (and its restricted parent dir) are cleaned up on BOTH
     // the EXIT trap (success/abort) AND the spawn-failure path (see `remove_mini_temp_files`).
@@ -998,17 +862,15 @@ pub(crate) fn build_mini_command_impl(
         if let Some(p) = result_target.parent() {
             writable_paths.push(p.to_path_buf());
         }
-        if let Some(p) = key_file.and_then(Path::parent) {
-            writable_paths.push(p.to_path_buf());
-        }
+
         let profile = build_seatbelt_profile(project_root, &writable_paths);
         let path = super::projects::write_restricted_prompt_file(&profile)?;
         Some(path)
     } else {
         None
     };
-    // The `.sb`'s restricted parent dir is added to the trap (removed on every exit),
-    // mirroring `key_dir`. Single-quoted for safe embedding in the trap variable.
+    // The `.sb`'s restricted parent dir is added to the trap (removed on every exit).
+    // Single-quoted for safe embedding in the trap variable.
     let profile_dir = profile_path.as_ref().map(|p| {
         sh_single_quote_local(
             &p.parent()
@@ -1019,7 +881,6 @@ pub(crate) fn build_mini_command_impl(
     let preamble = build_macos_trap_preamble(
         &prompt_dir,
         &raw_path,
-        key_dir.as_deref(),
         profile_dir.as_deref(),
         sandboxed,
     );
@@ -1127,7 +988,6 @@ pub(crate) fn build_mini_command_impl(
                     base_url,
                     model,
                     &prompt_path,
-                    key_file.is_some(),
                     fix_pass_thinking,
                 );
                 macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
@@ -1225,12 +1085,6 @@ pub(crate) fn build_mini_command_impl(
     // MINI-EXCLUSION (design §6): scrub the orchestrator-only user-MCP env var so the mini
     // child can NEVER inherit it from the host process env (CommandBuilder snapshots it).
     cmd.env_remove(FORBIDDEN_USER_MCP_ENV);
-    // oMLX-P2: the OPTIONAL key file PATH rides in env (never argv/PTY). python reads
-    // the token from this file and sends `Authorization: Bearer <token>`; unset ⇒ no
-    // header. The base URL + prompt path are exported inline inside the `$run` block.
-    if let Some(key_file) = key_file {
-        cmd.env(OMLX_KEY_FILE_ENV, key_file.as_os_str());
-    }
     Ok((cmd, profile_path))
 }
 
@@ -1333,7 +1187,6 @@ pub(crate) fn build_mini_command_impl(
     _project_root: &Path,
     _result_target: &Path,
     _prompt_file: &Path,
-    _key_file: Option<&Path>,
     _mcp_roots: Option<&McpRoots>,
     _fix_pass_thinking: bool,
 ) -> Result<(CommandBuilder, Option<PathBuf>), String> {

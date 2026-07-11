@@ -67,14 +67,6 @@ const PIGEON_MINI_POOL_RECEIVER: &str = "mini-pool";
 pub(crate) const MINI_SCRATCH_DIR: &str = ".aspis-mini";
 const VISUAL_CHECK_TIMEOUT_SECS: i64 = 120;
 
-/// Env var carrying the PATH to the OPTIONAL oMLX bearer-token file (oMLX-P2). The
-/// token itself NEVER touches argv/PTY/logs: it lives in a 0600 restricted file whose
-/// path rides in this env var; the launch script reads the file and sends
-/// `Authorization: Bearer <token>`. Unset ⇒ no key configured ⇒ no header. Used by
-/// both the Windows (`$env:OMLX_KEY_FILE`) and macOS (`$OMLX_KEY_FILE`) arms; kept
-/// uncfg'd so the platform-agnostic macOS-script test can reference it on Windows.
-pub(crate) const OMLX_KEY_FILE_ENV: &str = "OMLX_KEY_FILE";
-
 /// MINI-EXCLUSION (design §6): the Phase-B user-MCP env var the ORCHESTRATOR launch sets.
 /// The mini coder must NEVER receive it. The mini is a separate launch path that never SETS
 /// it, but `CommandBuilder::new()` SNAPSHOTS the host process env — so if the app itself was
@@ -3300,7 +3292,6 @@ fn spawn_one_shot_mini(
     let fix_pass_thinking = directive.attempt > 0;
     let MiniCommandBuild {
         prompt_file,
-        key_file,
         profile_file,
         command,
     } = build_mini_command(
@@ -3317,7 +3308,6 @@ fn spawn_one_shot_mini(
             // The launched shell never ran, so it cannot delete the temp files.
             remove_mini_temp_files(
                 prompt_file.as_deref(),
-                key_file.as_deref(),
                 profile_file.as_deref(),
             );
             return Err("Agent terminal state is unavailable.".to_string());
@@ -3329,7 +3319,6 @@ fn spawn_one_shot_mini(
             // Spawn failed -> the wrapper never ran to delete the temp files.
             remove_mini_temp_files(
                 prompt_file.as_deref(),
-                key_file.as_deref(),
                 profile_file.as_deref(),
             );
             Err(e)
@@ -3338,21 +3327,17 @@ fn spawn_one_shot_mini(
 }
 
 /// max-recall FIX 10: remove the restricted temp files a built mini command owns — the
-/// prompt file, the OPTIONAL oMLX key file, AND (P5) the OPTIONAL Seatbelt `.sb` profile
+/// prompt file, AND (P5) the OPTIONAL Seatbelt `.sb` profile
 /// (each in its own 0600 dir). Called on every pre-/at-spawn failure path in
 /// [`spawn_one_shot_mini`], where the in-script wrapper/trap never ran to delete them.
 /// Centralized (not inlined per arm) so the failure arms can't diverge and no cleanup
-/// (key file, or the `.sb` — a leaked profile per launch is a bug) can be forgotten. A
+/// (the `.sb` — a leaked profile per launch is a bug) can be forgotten. A
 /// `None` path is a no-op.
 fn remove_mini_temp_files(
     prompt_file: Option<&Path>,
-    key_file: Option<&Path>,
     profile_file: Option<&Path>,
 ) {
     if let Some(path) = prompt_file {
-        super::projects::remove_restricted_temp_file(path);
-    }
-    if let Some(path) = key_file {
         super::projects::remove_restricted_temp_file(path);
     }
     if let Some(path) = profile_file {

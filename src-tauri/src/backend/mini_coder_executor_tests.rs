@@ -2393,7 +2393,6 @@ fn codex_mini_command_wires_mcp_flags_only_with_roots_p3() {
         &root,
         &result_target,
         &prompt_file,
-        None,
         Some(&roots),
         false,
     )
@@ -2410,7 +2409,6 @@ fn codex_mini_command_wires_mcp_flags_only_with_roots_p3() {
         &root,
         &result_target,
         &prompt_file,
-        None,
         None,
         false,
     )
@@ -2444,7 +2442,7 @@ fn mini_command_never_carries_user_mcp_env_even_when_host_has_it() {
     let prompt_file = root.join("p.txt");
     // An oMLX (local-loopback) backend builds a real command on macOS (the sandboxed arm).
     let b = omlx_backend("qwen2.5-coder", "http://127.0.0.1:8000/v1");
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .expect("oMLX mini command builds")
         .0;
 
@@ -2476,7 +2474,7 @@ fn build_command_applefm_windows_returns_clean_macos_only_error() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("fake-prompt.txt");
     let b = backend(MiniCoderBackendKind::AppleFm, Some("apple-model"), None);
-    let err = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let err = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap_err();
     assert_eq!(err, "Apple on-device requires macOS 27+.");
 }
@@ -2503,7 +2501,7 @@ fn build_command_codex_uses_codex_exec_and_pipes_prompt_via_stdin() {
     let prompt_file = root.join("fake-prompt.txt");
     let b = backend(MiniCoderBackendKind::Codex, Some("gpt-5-codex"), None);
     // No mcp_roots -> no oracle grant flags.
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let argv = argv_strings(&cmd);
@@ -2583,7 +2581,7 @@ fn build_command_omlx_windows_posts_chat_completions_via_rest() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("p").join("fake-prompt.txt");
     let b = omlx_backend("qwen2.5-coder", "http://localhost:8000/v1");
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let argv = argv_strings(&cmd);
@@ -2655,7 +2653,7 @@ fn build_command_omlx_windows_posts_chat_completions_via_rest() {
         "Qwen-gated chat_template_kwargs missing from PS body: {script}"
     );
     // The fix-pass variant carries thinking ON.
-    let fix_run = build_omlx_run_windows("http://localhost:8000/v1", "qwen2.5-coder", None, true);
+    let fix_run = build_omlx_run_windows("http://localhost:8000/v1", "qwen2.5-coder", true);
     assert!(
         fix_run.contains("enable_thinking = $true"),
         "fix pass must enable thinking: {fix_run}"
@@ -2702,8 +2700,8 @@ fn build_command_omlx_windows_no_key_emits_no_auth_header_and_no_key_env() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("p").join("fake-prompt.txt");
     let b = omlx_backend("m", "http://127.0.0.1:8000");
-    // No key file passed (the default; omlx_api_key returns None today).
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    // No key file passed (the default case).
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let argv = argv_strings(&cmd);
@@ -2714,8 +2712,7 @@ fn build_command_omlx_windows_no_key_emits_no_auth_header_and_no_key_env() {
         "no auth header without a key: {script}"
     );
     // F4: a non-keyed spawn carries NO key-env collateral ANYWHERE — neither the
-    // request body nor the shared `finally` reference `$env:OMLX_KEY_FILE` (the
-    // key-dir cleanup line is emitted only when a key is configured for this spawn).
+    // request body nor the shared `finally` reference `$env:OMLX_KEY_FILE`.
     assert!(
         !script.contains("$env:OMLX_KEY_FILE"),
         "non-keyed script must not reference the key env anywhere: {script}"
@@ -2735,67 +2732,6 @@ fn build_command_omlx_windows_no_key_emits_no_auth_header_and_no_key_env() {
 
 #[cfg(windows)]
 #[test]
-fn build_command_omlx_windows_with_key_rides_env_file_not_argv_and_cleans_up() {
-    let root = std::env::temp_dir();
-    let result_target = root.join("d1.json");
-    let prompt_file = root.join("p").join("fake-prompt.txt");
-    let key_file = root.join("kdir").join("omlx-key.txt");
-    let b = omlx_backend("m", "http://localhost:8000/v1");
-    let cmd = build_mini_command_impl(
-        &b,
-        &root,
-        &result_target,
-        &prompt_file,
-        Some(&key_file),
-        None,
-        false,
-    )
-    .unwrap()
-    .0;
-    let argv = argv_strings(&cmd);
-    let script = argv.last().unwrap();
-
-    // The token is read from the env-passed FILE and sent as a Bearer header.
-    assert!(
-        script.contains("$env:OMLX_KEY_FILE")
-            && script.contains("Get-Content -Raw -LiteralPath $env:OMLX_KEY_FILE"),
-        "key must be read from the env-passed file: {script}"
-    );
-    assert!(
-        script.contains("'Bearer ' + $omlxKey"),
-        "token must ride an Authorization: Bearer header: {script}"
-    );
-    // max-recall FIX 8: the key variable is zeroed right after the header is set so the
-    // token does not linger in PS scope for the rest of the script.
-    assert!(
-        script.contains("$omlxKey = $null"),
-        "key variable must be zeroed after the header is set: {script}"
-    );
-    // The KEY FILE PATH rides on env, NEVER on argv. No argv entry contains the path.
-    let key_str = key_file.to_string_lossy().to_string();
-    assert!(
-        !argv.iter().any(|a| a.contains(&key_str)),
-        "key file path must NOT appear on argv: {argv:?}"
-    );
-    // The env var IS set on the command (path only — the token itself stays in the
-    // file, never in env/argv).
-    let env_val = cmd
-        .get_env("OMLX_KEY_FILE")
-        .map(|v| v.to_string_lossy().to_string());
-    assert_eq!(
-        env_val.as_deref(),
-        Some(key_str.as_str()),
-        "OMLX_KEY_FILE env must carry the key file PATH"
-    );
-    // The finally removes the key file's restricted dir on every exit path.
-    assert!(
-            script.contains("if ($env:OMLX_KEY_FILE) { Remove-Item -LiteralPath ([System.IO.Path]::GetDirectoryName($env:OMLX_KEY_FILE)) -Recurse -Force"),
-            "finally must remove the key dir on every exit: {script}"
-        );
-}
-
-#[cfg(windows)]
-#[test]
 fn build_command_windows_cleanup_always_runs_in_finally() {
     // FIX 1 (source-content leak): the read of the prompt happens INSIDE the try,
     // and the prompt dir + raw file are removed in the finally — so a failing
@@ -2804,7 +2740,7 @@ fn build_command_windows_cleanup_always_runs_in_finally() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("p").join("fake-prompt.txt");
     let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let script = argv_strings(&cmd).pop().unwrap();
@@ -2860,7 +2796,6 @@ fn windows_finally_cleans_files_even_when_backend_errors() {
         &result_target,
         &prompt_file,
         None,
-        None,
         false,
     )
     .unwrap()
@@ -2909,7 +2844,6 @@ fn build_command_codex_never_adds_mcp_config_flags_even_with_roots() {
         &root,
         &result_target,
         &prompt_file,
-        None,
         Some(&roots),
         false,
     )
@@ -2960,35 +2894,30 @@ fn build_mini_command_wires_mcp_when_roots_present_windows() {
 }
 
 #[test]
-fn remove_mini_temp_files_removes_prompt_key_and_profile_files() {
-    // max-recall FIX 10 + P5: a spawn-failure cleanup must remove ALL restricted temp
-    // files (prompt, the oMLX key file, AND the P5 Seatbelt `.sb` profile), each in its
-    // OWN 0600 dir. A leaked `.sb` per launch is a bug. We create three real restricted
-    // temp files (mirroring what build_mini_command writes) and assert the cleanup
-    // removes all three files AND their dirs.
+fn remove_mini_temp_files_removes_prompt_and_profile_files() {
+    // max-recall FIX 10 + P5: a spawn-failure cleanup must remove restricted temp
+    // files (prompt and the P5 Seatbelt `.sb` profile), each in its OWN 0600 dir. A
+    // leaked `.sb` per launch is a bug. We create two real restricted temp files
+    // (mirroring what build_mini_command writes) and assert the cleanup removes both
+    // files AND their dirs.
     let prompt_file = super::super::projects::write_restricted_prompt_file("prompt body")
         .expect("prompt file created");
-    let key_file = super::super::projects::write_restricted_prompt_file("secret-token")
-        .expect("key file created");
     let profile_file = super::super::projects::write_restricted_prompt_file("(version 1)")
         .expect("profile file created");
     // Distinct restricted directories (each call makes a fresh per-launch *.d dir).
     let prompt_dir = prompt_file.parent().unwrap().to_path_buf();
-    let key_dir = key_file.parent().unwrap().to_path_buf();
     let profile_dir = profile_file.parent().unwrap().to_path_buf();
-    assert!(prompt_dir != key_dir && key_dir != profile_dir && prompt_dir != profile_dir);
-    assert!(prompt_file.exists() && key_file.exists() && profile_file.exists());
+    assert!(prompt_dir != profile_dir);
+    assert!(prompt_file.exists() && profile_file.exists());
 
-    remove_mini_temp_files(Some(&prompt_file), Some(&key_file), Some(&profile_file));
+    remove_mini_temp_files(Some(&prompt_file), Some(&profile_file));
 
     assert!(!prompt_file.exists(), "prompt file must be removed");
-    assert!(!key_file.exists(), "key file must be removed (no leak)");
     assert!(
         !profile_file.exists(),
         "profile .sb file must be removed (no leak)"
     );
     assert!(!prompt_dir.exists(), "prompt dir must be removed");
-    assert!(!key_dir.exists(), "key dir must be removed (no leak)");
     assert!(
         !profile_dir.exists(),
         "profile dir must be removed (no leak)"
@@ -3002,7 +2931,7 @@ fn build_command_ollama_runs_model_pipes_stdin_and_wraps_stdout() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("fake-prompt.txt");
     let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let script = argv_strings(&cmd).pop().unwrap();
@@ -3058,7 +2987,7 @@ fn build_command_api_runs_configured_command_and_keeps_key_off_argv() {
     // The user's CLI command. Any API key must come from the CLI's OWN env, not
     // from us — we never inject a key, so it can't be on argv.
     let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let argv = argv_strings(&cmd);
@@ -3108,7 +3037,7 @@ fn macos_trap_preamble_uses_quoted_vars_and_survives_spaces() {
     let raw_path = q("/Users/the owner/My Project/scratch/d1.json.raw");
     // No key configured here (the common case): key dir is None. Not sandboxed (codex/
     // api/non-loopback path) so no profile dir and no rlimits — the pre-P5 status quo.
-    let preamble = build_macos_trap_preamble(&prompt_dir, &raw_path, None, None, false);
+    let preamble = build_macos_trap_preamble(&prompt_dir, &raw_path, None, false);
 
     // The paths are assigned to shell variables first.
     assert!(
@@ -3119,10 +3048,10 @@ fn macos_trap_preamble_uses_quoted_vars_and_survives_spaces() {
         preamble.contains(&format!("_MINI_RAW_FILE={raw_path}")),
         "raw path must always be assigned to a var with the quoted RHS: {preamble}"
     );
-    // No-key case still assigns an empty _MINI_KEY_DIR so the trap body is fixed.
+    // No-key case: no _MINI_KEY_DIR in the preamble.
     assert!(
-        preamble.contains("_MINI_KEY_DIR=''\n"),
-        "no-key case must assign an empty key dir: {preamble}"
+        !preamble.contains("_MINI_KEY_DIR"),
+        "no-key preamble must not reference key dir: {preamble}"
     );
     // P5: not sandboxed -> NO profile-dir machinery at all and NO rlimits (the preamble
     // is byte-for-byte the pre-P5 status quo).
@@ -3136,14 +3065,12 @@ fn macos_trap_preamble_uses_quoted_vars_and_survives_spaces() {
     );
 
     // The trap body references DOUBLE-QUOTED variables, NOT the raw quoted paths. The
-    // key-dir removal is GUARDED on a non-empty value (max-recall FIX 9) so the no-key
-    // case never runs `rm -rf ""`; the prompt-dir/raw-file removal is unconditional. The
-    // non-sandboxed trap is byte-identical to pre-P5 (no profile clause).
+    // prompt-dir/raw-file removal is unconditional.
     assert!(
             preamble.contains(
-                "trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_KEY_DIR\" ] && rm -rf \"$_MINI_KEY_DIR\" 2>/dev/null || true' EXIT"
+                "trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true' EXIT"
             ),
-            "trap must reference double-quoted vars and guard the key-dir removal (pre-P5 string): {preamble}"
+            "trap must reference double-quoted vars and remove prompt dir + raw file: {preamble}"
         );
 
     // The trap is armed BEFORE `set -e` (so it fires even on a set -e abort).
@@ -3185,7 +3112,6 @@ fn omlx_macos_run_posts_via_python_urllib_json_dumps_env_only() {
         "http://localhost:8000/v1",
         "qwen2.5-coder",
         prompt_q,
-        false,
         false,
     );
 
@@ -3242,7 +3168,6 @@ fn omlx_macos_run_posts_via_python_urllib_json_dumps_env_only() {
         "http://localhost:8000/v1",
         "qwen2.5-coder",
         prompt_q,
-        false,
         true,
     );
     assert!(
@@ -3307,35 +3232,14 @@ fn omlx_macos_run_posts_via_python_urllib_json_dumps_env_only() {
         run.trim_end().ends_with("pass\nOMLXEOF") || run.contains("\n    pass\n"),
         "the catch-all handler must be a bare pass (no stdout on error): {run}"
     );
-    // No-key case: key env cleared, no Authorization unless a key path is present.
+    // No key-related lines anywhere (no Authorization, no OMLX_KEY_FILE references).
     assert!(
-        run.contains("unset OMLX_KEY_FILE"),
-        "no-key case must clear the key env: {run}"
-    );
-}
-
-#[test]
-fn omlx_macos_run_with_key_reads_env_file_and_sends_bearer() {
-    let prompt_q = "'/tmp/p.d/p.txt'";
-    let run = build_omlx_run_macos("http://127.0.0.1:8000", "m", prompt_q, true, false);
-    // The key path rides env; python reads the FILE and sends a Bearer header.
-    assert!(
-        run.contains("export OMLX_KEY_FILE"),
-        "key env must be exported when keyed: {run}"
+        !run.contains("Authorization"),
+        "no auth header without a key: {run}"
     );
     assert!(
-        run.contains("key_path = os.environ.get('OMLX_KEY_FILE')")
-            && run.contains("with open(key_path"),
-        "token must be read from the env-passed key file: {run}"
-    );
-    assert!(
-        run.contains("req.add_header('Authorization', 'Bearer ' + token)"),
-        "token must ride an Authorization: Bearer header: {run}"
-    );
-    // The token VALUE never appears literally — only the file is read.
-    assert!(
-        !run.contains("Bearer sk-"),
-        "no literal token in the script: {run}"
+        !run.contains("OMLX_KEY_FILE"),
+        "no key env references without a key: {run}"
     );
 }
 
@@ -3351,40 +3255,6 @@ fn apple_fm_macos_run_uses_fixed_fm_respond_and_prompt_pipe_only() {
         "cat '/tmp/aspis prompt.d/p.txt' | '/usr/bin/fm' respond --model 'apple-default'"
     );
     assert!(!run.contains("TOP_SECRET_PROMPT"));
-}
-
-#[test]
-fn omlx_macos_trap_cleans_key_dir_when_keyed() {
-    fn q(v: &str) -> String {
-        format!("'{}'", v.replace('\'', "'\\''"))
-    }
-    let prompt_dir = q("/tmp/aspis-agent-prompt-abc.d");
-    let raw = q("/tmp/scratch/d1.json.raw");
-    let key_dir = q("/tmp/aspis-agent-prompt-key.d");
-    // Keyed but not sandboxed here (this test isolates key-dir handling): profile dir
-    // None, sandboxed false.
-    let preamble = build_macos_trap_preamble(&prompt_dir, &raw, Some(&key_dir), None, false);
-    // The key dir is assigned and removed by the trap (double-quoted var) on EXIT.
-    assert!(
-        preamble.contains(&format!("_MINI_KEY_DIR={key_dir}")),
-        "key dir must be assigned to a var: {preamble}"
-    );
-    assert!(
-            preamble.contains(
-                "trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_KEY_DIR\" ] && rm -rf \"$_MINI_KEY_DIR\" 2>/dev/null || true' EXIT"
-            ),
-            "trap must remove the key dir on every exit (guarded on non-empty): {preamble}"
-        );
-    // The literal key path must NOT appear inside the trap body (only the var does).
-    let trap_idx = preamble.find("trap '").unwrap();
-    let trap_end = preamble[trap_idx..]
-        .find('\n')
-        .map(|o| trap_idx + o)
-        .unwrap();
-    assert!(
-        !preamble[trap_idx..trap_end].contains("aspis-agent-prompt-key.d"),
-        "literal key path must not be embedded in the trap body"
-    );
 }
 
 #[cfg(windows)]
@@ -3498,7 +3368,6 @@ fn windows_api_multiword_command_tokenizes_and_runs() {
         &result_target,
         &prompt_file,
         None,
-        None,
         false,
     )
     .unwrap()
@@ -3556,7 +3425,6 @@ fn windows_omlx_down_server_yields_clean_failed_fallback() {
         &scratch,
         &result_target,
         &prompt_file,
-        None,
         None,
         false,
     )
@@ -3617,7 +3485,7 @@ fn macos_api_multiword_command_tokenizes_no_call_operator() {
     let result_target = root.join("d1.json");
     let prompt_file = root.join("p.txt");
     let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let script = macos_script(&cmd);
@@ -3691,7 +3559,6 @@ fn macos_trap_cleans_prompt_dir_and_raw_on_any_exit() {
         &result_target,
         &prompt_file,
         None,
-        None,
         false,
     )
     .unwrap();
@@ -3703,8 +3570,8 @@ fn macos_trap_cleans_prompt_dir_and_raw_on_any_exit() {
         "preamble must assign the prompt-dir var first: {script}"
     );
     assert!(
-            script.contains("trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_KEY_DIR\" ] && rm -rf \"$_MINI_KEY_DIR\" 2>/dev/null || true; [ -n \"$_MINI_PROFILE_DIR\" ] && rm -rf \"$_MINI_PROFILE_DIR\" 2>/dev/null || true' EXIT"),
-            "trap must remove prompt dir + raw + (guarded) key dir + (guarded P5) profile dir via vars on EXIT: {script}"
+            script.contains("trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_PROFILE_DIR\" ] && rm -rf \"$_MINI_PROFILE_DIR\" 2>/dev/null || true' EXIT"),
+            "trap must remove prompt dir + raw + (guarded P5) profile dir via vars on EXIT: {script}"
         );
     // Both the prompt DIR and the .raw file are assigned to the vars the trap removes.
     assert!(
@@ -3750,7 +3617,6 @@ fn macos_prompt_bytes_preserved_and_files_cleaned_after_exit() {
         &scratch,
         &result_target,
         &prompt_file,
-        None,
         None,
         false,
     )
@@ -3798,7 +3664,6 @@ fn macos_codex_adds_mcp_flags_only_with_roots_p3() {
         &root,
         &result_target,
         &prompt_file,
-        None,
         Some(&roots),
         false,
     )
@@ -3820,7 +3685,7 @@ fn macos_codex_adds_mcp_flags_only_with_roots_p3() {
         "granted mini must carry the MCP server flags: {script}"
     );
 
-    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+    let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
         .unwrap()
         .0;
     let script = macos_script(&cmd);
@@ -4109,7 +3974,7 @@ fn macos_local_backend_wraps_with_sandbox_exec() {
     let prompt_file = root.join("p").join("fake-prompt.txt");
     let b = omlx_backend("qwen2.5-coder", "http://127.0.0.1:8000/v1");
     let (cmd, profile) =
-        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
             .unwrap();
     let argv: Vec<String> = cmd
         .get_argv()
@@ -4146,7 +4011,7 @@ fn macos_codex_path_unchanged_no_sandbox() {
     let prompt_file = root.join("p.txt");
     let b = backend(MiniCoderBackendKind::Codex, Some("gpt-5-codex"), None);
     let (cmd, profile) =
-        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
             .unwrap();
     assert_eq!(
         macos_argv0(&cmd),
@@ -4159,9 +4024,8 @@ fn macos_codex_path_unchanged_no_sandbox() {
         !script.contains("sandbox-exec"),
         "codex script must not reference sandbox-exec: {script}"
     );
-    // The codex preamble is BYTE-FOR-BYTE-identical to the pre-P5 status quo: NO rlimit
-    // lines AND NO `.sb` profile machinery at all (not even an inert empty var) — the
-    // trap is exactly the pre-P5 prompt/raw/(guarded)key removal.
+    // The codex preamble has NO rlimit lines AND NO `.sb` profile machinery at all
+    // (not even an inert empty var) — the trap removes only prompt dir + raw file.
     assert!(
         !script.contains("ulimit -"),
         "codex must carry NO rlimit lines: {script}"
@@ -4171,8 +4035,8 @@ fn macos_codex_path_unchanged_no_sandbox() {
             "non-sandboxed codex must carry NO profile-dir machinery (byte-for-byte unchanged): {script}"
         );
     assert!(
-            script.contains("trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true; [ -n \"$_MINI_KEY_DIR\" ] && rm -rf \"$_MINI_KEY_DIR\" 2>/dev/null || true' EXIT"),
-            "codex trap must be the exact pre-P5 string (no profile clause): {script}"
+            script.contains("trap 'rm -rf \"$_MINI_PROMPT_DIR\" \"$_MINI_RAW_FILE\" 2>/dev/null || true' EXIT"),
+            "codex trap must remove prompt dir + raw file (no profile clause): {script}"
         );
 }
 
@@ -4186,7 +4050,7 @@ fn macos_local_backend_nonloopback_url_not_sandboxed() {
     let prompt_file = root.join("p.txt");
     let b = omlx_backend("qwen2.5-coder", "http://10.0.0.5:8000/v1");
     let (cmd, profile) =
-        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
             .unwrap();
     assert_eq!(
         macos_argv0(&cmd),
@@ -4215,7 +4079,7 @@ fn rlimit_preamble_order_when_sandboxed() {
     let prompt_file = root.join("p.txt");
     let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
     let (cmd, profile) =
-        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
             .unwrap();
     let script = macos_script(&cmd);
     let trap_idx = script.find("trap 'rm -rf ").expect("trap present");
@@ -4248,7 +4112,7 @@ fn rlimit_preamble_order_when_sandboxed() {
     // NON-SANDBOXED (api): ABSENT.
     let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat"));
     let (cmd, profile) =
-        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+        build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, false)
             .unwrap();
     assert!(profile.is_none());
     let script = macos_script(&cmd);
