@@ -1,8 +1,8 @@
+use crate::embedder::{load_model, resolve_device, DeviceArg, DtypeArg};
+use crate::onnx_embedder::{EpArg, OnnxEmbedder};
+use crate::BackendArg;
 use anyhow::{Context, Result};
 use arrow_array::{Array, Float32Array, RecordBatch, StringArray};
-use crate::embedder::{load_model, resolve_device, DtypeArg, DeviceArg};
-use crate::BackendArg;
-use crate::onnx_embedder::{EpArg, OnnxEmbedder};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use tokenizers::{
     PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
     TruncationStrategy,
@@ -41,12 +41,16 @@ impl OnnxEmbedder {
         let start = Instant::now();
 
         let variant = std::env::var("ORACLE_RS_ONNX_VARIANT").unwrap_or_else(|_| "int8".into());
-        let model_file = if variant == "fp32" { "model.onnx".to_string() } else { format!("model_{variant}.onnx") };
+        let model_file = if variant == "fp32" {
+            "model.onnx".to_string()
+        } else {
+            format!("model_{variant}.onnx")
+        };
         let model_path = model_dir.join("onnx").join(model_file);
         let tokenizer_path = model_dir.join("tokenizer.json");
 
-        let session_builder = Session::builder()
-            .context("failed to create ONNX session builder")?;
+        let session_builder =
+            Session::builder().context("failed to create ONNX session builder")?;
         let mut builder = session_builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("failed to set ONNX optimization level: {e}"))?
@@ -65,7 +69,9 @@ impl OnnxEmbedder {
                     .with_execution_providers([ep::CoreML::default()
                         .with_model_format(ep::coreml::ModelFormat::MLProgram)
                         .build()])
-                    .map_err(|e| anyhow::anyhow!("failed to register CoreML execution provider: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to register CoreML execution provider: {e}")
+                    })?;
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -73,14 +79,15 @@ impl OnnxEmbedder {
             anyhow::bail!("--ep coreml is only supported on macOS builds");
         }
 
-        let session = builder
-            .commit_from_file(&model_path)
-            .with_context(|| {
-                format!("failed to build ONNX session from {}", model_path.display())
-            })?;
+        let session = builder.commit_from_file(&model_path).with_context(|| {
+            format!("failed to build ONNX session from {}", model_path.display())
+        })?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            anyhow::anyhow!("failed to load tokenizer from {}: {e}", tokenizer_path.display())
+            anyhow::anyhow!(
+                "failed to load tokenizer from {}: {e}",
+                tokenizer_path.display()
+            )
         })?;
 
         let embedder = OnnxEmbedder { session, tokenizer };

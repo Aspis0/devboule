@@ -3,7 +3,10 @@ use oracle_core::embedder::{self, DeviceArg, DtypeArg};
 use oracle_core::{lance, onnx_embedder, BackendArg};
 
 #[derive(Parser)]
-#[command(name = "oracle-cli", about = "oracle-core dev CLI: embed / query / bench")]
+#[command(
+    name = "oracle-cli",
+    about = "oracle-core dev CLI: embed / query / bench"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -87,14 +90,7 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
         } => {
             embedder::cmd_embed(
-                texts_file,
-                out,
-                backend,
-                device,
-                dtype,
-                model_dir,
-                ep,
-                batch_size,
+                texts_file, out, backend, device, dtype, model_dir, ep, batch_size,
             )
             .await
         }
@@ -110,15 +106,7 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
         } => {
             lance::cmd_query(
-                db,
-                query,
-                limit,
-                backend,
-                device,
-                dtype,
-                model_dir,
-                ep,
-                batch_size,
+                db, query, limit, backend, device, dtype, model_dir, ep, batch_size,
             )
             .await
         }
@@ -133,14 +121,7 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
         } => {
             embedder::cmd_bench(
-                texts_file,
-                iters,
-                backend,
-                device,
-                dtype,
-                model_dir,
-                ep,
-                batch_size,
+                texts_file, iters, backend, device, dtype, model_dir, ep, batch_size,
             )
             .await
         }

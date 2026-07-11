@@ -7,8 +7,8 @@ use clap::ValueEnum;
 use fastembed::Qwen3TextEmbedding;
 use serde::Serialize;
 
-use crate::BackendArg;
 use crate::onnx_embedder::{EpArg, OnnxEmbedder, ONNX_MODEL_ID};
+use crate::BackendArg;
 use std::time::Instant;
 
 pub const MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
@@ -159,10 +159,7 @@ pub async fn cmd_embed(
         } else {
             0.0
         };
-        eprintln!(
-            "embed: {} ms ({} texts, {:.1} texts/sec)",
-            embed_ms, n, tps
-        );
+        eprintln!("embed: {} ms ({} texts, {:.1} texts/sec)", embed_ms, n, tps);
 
         let dims = vectors.first().map(|v| v.len()).unwrap_or(0);
         let out_obj = EmbedOut {
