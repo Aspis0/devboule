@@ -136,6 +136,19 @@ tree-sitter-kotlin-ng = "1.1"
 # the line/char diff + ratio machinery (drops bytes/unicode/inline/serde/web-time).
 similar = { version = "2", default-features = false, features = ["text"] }
 
+# M2: the Rust-native Oracle runtime (indexing, retrieval, answering). Wired as
+# a path dep so the app can host `oracle_core::server::serve` in-process on the
+# loopback port, replacing the `python -m oracle.server.main` subprocess when
+# `oracle.engine == "rust"` (the Python path stays untouched under
+# `oracle.engine == "python"`). DEFAULT features only: `default = []` in
+# oracle-core means NO `metal` — candle builds CPU-only and `ort` is target-gated
+# (CoreML on macOS, plain ONNX elsewhere), so this is cross-platform safe. The
+# server JSON is byte-compatible with the Python Oracle, so the app's existing
+# reqwest::blocking client + all Tauri commands call it unchanged.
+# BUILD REQUIREMENT: lancedb pulls a `protoc` build step — install protobuf
+# (`brew install protobuf` on macOS; the Windows toolchain needs it too).
+oracle-core = { path = "../oracle-core" }
+
 # Windows-only WinRT/Win32 bindings. All `use windows::` call sites in src/ are
 # `#[cfg(windows)]`-gated, so target-gate the crate too: it is never fetched or
 # built on macOS/Linux.
