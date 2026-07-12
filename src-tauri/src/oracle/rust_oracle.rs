@@ -210,6 +210,32 @@ mod live_test {
         }
         assert!(!chunks.is_empty(), "context returned no chunks from real index");
 
+        // /runtime — the app's READINESS GATE (get_oracle_runtime deserializes the
+        // body into the app's OracleRuntime struct). Parity proof: the Rust
+        // server's JSON must deserialize into that exact struct with sane values.
+        let rt = client
+            .get(format!("{base_url}/runtime"))
+            .header("x-oracle-auth-token", token)
+            .send()
+            .expect("GET /runtime");
+        assert_eq!(rt.status().as_u16(), 200, "runtime not 200");
+        let rt_text = rt.text().expect("runtime text");
+        let runtime: crate::oracle::model::OracleRuntime = serde_json::from_str(&rt_text)
+            .unwrap_or_else(|e| panic!("/runtime did not match app OracleRuntime: {e}\nbody: {rt_text}"));
+        println!(
+            "RUNTIME: chunk_store files={} records={} vectors={} ready={}",
+            runtime.chunk_store.files,
+            runtime.chunk_store.records,
+            runtime.chunk_store.vector_records,
+            runtime.chunk_store.ready
+        );
+        // The real store has 8196 chunk records; deserialization + counts prove the
+        // readiness gate works against the Rust server exactly as against Python.
+        assert_eq!(
+            runtime.chunk_store.records, 8196,
+            "chunk_store.records should reflect the real sqlite chunk table"
+        );
+
         stop_rust_oracle_server();
     }
 }
