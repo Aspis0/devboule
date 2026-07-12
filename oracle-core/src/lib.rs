@@ -6,12 +6,14 @@
 
 pub mod cluster;
 pub mod config;
+pub mod doctor;
 pub mod embed;
 pub mod embedder;
 pub mod ingest;
 pub mod jobs;
 pub mod lance;
 pub mod onnx_embedder;
+pub mod server;
 pub mod store;
 pub mod watch;
 
