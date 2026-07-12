@@ -6,14 +6,14 @@ import type { OracleLlmSettingsStatus, SecretStatus } from "../../types/backend"
 // `providerConfigured` memo to avoid duplicating the rule.
 //
 // Lightweight only — no model load. Primary signal is the Oracle LLM settings
-// status; a configured Scaleway secret is accepted as a fallback so the state is
-// not falsely "not configured" before the LLM settings have been refreshed.
-// Scaleway is the only valid reuse path: the Oracle LLM runs on Scaleway and the
-// OracleAnswerSettings UI says "reused Scaleway token". A Cloudflare secret is
-// unrelated to Oracle and must NOT make the Oracle provider appear configured.
+// status. Local providers (oMLX/Ollama) are keyless and signal via status.
+// Remote providers (OpenAI, OpenRouter, DeepSeek) require an API key.
 export function deriveProviderConfigured(
   oracleLlmSettings: OracleLlmSettingsStatus | null,
-  secretStatuses: SecretStatus[] | undefined,
+  // Reserved (kept for a stable 2-arg signature shared by the admin panel and
+  // the Polis ask-panel). The Scaleway-token fallback that consumed it is gone;
+  // configuration is now derived solely from the Oracle LLM settings status.
+  _secretStatuses: SecretStatus[] | undefined,
 ): boolean {
   if (oracleLlmSettings?.apiKeyConfigured) return true;
   // LOCAL providers (oMLX/Ollama) are KEYLESS by design — the Rust vault
@@ -23,7 +23,5 @@ export function deriveProviderConfigured(
   // this, selecting a local provider left the ask panel falsely "not
   // configured" and refused questions.
   if (oracleLlmSettings?.status === "configured") return true;
-  return (secretStatuses ?? []).some(
-    (s) => s.provider === "scaleway" && s.configured,
-  );
+  return false;
 }

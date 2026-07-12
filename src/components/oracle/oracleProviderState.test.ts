@@ -7,9 +7,9 @@ import { deriveProviderConfigured } from "./oracleProviderState";
 // the Polis ask-panel use, so the two surfaces never disagree on whether an
 // answer provider is available.
 //
-// Rule after fix-2: apiKeyConfigured || (scaleway secret configured).
+// Rule: apiKeyConfigured || status === "configured" (for local providers).
 // A Cloudflare secret alone MUST NOT make Oracle appear configured — Cloudflare
-// is unrelated to Oracle LLM (which runs on Scaleway).
+// is unrelated to Oracle LLM.
 
 function secret(
   provider: SecretStatus["provider"],
@@ -21,8 +21,8 @@ function secret(
 function llm(apiKeyConfigured: boolean): OracleLlmSettingsStatus {
   return {
     settings: {
-      provider: "scaleway",
-      model: "voxtral-small-24b-2507",
+      provider: "deepseek",
+      model: "deepseek-chat",
       baseUrl: null,
       remoteEnabled: true,
     },
@@ -68,21 +68,21 @@ describe("deriveProviderConfigured", () => {
     expect(deriveProviderConfigured(llm(true), [])).toBe(true);
   });
 
-  it("is configured when a reused provider (Scaleway) token exists", () => {
+  it("is configured when status is configured (local keyless provider)", () => {
     expect(
-      deriveProviderConfigured(llm(false), [secret("scaleway", true)]),
+      deriveProviderConfigured({ ...llm(false), status: "configured" }, []),
     ).toBe(true);
   });
 
-  it("is configured when the API key is set even if no secrets are", () => {
+  it("is configured when the API key is set even if no secrets exist", () => {
     expect(
-      deriveProviderConfigured(llm(true), [secret("scaleway", false)]),
+      deriveProviderConfigured(llm(true), []),
     ).toBe(true);
   });
 
-  it("is NOT configured when neither a key nor any configured secret exists", () => {
+  it("is NOT configured when neither a key nor configured status exists", () => {
     expect(
-      deriveProviderConfigured(llm(false), [secret("scaleway", false)]),
+      deriveProviderConfigured(llm(false), []),
     ).toBe(false);
   });
 
@@ -90,10 +90,10 @@ describe("deriveProviderConfigured", () => {
     expect(deriveProviderConfigured(null, [])).toBe(false);
   });
 
-  it("is configured with null settings but a configured Scaleway secret (pre-load fallback)", () => {
+  it("is NOT configured with null settings and no secrets", () => {
     expect(
-      deriveProviderConfigured(null, [secret("scaleway", true)]),
-    ).toBe(true);
+      deriveProviderConfigured(null, [secret("cloudflare", true)]),
+    ).toBe(false);
   });
 
   it("tolerates an undefined secrets list", () => {
@@ -103,17 +103,11 @@ describe("deriveProviderConfigured", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Regression: fix-2 — Cloudflare-only secret must NOT configure Oracle
+// Regression: Cloudflare-only secret must NOT configure Oracle
 // ---------------------------------------------------------------------------
-describe("deriveProviderConfigured — Scaleway-only reuse path (regression)", () => {
+describe("deriveProviderConfigured — Cloudflare must not bleed (regression)", () => {
   it("apiKeyConfigured=true → true (primary signal)", () => {
     expect(deriveProviderConfigured(llm(true), [])).toBe(true);
-  });
-
-  it("only scaleway configured → true (valid reuse path)", () => {
-    expect(
-      deriveProviderConfigured(llm(false), [secret("scaleway", true)]),
-    ).toBe(true);
   });
 
   it("only cloudflare configured → false (unrelated provider, must not bleed)", () => {
@@ -124,23 +118,5 @@ describe("deriveProviderConfigured — Scaleway-only reuse path (regression)", (
 
   it("nothing configured → false", () => {
     expect(deriveProviderConfigured(null, [])).toBe(false);
-  });
-
-  it("both cloudflare and scaleway configured → true (scaleway match)", () => {
-    expect(
-      deriveProviderConfigured(llm(false), [
-        secret("cloudflare", true),
-        secret("scaleway", true),
-      ]),
-    ).toBe(true);
-  });
-
-  it("cloudflare configured + scaleway NOT configured → false", () => {
-    expect(
-      deriveProviderConfigured(llm(false), [
-        secret("cloudflare", true),
-        secret("scaleway", false),
-      ]),
-    ).toBe(false);
   });
 });

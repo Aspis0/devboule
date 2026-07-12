@@ -2,7 +2,7 @@
 //
 // The user saves the Oracle LLM API key in Settings -> Oracle and cannot tell
 // whether it worked: there is no save confirmation, no error surfaced when the
-// backend returns an error STATUS object, and the "Scaleway token is reused"
+// backend returns an error STATUS object, and the provider-token-reuse
 // behaviour is invisible. These two pure functions are the single source of
 // truth for (a) what the Save button should say after a save resolves, and
 // (b) the always-visible key-status line. They are React/DOM-free so they can
@@ -69,20 +69,19 @@ export interface KeyStatusHint {
 /**
  * Decide the always-visible key-status line from the loaded settings.
  *
- * `usesScalewayProviderToken` is computed by the view (it depends on the
- * separately-fetched Scaleway secret status, not on `OracleLlmSettingsStatus`),
- * so it is passed in rather than re-derived here.
+ * `usesProviderToken` is true when a shared provider token (e.g. an OpenRouter
+ * account token) can be reused instead of a dedicated Oracle key.
  *
  * The three states:
  *   - ok   : a dedicated Oracle key is saved in the vault.
- *   - info : no dedicated key, but the saved Scaleway provider token is reused.
+ *   - info : no dedicated key, but a saved provider token is reused.
  *   - warn : remote answers are enabled but there is no key/token at all.
  * When remote answering is disabled there is no key to report, so the line is
  * hidden (returns null).
  */
 export function keyStatusHint(
   status: OracleLlmSettingsStatus | null,
-  usesScalewayProviderToken: boolean,
+  usesProviderToken: boolean,
 ): KeyStatusHint | null {
   // No loaded settings yet, or remote answering off -> nothing meaningful to
   // say about a key.
@@ -97,10 +96,10 @@ export function keyStatusHint(
     return { tone: "ok", label: "API key saved in the Windows vault" };
   }
 
-  if (usesScalewayProviderToken) {
+  if (usesProviderToken) {
     return {
       tone: "info",
-      label: "Using your saved Scaleway token (no dedicated key needed)",
+      label: "Using a saved provider token (no dedicated key needed)",
     };
   }
 

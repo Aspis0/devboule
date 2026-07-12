@@ -52,8 +52,8 @@ const answer: OracleAnswer = {
       score: 0.9,
     },
   ],
-  llmProvider: "scaleway",
-  llmModel: "voxtral",
+  llmProvider: "deepseek",
+  llmModel: "deepseek-chat",
   results: [],
 };
 

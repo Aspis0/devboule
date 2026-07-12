@@ -7,8 +7,8 @@ import type {
 
 function baseSettings(over: Partial<OracleLlmSettings> = {}): OracleLlmSettings {
   return {
-    provider: "scaleway",
-    model: "voxtral-small-24b-2507",
+    provider: "deepseek",
+    model: "deepseek-chat",
     baseUrl: null,
     remoteEnabled: true,
     ...over,
@@ -87,17 +87,17 @@ describe("keyStatusHint", () => {
     });
   });
 
-  it("prefers the dedicated key over the reused Scaleway token", () => {
+  it("prefers the dedicated key over a reused provider token", () => {
     const status = baseStatus({ apiKeyConfigured: true });
-    // Even when the Scaleway token would be reused, a dedicated key wins.
+    // Even when a provider token would be reused, a dedicated key wins.
     expect(keyStatusHint(status, true)?.tone).toBe("ok");
   });
 
-  it("reports the reused Scaleway token when no dedicated key is set (info tone)", () => {
+  it("reports the reused provider token when no dedicated key is set (info tone)", () => {
     const status = baseStatus({ apiKeyConfigured: false });
     expect(keyStatusHint(status, true)).toEqual({
       tone: "info",
-      label: "Using your saved Scaleway token (no dedicated key needed)",
+      label: "Using a saved provider token (no dedicated key needed)",
     });
   });
 

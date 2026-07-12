@@ -17,61 +17,52 @@ import {
 } from "../../utils/oracleLlmFeedback";
 import type { OracleLlmSettings } from "../../types/backend";
 
-// Remote-first default: prefer an API-key provider over the heavy local model.
-// Scaleway is the default because the app already manages a Scaleway token for
-// the Cloud pages, so Oracle answering works out of the box for anyone who has
-// it saved. Mirrors `default_oracle_llm_settings()` in the Rust vault.
+// Remote-first default: DeepSeek is a cost-effective OpenAI-compatible provider.
+// Mirrors `default_oracle_llm_settings()` in the Rust vault.
 const defaultLlmSettings: OracleLlmSettings = {
-	provider: "scaleway",
-	model: "voxtral-small-24b-2507",
+	provider: "deepseek",
+	model: "deepseek-chat",
 	baseUrl: null,
 	remoteEnabled: true,
 };
 
 const providerLabels: Record<string, string> = {
-	scaleway: "Scaleway EU",
-	infomaniak: "Infomaniak Swiss",
-	mistral: "Mistral direct",
+	openai: "OpenAI",
+	openrouter: "OpenRouter",
+	deepseek: "DeepSeek",
 	omlx: "oMLX (local)",
 	ollama: "Ollama (local)",
 };
 
 const defaultModels: Record<string, string> = {
-	scaleway: "voxtral-small-24b-2507",
-	infomaniak: "google/gemma-4-31B-it",
-	mistral: "mistral-small-latest",
+	openai: "gpt-4o-mini",
+	openrouter: "deepseek/deepseek-chat",
+	deepseek: "deepseek-chat",
 	omlx: "",
 	ollama: "",
 };
 
 const defaultBaseUrls: Record<string, string> = {
-	scaleway: "https://api.scaleway.ai/v1/chat/completions",
-	infomaniak:
-		"https://api.infomaniak.com/2/ai/108646/openai/v1/chat/completions",
-	mistral: "https://api.mistral.ai/v1/chat/completions",
+	openai: "https://api.openai.com/v1/chat/completions",
+	openrouter: "https://openrouter.ai/api/v1/chat/completions",
+	deepseek: "https://api.deepseek.com/v1/chat/completions",
 	omlx: "http://127.0.0.1:8000/v1/chat/completions",
 	ollama: "http://127.0.0.1:11434/v1/chat/completions",
 };
 
 const providerPrivacyNotes: Record<string, string> = {
-	scaleway:
-		"EU-hosted Generative APIs. Reuses the saved Scaleway token if no dedicated Oracle key is saved.",
-	infomaniak:
-		"Swiss-hosted AI Services. Default product id 108646 is the saved Gemma 4 31B endpoint.",
-	mistral:
-		"GDPR/API no-training provider. Use only with an account policy acceptable for your retention requirements.",
+	openai: "OpenAI API (OpenAI-compatible). Requires an OpenAI API key. Review OpenAI's data-retention/training policy for your account.",
+	openrouter: "OpenRouter gateway (OpenAI-compatible). Requires an OpenRouter API key. Routes to many models, including Claude (e.g. anthropic/claude-sonnet-4) and DeepSeek.",
+	deepseek: "DeepSeek API (OpenAI-compatible). Requires a DeepSeek API key. Review DeepSeek's data policy for your retention requirements.",
 	omlx: "Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
 	ollama:
 		"Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
 };
 
 const modelHints: Record<string, string> = {
-	scaleway:
-		"Current cheap default: voxtral-small-24b-2507. Lighter alternative: pixtral-12b-2409.",
-	infomaniak:
-		"Reliable default: google/gemma-4-31B-it. Nemotron was cheaper but slower and weaker in our smoke test.",
-	mistral:
-		"Cheap default: mistral-small-latest. Stronger coding: devstral-small-latest.",
+	openai: "Cheap default: gpt-4o-mini. Stronger: gpt-4o or o4-mini.",
+	openrouter: "Use any OpenRouter model id, e.g. deepseek/deepseek-chat (cheap) or anthropic/claude-sonnet-4 (Claude).",
+	deepseek: "Default: deepseek-chat. Reasoning: deepseek-reasoner.",
 	omlx: "Enter an installed oMLX model id (e.g. the one your mini-coder uses).",
 	ollama: "Enter a pulled Ollama tag (e.g. qwen2.5-coder).",
 };
@@ -85,7 +76,6 @@ const modelHints: Record<string, string> = {
 export function OracleAnswerSettingsCard() {
 	const {
 		oracleLlmSettings,
-		secretStatuses,
 		refreshOracleLlmSettings,
 		saveOracleLlmSettings,
 		deleteOracleLlmApiKey,
@@ -148,19 +138,6 @@ export function OracleAnswerSettingsCard() {
 		(!savedLlm ||
 			savedLlm.provider !== llmForm.provider ||
 			(savedLlm.baseUrl ?? "") !== (llmForm.baseUrl ?? ""));
-	const scalewayProviderTokenConfigured = secretStatuses.some(
-		(status) => status.provider === "scaleway" && status.configured,
-	);
-	// CONVENIENCE: when the provider is scaleway and no dedicated Oracle key is
-	// saved, the saved Scaleway provider token is reused so Oracle works out of
-	// the box. Typing a key here always saves a dedicated key that takes
-	// precedence.
-	const usesScalewayProviderToken =
-		llmForm.remoteEnabled &&
-		llmForm.provider === "scaleway" &&
-		scalewayProviderTokenConfigured;
-	const baseUrlRequired =
-		llmForm.remoteEnabled && llmForm.provider === "infomaniak";
 	// LOCAL providers (loopback) are keyless by design: configured as soon as a
 	// model is set — the API-key checks below only gate the remote providers.
 	const isLocalProvider =
@@ -168,20 +145,17 @@ export function OracleAnswerSettingsCard() {
 	const llmConfigured =
 		isLocalProvider ||
 		!llmForm.remoteEnabled ||
-		usesScalewayProviderToken ||
 		(!llmKeyScopeChanged && oracleLlmSettings?.apiKeyConfigured) ||
 		apiKeyDraft.trim().length >= 12;
 	const canSaveLlm =
-		llmForm.model.trim().length > 0 &&
-		(!baseUrlRequired || Boolean(llmForm.baseUrl?.trim())) &&
-		llmConfigured;
+		llmForm.model.trim().length > 0 && llmConfigured;
 
 	// Always-visible key-status line so the user knows the real state after a
-	// save (dedicated key / reused Scaleway token / none). Hidden when remote
+	// save (dedicated key / none). Hidden when remote
 	// answering is off or settings have not loaded yet. See oracleLlmFeedback.
 	const keyStatus = keyStatusHint(
 		oracleLlmSettings ?? null,
-		usesScalewayProviderToken,
+		false,
 	);
 
 	// Why is Save disabled? Surface the FIRST blocking reason so a click that
@@ -191,11 +165,9 @@ export function OracleAnswerSettingsCard() {
 		? "loading settings…"
 		: llmForm.model.trim().length === 0
 			? "enter a model"
-			: baseUrlRequired && !llmForm.baseUrl?.trim()
-				? "enter a base URL"
-				: !llmConfigured
-					? "enter an API key"
-					: null;
+			: !llmConfigured
+				? "enter an API key"
+				: null;
 
 	const changeProvider = (provider: string) => {
 		resetSaveFeedback();
@@ -288,7 +260,7 @@ export function OracleAnswerSettingsCard() {
 							value={selectedProvider}
 							onChange={(event) => changeProvider(event.target.value)}
 							data-help-title="This chooses who writes Oracle answers."
-							data-help-lines="Remote providers: Scaleway, Infomaniak, Mistral (API key required). Local providers: oMLX and Ollama on this machine, loopback-only, no key.|Retrieval always runs locally.|Changing provider does not send a question yet.|Apple on-device (Foundation Models) arrives with macOS 27.|Without a key, remote providers return retrieval-only answers."
+							data-help-lines="Remote providers: OpenAI, OpenRouter, DeepSeek (API key required). Local providers: oMLX and Ollama on this machine, loopback-only, no key.|Retrieval always runs locally.|Changing provider does not send a question yet.|Apple on-device (Foundation Models) arrives with macOS 27.|Without a key, remote providers return retrieval-only answers."
 							className="mt-1 w-full rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-terracotta-200"
 						>
 							{providerEntries.map(([value, label]) => (
@@ -354,23 +326,15 @@ export function OracleAnswerSettingsCard() {
 										spellCheck={false}
 										autoCapitalize="off"
 										placeholder={
-											usesScalewayProviderToken
-												? "optional — reusing your saved Scaleway token"
-												: oracleLlmSettings?.apiKeyConfigured
-													? "saved in Windows vault — type to replace"
-													: "paste your provider API key"
+											oracleLlmSettings?.apiKeyConfigured
+												? "saved in Windows vault — type to replace"
+												: "paste your provider API key"
 										}
 										data-help-title="This is the private API key for Oracle answers."
-										data-help-lines="An API key is like a temporary password for the model provider.|It is saved in the Windows vault, not in project Markdown or Oracle chunks.|If it expires, remote answers fail until you replace it.|Scaleway: if you leave this empty, your saved Scaleway token is reused."
+										data-help-lines="An API key is like a temporary password for the model provider.|It is saved in the Windows vault, not in project Markdown or Oracle chunks.|If it expires, remote answers fail until you replace it."
 										className="mt-1 w-full rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-terracotta-200"
 									/>
-									{usesScalewayProviderToken &&
-										!oracleLlmSettings?.apiKeyConfigured && (
-											<span className="mt-1 block text-[10px] normal-case leading-4 tracking-normal text-cream-400">
-												Reusing your saved Scaleway token. Type a key only to
-												use a dedicated Oracle key instead.
-											</span>
-										)}
+
 								</label>
 							)}
 						</>
@@ -397,7 +361,7 @@ export function OracleAnswerSettingsCard() {
 				)}
 
 				{/* Always-visible key-status line: the user must never be left guessing
-            whether a key is in the vault, the Scaleway token is reused, or
+            whether a key is in the vault or
             remote answers are disabled for lack of any key. */}
 				{keyStatus && (
 					<p
@@ -409,7 +373,7 @@ export function OracleAnswerSettingsCard() {
 									: "bg-coral/10 text-coral-dark"
 						}`}
 						data-help-title="This shows the current Oracle answer-key state."
-						data-help-lines="It reflects what is saved after you press Save LLM.|A dedicated key lives in the Windows vault and takes precedence.|Without a dedicated key, a saved Scaleway token can be reused.|With neither, remote answers are off and Oracle stays extractive."
+						data-help-lines="It reflects what is saved after you press Save LLM.|A dedicated key lives in the Windows vault and takes precedence.|With no key, remote answers are off and Oracle stays extractive."
 					>
 						{keyStatus.tone === "ok" ? (
 							<CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
