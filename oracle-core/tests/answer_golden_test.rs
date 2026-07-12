@@ -340,7 +340,7 @@ fn test_unknown_provider_fail_closed() {
 #[test]
 fn test_missing_key_degrades_to_extractive() {
     let result = normalize_llm_config(Some(&LlmConfig {
-        provider: "deepseek".to_string(),
+        provider: "openai".to_string(),
         model: "test".to_string(),
         base_url: String::new(),
         api_key: String::new(),
@@ -395,7 +395,7 @@ fn test_enforce_allowlist_unknown_provider() {
 
 #[test]
 fn test_enforce_allowlist_known_provider() {
-    for provider in &["openai", "openrouter", "deepseek", "omlx", "ollama"] {
+    for provider in &["openai", "omlx", "ollama"] {
         let result = enforce_remote_llm_provider_allowlist(provider);
         assert!(result.is_ok(), "Provider {} should be allowed", provider);
     }
@@ -406,14 +406,6 @@ fn test_default_base_urls() {
     assert_eq!(
         default_base_url("openai"),
         "https://api.openai.com/v1/chat/completions"
-    );
-    assert_eq!(
-        default_base_url("openrouter"),
-        "https://openrouter.ai/api/v1/chat/completions"
-    );
-    assert_eq!(
-        default_base_url("deepseek"),
-        "https://api.deepseek.com/v1/chat/completions"
     );
     assert_eq!(
         default_base_url("omlx"),
@@ -462,24 +454,24 @@ fn cfg(provider: &str, base_url: &str) -> oracle_core::answer::providers::LlmCon
 fn generic_host_guard_remote_providers() {
     use oracle_core::answer::providers::validate_remote_llm_config;
 
-    // deepseek → own host: OK
+    // openai → own host: OK
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
-        "https://api.deepseek.com/v1/chat/completions"
+        "openai",
+        "https://api.openai.com/v1/chat/completions"
     ))
     .is_ok());
 
-    // deepseek → openrouter host: also OK (no per-provider pinning).
+    // openai → openrouter host: also OK (no per-provider pinning).
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://openrouter.ai/api/v1/chat/completions"
     ))
     .is_ok());
 
-    // deepseek → openai host: also OK.
+    // openai → deepseek host: also OK.
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
-        "https://api.openai.com/v1/chat/completions"
+        "openai",
+        "https://api.deepseek.com/v1/chat/completions"
     ))
     .is_ok());
 
@@ -497,61 +489,61 @@ fn generic_host_guard_remote_providers() {
 
     // SSRF: bare IPv4 literal.
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://169.254.169.254/v1/chat/completions"
     ))
     .is_err());
 
     // SSRF: partial IPv4 shorthands (getaddrinfo expands 127.1 → 127.0.0.1).
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://127.1/v1/chat/completions"
     ))
     .is_err());
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://127.0.1/v1"
     ))
     .is_err());
 
     // SSRF: all-numeric-label host (2 labels, not just 4).
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://10.1/v1"
     ))
     .is_err());
 
     // Numeric subdomain FQDN must still be accepted (alphabetic TLD present).
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://192.host.deepseek.com/v1/chat/completions"
     ))
     .is_ok());
 
     // SSRF: localhost.
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://localhost/v1/chat/completions"
     ))
     .is_err());
 
     // SSRF: single-label host (no dot).
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://internalhost/v1/chat/completions"
     ))
     .is_err());
 
     // SSRF: .internal host.
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://myhost.internal/v1/chat/completions"
     ))
     .is_err());
 
     // SSRF: .local host.
     assert!(validate_remote_llm_config(&cfg(
-        "deepseek",
+        "openai",
         "https://printer.local/v1/chat/completions"
     ))
     .is_err());

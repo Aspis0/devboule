@@ -7,8 +7,8 @@ import type {
 
 function baseSettings(over: Partial<OracleLlmSettings> = {}): OracleLlmSettings {
   return {
-    provider: "deepseek",
-    model: "deepseek-chat",
+    provider: "openai",
+    model: "gpt-4o-mini",
     baseUrl: null,
     remoteEnabled: true,
     ...over,

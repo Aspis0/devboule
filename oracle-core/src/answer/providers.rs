@@ -19,7 +19,7 @@ const DEFAULT_LLM_MODEL: &str = "voxtral-small-24b-2507";
 pub const LLM_TEMPERATURE: f64 = 0.1;
 const DEFAULT_MAX_TOKENS: u32 = 1500;
 pub const LOCAL_LLM_PROVIDERS: &[&str] = &["omlx", "ollama"];
-const REMOTE_PROVIDERS: &[&str] = &["openai", "openrouter", "deepseek"];
+const REMOTE_PROVIDERS: &[&str] = &["openai"];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -74,8 +74,6 @@ pub fn default_base_url(provider: &str) -> String {
         "omlx" => "http://127.0.0.1:8000/v1/chat/completions".to_string(),
         "ollama" => "http://127.0.0.1:11434/v1/chat/completions".to_string(),
         "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
-        "openrouter" => "https://openrouter.ai/api/v1/chat/completions".to_string(),
-        "deepseek" => "https://api.deepseek.com/v1/chat/completions".to_string(),
         _ => String::new(),
     }
 }
@@ -103,7 +101,7 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
 
     let provider = if source.provider.trim().is_empty() {
         env::var("ORACLE_LLM_PROVIDER")
-            .unwrap_or_else(|_| "openrouter".to_string())
+            .unwrap_or_else(|_| "openai".to_string())
             .trim()
             .to_lowercase()
     } else {
@@ -114,7 +112,7 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
     if !allowed.contains(provider.as_str()) {
         return Err(AnswerError::PrivacyGate(format!(
             "Oracle LLM provider {:?} is not allowlisted; \
-             allowed: openai / openrouter / deepseek (remote, keyed) and \
+             allowed: openai (OpenAI-compatible remote, keyed) and \
              omlx / ollama (local, loopback-only).",
             provider
         )));

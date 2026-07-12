@@ -21,8 +21,8 @@ function secret(
 function llm(apiKeyConfigured: boolean): OracleLlmSettingsStatus {
   return {
     settings: {
-      provider: "deepseek",
-      model: "deepseek-chat",
+      provider: "openai",
+      model: "gpt-4o-mini",
       baseUrl: null,
       remoteEnabled: true,
     },

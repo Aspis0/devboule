@@ -17,52 +17,42 @@ import {
 } from "../../utils/oracleLlmFeedback";
 import type { OracleLlmSettings } from "../../types/backend";
 
-// Remote-first default: DeepSeek is a cost-effective OpenAI-compatible provider.
+// Remote-first default: a generic OpenAI-compatible endpoint.
 // Mirrors `default_oracle_llm_settings()` in the Rust vault.
 const defaultLlmSettings: OracleLlmSettings = {
-	provider: "deepseek",
-	model: "deepseek-chat",
+	provider: "openai",
+	model: "gpt-4o-mini",
 	baseUrl: null,
 	remoteEnabled: true,
 };
 
 const providerLabels: Record<string, string> = {
-	openai: "OpenAI",
-	openrouter: "OpenRouter",
-	deepseek: "DeepSeek",
+	openai: "OpenAI-compatible API",
 	omlx: "oMLX (local)",
 	ollama: "Ollama (local)",
 };
 
 const defaultModels: Record<string, string> = {
 	openai: "gpt-4o-mini",
-	openrouter: "deepseek/deepseek-chat",
-	deepseek: "deepseek-chat",
 	omlx: "",
 	ollama: "",
 };
 
 const defaultBaseUrls: Record<string, string> = {
 	openai: "https://api.openai.com/v1/chat/completions",
-	openrouter: "https://openrouter.ai/api/v1/chat/completions",
-	deepseek: "https://api.deepseek.com/v1/chat/completions",
 	omlx: "http://127.0.0.1:8000/v1/chat/completions",
 	ollama: "http://127.0.0.1:11434/v1/chat/completions",
 };
 
 const providerPrivacyNotes: Record<string, string> = {
-	openai: "OpenAI API (OpenAI-compatible). Requires an OpenAI API key. Review OpenAI's data-retention/training policy for your account.",
-	openrouter: "OpenRouter gateway (OpenAI-compatible). Requires an OpenRouter API key. Routes to many models, including Claude (e.g. anthropic/claude-sonnet-4) and DeepSeek.",
-	deepseek: "DeepSeek API (OpenAI-compatible). Requires a DeepSeek API key. Review DeepSeek's data policy for your retention requirements.",
+	openai: "Any OpenAI-compatible endpoint. Set the base URL to your provider and save its API key. Examples: OpenAI (api.openai.com), DeepSeek (api.deepseek.com), OpenRouter (openrouter.ai) — for Claude use OpenRouter with an anthropic/… model. Retrieved code is sent to whatever endpoint you configure, so pick a provider whose data policy you accept.",
 	omlx: "Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
 	ollama:
 		"Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
 };
 
 const modelHints: Record<string, string> = {
-	openai: "Cheap default: gpt-4o-mini. Stronger: gpt-4o or o4-mini.",
-	openrouter: "Use any OpenRouter model id, e.g. deepseek/deepseek-chat (cheap) or anthropic/claude-sonnet-4 (Claude).",
-	deepseek: "Default: deepseek-chat. Reasoning: deepseek-reasoner.",
+	openai: "Set the base URL + model for your endpoint. Examples — OpenAI: gpt-4o-mini (base https://api.openai.com/v1/chat/completions); DeepSeek: deepseek-chat (base https://api.deepseek.com/v1/chat/completions); OpenRouter: anthropic/claude-sonnet-4 or deepseek/deepseek-chat (base https://openrouter.ai/api/v1/chat/completions).",
 	omlx: "Enter an installed oMLX model id (e.g. the one your mini-coder uses).",
 	ollama: "Enter a pulled Ollama tag (e.g. qwen2.5-coder).",
 };
@@ -260,7 +250,7 @@ export function OracleAnswerSettingsCard() {
 							value={selectedProvider}
 							onChange={(event) => changeProvider(event.target.value)}
 							data-help-title="This chooses who writes Oracle answers."
-							data-help-lines="Remote providers: OpenAI, OpenRouter, DeepSeek (API key required). Local providers: oMLX and Ollama on this machine, loopback-only, no key.|Retrieval always runs locally.|Changing provider does not send a question yet.|Apple on-device (Foundation Models) arrives with macOS 27.|Without a key, remote providers return retrieval-only answers."
+							data-help-lines="Remote: OpenAI-compatible API (any provider with a key — OpenAI, DeepSeek, OpenRouter, etc.). Local: oMLX and Ollama on this machine, loopback-only, no key.|Retrieval always runs locally.|Changing provider does not send a question yet.|Apple on-device (Foundation Models) arrives with macOS 27.|Without a key, remote providers return retrieval-only answers."
 							className="mt-1 w-full rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-terracotta-200"
 						>
 							{providerEntries.map(([value, label]) => (
