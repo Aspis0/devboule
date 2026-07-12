@@ -325,7 +325,7 @@ fn test_unsupported_claims_high_risk() {
 #[test]
 fn test_unknown_provider_fail_closed() {
     let result = normalize_llm_config(Some(&LlmConfig {
-        provider: "openrouter".to_string(),
+        provider: "anthropic".to_string(),
         model: "test".to_string(),
         base_url: String::new(),
         api_key: String::new(),
@@ -340,7 +340,7 @@ fn test_unknown_provider_fail_closed() {
 #[test]
 fn test_missing_key_degrades_to_extractive() {
     let result = normalize_llm_config(Some(&LlmConfig {
-        provider: "scaleway".to_string(),
+        provider: "deepseek".to_string(),
         model: "test".to_string(),
         base_url: String::new(),
         api_key: String::new(),
@@ -395,7 +395,7 @@ fn test_enforce_allowlist_unknown_provider() {
 
 #[test]
 fn test_enforce_allowlist_known_provider() {
-    for provider in &["scaleway", "infomaniak", "mistral", "omlx", "ollama"] {
+    for provider in &["openai", "openrouter", "deepseek", "omlx", "ollama"] {
         let result = enforce_remote_llm_provider_allowlist(provider);
         assert!(result.is_ok(), "Provider {} should be allowed", provider);
     }
@@ -404,16 +404,16 @@ fn test_enforce_allowlist_known_provider() {
 #[test]
 fn test_default_base_urls() {
     assert_eq!(
-        default_base_url("scaleway"),
-        "https://api.scaleway.ai/v1/chat/completions"
+        default_base_url("openai"),
+        "https://api.openai.com/v1/chat/completions"
     );
     assert_eq!(
-        default_base_url("infomaniak"),
-        "https://api.infomaniak.com/2/ai/108646/openai/v1/chat/completions"
+        default_base_url("openrouter"),
+        "https://openrouter.ai/api/v1/chat/completions"
     );
     assert_eq!(
-        default_base_url("mistral"),
-        "https://api.mistral.ai/v1/chat/completions"
+        default_base_url("deepseek"),
+        "https://api.deepseek.com/v1/chat/completions"
     );
     assert_eq!(
         default_base_url("omlx"),
@@ -428,20 +428,20 @@ fn test_default_base_urls() {
 #[test]
 fn test_chat_completions_url() {
     assert_eq!(
-        chat_completions_url("https://api.scaleway.ai/v1"),
-        "https://api.scaleway.ai/v1/chat/completions"
+        chat_completions_url("https://api.openai.com/v1"),
+        "https://api.openai.com/v1/chat/completions"
     );
     assert_eq!(
-        chat_completions_url("https://api.scaleway.ai/v1/chat/completions"),
-        "https://api.scaleway.ai/v1/chat/completions"
+        chat_completions_url("https://api.openai.com/v1/chat/completions"),
+        "https://api.openai.com/v1/chat/completions"
     );
     assert_eq!(
-        chat_completions_url("https://api.mistral.ai/openai/v1"),
-        "https://api.mistral.ai/openai/v1/chat/completions"
+        chat_completions_url("https://openrouter.ai/api/v1"),
+        "https://openrouter.ai/api/v1/chat/completions"
     );
     assert_eq!(
-        chat_completions_url("https://api.scaleway.ai/v1/"),
-        "https://api.scaleway.ai/v1/chat/completions"
+        chat_completions_url("https://api.deepseek.com/v1/"),
+        "https://api.deepseek.com/v1/chat/completions"
     );
 }
 
@@ -456,24 +456,97 @@ fn cfg(provider: &str, base_url: &str) -> oracle_core::answer::providers::LlmCon
     }
 }
 
-/// Python compares the RAW netloc (host:port) against a plain-host allowlist,
-/// so ANY explicit port — even :443 — must be rejected (review F1).
+/// Generic SSRF-guarded host validation: provider names are labels only;
+/// base_url may target ANY public https OpenAI-compatible endpoint.
 #[test]
-fn provider_gate_rejects_explicit_ports() {
+fn generic_host_guard_remote_providers() {
     use oracle_core::answer::providers::validate_remote_llm_config;
+
+    // deepseek → own host: OK
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://api.deepseek.com/v1/chat/completions"
+    ))
+    .is_ok());
+
+    // deepseek → openrouter host: also OK (no per-provider pinning).
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://openrouter.ai/api/v1/chat/completions"
+    ))
+    .is_ok());
+
+    // deepseek → openai host: also OK.
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://api.openai.com/v1/chat/completions"
+    ))
+    .is_ok());
+
+    // Valid explicit port :443 is now ALLOWED.
+    assert!(validate_remote_llm_config(&cfg(
+        "openai",
+        "https://api.openai.com:443/v1"
+    ))
+    .is_ok());
+
+    // Case-insensitive host match.
     assert!(
-        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai:8443/v1")).is_err()
+        validate_remote_llm_config(&cfg("openai", "https://Api.OPENAI.COM/v1")).is_ok()
     );
-    assert!(
-        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai:443/v1")).is_err()
-    );
-    // Case-insensitive host match (Python lowercases the netloc).
-    assert!(validate_remote_llm_config(&cfg("scaleway", "https://Api.SCALEWAY.AI/v1")).is_ok());
-    // Subdomain trick must fail: netloc compare is exact, not contains.
-    assert!(
-        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai.evil.com/v1"))
-            .is_err()
-    );
+
+    // SSRF: bare IPv4 literal.
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://169.254.169.254/v1/chat/completions"
+    ))
+    .is_err());
+
+    // SSRF: localhost.
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://localhost/v1/chat/completions"
+    ))
+    .is_err());
+
+    // SSRF: single-label host (no dot).
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://internalhost/v1/chat/completions"
+    ))
+    .is_err());
+
+    // SSRF: .internal host.
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://myhost.internal/v1/chat/completions"
+    ))
+    .is_err());
+
+    // SSRF: .local host.
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://printer.local/v1/chat/completions"
+    ))
+    .is_err());
+
+    // Malformed: invalid port.
+    assert!(validate_remote_llm_config(&cfg(
+        "openai",
+        "https://api.openai.com:99999/v1"
+    ))
+    .is_err());
+
+    // Under the GENERIC guard (owner's "open api" choice) there is NO per-provider
+    // host pinning: any well-formed public https FQDN is accepted, so a host like
+    // `api.openai.com.evil.com` is a legitimate (if unusual) user-chosen endpoint,
+    // not a rejected "subdomain trick". The guard only blocks loopback / IP-literals
+    // / intranet-metadata, which the assertions above cover.
+    assert!(validate_remote_llm_config(&cfg(
+        "openai",
+        "https://api.openai.com.evil.com/v1"
+    ))
+    .is_ok());
 }
 
 /// focused_excerpt behavior (review F14): untested by the golden prompts

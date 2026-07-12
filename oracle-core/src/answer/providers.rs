@@ -19,7 +19,7 @@ const DEFAULT_LLM_MODEL: &str = "voxtral-small-24b-2507";
 pub const LLM_TEMPERATURE: f64 = 0.1;
 const DEFAULT_MAX_TOKENS: u32 = 1500;
 pub const LOCAL_LLM_PROVIDERS: &[&str] = &["omlx", "ollama"];
-const REMOTE_PROVIDERS: &[&str] = &["scaleway", "infomaniak", "mistral"];
+const REMOTE_PROVIDERS: &[&str] = &["openai", "openrouter", "deepseek"];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -64,14 +64,6 @@ fn all_allowed_providers() -> HashSet<&'static str> {
         .collect()
 }
 
-fn provider_allowed_hosts(provider: &str) -> HashSet<&'static str> {
-    match provider {
-        "scaleway" => ["api.scaleway.ai"].iter().copied().collect(),
-        "infomaniak" => ["api.infomaniak.com"].iter().copied().collect(),
-        "mistral" => ["api.mistral.ai"].iter().copied().collect(),
-        _ => HashSet::new(),
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Default base URLs (byte-exact from Python)
@@ -81,11 +73,9 @@ pub fn default_base_url(provider: &str) -> String {
     match provider {
         "omlx" => "http://127.0.0.1:8000/v1/chat/completions".to_string(),
         "ollama" => "http://127.0.0.1:11434/v1/chat/completions".to_string(),
-        "scaleway" => "https://api.scaleway.ai/v1/chat/completions".to_string(),
-        "infomaniak" => {
-            "https://api.infomaniak.com/2/ai/108646/openai/v1/chat/completions".to_string()
-        }
-        "mistral" => "https://api.mistral.ai/v1/chat/completions".to_string(),
+        "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
+        "openrouter" => "https://openrouter.ai/api/v1/chat/completions".to_string(),
+        "deepseek" => "https://api.deepseek.com/v1/chat/completions".to_string(),
         _ => String::new(),
     }
 }
@@ -113,7 +103,7 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
 
     let provider = if source.provider.trim().is_empty() {
         env::var("ORACLE_LLM_PROVIDER")
-            .unwrap_or_else(|_| "scaleway".to_string())
+            .unwrap_or_else(|_| "openrouter".to_string())
             .trim()
             .to_lowercase()
     } else {
@@ -124,7 +114,7 @@ pub fn normalize_llm_config(config: Option<&LlmConfig>) -> Result<LlmConfig, Ans
     if !allowed.contains(provider.as_str()) {
         return Err(AnswerError::PrivacyGate(format!(
             "Oracle LLM provider {:?} is not allowlisted; \
-             allowed: scaleway / infomaniak / mistral (remote, keyed) and \
+             allowed: openai / openrouter / deepseek (remote, keyed) and \
              omlx / ollama (local, loopback-only).",
             provider
         )));
@@ -233,31 +223,108 @@ pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError>
             "Remote Oracle LLM base URL must be HTTPS.".to_string(),
         ));
     }
-    // Python compares `urlparse(url).netloc.lower()` — the RAW authority
-    // including any explicit port — against a plain-host allowlist, so ANY
-    // explicit port (even :443) is rejected. `Url::host_str()`/`port()`
-    // normalize default ports away, which would let
-    // `https://api.scaleway.ai:8443/...` through; extract the raw netloc
-    // from the string instead.
-    let netloc = raw_netloc(&base_url).to_lowercase();
-    let allowed_hosts = provider_allowed_hosts(&provider);
-    if !allowed_hosts.contains(netloc.as_str()) {
-        return Err(AnswerError::Validation(
-            "Remote Oracle LLM base URL host does not match the selected provider.".to_string(),
-        ));
-    }
-    Ok(())
+    validate_host_for_remote_llm(&base_url)
 }
 
-/// The raw authority component (`host[:port]`, incl. userinfo if present) of
-/// a URL string — Python `urlparse(url).netloc` equivalent.
-fn raw_netloc(url: &str) -> &str {
-    let rest = match url.find("://") {
-        Some(i) => &url[i + 3..],
-        None => return "",
+/// Generic SSRF-guarded host validator for remote OpenAI-compatible endpoints.
+/// Mirrors the app's Censor Cloud validator (`validate_cloud_base_for_censor`).
+/// Operates on a fully-formed `https://…` URL string.
+fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
+    let url_after_https = match url.strip_prefix("https://") {
+        Some(rest) => rest,
+        None => {
+            return Err(AnswerError::Validation(
+                "Remote Oracle LLM base URL must be HTTPS.".to_string(),
+            ));
+        }
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    &rest[..end]
+
+    let authority = url_after_https
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+
+    if authority.is_empty() {
+        return Err(AnswerError::Validation(
+            "Remote Oracle LLM base URL is missing a host.".to_string(),
+        ));
+    }
+    if authority.contains('@') {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL must not contain userinfo (\"@\")."
+                .to_string(),
+        ));
+    }
+    if authority.starts_with('[') {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL must not use an IPv6 literal.".to_string(),
+        ));
+    }
+
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+
+    if let Some(p) = port {
+        if p.is_empty()
+            || p.len() > 5
+            || !p.bytes().all(|b| b.is_ascii_digit())
+            || p.parse::<u32>()
+                .map(|n| n > 65535)
+                .unwrap_or(true)
+        {
+            return Err(AnswerError::Validation(
+                "Remote Oracle LLM base URL has an invalid port.".to_string(),
+            ));
+        }
+    }
+
+    let host_lower = host.to_ascii_lowercase();
+
+    if host_lower == "localhost" {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL must not point to localhost.".to_string(),
+        ));
+    }
+
+    let labels: Vec<&str> = host.split('.').collect();
+    let is_quad = labels.len() == 4
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    if is_quad {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL must not be a bare IPv4 address.".to_string(),
+        ));
+    }
+
+    if host_lower == "metadata.google.internal"
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".local")
+    {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL must not target intranet/metadata hosts."
+                .to_string(),
+        ));
+    }
+
+    if !host.contains('.') {
+        return Err(AnswerError::PrivacyGate(
+            "Remote Oracle LLM base URL host must be fully-qualified.".to_string(),
+        ));
+    }
+
+    if !labels
+        .iter()
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    {
+        return Err(AnswerError::Validation(
+            "Remote Oracle LLM base URL contains an invalid host label.".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -295,8 +362,6 @@ pub fn generate_with_openai_compatible(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let provider = config.provider.trim().to_lowercase();
-
     let mut body = serde_json::json!({
         "model": config.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -304,19 +369,7 @@ pub fn generate_with_openai_compatible(
         "max_tokens": max_tokens,
     });
 
-    if provider == "infomaniak" {
-        body["response_format"] = serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": "oracle_answer",
-                "strict": true,
-                "schema": answer_json_schema(),
-            }
-        });
-        body["reasoning_effort"] = serde_json::json!("none");
-    } else {
-        body["response_format"] = serde_json::json!({"type": "json_object"});
-    }
+    body["response_format"] = serde_json::json!({"type": "json_object"});
 
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("Content-Type", "application/json".parse().unwrap());
