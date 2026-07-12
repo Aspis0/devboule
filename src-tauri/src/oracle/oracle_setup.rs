@@ -752,12 +752,75 @@ pub fn run_oracle_runtime_bootstrap(
     Ok(status)
 }
 
+// --- Rust engine (ONNX) runtime helpers -----------------------------------
+
+/// The oracle-data directory the Rust engine downloads/reads the ONNX model
+/// under, derived identically to the in-process server
+/// (`OracleDataPaths::from_root(root).root`). `root` is the workspace/data root
+/// returned by `oracle_data_root()`.
+fn rust_model_data_dir(root: &Path) -> PathBuf {
+    oracle_core::config::OracleDataPaths::from_root(root).root
+}
+
+fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
+    let data_dir = rust_model_data_dir(root);
+    let present = oracle_core::model_download::model_present(&data_dir, false); // fp32
+    let mut messages = Vec::new();
+    if present {
+        messages.push("Rust engine: ONNX embedding model is installed.".to_string());
+    } else {
+        messages.push("Rust engine: ONNX embedding model not downloaded yet.".to_string());
+    }
+    OracleRuntimeSetup {
+        // The Rust engine needs no Python — report the Python-specific gates as
+        // satisfied so the existing UI does not show a spurious "install Python 3".
+        python_found: true,
+        checking: false,
+        python_command: None,
+        python_version: None,
+        venv_ready: true,
+        deps_ready: true,
+        embedder_ready: present,
+        ready: present,
+        embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX fp32)".to_string(),
+        messages,
+    }
+}
+
+fn install_rust_runtime(root: &Path) -> Result<OracleRuntimeSetup, String> {
+    let data_dir = rust_model_data_dir(root);
+    // v1: no UI progress channel is wired; log progress to stderr. The UI polls
+    // get_oracle_runtime_setup separately and will show `ready` once done.
+    oracle_core::model_download::ensure_qwen3_onnx(&data_dir, false, |p| {
+        let pct = match p.bytes_total {
+            Some(t) if t > 0 => format!("{}%", (p.bytes_done * 100) / t),
+            _ => format!("{} bytes", p.bytes_done),
+        };
+        eprintln!(
+            "[rust-oracle model] {} ({}/{}) {}",
+            p.file, p.index, p.total_files, pct
+        );
+    })
+    .map_err(|e| format!("ONNX model download failed: {e:#}"))?;
+    Ok(rust_runtime_setup_status(root))
+}
+
+// --- public entry points ---------------------------------------------------
+
 /// Resolve the writable data root (where the venv lives) and return the current
 /// setup status (no install). Status is read from the DATA root, NOT the package
 /// root, because the installed runtime lives under the data root.
 pub fn current_oracle_runtime_setup() -> OracleRuntimeSetup {
     match oracle_data_root() {
-        Some(root) => oracle_runtime_setup_status(&root),
+        Some(root) => {
+            if crate::backend::oracle_service::oracle_current_engine()
+                == crate::backend::oracle_service::OracleEngine::Rust
+            {
+                rust_runtime_setup_status(&root)
+            } else {
+                oracle_runtime_setup_status(&root)
+            }
+        }
         None => OracleRuntimeSetup::unavailable(
             "Could not locate the bundled oracle/ package next to the app.",
         ),
@@ -771,6 +834,11 @@ pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
     let data_root = oracle_data_root().ok_or_else(|| {
         "Could not locate a writable location for the Oracle runtime.".to_string()
     })?;
+    if crate::backend::oracle_service::oracle_current_engine()
+        == crate::backend::oracle_service::OracleEngine::Rust
+    {
+        return install_rust_runtime(&data_root);
+    }
     let package_root = find_oracle_package_root(None).ok_or_else(|| {
         "Could not locate the bundled oracle/ package next to the app.".to_string()
     })?;
@@ -1036,5 +1104,22 @@ mod tests {
             status.ready,
             "the runtime must be fully ready after install"
         );
+    }
+
+    #[test]
+    fn rust_runtime_status_reports_absent_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-m24-absent-{}",
+            std::process::id()
+        ));
+        let s = rust_runtime_setup_status(&dir);
+        assert!(!s.ready, "absent model dir must not be ready");
+        assert!(!s.embedder_ready);
+        assert!(
+            s.python_found,
+            "python gates reported satisfied under rust engine"
+        );
+        assert!(s.venv_ready && s.deps_ready);
+        assert!(s.embed_model.contains("ONNX"));
     }
 }
