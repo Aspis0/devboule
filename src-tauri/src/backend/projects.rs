@@ -1416,7 +1416,7 @@ fn spawn_pi_orchestrator_session(
     initial_goal_msg_id: Option<&str>,
 ) -> Result<ProjectAgentLaunchResult, String> {
     let info =
-        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id))?;
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id), None)?;
     // Fix C: inject the Rust-authored user chat echo INTO THE QUEUE BEFORE
     // delivering the prompt. The queue is drained only by the reader thread's
     // `handle_event`, which fires after the sidecar receives the prompt via
@@ -1490,6 +1490,7 @@ fn spawn_pi_coder_session(
     root_path: &std::path::Path,
     prompt: &str,
     role: &str,
+    agent_id: &str,
 ) -> Result<ProjectAgentLaunchResult, String> {
     // Map the launch role to the sidecar's agent-role namespace. The launch role
     // is "coder" (the Main coder) or "mini"; the sidecar expects "main-coder" /
@@ -1501,7 +1502,7 @@ fn spawn_pi_coder_session(
         other => other,
     };
     let info =
-        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id))?;
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id), Some(agent_id))?;
     // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
     // this the agent sits idle forever while the UI reports `launched: true`.
     // Only send when there is actual text; fail loudly on delivery error rather
@@ -1515,14 +1516,9 @@ fn spawn_pi_coder_session(
             return Err(e);
         }
     }
-    // Register the channel with an initial empty snapshot — matches the existing
-    // activity bridge so the frontend console renders without React changes
-    // (EventMapper uses the same agent id on every event).
-    let channel = crate::backend::mini_activity::mini_activity_channel(&info.session_id);
-    let event = crate::backend::mini_activity::MiniActivityEvent::Snapshot {
-        activity: crate::backend::mini_activity::ConsoleActivity::empty(),
-    };
-    let _ = app.emit(&channel, event);
+    // F4: the stale empty-Snapshot emit that was here (clobbering store-backed
+    // state on the live channel) was deleted — the EventMapper's first
+    // store-backed snapshot covers it.
     // B13: capture the diff baseline the first time an agent launches for this repo.
     crate::backend::changes::ensure_diff_baseline(root_path);
     Ok(ProjectAgentLaunchResult {
@@ -1643,6 +1639,30 @@ fn prepare_or_launch_project_agent(
     // conversation belongs to the project, not the process); other roles ⇒ fresh
     // per-launch id, unchanged. See `launch_agent_id`/`stable_orchestrator_agent_id`.
     let agent_id = launch_agent_id(input.agent_id.as_deref(), &role, &project.metadata.id);
+    // F1: compute pi route EARLY — before prompt composition — so when the pi
+    // route fires for coder/mini, we can override `agent_id` with the pi-namespace
+    // id (`main-*`/`mini-*`) so the prompt, the launch result, and the session all
+    // carry the SAME id. Orchestrator is already consistent (both resolve to
+    // stable_orchestrator_agent_id) — its id flow is unchanged.
+    let pi_role = crate::backend::pi_sidecar::pi_route_for_launch(
+        launch_terminal,
+        &role,
+        &client,
+        crate::backend::pi_sidecar::pi_sidecar_enabled(),
+    );
+    // When the pi route will fire for coder/mini, override the per-launch
+    // timestamp id with the canonical pi-namespace id so the prompt's
+    // agent_register(agent_id="...") matches the session id. Orchestrator
+    // already resolves to stable_orchestrator_agent_id — no override needed.
+    let agent_id = if let Some(pr) = pi_role {
+        if let Some(override_id) = crate::backend::pi_sidecar::pi_override_agent_id(pr, &project.metadata.id) {
+            override_id
+        } else {
+            agent_id
+        }
+    } else {
+        agent_id
+    };
     let task_id = clean_optional(input.task_id.as_deref());
     // D1 FENCE: defined further down (it needs `projects_path` for the steer purge);
     // called at the three spawn points, deliberately NOT here at the top — every step
@@ -1736,12 +1756,9 @@ fn prepare_or_launch_project_agent(
     // Claude/Codex/OpenAI NEVER run inside pi — they have their own paths below
     // (cloud duplex / PTY / external). `launch_terminal` gates this so the
     // prepare-only path (host metadata only) is never intercepted.
-    if let Some(pi_role) = crate::backend::pi_sidecar::pi_route_for_launch(
-        launch_terminal,
-        &role,
-        &client,
-        crate::backend::pi_sidecar::pi_sidecar_enabled(),
-    ) {
+    // pi_role was computed early (before prompt composition) so the coder/mini
+    // agent_id override above is consistent with the prompt's agent_register.
+    if let Some(pi_role) = pi_role {
         // D1 FENCE (pi path): the pi sidecar's stable orchestrator id is the SAME
         // stable id `agent_id` already holds (generate_agent_id("orchestrator", ..)
         // resolves to stable_orchestrator_agent_id), so a relaunch here needs the
@@ -1783,6 +1800,7 @@ fn prepare_or_launch_project_agent(
                 &root_path,
                 &prompt,
                 &role,
+                &agent_id,
             ),
         };
     }
@@ -6441,6 +6459,34 @@ mod tests {
         assert!(hinted.contains("model=\"opus\""));
         assert!(!hinted.contains("model=\"<your model>\""));
         assert!(hinted.contains("Report your REAL model name"));
+    }
+
+    // F1 seam test: project_agent_prompt embeds the EXACT agent_id passed in
+    // its agent_register line — together with pi_override_agent_id's namespace
+    // tests, this pins the override→prompt seam.
+    #[test]
+    fn prompt_embeds_exact_agent_id_in_agent_register() {
+        let project = censor_prompt_test_project();
+        let root = std::env::temp_dir().join("aspis-agentid-seam");
+        let _ = std::fs::create_dir_all(&root);
+        let prompt = project_agent_prompt(
+            &project,
+            "coder",
+            "main-99999",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("agent_register(agent_id=\"main-99999\""),
+            "prompt must contain the exact agent_id passed in"
+        );
     }
 
     #[test]

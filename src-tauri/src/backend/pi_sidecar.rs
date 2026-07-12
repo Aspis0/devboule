@@ -100,12 +100,12 @@ pub struct PiSidecarState {
 
 impl Default for PiSidecarState {
     fn default() -> Self {
-        let restored = restore_pi_sessions(&pi_project_root());
+        let (restored, persisted_map) = restore_and_seed_persisted(&pi_project_root());
         Self {
             inner: Mutex::new(HashMap::new()),
             // Note: HashMap<String, SessionSlot> — each entry holds Option<PiSession>.
             session_counter: AtomicU64::new(0),
-            persisted: Mutex::new(HashMap::new()),
+            persisted: Mutex::new(persisted_map),
             restored: Mutex::new(restored),
         }
     }
@@ -135,7 +135,23 @@ impl PiSidecarState {
 /// transient pi sessions onto the agent-state file (which never records them).
 /// The liveness check is the real child `try_wait()` — a dead process means the
 /// row disappears on the next poll, so the frontend correctly relaunches.
-pub(crate) fn live_orchestrator_sessions(app: &AppHandle) -> Vec<(String, String)> {
+/// Result of scanning live pi sessions for the agent-state overlay. One entry
+/// per live sidecar session with a persisted project id.
+pub(crate) struct LivePiSession {
+    pub(crate) agent_id: String,
+    pub(crate) project_id: String,
+    /// The sidecar role from PersistedSession.agent_role ("orchestrator" /
+    /// "main-coder" / "mini-coder" / unknown).
+    pub(crate) role: String,
+    pub(crate) model: Option<String>,
+}
+
+/// Return a `LivePiSession` for every live pi sidecar session whose child
+/// process is still alive. Used by `get_agent_live_state` to overlay transient
+/// pi sessions onto the agent-state file (which never records them). The
+/// liveness check is the real child `try_wait()` — a dead process means the
+/// row disappears on the next poll, so the frontend correctly relaunches.
+pub(crate) fn live_pi_sessions(app: &AppHandle) -> Vec<LivePiSession> {
     let state = match app.try_state::<PiSidecarState>() {
         Some(s) => s,
         None => return Vec::new(),
@@ -154,9 +170,8 @@ pub(crate) fn live_orchestrator_sessions(app: &AppHandle) -> Vec<(String, String
     };
     let mut result = Vec::new();
     for (id, slot) in guard.iter() {
-        if !id.starts_with("orchestrator-") {
-            continue;
-        }
+        // Every live entry in the inner map with a persisted project_id qualifies.
+        // No prefix filter — orchestrator, main-coder, mini-coder all overlay.
         let alive = match &slot.inner {
             Some(session) => {
                 // ITEM 3+4: try_lock the child mutex; on contention (WouldBlock)
@@ -178,42 +193,62 @@ pub(crate) fn live_orchestrator_sessions(app: &AppHandle) -> Vec<(String, String
         }
         if let Some(ps) = persisted.get(id) {
             if let Some(ref project_id) = ps.project_id {
-                result.push((id.clone(), project_id.clone()));
+                result.push(LivePiSession {
+                    agent_id: id.clone(),
+                    project_id: project_id.clone(),
+                    role: ps.agent_role.clone(),
+                    model: ps.model.clone(),
+                });
             }
         }
     }
     result
 }
 
-/// Pure helper: overlay live pi orchestrator sessions onto the agent session list.
+/// Pure helper: overlay live pi sessions onto the agent session list.
 /// Called from `get_agent_live_state` — read-time only, never persists.
 ///
 /// Invariant: liveness comes from the real child process (`try_wait()`), so a row
 /// disappears the moment the sidecar dies — the frontend then correctly relaunches.
 pub(crate) fn overlay_pi_sessions(
     sessions: &mut Vec<super::model::AgentSession>,
-    live: &[(String, String)],
+    live: &[LivePiSession],
     now: &str,
 ) {
-    for (agent_id, project_id) in live {
-        if let Some(existing) = sessions.iter_mut().find(|s| &s.agent_id == agent_id) {
+    for lp in live {
+        // Map sidecar agent_role to the session role and client shown in the UI.
+        // WHY client="pi": the work rail's `workModeSessions` filter drops
+        // client=="orchestrator" (ProjectsView.tsx:1139), and
+        // isMiniManagedSession treats any non-{claude,codex,openai} client as
+        // mini-managed, whose steer path no-ops safely for pi sessions.
+        let (session_role, client) = match lp.role.as_str() {
+            "orchestrator" => ("orchestrator".to_string(), "orchestrator".to_string()),
+            "main-coder" | "coder" => ("coder".to_string(), "pi".to_string()),
+            "mini-coder" | "mini" => ("mini".to_string(), "pi".to_string()),
+            other => (other.to_string(), "pi".to_string()),
+        };
+        if let Some(existing) = sessions.iter_mut().find(|s| s.agent_id == lp.agent_id) {
             // Refresh existing row in place — status to running, stamp timestamps.
             existing.status = "running".to_string();
             existing.last_seen_at = Some(now.to_string());
-            existing.client = Some("orchestrator".to_string());
+            existing.client = Some(client);
+            existing.role = session_role;
+            if existing.model.is_none() {
+                existing.model = lp.model.clone();
+            }
             if existing.current_project_id.is_none() {
-                existing.current_project_id = Some(project_id.clone());
+                existing.current_project_id = Some(lp.project_id.clone());
             }
         } else {
             // Push a synthetic row — never written to the file.
             sessions.push(super::model::AgentSession {
-                agent_id: agent_id.clone(),
-                role: "orchestrator".to_string(),
-                model: None,
+                agent_id: lp.agent_id.clone(),
+                role: session_role,
+                model: lp.model.clone(),
                 status: "running".to_string(),
                 message: None,
-                client: Some("orchestrator".to_string()),
-                current_project_id: Some(project_id.clone()),
+                client: Some(client),
+                current_project_id: Some(lp.project_id.clone()),
                 current_task_id: None,
                 current_file_path: None,
                 first_seen_at: Some(now.to_string()),
@@ -282,6 +317,10 @@ pub struct PersistedSession {
     pub created_at: u64,
     pub last_active_at: u64,
     pub status: SessionStatus,
+    /// F3: the resolved model for this session (from DEVBOULE_PI_MODEL).
+    /// Old files without this field deserialize as None (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// On-disk shape of `.devboule/pi-sessions.json`.
@@ -410,6 +449,59 @@ pub fn restore_pi_sessions(project_root: &Path) -> Vec<SessionInfo> {
             }
         })
         .collect()
+}
+
+/// F5: load `.devboule/pi-sessions.json`, apply cleanup, seed the in-memory
+/// `persisted` map (so subsequent `save_pi_sessions` calls preserve on-disk
+/// entries), and write the cleaned file back (so crashed entries aren't stuck
+/// as "Active" forever). Returns the restored sessions (for the banner) and
+/// the seeded persisted map.
+///
+/// Seeding persisted does NOT make `live_pi_sessions` overlay them — it
+/// iterates the `inner` (live process) map and only LOOKS UP persisted;
+/// restored entries have no inner slot, so they are invisible to the overlay.
+fn restore_and_seed_persisted(
+    project_root: &Path,
+) -> (Vec<SessionInfo>, HashMap<String, PersistedSession>) {
+    let path = project_root.join(".devboule").join("pi-sessions.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return (Vec::new(), HashMap::new());
+    };
+    let Ok(file) = serde_json::from_str::<SessionFile>(&data) else {
+        return (Vec::new(), HashMap::new());
+    };
+    let file = apply_cleanup(file);
+    // Seed the in-memory persisted map so save_pi_sessions preserves these.
+    let persisted_map: HashMap<String, PersistedSession> = file
+        .sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.clone()))
+        .collect();
+    // Write the cleaned file back so crashed/stale entries don't stay Active.
+    if persist_enabled() {
+        let dir = project_root.join(".devboule");
+        if let Ok(json) = serde_json::to_string_pretty(&file) {
+            let _ = std::fs::create_dir_all(&dir);
+            let tmp = dir.join("pi-sessions.json.tmp");
+            let _ = std::fs::write(&tmp, &json);
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    let restored = file
+        .sessions
+        .into_iter()
+        .filter(|s| s.status == SessionStatus::Active)
+        .map(|s| {
+            let id = s.id.clone();
+            SessionInfo {
+                session_id: s.id,
+                is_new: false,
+                agent_role: s.agent_role,
+                channel: super::mini_activity::mini_activity_channel(&id),
+            }
+        })
+        .collect();
+    (restored, persisted_map)
 }
 
 /// Generate a **role-aware** agent id for a sidecar session. The frontend consoles
@@ -735,7 +827,7 @@ fn spawn_pi_session_inner(
     prev_generation: Option<Arc<AtomicU64>>,
     role: Option<&str>,
     project_id: Option<&str>,
-) -> Result<PiSession, String> {
+) -> Result<(PiSession, String), String> {
     let script = resolve_sidecar_script()?;
     let sidecar_dir = script
         .parent()
@@ -924,7 +1016,7 @@ fn spawn_pi_session_inner(
         read_session_timeout_secs(),
     );
 
-    Ok(PiSession {
+    Ok((PiSession {
         child,
         stdin,
         generation,
@@ -932,7 +1024,7 @@ fn spawn_pi_session_inner(
         spawned_at,
         injections,
         reader_handle: Some(reader_handle),
-    })
+    }, env_vars.model))
 }
 
 /// Stop a specific pi sidecar session: kill the child, join reader, remove from state.
@@ -977,6 +1069,19 @@ pub(crate) fn pi_route_for_launch(
     match role {
         "orchestrator" => Some("orchestrator"),
         "coder" | "mini" => Some("coder"),
+        _ => None,
+    }
+}
+
+/// F1: pure helper that computes the pi-namespace agent id override for
+/// coder/mini launches. Returns `Some(main-*)` for coder, `Some(mini-*)` for
+/// mini, `None` for orchestrator (already consistent) or unknown roles.
+/// Extracted so the override decision is unit-testable without an AppHandle.
+pub(crate) fn pi_override_agent_id(pi_role: &str, project_id: &str) -> Option<String> {
+    match pi_role {
+        "orchestrator" => None, // already resolves to stable_orchestrator_agent_id
+        "coder" => Some(generate_agent_id("main-coder", Some(project_id))),
+        "mini" => Some(generate_agent_id("mini-coder", Some(project_id))),
         _ => None,
     }
 }
@@ -1108,7 +1213,7 @@ fn get_or_spawn_session(
     // Lock is now DROPPED — spawn happens without holding the lock.
 
     // Phase 2: spawn outside the lock.
-    let new_session = spawn_pi_session_inner(app, &id, prev_gen, role, project_id)?;
+    let (new_session, resolved_model) = spawn_pi_session_inner(app, &id, prev_gen, role, project_id)?;
 
     // Fix 2: a fresh child process = a fresh generation. Reset this session's
     // anti-loop cap AND delivered-finding set (censor_session_state_reset) so a
@@ -1139,6 +1244,9 @@ fn get_or_spawn_session(
 
     // Persist: record this session (active) and rewrite the sessions file so it
     // survives an app restart. Decoupled from the live `inner` map.
+    // F3: use the model already resolved by spawn_pi_session_inner (avoids a
+    // redundant config read). Empty model => None for the overlay.
+    let model_for_persisted = if resolved_model.is_empty() { None } else { Some(resolved_model) };
     {
         let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
         pg.insert(
@@ -1150,6 +1258,7 @@ fn get_or_spawn_session(
                 created_at: now_ms(),
                 last_active_at: now_ms(),
                 status: SessionStatus::Active,
+                model: model_for_persisted,
             },
         );
     }
@@ -1301,7 +1410,8 @@ pub(crate) fn inject_console_entry(
 /// default devboule env vars the sidecar reads in `devbouleContext` (Task 1).
 ///
 /// 1. Generates the agent id via [`generate_agent_id`] (orchestrator / main / mini
-///    namespaces, else the legacy `pi-<counter>` fallback).
+///    namespaces, else the legacy `pi-<counter>` fallback), or uses
+///    `explicit_id` when provided (the caller already minted the canonical id).
 /// 2. Spawns the sidecar with `DEVBOULE_AGENT_ROLE=role` and
 ///    `DEVBOULE_SESSION_ID=<agent id>` (plus `DEVBOULE_PROJECT_ID` when given).
 /// 3. Returns the session id, role, and the `mini-activity://<agentId>` channel.
@@ -1313,8 +1423,12 @@ pub fn spawn_sidecar_for_role(
     app: &AppHandle,
     role: &str,
     project_id: Option<&str>,
+    explicit_id: Option<&str>,
 ) -> Result<SessionInfo, String> {
-    let agent_id = generate_agent_id(role, project_id);
+    let agent_id = match explicit_id {
+        Some(id) => id.to_string(),
+        None => generate_agent_id(role, project_id),
+    };
     let (sid, is_new) = get_or_spawn_session(
         app,
         Some(agent_id.clone()),
@@ -1502,18 +1616,31 @@ fn extract_partial_snippet(partial: &serde_json::Value) -> String {
     cap_chars(&single, 200)
 }
 
+/// F6: map a sidecar agent role to the human-readable label used in the
+/// response-failure banner. Pure, total, testable.
+fn role_failure_label(role: Option<&str>) -> &'static str {
+    match role {
+        Some("orchestrator") => "Orchestrator",
+        Some("main-coder") | Some("coder") => "Coder",
+        Some("mini-coder") | Some("mini") => "Mini",
+        _ => "Agent",
+    }
+}
+
 /// Fix D: pure helper that extracts the response-failure banner text from a
 /// `response` event. Returns `Some(text)` when `success==Some(false)`, `None`
-/// otherwise. Extracted so the 3 unit tests below can call it directly without
-/// an AppHandle.
-fn response_failure_banner(event: &PiEvent) -> Option<String> {
+/// otherwise. The `role` parameter (from `EventMapper::current_role`) selects
+/// the human-readable label in the banner. Extracted so the unit tests below
+/// can call it directly without an AppHandle.
+fn response_failure_banner(event: &PiEvent, role: Option<&str>) -> Option<String> {
     if event.event_type == "response" && event.success == Some(false) {
+        let label = role_failure_label(role);
         Some(
             event
                 .error
                 .as_deref()
-                .map(|e| format!("Orchestrator turn failed: {e}"))
-                .unwrap_or_else(|| "Orchestrator turn failed".to_string()),
+                .map(|e| format!("{label} turn failed: {e}"))
+                .unwrap_or_else(|| format!("{label} turn failed")),
         )
     } else {
         None
@@ -2057,7 +2184,7 @@ impl EventMapper {
                 // Fix D: a `response` with success==Some(false) means a provider/
                 // turn error — surface the failure so the user sees it instead of a
                 // silent stall.
-                if let Some(text) = response_failure_banner(event) {
+                if let Some(text) = response_failure_banner(event, self.current_role.as_deref()) {
                     self.push_entry(ConsoleEntry::Banner {
                         text,
                         time: Self::now_str(),
@@ -2837,6 +2964,57 @@ fn persist_session_status(app: &AppHandle, agent_id: &str, status: SessionStatus
         if let Some(s) = pg.get_mut(agent_id) {
             s.status = status;
             s.last_active_at = now_ms();
+        } else {
+            eprintln!("[pi-sidecar] persist_session_status: no persisted entry for {agent_id}");
+        }
+    }
+    save_pi_sessions(&state, &pi_project_root());
+}
+
+/// F7: app-exit cleanup — kill every live pi child process, join readers
+/// (best-effort, bounded), and persist status Stopped. Idempotent: a second
+/// call on an empty map is a no-op. Mirrors `agent_pty::kill_all_on_exit`.
+pub fn kill_all_pi_sessions(app: &AppHandle) {
+    let state = match app.try_state::<PiSidecarState>() {
+        Some(s) => s,
+        None => return,
+    };
+    // Two-phase shutdown: UNDER the lock, bump every session's generation and
+    // collect (child_arc, reader_handle, id) triples; then DROP the lock BEFORE
+    // joining any reader. This mirrors stop_pi_session's #1 deadlock rationale:
+    // a reader thread of a DIFFERENT session can hit EOF and block on
+    // state.inner inside remove_session_if_same_generation — holding the lock
+    // while joining would deadlock.
+    let to_kill: Vec<(Arc<Mutex<Child>>, Option<JoinHandle<()>>, String)> = {
+        let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (id, slot) in guard.iter_mut() {
+            if let Some(ref mut session) = slot.inner {
+                // Bump generation so the reader thread detects staleness and exits.
+                session.generation.fetch_add(1, Ordering::SeqCst);
+                // Take the reader handle and clone the child Arc; clear the slot.
+                let reader = session.reader_handle.take();
+                let child = session.child.clone();
+                collected.push((child, reader, id.clone()));
+            }
+        }
+        collected
+    }; // lock dropped here
+    // Phase 2: kill children, join readers, persist status — all outside the lock.
+    for (child, reader, id) in to_kill {
+        if let Ok(mut c) = child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(handle) = reader {
+            let _ = handle.join();
+        }
+        {
+            let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = pg.get_mut(&id) {
+                s.status = SessionStatus::Stopped;
+                s.last_active_at = now_ms();
+            }
         }
     }
     save_pi_sessions(&state, &pi_project_root());
@@ -2990,6 +3168,9 @@ fn read_sidecar_events(
                 });
                 mapper.emit_snapshot(&app);
                 persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                // F7: reset censor anti-loop state so a stable-id respawn doesn't
+                // inherit stale counters/delivered-ids from the dead session.
+                censor_session_state_reset(agent_id);
                 remove_session_if_same_generation(&app, agent_id, gen, &generation);
             }
             SidecarTermination::Crash(code) => {
@@ -3002,6 +3183,7 @@ fn read_sidecar_events(
                 });
                 mapper.emit_snapshot(&app);
                 persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                censor_session_state_reset(agent_id);
                 remove_session_if_same_generation(&app, agent_id, gen, &generation);
             }
             SidecarTermination::Clean => {
@@ -3016,10 +3198,12 @@ fn read_sidecar_events(
                     );
                     remove_session_if_same_generation(&app, agent_id, gen, &generation);
                     persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                    censor_session_state_reset(agent_id);
                 } else {
                     mapper.running = false;
                     mapper.emit_snapshot(&app);
                     persist_session_status(&app, agent_id, SessionStatus::Stopped);
+                    censor_session_state_reset(agent_id);
                 }
             }
         }
@@ -3263,6 +3447,48 @@ mod tests {
         let b = generate_agent_id("weird-role", None);
         assert!(a.starts_with("pi-"), "fallback id: {a}");
         assert_ne!(a, b, "two fallback ids must be unique");
+    }
+
+    // -- F1: pi branch id override produces correct namespaces -----------------
+
+    #[test]
+    fn pi_route_id_override_proves_main_mini_namespace() {
+        // F1: the pi branch's id override uses the same generate_agent_id
+        // function that spawn_sidecar_for_role uses, so the prompt's
+        // agent_register(agent_id) and the session id are guaranteed identical
+        // (the override threads the minted id via explicit_id, not regeneration).
+        let coder_id = generate_agent_id("main-coder", Some("my-proj"));
+        let mini_id = generate_agent_id("mini-coder", Some("my-proj"));
+        assert!(coder_id.starts_with("main-"), "coder must be main-*: {coder_id}");
+        assert!(mini_id.starts_with("mini-"), "mini must be mini-*: {mini_id}");
+        // Each call appends a global monotonic counter, so every call is unique
+        // BY DESIGN (uniqueness is the property; determinism is not).
+        let coder_id2 = generate_agent_id("main-coder", Some("my-proj"));
+        assert_ne!(coder_id, coder_id2, "each call must be unique");
+    }
+
+    #[test]
+    fn pi_override_agent_id_coder_yields_main_namespace() {
+        let result = pi_override_agent_id("coder", "my-proj");
+        let id = result.expect("coder must override");
+        assert!(id.starts_with("main-"), "coder override must be main-*: {id}");
+    }
+
+    #[test]
+    fn pi_override_agent_id_mini_yields_mini_namespace() {
+        let result = pi_override_agent_id("mini", "my-proj");
+        let id = result.expect("mini must override");
+        assert!(id.starts_with("mini-"), "mini override must be mini-*: {id}");
+    }
+
+    #[test]
+    fn pi_override_agent_id_orchestrator_yields_none() {
+        assert!(pi_override_agent_id("orchestrator", "my-proj").is_none());
+    }
+
+    #[test]
+    fn pi_override_agent_id_unknown_yields_none() {
+        assert!(pi_override_agent_id("verifier", "my-proj").is_none());
     }
 
     // -- session info serialization -------------------------------------------
@@ -4355,6 +4581,7 @@ mod tests {
                     created_at: now,
                     last_active_at: now,
                     status: SessionStatus::Active,
+                    model: None,
                 },
             );
             g.insert(
@@ -4366,6 +4593,7 @@ mod tests {
                     created_at: now,
                     last_active_at: now,
                     status: SessionStatus::Active,
+                    model: None,
                 },
             );
         }
@@ -4413,6 +4641,7 @@ mod tests {
                     created_at: old,
                     last_active_at: old,
                     status: SessionStatus::Stopped,
+                    model: None,
                 },
             );
             g.insert(
@@ -4424,6 +4653,7 @@ mod tests {
                     created_at: now,
                     last_active_at: now,
                     status: SessionStatus::Stopped,
+                    model: None,
                 },
             );
         }
@@ -4512,6 +4742,7 @@ mod tests {
                             created_at: now,
                             last_active_at: now,
                             status: SessionStatus::Active,
+                            model: None,
                         },
                     );
                 }
@@ -4536,6 +4767,92 @@ mod tests {
                 "session pi-conc-{i} lost under concurrent save"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- F5: restart data loss — seed/write-back test ---------------------------
+
+    #[test]
+    fn restart_preserves_prior_sessions_and_adds_new() {
+        std::env::set_var("DEVBOULE_PI_PERSIST", "true");
+        let root = std::env::temp_dir().join(format!(
+            "pi-sessions-f5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Write 2 pre-existing sessions to disk (simulating a prior app run).
+        // Use recent timestamps so apply_cleanup keeps them (>24h old → Crashed).
+        let dir = root.join(".devboule");
+        let _ = std::fs::create_dir_all(&dir);
+        let now = super::now_ms();
+        let prior = SessionFile {
+            sessions: vec![
+                PersistedSession {
+                    id: "orchestrator-proj1".to_string(),
+                    agent_role: "orchestrator".to_string(),
+                    project_id: Some("proj1".to_string()),
+                    created_at: now - 60_000,
+                    last_active_at: now - 30_000,
+                    status: SessionStatus::Active,
+                    model: None,
+                },
+                PersistedSession {
+                    id: "main-old".to_string(),
+                    agent_role: "main-coder".to_string(),
+                    project_id: Some("proj2".to_string()),
+                    created_at: now - 60_000,
+                    last_active_at: now - 30_000,
+                    status: SessionStatus::Active,
+                    model: Some("claude-sonnet".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_string_pretty(&prior).unwrap();
+        std::fs::write(dir.join("pi-sessions.json"), &json).unwrap();
+        // Simulate a restart: Default loads + seeds persisted.
+        let state = PiSidecarState {
+            inner: std::sync::Mutex::new(HashMap::new()),
+            session_counter: std::sync::atomic::AtomicU64::new(0),
+            persisted: std::sync::Mutex::new(HashMap::new()),
+            restored: std::sync::Mutex::new(Vec::new()),
+        };
+        // Manually seed like Default does.
+        let (restored, seeded) = super::restore_and_seed_persisted(&root);
+        *state.persisted.lock().unwrap() = seeded;
+        *state.restored.lock().unwrap() = restored;
+        // Verify the 2 prior sessions were seeded.
+        {
+            let pg = state.persisted.lock().unwrap();
+            assert_eq!(pg.len(), 2);
+            assert!(pg.contains_key("orchestrator-proj1"));
+            assert!(pg.contains_key("main-old"));
+        }
+        // Now add a 3rd session (simulating a new launch) and save.
+        {
+            let mut pg = state.persisted.lock().unwrap();
+            pg.insert(
+                "main-new".to_string(),
+                PersistedSession {
+                    id: "main-new".to_string(),
+                    agent_role: "main-coder".to_string(),
+                    project_id: Some("proj1".to_string()),
+                    created_at: now,
+                    last_active_at: now,
+                    status: SessionStatus::Active,
+                    model: None,
+                },
+            );
+        }
+        super::save_pi_sessions(&state, &root);
+        // Verify all 3 sessions are on disk.
+        let data = std::fs::read_to_string(dir.join("pi-sessions.json")).unwrap();
+        let file: SessionFile = serde_json::from_str(&data).unwrap();
+        assert_eq!(file.sessions.len(), 3, "prior 2 + new 1 = 3 sessions");
+        assert!(file.sessions.iter().any(|s| s.id == "orchestrator-proj1"));
+        assert!(file.sessions.iter().any(|s| s.id == "main-old"));
+        assert!(file.sessions.iter().any(|s| s.id == "main-new"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5092,7 +5409,7 @@ mod tests {
         }
     }
 
-    // -- overlay_pi_sessions (Fix A) -------------------------------------------
+    // -- overlay_pi_sessions (Fix A + F2) --------------------------------------
 
     use crate::backend::model::AgentSession;
 
@@ -5122,12 +5439,19 @@ mod tests {
         }
     }
 
+    fn make_live(agent_id: &str, project_id: &str, role: &str, model: Option<&str>) -> LivePiSession {
+        LivePiSession {
+            agent_id: agent_id.to_string(),
+            project_id: project_id.to_string(),
+            role: role.to_string(),
+            model: model.map(|s| s.to_string()),
+        }
+    }
+
     #[test]
-    fn overlay_pi_sessions_adds_synthetic_row_when_no_existing() {
+    fn overlay_pi_sessions_orchestrator_synthetic_row() {
         let mut sessions = vec![make_session("coder-1", "running")];
-        let live = vec![
-            ("orchestrator-proj1".to_string(), "proj1".to_string()),
-        ];
+        let live = vec![make_live("orchestrator-proj1", "proj1", "orchestrator", None)];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 2);
         let orch = sessions.iter().find(|s| s.agent_id == "orchestrator-proj1").unwrap();
@@ -5138,11 +5462,9 @@ mod tests {
     }
 
     #[test]
-    fn overlay_pi_sessions_refreshes_terminal_status_to_running() {
+    fn overlay_pi_sessions_refreshes_terminal_status() {
         let mut sessions = vec![make_session("orchestrator-proj1", "closed")];
-        let live = vec![
-            ("orchestrator-proj1".to_string(), "proj1".to_string()),
-        ];
+        let live = vec![make_live("orchestrator-proj1", "proj1", "orchestrator", None)];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 1);
         let orch = &sessions[0];
@@ -5152,12 +5474,45 @@ mod tests {
     }
 
     #[test]
-    fn overlay_pi_sessions_leaves_unmatched_ledger_rows_untouched() {
+    fn overlay_pi_sessions_leaves_unmatched_rows_untouched() {
         let mut sessions = vec![make_session("coder-1", "running")];
-        let live: Vec<(String, String)> = Vec::new();
+        let live: Vec<LivePiSession> = Vec::new();
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, "running");
+    }
+
+    #[test]
+    fn overlay_pi_sessions_main_coder_gets_role_coder_client_pi() {
+        let mut sessions = vec![];
+        let live = vec![make_live("main-123", "proj1", "main-coder", Some("claude-sonnet"))];
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.agent_id, "main-123");
+        assert_eq!(s.role, "coder");
+        assert_eq!(s.client.as_deref(), Some("pi"));
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(s.current_project_id.as_deref(), Some("proj1"));
+    }
+
+    #[test]
+    fn overlay_pi_sessions_mini_coder_gets_role_mini() {
+        let mut sessions = vec![];
+        let live = vec![make_live("mini-456", "proj1", "mini-coder", None)];
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].role, "mini");
+        assert_eq!(sessions[0].client.as_deref(), Some("pi"));
+        assert!(sessions[0].model.is_none());
+    }
+
+    #[test]
+    fn overlay_pi_sessions_model_threaded_from_persisted() {
+        let mut sessions = vec![];
+        let live = vec![make_live("main-789", "proj1", "main-coder", Some("qwen2.5-coder:7b"))];
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions[0].model.as_deref(), Some("qwen2.5-coder:7b"));
     }
 
     // -- response_failure_banner pure helper (Fix D, ITEM 5) --------------------
@@ -5193,22 +5548,36 @@ mod tests {
     }
 
     #[test]
-    fn response_failure_banner_with_error_message() {
+    fn response_failure_banner_orchestrator_label() {
         let event = make_response_event(Some(false), Some("rate limit exceeded".to_string()));
-        let banner = response_failure_banner(&event);
+        let banner = response_failure_banner(&event, Some("orchestrator"));
         assert_eq!(banner.as_deref(), Some("Orchestrator turn failed: rate limit exceeded"));
     }
 
     #[test]
     fn response_failure_banner_success_true_yields_none() {
         let event = make_response_event(Some(true), None);
-        assert!(response_failure_banner(&event).is_none());
+        assert!(response_failure_banner(&event, Some("orchestrator")).is_none());
     }
 
     #[test]
     fn response_failure_banner_no_error_uses_fallback() {
         let event = make_response_event(Some(false), None);
-        assert_eq!(response_failure_banner(&event).as_deref(), Some("Orchestrator turn failed"));
+        assert_eq!(response_failure_banner(&event, Some("orchestrator")).as_deref(), Some("Orchestrator turn failed"));
+    }
+
+    #[test]
+    fn response_failure_banner_coder_label() {
+        let event = make_response_event(Some(false), Some("context window".to_string()));
+        let banner = response_failure_banner(&event, Some("main-coder"));
+        assert_eq!(banner.as_deref(), Some("Coder turn failed: context window"));
+    }
+
+    #[test]
+    fn response_failure_banner_unknown_role_uses_agent() {
+        let event = make_response_event(Some(false), Some("oops".to_string()));
+        let banner = response_failure_banner(&event, None);
+        assert_eq!(banner.as_deref(), Some("Agent turn failed: oops"));
     }
 
     // -- drain_injections (BLOCKER fix) -----------------------------------------

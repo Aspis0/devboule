@@ -826,6 +826,9 @@ pub fn run() {
                 // are reaped by agent_pty::kill_all_on_exit above (they live in the
                 // same PTY map). Non-blocking + idempotent.
                 backend::mini_coder_executor::kill_all_on_exit(app_handle);
+                // F7: kill every live pi sidecar child, join readers, and persist
+                // status Stopped so app restart never inherits orphaned pi children.
+                backend::pi_sidecar::kill_all_pi_sessions(app_handle);
                 // Signal EVERY orchestrator activity-tail task to stop on quit. The
                 // per-agent stop is normally driven by `mark_agent_session_closed`, but
                 // the app-EXIT path does not funnel through there — without this the tail
