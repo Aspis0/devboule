@@ -139,3 +139,77 @@ pub(crate) fn stop_rust_oracle_server() {
         let _ = server.shutdown.send(true);
     }
 }
+
+#[cfg(test)]
+mod live_test {
+    //! Operator-run live test of the M2.3 seam (`--ignored`): drives the REAL
+    //! production `ensure_rust_oracle_server` against the repo's REAL oracle-data
+    //! index + the REAL ONNX model, then hits the session port with an HTTP
+    //! client carrying the operator token — exactly as the app's reqwest client
+    //! does. Requires the model symlinked/copied at `<repo>/oracle-data/models/
+    //! qwen3-onnx/`. Run:
+    //!   cargo test -p aspis-management --lib rust_oracle::live_test -- --ignored --nocapture
+
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    #[ignore]
+    fn ensure_rust_server_serves_real_index_over_http() {
+        // Repo root is one level up from src-tauri.
+        let root = std::path::Path::new("..")
+            .canonicalize()
+            .expect("canonicalize repo root");
+        let model = root.join("oracle-data/models/qwen3-onnx/onnx/model.onnx");
+        if !model.exists() {
+            eprintln!("skipping: model missing at {}", model.display());
+            return;
+        }
+
+        // Drive the actual production seam function.
+        let stop = AtomicBool::new(false);
+        ensure_rust_oracle_server(&root, &stop).expect("rust oracle server became ready");
+
+        let (base_url, _port) = crate::oracle::python_oracle::oracle_session_endpoint();
+        let token = crate::oracle::python_oracle::oracle_operator_token();
+        let client = reqwest::blocking::Client::new();
+
+        // /health — proves bind + auth + readiness through the app's own probe.
+        let health = client
+            .get(format!("{base_url}/health"))
+            .header("x-oracle-auth-token", token)
+            .send()
+            .expect("GET /health");
+        assert_eq!(health.status().as_u16(), 200, "health not 200");
+        let hbody: serde_json::Value = health.json().expect("health json");
+        println!("HEALTH: {hbody}");
+        assert!(hbody["status"].is_string(), "health missing status");
+
+        // Wrong token must be rejected (auth really enforced by the Rust server).
+        let bad = client
+            .get(format!("{base_url}/health"))
+            .header("x-oracle-auth-token", "definitely-wrong")
+            .send()
+            .expect("GET /health bad token");
+        assert_ne!(bad.status().as_u16(), 200, "wrong token must not pass");
+
+        // /context against the REAL index (8196 lexical chunks) — proves the full
+        // retrieval path through the seam, over HTTP, with the operator token.
+        let ctx = client
+            .get(format!("{base_url}/context"))
+            .query(&[("q", "oracle server index"), ("limit", "5")])
+            .header("x-oracle-auth-token", token)
+            .send()
+            .expect("GET /context");
+        assert_eq!(ctx.status().as_u16(), 200, "context not 200");
+        let cbody: serde_json::Value = ctx.json().expect("context json");
+        let chunks = cbody["chunks"].as_array().expect("chunks array");
+        println!("CONTEXT chunks returned: {}", chunks.len());
+        if let Some(first) = chunks.first() {
+            println!("  top file_source: {}", first["file_source"]);
+        }
+        assert!(!chunks.is_empty(), "context returned no chunks from real index");
+
+        stop_rust_oracle_server();
+    }
+}
