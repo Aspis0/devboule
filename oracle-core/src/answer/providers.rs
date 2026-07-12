@@ -271,7 +271,7 @@ fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
             || p.len() > 5
             || !p.bytes().all(|b| b.is_ascii_digit())
             || p.parse::<u32>()
-                .map(|n| n > 65535)
+                .map(|n| n == 0 || n > 65535)
                 .unwrap_or(true)
         {
             return Err(AnswerError::Validation(

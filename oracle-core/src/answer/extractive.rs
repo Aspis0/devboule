@@ -383,9 +383,9 @@ fn oracle_privacy_extractive_answer(
     reason: Option<&str>,
 ) -> Option<NormalizedAnswer> {
     let combined = combined_text(context).to_lowercase();
-    if !(combined.contains("scaleway")
-        && combined.contains("infomaniak")
-        && combined.contains("mistral"))
+    if !(combined.contains("openai")
+        || combined.contains("openrouter")
+        || combined.contains("deepseek"))
     {
         return None;
     }
@@ -400,9 +400,9 @@ fn oracle_privacy_extractive_answer(
         context,
         &[
             "allow only",
-            "scaleway",
-            "infomaniak",
-            "mistral",
+            "openai",
+            "openrouter",
+            "deepseek",
             "oracle_llm",
         ],
     );
@@ -414,7 +414,7 @@ fn oracle_privacy_extractive_answer(
             "allowed_hosts",
         ],
     );
-    let graph_ref = find_context_ref(context, &["provider", "base_url", "scaleway"]);
+    let graph_ref = find_context_ref(context, &["provider", "base_url", "deepseek"]);
     let refs: Vec<&PreparedChunk> = [vault_ref, answerer_ref, graph_ref]
         .into_iter()
         .flatten()
@@ -423,7 +423,7 @@ fn oracle_privacy_extractive_answer(
     if refs.is_empty() {
         return None;
     }
-    let answer = "The privacy gate is the provider allowlist, enforced in two places. The Windows app settings/vault code restricts Oracle LLM providers to `scaleway`, `infomaniak`, and `mistral` (the local Ollama chat path has been removed — answers are API-only), while `oracle/server/answerer.py` rejects any remote provider outside `scaleway`, `infomaniak`, or `mistral`. Remote calls also require a saved API key and an HTTPS base URL whose host matches the selected provider. There is no ZDR/GDPR gate and no LLM-to-LLM fallback; when no key is configured Oracle returns an extractive, retrieval-only answer.";
+    let answer = "The privacy gate is the provider allowlist, enforced in two places. The app settings/vault code restricts Oracle LLM providers to `openai`, `openrouter`, and `deepseek` (remote, OpenAI-compatible) plus local `omlx`/`ollama` (loopback-only), and the Rust oracle-core answerer rejects any remote provider outside that set. Remote calls require a saved API key and an HTTPS base URL that passes an SSRF guard (no loopback/IP-literal/intranet/metadata hosts); the endpoint host is NOT pinned per provider. When no key is configured Oracle returns an extractive, retrieval-only answer.";
     Some(NormalizedAnswer {
         answer: truncate_text(answer, max_answer_chars()),
         citations: refs.iter().map(|r| context_citation(r)).collect(),

@@ -199,9 +199,7 @@ pub fn read_token(provider: ProviderId) -> Result<Option<String>, String> {
 
 fn llm_provider_credential_account(provider: &str) -> Option<&'static str> {
     match provider.trim().to_ascii_lowercase().as_str() {
-        "scaleway" => Some("provider:scaleway_ai"),
-        "infomaniak" => Some("provider:infomaniak"),
-        "mistral" => Some("provider:mistral"),
+        "openrouter" => Some("openrouter"),
         _ => None,
     }
 }
@@ -905,18 +903,16 @@ fn cloudflare_agent_token_profile_status_with(
 
 /// Remote-first default: Oracle answers are API-only (remote providers).
 ///
-/// The local Ollama + qwen3.5:4b chat path has been removed entirely; only the
-/// remote providers (scaleway / infomaniak / mistral) are supported. Scaleway
-/// is the default remote provider because the app already manages a Scaleway
-/// token for the Cloud pages, so Oracle answering works out of the box for
-/// anyone who has that token saved; users without it get a "missing_api_key"
-/// nudge and extractive (retrieval-only) answers until they add a key.
+/// The default is DeepSeek (OpenAI-compatible), with the key saved in Devboule.
+/// Remote providers use a generic OpenAI-compatible interface (any public HTTPS
+/// endpoint, SSRF-guarded) — no per-provider host pinning. Users without a key
+/// get extractive (retrieval-only) answers.
 /// NOTE: the local *embedder* (Qwen3-Embedding-0.6B) is unaffected and remains
 /// mandatory for retrieval.
 pub fn default_oracle_llm_settings() -> OracleLlmSettings {
     OracleLlmSettings {
-        provider: "scaleway".into(),
-        model: "voxtral-small-24b-2507".into(),
+        provider: "deepseek".into(),
+        model: "deepseek-chat".into(),
         base_url: None,
         remote_enabled: true,
     }
@@ -1233,9 +1229,9 @@ pub fn oracle_llm_api_key_present() -> bool {
 
 fn llm_provider_label(provider: &str) -> &'static str {
     match provider.trim().to_ascii_lowercase().as_str() {
-        "scaleway" => "Scaleway",
-        "infomaniak" => "Infomaniak",
-        "mistral" => "Mistral",
+        "openai" => "OpenAI",
+        "openrouter" => "OpenRouter",
+        "deepseek" => "DeepSeek",
         "omlx" => "oMLX (local)",
         "ollama" => "Ollama (local)",
         _ => "selected",
@@ -1253,7 +1249,7 @@ fn sanitize_oracle_llm_settings(settings: &OracleLlmSettings) -> Result<OracleLl
             remote_enabled: false,
         });
     }
-    let allowed = ["scaleway", "infomaniak", "mistral", "omlx", "ollama"];
+    let allowed = ["openai", "openrouter", "deepseek", "omlx", "ollama"];
     if !allowed.contains(&provider.as_str()) {
         return Err("Oracle LLM provider is not allowlisted.".into());
     }
@@ -1263,9 +1259,6 @@ fn sanitize_oracle_llm_settings(settings: &OracleLlmSettings) -> Result<OracleLl
     }
     let remote_enabled = settings.remote_enabled;
     let base_url = sanitize_llm_base_url(&provider, settings.base_url.as_deref())?;
-    if provider == "infomaniak" && remote_enabled && base_url.is_none() {
-        return Err("Infomaniak Oracle LLM requires the product-specific HTTPS base URL.".into());
-    }
     Ok(OracleLlmSettings {
         provider,
         model: model.into(),
@@ -1314,30 +1307,72 @@ fn sanitize_llm_base_url(provider: &str, base_url: Option<&str>) -> Result<Optio
                         .to_string(),
                 );
             }
-            if let Some(host) = allowed_llm_host_prefix(provider) {
-                let lower = value.to_ascii_lowercase();
-                let host = host.to_ascii_lowercase();
-                if lower != format!("https://{host}")
-                    && !lower.starts_with(&format!("https://{host}/"))
-                {
-                    return Err(
-                        "Oracle LLM base URL host does not match the selected provider."
-                            .to_string(),
-                    );
-                }
-            }
+            reject_ssrf_remote_host(value)?;
             Ok(value.to_string())
         })
         .transpose()
 }
 
-fn allowed_llm_host_prefix(provider: &str) -> Option<&'static str> {
-    match provider {
-        "scaleway" => Some("api.scaleway.ai"),
-        "infomaniak" => Some("api.infomaniak.com"),
-        "mistral" => Some("api.mistral.ai"),
-        _ => None,
+/// Generic SSRF guard for a remote (non-local) Oracle LLM base URL. Mirrors the
+/// Censor Cloud validator: the endpoint may be ANY public https host (no
+/// per-provider pinning), but loopback / IP-literals / cloud-metadata / intranet
+/// names are refused so a saved base URL can't exfiltrate code to an internal
+/// target. `value` is already known to start with `https://` and to contain no
+/// `@`/`<`/`>`.
+///
+/// NOTE: this is a *string-level* guard (hostname allow/deny); it CANNOT defend
+/// against DNS rebinding (e.g. `*.nip.io` → 127.0.0.1). Full protection needs
+/// post-DNS IP filtering in the HTTP connector, tracked as a follow-up — mirroring
+/// the identical limitation in the Censor Cloud validator (`censor/gemma.rs`).
+fn reject_ssrf_remote_host(value: &str) -> Result<(), String> {
+    // Reject invisible / bidi / control characters early (mirrors the Censor Cloud
+    // validator's `is_forbidden_command_char` check) — these can be used for
+    // spoofing or hiding the true authority in a URL.
+    if value.chars().any(crate::backend::mini_coder::is_forbidden_command_char) {
+        return Err("Oracle LLM base URL must not contain control, bidi or invisible characters.".to_string());
     }
+    let rest = value.strip_prefix("https://").unwrap_or(value);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("Oracle LLM base URL must include a host.".to_string());
+    }
+    if authority.starts_with('[') {
+        return Err("Oracle LLM base URL must be a hostname, not an IP literal.".to_string());
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if let Some(p) = port {
+        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit())
+            || p.parse::<u32>().map(|n| n == 0 || n > 65535).unwrap_or(true)
+        {
+            return Err("Oracle LLM base URL has an invalid port.".to_string());
+        }
+    }
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost" {
+        return Err("Oracle LLM base URL must be a remote host (not localhost).".to_string());
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let is_quad = labels.len() == 4
+        && labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    if is_quad {
+        return Err("Oracle LLM base URL must be a hostname, not an IP literal.".to_string());
+    }
+    if host_lower == "metadata.google.internal"
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".local")
+    {
+        return Err("Oracle LLM base URL targets a disallowed intranet/metadata host.".to_string());
+    }
+    if !host.contains('.') {
+        return Err("Oracle LLM base URL must be a fully-qualified host (needs a dot).".to_string());
+    }
+    if !labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        return Err("Oracle LLM base URL has an invalid host label.".to_string());
+    }
+    Ok(())
 }
 
 /// Storage-slot identifier for the dedicated Oracle LLM key entry.
@@ -1617,15 +1652,15 @@ mod tests {
     }
 
     impl OracleVaultSnapshot {
-        fn default_scaleway_settings() -> OracleLlmSettings {
+        fn default_deepseek_settings() -> OracleLlmSettings {
             let mut settings = default_oracle_llm_settings();
-            settings.provider = "scaleway".into();
-            settings.base_url = Some("https://api.scaleway.ai/v1/chat/completions".into());
+            settings.provider = "deepseek".into();
+            settings.base_url = Some("https://api.deepseek.com/v1/chat/completions".into());
             settings
         }
 
         fn capture() -> Self {
-            let probe = Self::default_scaleway_settings();
+            let probe = Self::default_deepseek_settings();
             Self {
                 settings: oracle_llm_settings_entry().unwrap().get_password().ok(),
                 primary_key: oracle_llm_api_key_entry(&probe)
@@ -1659,7 +1694,7 @@ mod tests {
 
     impl Drop for OracleVaultSnapshot {
         fn drop(&mut self) {
-            let probe = Self::default_scaleway_settings();
+            let probe = Self::default_deepseek_settings();
             Self::restore_slot(oracle_llm_settings_entry(), &self.settings);
             Self::restore_slot(oracle_llm_api_key_entry(&probe), &self.primary_key);
             Self::restore_slot(
@@ -1719,11 +1754,11 @@ mod tests {
     fn oracle_llm_api_key_persists_and_is_reported_configured() {
         let _snapshot = OracleVaultSnapshot::capture();
         let mut settings = default_oracle_llm_settings();
-        settings.base_url = Some("https://api.scaleway.ai/v1/chat/completions".into());
+        settings.base_url = Some("https://api.deepseek.com/v1/chat/completions".into());
 
         let _ = delete_oracle_llm_api_key();
         let save_status =
-            save_oracle_llm_settings(&settings, Some("dummy-scaleway-key-123456")).unwrap();
+            save_oracle_llm_settings(&settings, Some("dummy-deepseek-key-123456")).unwrap();
         assert_eq!(
             save_status.status, "configured",
             "save must report the key as configured once it persists"
@@ -1748,7 +1783,7 @@ mod tests {
         let saved = read_oracle_llm_settings().unwrap();
         assert_eq!(
             saved.base_url.as_deref(),
-            Some("https://api.scaleway.ai/v1/chat/completions"),
+            Some("https://api.deepseek.com/v1/chat/completions"),
             "base_url must survive persistence so the key-entry scope matches"
         );
 
@@ -1795,63 +1830,63 @@ mod tests {
     /// user edited their endpoint URL.
     #[test]
     fn oracle_llm_key_scope_is_stable_across_base_url_and_differs_by_provider() {
-        let scaleway = OracleLlmSettings {
-            provider: "scaleway".into(),
+        let deepseek = OracleLlmSettings {
+            provider: "deepseek".into(),
             model: "model-a".into(),
-            base_url: Some("https://api.scaleway.ai/v1/chat/completions".into()),
+            base_url: Some("https://api.deepseek.com/v1/chat/completions".into()),
             remote_enabled: true,
         };
-        // Same provider, DIFFERENT base_url (e.g. a custom Scaleway deployment).
-        let scaleway_custom_url = OracleLlmSettings {
-            base_url: Some("https://api.scaleway.ai/v1/deployments/abc/chat/completions".into()),
-            ..scaleway.clone()
+        // Same provider, DIFFERENT base_url (e.g. a custom deployment).
+        let deepseek_custom_url = OracleLlmSettings {
+            base_url: Some("https://api.deepseek.com/v1/deployments/abc/chat/completions".into()),
+            ..deepseek.clone()
         };
         // Same provider, NO base_url.
-        let scaleway_no_url = OracleLlmSettings {
+        let deepseek_no_url = OracleLlmSettings {
             base_url: None,
-            ..scaleway.clone()
+            ..deepseek.clone()
         };
-        let infomaniak = OracleLlmSettings {
-            provider: "infomaniak".into(),
-            base_url: Some("https://api.infomaniak.com/2/ai/123/openai/v1/chat/completions".into()),
-            ..scaleway.clone()
+        let openai = OracleLlmSettings {
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1/chat/completions".into()),
+            ..deepseek.clone()
         };
-        let mistral = OracleLlmSettings {
-            provider: "mistral".into(),
-            base_url: Some("https://api.mistral.ai/v1/chat/completions".into()),
-            ..scaleway.clone()
+        let openrouter = OracleLlmSettings {
+            provider: "openrouter".into(),
+            base_url: Some("https://openrouter.ai/api/v1/chat/completions".into()),
+            ..deepseek.clone()
         };
 
         // STABLE across base_url for the same provider.
         assert_eq!(
-            oracle_llm_key_scope(&scaleway),
-            oracle_llm_key_scope(&scaleway_custom_url),
+            oracle_llm_key_scope(&deepseek),
+            oracle_llm_key_scope(&deepseek_custom_url),
             "scope must not change when only base_url changes"
         );
         assert_eq!(
-            oracle_llm_key_scope(&scaleway),
-            oracle_llm_key_scope(&scaleway_no_url),
+            oracle_llm_key_scope(&deepseek),
+            oracle_llm_key_scope(&deepseek_no_url),
             "scope must not change when base_url is dropped"
         );
 
         // DIFFERS across providers.
         assert_ne!(
-            oracle_llm_key_scope(&scaleway),
-            oracle_llm_key_scope(&infomaniak)
+            oracle_llm_key_scope(&deepseek),
+            oracle_llm_key_scope(&openai)
         );
         assert_ne!(
-            oracle_llm_key_scope(&scaleway),
-            oracle_llm_key_scope(&mistral)
+            oracle_llm_key_scope(&deepseek),
+            oracle_llm_key_scope(&openrouter)
         );
 
         // Provider normalization: case/whitespace must not split the slot.
-        let scaleway_messy = OracleLlmSettings {
-            provider: "  Scaleway  ".into(),
-            ..scaleway.clone()
+        let deepseek_messy = OracleLlmSettings {
+            provider: "  DeepSeek  ".into(),
+            ..deepseek.clone()
         };
         assert_eq!(
-            oracle_llm_key_scope(&scaleway),
-            oracle_llm_key_scope(&scaleway_messy),
+            oracle_llm_key_scope(&deepseek),
+            oracle_llm_key_scope(&deepseek_messy),
             "provider must be normalized (trim/lowercase) before hashing"
         );
     }
@@ -1863,31 +1898,31 @@ mod tests {
     /// that the LLM-to-LLM fallback (and its second slot) has been removed.
     #[test]
     fn oracle_llm_entry_name_is_provider_scoped_and_stable_across_base_url() {
-        let mut scaleway = default_oracle_llm_settings();
-        scaleway.provider = "scaleway".into();
-        scaleway.base_url = Some("https://api.scaleway.ai/v1/chat/completions".into());
+        let mut deepseek = default_oracle_llm_settings();
+        deepseek.provider = "deepseek".into();
+        deepseek.base_url = Some("https://api.deepseek.com/v1/chat/completions".into());
 
-        let name = oracle_llm_api_key_entry_name(&scaleway);
+        let name = oracle_llm_api_key_entry_name(&deepseek);
 
         // The hash suffix (provider-only scope) keys the slot under `:primary:`.
-        let scope = oracle_llm_key_scope(&scaleway);
+        let scope = oracle_llm_key_scope(&deepseek);
         assert_eq!(name, format!("oracle:llm_api_key:primary:{scope}"));
 
         // Stable across base_url edits (provider-only scope).
-        let scaleway_custom_url = OracleLlmSettings {
-            base_url: Some("https://api.scaleway.ai/v1/deployments/abc/chat/completions".into()),
-            ..scaleway.clone()
+        let deepseek_custom_url = OracleLlmSettings {
+            base_url: Some("https://api.deepseek.com/v1/deployments/abc/chat/completions".into()),
+            ..deepseek.clone()
         };
         assert_eq!(
             name,
-            oracle_llm_api_key_entry_name(&scaleway_custom_url),
+            oracle_llm_api_key_entry_name(&deepseek_custom_url),
             "the dedicated-key slot must be stable across base_url"
         );
 
         // The name can NEVER equal a LEGACY base_url-scoped name: the legacy name
         // is `oracle:llm_api_key:<hex>` (no role word), so the segment after the
         // second colon is hex, never "primary".
-        let legacy_scope = legacy_oracle_llm_key_scope(&scaleway);
+        let legacy_scope = legacy_oracle_llm_key_scope(&deepseek);
         let legacy_name = format!("oracle:llm_api_key:{legacy_scope}");
         assert_ne!(name, legacy_name);
     }
@@ -1904,23 +1939,23 @@ mod tests {
         let _snapshot = OracleVaultSnapshot::capture();
 
         let mut save_settings = default_oracle_llm_settings();
-        save_settings.provider = "scaleway".into();
-        save_settings.base_url = Some("https://api.scaleway.ai/v1/chat/completions".into());
+        save_settings.provider = "deepseek".into();
+        save_settings.base_url = Some("https://api.deepseek.com/v1/chat/completions".into());
 
         let _ = delete_oracle_llm_api_key();
         let status =
-            save_oracle_llm_settings(&save_settings, Some("dummy-scaleway-key-123456")).unwrap();
+            save_oracle_llm_settings(&save_settings, Some("dummy-deepseek-key-123456")).unwrap();
         assert_eq!(status.status, "configured");
 
         // Same provider, DIFFERENT base_url — simulates the desync scenario.
         let mut read_settings = save_settings.clone();
         read_settings.base_url =
-            Some("https://api.scaleway.ai/v1/deployments/xyz/chat/completions".into());
+            Some("https://api.deepseek.com/v1/deployments/xyz/chat/completions".into());
 
         let read_back = read_oracle_llm_api_key_for_settings(&read_settings).unwrap();
         assert_eq!(
             read_back.as_deref(),
-            Some("dummy-scaleway-key-123456"),
+            Some("dummy-deepseek-key-123456"),
             "key must round-trip even though base_url changed between save and read"
         );
 
@@ -1939,29 +1974,29 @@ mod tests {
         let _snapshot = OracleVaultSnapshot::capture();
 
         let mut settings = default_oracle_llm_settings();
-        settings.provider = "scaleway".into();
-        settings.base_url = Some("https://api.scaleway.ai/v1/chat/completions".into());
+        settings.provider = "deepseek".into();
+        settings.base_url = Some("https://api.deepseek.com/v1/chat/completions".into());
 
         // Start clean, then plant a key in the LEGACY base_url-scoped slot only.
         let _ = delete_oracle_llm_api_key();
         legacy_oracle_llm_api_key_entry_for_settings(&settings)
             .unwrap()
-            .set_password("legacy-scaleway-key-123456")
+            .set_password("legacy-deepseek-key-123456")
             .unwrap();
 
         // The migration read-fallback must find it under the legacy slot.
         let read_back = read_oracle_llm_api_key_for_settings(&settings).unwrap();
-        assert_eq!(read_back.as_deref(), Some("legacy-scaleway-key-123456"));
+        assert_eq!(read_back.as_deref(), Some("legacy-deepseek-key-123456"));
 
         // A save migrates to the provider-only slot and removes the legacy orphan.
-        let status = save_oracle_llm_settings(&settings, Some("new-scaleway-key-7890ab")).unwrap();
+        let status = save_oracle_llm_settings(&settings, Some("new-deepseek-key-7890ab")).unwrap();
         assert_eq!(status.status, "configured");
         assert_eq!(
             oracle_llm_api_key_entry(&settings)
                 .unwrap()
                 .get_password()
                 .unwrap(),
-            "new-scaleway-key-7890ab",
+            "new-deepseek-key-7890ab",
             "key must live in the provider-only slot after save"
         );
         assert!(
@@ -1979,37 +2014,25 @@ mod tests {
     }
 
     #[test]
-    fn llm_provider_tokens_include_infomaniak_provider_account() {
+    fn llm_provider_credential_account_maps_openrouter() {
         assert_eq!(
-            llm_provider_credential_account("scaleway"),
-            Some("provider:scaleway_ai")
+            llm_provider_credential_account("openrouter"),
+            Some("openrouter")
         );
-        assert_eq!(
-            llm_provider_credential_account("infomaniak"),
-            Some("provider:infomaniak")
-        );
-        assert_eq!(
-            llm_provider_credential_account("mistral"),
-            Some("provider:mistral")
-        );
-        assert_eq!(llm_provider_credential_account("openrouter"), None);
+        // openai/deepseek use the dedicated Oracle key, not a shared provider token.
+        assert_eq!(llm_provider_credential_account("openai"), None);
+        assert_eq!(llm_provider_credential_account("deepseek"), None);
+        assert_eq!(llm_provider_credential_account("omlx"), None);
+        assert_eq!(llm_provider_credential_account("ollama"), None);
+        // Legacy providers are no longer mapped.
+        assert_eq!(llm_provider_credential_account("scaleway"), None);
+        assert_eq!(llm_provider_credential_account("infomaniak"), None);
+        assert_eq!(llm_provider_credential_account("mistral"), None);
     }
 
     #[test]
-    fn infomaniak_requires_base_url_when_remote_enabled() {
-        let settings = OracleLlmSettings {
-            provider: "infomaniak".into(),
-            model: "model-a".into(),
-            base_url: None,
-            remote_enabled: true,
-        };
-
-        assert!(sanitize_oracle_llm_settings(&settings).is_err());
-    }
-
-    #[test]
-    fn removed_remote_llm_providers_are_rejected() {
-        for provider in ["openrouter", "openai", "openai_compatible"] {
+    fn legacy_remote_llm_providers_are_rejected() {
+        for provider in ["scaleway", "infomaniak", "mistral"] {
             let settings = OracleLlmSettings {
                 provider: provider.into(),
                 model: "model-a".into(),
@@ -2022,11 +2045,173 @@ mod tests {
     }
 
     #[test]
-    fn llm_base_url_must_match_selected_provider() {
+    fn ssrf_guard_allows_valid_remote_host() {
         let settings = OracleLlmSettings {
-            provider: "scaleway".into(),
-            model: "model-a".into(),
-            base_url: Some("https://api.infomaniak.com/2/ai/123/openai/v1".into()),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://api.deepseek.com/v1/chat/completions".into()),
+            remote_enabled: true,
+        };
+
+        let out = sanitize_oracle_llm_settings(&settings).expect("valid deepseek URL must be accepted");
+        assert_eq!(out.provider, "deepseek");
+        assert!(out.remote_enabled);
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_loopback_and_metadata_hosts() {
+        for bad_url in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://localhost/some/path",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://my-app.internal/api",
+            "https://host.local/api",
+        ] {
+            let settings = OracleLlmSettings {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                base_url: Some(bad_url.into()),
+                remote_enabled: true,
+            };
+
+            assert!(
+                sanitize_oracle_llm_settings(&settings).is_err(),
+                "SSRF guard must reject: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_ipv6_bracketed_and_bracketless() {
+        for bad_url in [
+            "https://[::1]/v1/chat/completions",
+            "https://::1/v1/chat/completions",
+        ] {
+            let settings = OracleLlmSettings {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                base_url: Some(bad_url.into()),
+                remote_enabled: true,
+            };
+            assert!(
+                sanitize_oracle_llm_settings(&settings).is_err(),
+                "SSRF guard must reject IPv6: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_trailing_dot_host() {
+        for bad_url in [
+            "https://localhost./v1",
+            "https://metadata.google.internal./v1",
+        ] {
+            let settings = OracleLlmSettings {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                base_url: Some(bad_url.into()),
+                remote_enabled: true,
+            };
+            assert!(
+                sanitize_oracle_llm_settings(&settings).is_err(),
+                "SSRF guard must reject trailing-dot host: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_port_zero_and_above_65535() {
+        for bad_url in [
+            "https://api.deepseek.com:0/v1/chat/completions",
+            "https://api.deepseek.com:65536/v1",
+        ] {
+            let settings = OracleLlmSettings {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                base_url: Some(bad_url.into()),
+                remote_enabled: true,
+            };
+            assert!(
+                sanitize_oracle_llm_settings(&settings).is_err(),
+                "SSRF guard must reject port out of range: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_accepts_valid_port() {
+        let settings = OracleLlmSettings {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://api.deepseek.com:8443/v1/chat/completions".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn ssrf_guard_cross_wiring_local_provider_remote_url_and_vice_versa() {
+        // A LOCAL provider (omlx) with a remote https base_url must be rejected
+        // (local providers must use loopback). The sanitize path catches this
+        // before the SSRF guard even fires.
+        let local_with_remote = OracleLlmSettings {
+            provider: "omlx".into(),
+            model: "qwen".into(),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&local_with_remote).is_err());
+
+        // A REMOTE provider (deepseek) with a loopback base_url must be rejected
+        // (quad check: 127.0.0.1 is a bare IPv4 literal).
+        let remote_with_loopback = OracleLlmSettings {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://127.0.0.1/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&remote_with_loopback).is_err());
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_control_or_bidi_char_in_host() {
+        let settings = OracleLlmSettings {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://ev\u{202e}il.com/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(
+            sanitize_oracle_llm_settings(&settings).is_err(),
+            "SSRF guard must reject bidi char in URL"
+        );
+    }
+
+    /// KNOWN LIMITATION: DNS rebinding (e.g. `*.nip.io` resolving to 127.0.0.1)
+    /// passes the string-level SSRF guard because the guard checks hostnames, not
+    /// resolved IPs. Full protection requires post-DNS SocketAddr filtering in the
+    /// HTTP connector — tracked as a follow-up, mirroring the identical limitation
+    /// in the Censor Cloud validator (`censor/gemma.rs`).
+    #[test]
+    fn dns_rebinding_host_passes_string_guard_known_limitation() {
+        let settings = OracleLlmSettings {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://127.0.0.1.nip.io/v1/chat/completions".into()),
+            remote_enabled: true,
+        };
+        assert!(
+            sanitize_oracle_llm_settings(&settings).is_ok(),
+            "string guard cannot catch DNS rebinding — this documents the accepted gap"
+        );
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_single_label_host() {
+        let settings = OracleLlmSettings {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            base_url: Some("https://localhostt/api".into()),
             remote_enabled: true,
         };
 
@@ -2073,16 +2258,16 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_accepts_scaleway_provider() {
+    fn sanitize_accepts_deepseek_provider() {
         let settings = OracleLlmSettings {
-            provider: "scaleway".into(),
-            model: "voxtral-small-24b-2507".into(),
-            base_url: Some("https://api.scaleway.ai/v1/chat/completions".into()),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://api.deepseek.com/v1/chat/completions".into()),
             remote_enabled: true,
         };
 
-        let out = sanitize_oracle_llm_settings(&settings).expect("scaleway must be accepted");
-        assert_eq!(out.provider, "scaleway");
+        let out = sanitize_oracle_llm_settings(&settings).expect("deepseek must be accepted");
+        assert_eq!(out.provider, "deepseek");
         assert!(out.remote_enabled);
     }
 
