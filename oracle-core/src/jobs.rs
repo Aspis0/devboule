@@ -349,6 +349,31 @@ impl OracleIndexJobManager {
                 ))?;
             }
 
+            let inner_for_progress = std::sync::Arc::clone(&self.inner);
+            let progress = move |line: &str| {
+                // Map the indexer's progress lines to a live job phase. Pause lines
+                // (memory / GPU cooldown) must override "embedding" so the UI stops
+                // claiming it is embedding while it is actually waiting. phase_message
+                // None lets the frontend show its own fallback label for the pause phases.
+                let update: Option<(&'static str, Option<String>)> =
+                    if line.starts_with("chunk-index low-memory retry") {
+                        Some(("waiting_memory", None))
+                    } else if line.starts_with("chunk-index gpu cooldown") {
+                        Some(("cooling_gpu", None))
+                    } else if let Some(rest) = line.strip_prefix("chunk-index progress embedded_chunks=") {
+                        rest.trim().parse::<usize>().ok().map(|n| {
+                            ("embedding", Some(format!("Embedding\u{2026} {n} chunks")))
+                        })
+                    } else {
+                        None
+                    };
+                if let Some((phase, msg)) = update {
+                    let mut inner = inner_for_progress.lock().unwrap_or_else(|e| e.into_inner());
+                    inner.job.phase = Some(phase.to_string());
+                    inner.job.phase_message = msg;
+                }
+            };
+
             let index_result = if max_batches == Some(0) {
                 indexer::IndexResult {
                     status: IndexStatus::Complete,
@@ -383,7 +408,7 @@ impl OracleIndexJobManager {
                         force,
                         ..Default::default()
                     },
-                    None,
+                    Some(&progress),
                 ))?
             };
 

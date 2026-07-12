@@ -771,3 +771,77 @@ describe("OracleAdminPanel — stall-aware Index-now gate", () => {
     expect(ctx.startOracleIndexJob).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// First-batch banner: shown while vectorRecords is 0, hidden once vectors exist.
+// ---------------------------------------------------------------------------
+describe("OracleAdminPanel — first-batch banner", () => {
+  it("shows the first-batch banner when vectorRecords is 0, expectedFiles > 0, and a job is active", async () => {
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 0,
+        expectedFiles: 100,
+        vectorRecords: 0,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container } = await render();
+    expect(container.textContent).toContain("The first batch is the slowest");
+  });
+
+  it("hides the first-batch banner when vectorRecords > 0", async () => {
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 10,
+        expectedFiles: 100,
+        vectorRecords: 42,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container } = await render();
+    expect(container.textContent).not.toContain("The first batch is the slowest");
+  });
+
+  it("hides the banner when expectedFiles is 0 (empty workspace) even with vectorRecords 0", async () => {
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 0,
+        expectedFiles: 0,
+        vectorRecords: 0,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container } = await render();
+    expect(container.textContent).not.toContain("The first batch is the slowest");
+  });
+
+  it("hides the banner when index is null while a job is active", async () => {
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: null,
+    } as unknown as OracleIndexStatus;
+
+    const { container } = await render();
+    expect(container.textContent).not.toContain("The first batch is the slowest");
+  });
+});

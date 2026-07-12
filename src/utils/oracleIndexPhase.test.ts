@@ -31,6 +31,32 @@ describe("oracleIndexPhaseHint", () => {
     });
   });
 
+  it("returns a server message for the embedding phase", () => {
+    const hint = oracleIndexPhaseHint(
+      "embedding",
+      "Embedding\u2026 42 chunks",
+    );
+    expect(hint).toEqual({
+      phase: "embedding",
+      label: "Embedding\u2026 42 chunks",
+    });
+  });
+
+  it("falls back to a static label when the embedding server message is absent", () => {
+    expect(oracleIndexPhaseHint("embedding", undefined)).toEqual({
+      phase: "embedding",
+      label: "Embedding\u2026",
+    });
+    expect(oracleIndexPhaseHint("embedding", "   ")).toEqual({
+      phase: "embedding",
+      label: "Embedding\u2026",
+    });
+    expect(oracleIndexPhaseHint("embedding", 123)).toEqual({
+      phase: "embedding",
+      label: "Embedding\u2026",
+    });
+  });
+
   it("falls back to a static label when the server message is absent or blank", () => {
     expect(oracleIndexPhaseHint("cooling_gpu", undefined)).toEqual({
       phase: "cooling_gpu",

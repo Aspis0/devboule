@@ -53,7 +53,11 @@ use crate::store::sqlite::{FileChunk, SqliteStore};
 // Configuration constants (defaults, mirroring oracle/config.py)
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const DEFAULT_BATCH_FILES: usize = 16;
+/// Files committed per outer index batch. Small (4) on purpose: the UI's
+/// `indexed_files / expected_files` counter only advances when a batch commits,
+/// so a small batch makes progress visible early instead of sitting at 0 for
+/// minutes during the first (slowest) batch. Override via ORACLE_CHUNK_BATCH_FILES.
+pub const DEFAULT_BATCH_FILES: usize = 4;
 pub const DEFAULT_BATCH_CHUNKS: usize = 8;
 pub const DEFAULT_BATCH_CHARS: usize = 50_000;
 pub const DEFAULT_MIN_FREE_GB: f64 = 5.0;
@@ -989,6 +993,7 @@ pub async fn index_file_chunks(
         // ── Embed + build vector records ────────────────────────────────
         let mut vector_records: Vec<LanceRow> = Vec::new();
         let sub_batches = chunk_batches(&batch_chunks_all, chunk_batch_size, chunk_char_budget);
+        let mut batch_embedded = 0usize;
 
         for sub_batch in &sub_batches {
             if cancel.is_cancelled() {
@@ -1108,6 +1113,15 @@ pub async fn index_file_chunks(
             for (chunk, vector) in sub_batch.iter().zip(vectors) {
                 vector_records.push(chunk_value_to_lance_row(chunk, vector));
             }
+
+            batch_embedded += sub_batch.len();
+            log_progress(
+                progress,
+                &format!(
+                    "chunk-index progress embedded_chunks={}",
+                    processed_chunks + batch_embedded
+                ),
+            );
         }
 
         // ── Commit batch to stores ──────────────────────────────────────

@@ -7,6 +7,7 @@ import {
   Eye,
   Files,
   FolderOpen,
+  Loader2,
   Play,
   RefreshCw,
   Search,
@@ -687,16 +688,26 @@ export function OracleAdminPanel() {
                     }}
                   />
                 </div>
+                {index != null && index.vectorRecords === 0 && index.expectedFiles > 0 && (
+                  <p className="mt-2 rounded-lg bg-teal/[0.08] px-2 py-1 text-[10px] leading-4 text-teal-dark">
+                    The first batch is the slowest — the embedding model is warming up. The counter starts moving once the first files finish (up to a few minutes on large folders).
+                  </p>
+                )}
                 {phaseHint && (
                   <div
                     className="mt-2 flex items-center gap-1.5 rounded-lg bg-amber/10 px-2 py-1 text-[10px] font-semibold leading-4 text-amber-dark"
                     role="status"
                     aria-live="polite"
-                    data-help-title="The index paused itself to stay safe."
-                    data-help-lines="Indexing keeps the GPU and memory within safe limits.|When the GPU gets hot it cools down, then resumes on its own.|When memory runs low it waits for it to free up, then resumes.|The job is still alive — it is not stuck."
+                    data-help-title={phaseHint.phase === "embedding" ? "The index is turning text into vectors." : "The index paused itself to stay safe."}
+                    data-help-lines={phaseHint.phase === "embedding"
+                      ? "Each chunk is embedded into a vector LanceDB can search.|The first batch is the slowest — the model is warming up.|The counter advances as batches finish.|The job is alive — it is not stuck."
+                      : "Indexing keeps the GPU and memory within safe limits.|When the GPU gets hot it cools down, then resumes on its own.|When memory runs low it waits for it to free up, then resumes.|The job is still alive — it is not stuck."
+                    }
                   >
                     {phaseHint.phase === "cooling_gpu" ? (
                       <Snowflake className="h-3 w-3 shrink-0" aria-hidden="true" />
+                    ) : phaseHint.phase === "embedding" ? (
+                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
                     ) : (
                       <Clock className="h-3 w-3 shrink-0" aria-hidden="true" />
                     )}

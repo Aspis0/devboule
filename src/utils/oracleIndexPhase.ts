@@ -8,7 +8,7 @@
 
 // The live index sub-states that warrant a visible hint. Anything else (incl.
 // undefined / "running") means "normal progress" and no hint is shown.
-export type OracleIndexPhase = "cooling_gpu" | "waiting_memory";
+export type OracleIndexPhase = "cooling_gpu" | "waiting_memory" | "embedding";
 
 export interface OracleIndexPhaseHint {
   phase: OracleIndexPhase;
@@ -23,6 +23,13 @@ export function oracleIndexPhaseHint(
   phase: unknown,
   phaseMessage: unknown,
 ): OracleIndexPhaseHint | null {
+  if (phase === "embedding") {
+    const fromServer =
+      typeof phaseMessage === "string" && phaseMessage.trim().length > 0
+        ? phaseMessage.trim()
+        : null;
+    return { phase: "embedding", label: fromServer ?? "Embedding\u2026" };
+  }
   if (phase !== "cooling_gpu" && phase !== "waiting_memory") return null;
   const fromServer =
     typeof phaseMessage === "string" && phaseMessage.trim().length > 0
