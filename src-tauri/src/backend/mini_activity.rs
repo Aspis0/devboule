@@ -519,6 +519,19 @@ impl MiniActivityStore {
     }
 }
 
+/// HH:MM:SS wall-clock stamp matching the EventMapper's format. Public so
+/// `spawn_pi_orchestrator_session` can stamp Rust-authored user echoes.
+pub(crate) fn console_now_str() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() % 86400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 // ---- command ----------------------------------------------------------------
 
 /// `mini_activity_snapshot({ agentId }) -> ConsoleActivity` — the hook's initial hydration.

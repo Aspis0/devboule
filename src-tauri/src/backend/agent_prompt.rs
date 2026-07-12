@@ -38,6 +38,17 @@ fn sanitize_handoff_label(label: &str) -> String {
         .collect()
 }
 
+/// Client-agnostic goal addendum: the shared goal text block appended to any
+/// orchestrator prompt that carries a typed goal. `None` when the goal is
+/// absent/blank. Used by both the pi sidecar path (no client gate) and the
+/// cloud path (gated through `cloud_goal_addendum`). Pure → testable.
+pub(crate) fn goal_addendum(initial_goal: Option<&str>) -> Option<String> {
+    let goal = initial_goal.map(str::trim).filter(|g| !g.is_empty())?;
+    Some(format!(
+        "\n\n# Your goal for this project\n\n{goal}\n\nDiscuss this goal with the user to shape a plan. When the conversation has converged, draft the plan (plan_submit) and create the Kanban tasks (project_create_plan_tasks). Do not start coding until the plan is agreed.\n\n# Surfacing genuine doubt (Kairion)\n\nWhile shaping the plan, reason OUT LOUD about the decisions you are unsure of. When a decision genuinely forks the plan and the user should weigh in, do NOT bury it in prose — emit it on its OWN line, exactly:\nKAIRION_QUESTION {{\"id\":\"<stable-id>\",\"text\":\"<the question>\",\"options\":[{{\"id\":\"<short>\",\"label\":\"<label>\"}}],\"affects\":[\"<task title or number>\"]}}\nUse 2-4 discrete options; keep ids short and stable, and re-emit the SAME id (same shape) to re-open a decision. The user's reply arrives as an ordinary turn — continue once they choose, or choose yourself if they defer. Surface only the few load-bearing forks, never every minor choice.\n"
+    ))
+}
+
 /// B2 F1: build the goal section appended to a CLOUD orchestrator's stdin prompt.
 /// Returns `None` (no change) for the local orchestrator client (it reads the goal
 /// from DEVBOULE_GOAL env, ignoring this prompt) or when no goal was typed. Gating on
@@ -47,10 +58,7 @@ pub(crate) fn cloud_goal_addendum(client: &str, initial_goal: Option<&str>) -> O
     if client == "orchestrator" {
         return None;
     }
-    let goal = initial_goal.map(str::trim).filter(|g| !g.is_empty())?;
-    Some(format!(
-        "\n\n# Your goal for this project\n\n{goal}\n\nDiscuss this goal with the user to shape a plan. When the conversation has converged, draft the plan (plan_submit) and create the Kanban tasks (project_create_plan_tasks). Do not start coding until the plan is agreed.\n\n# Surfacing genuine doubt (Kairion)\n\nWhile shaping the plan, reason OUT LOUD about the decisions you are unsure of. When a decision genuinely forks the plan and the user should weigh in, do NOT bury it in prose — emit it on its OWN line, exactly:\nKAIRION_QUESTION {{\"id\":\"<stable-id>\",\"text\":\"<the question>\",\"options\":[{{\"id\":\"<short>\",\"label\":\"<label>\"}}],\"affects\":[\"<task title or number>\"]}}\nUse 2-4 discrete options; keep ids short and stable, and re-emit the SAME id (same shape) to re-open a decision. The user's reply arrives as an ordinary turn — continue once they choose, or choose yourself if they defer. Surface only the few load-bearing forks, never every minor choice.\n"
-    ))
+    goal_addendum(initial_goal)
 }
 
 pub(crate) fn project_agent_prompt(

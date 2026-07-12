@@ -43,6 +43,17 @@ struct SessionSlot {
     inner: Option<PiSession>,
 }
 
+// ---- console injection queue (BLOCKER fix: single-writer invariant) ----------
+//
+// EventMapper is the ONLY writer to MiniActivityStore — it rebuilds the full
+// snapshot from its private `entries` on every event and writes it wholesale via
+// `store.update(.., |a| *a = snapshot)`. Any external store.write is immediately
+// overwritten by the next mapper event. Instead, control paths (steer, spawn,
+// censor note) PUSH into this per-session injection queue, which the mapper
+// drains at the top of `handle_event` into its own `entries` via `push_entry`
+// (cap/index bookkeeping stays consistent).
+pub(crate) type ConsoleInjections = Arc<Mutex<Vec<ConsoleEntry>>>;
+
 /// A single active pi sidecar session. Each session gets its own Node child process,
 /// stdin writer, per-session generation counter, and reader thread handle.
 struct PiSession {
@@ -64,6 +75,10 @@ struct PiSession {
     /// When this session was spawned (#5) — the watchdog measures elapsed time
     /// against `DEVBOULE_PI_SESSION_TIMEOUT_SECS` from this instant.
     spawned_at: Instant,
+    /// Injection queue shared between control paths (steer, spawn, censor note)
+    /// and the reader thread's EventMapper. Pushed to by `inject_console_entry`,
+    /// drained by `EventMapper::drain_injections` at the top of every event.
+    injections: ConsoleInjections,
     /// Handle to the stdout reader thread. Joined on stop to ensure clean teardown.
     reader_handle: Option<JoinHandle<()>>,
 }
@@ -115,7 +130,109 @@ impl PiSidecarState {
     }
 }
 
-/// Generate a unique session id in the form `pi-<counter>`.
+/// Return (agent_id, project_id) for every live pi orchestrator session whose
+/// child process is still alive. Used by `get_agent_live_state` to overlay
+/// transient pi sessions onto the agent-state file (which never records them).
+/// The liveness check is the real child `try_wait()` — a dead process means the
+/// row disappears on the next poll, so the frontend correctly relaunches.
+pub(crate) fn live_orchestrator_sessions(app: &AppHandle) -> Vec<(String, String)> {
+    let state = match app.try_state::<PiSidecarState>() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    // ITEM 3: use try_lock to avoid stalling the agent-state file lock when the
+    // sidecar mutex is contended (e.g. send_prompt_to_session holds it across a
+    // synchronous stdin write). Degrade to no overlay this poll rather than
+    // blocking the whole app.
+    let guard = match state.inner.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let persisted = match state.persisted.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for (id, slot) in guard.iter() {
+        if !id.starts_with("orchestrator-") {
+            continue;
+        }
+        let alive = match &slot.inner {
+            Some(session) => {
+                // ITEM 3+4: try_lock the child mutex; on contention (WouldBlock)
+                // treat as alive (someone is actively using it — it exists); on
+                // Poisoned recover like the rest of this file and evaluate normally.
+                match session.child.try_lock() {
+                    Ok(mut c) => matches!(c.try_wait(), Ok(None)),
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        let mut c = e.into_inner();
+                        matches!(c.try_wait(), Ok(None))
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                }
+            }
+            None => false,
+        };
+        if !alive {
+            continue;
+        }
+        if let Some(ps) = persisted.get(id) {
+            if let Some(ref project_id) = ps.project_id {
+                result.push((id.clone(), project_id.clone()));
+            }
+        }
+    }
+    result
+}
+
+/// Pure helper: overlay live pi orchestrator sessions onto the agent session list.
+/// Called from `get_agent_live_state` — read-time only, never persists.
+///
+/// Invariant: liveness comes from the real child process (`try_wait()`), so a row
+/// disappears the moment the sidecar dies — the frontend then correctly relaunches.
+pub(crate) fn overlay_pi_sessions(
+    sessions: &mut Vec<super::model::AgentSession>,
+    live: &[(String, String)],
+    now: &str,
+) {
+    for (agent_id, project_id) in live {
+        if let Some(existing) = sessions.iter_mut().find(|s| &s.agent_id == agent_id) {
+            // Refresh existing row in place — status to running, stamp timestamps.
+            existing.status = "running".to_string();
+            existing.last_seen_at = Some(now.to_string());
+            existing.client = Some("orchestrator".to_string());
+            if existing.current_project_id.is_none() {
+                existing.current_project_id = Some(project_id.clone());
+            }
+        } else {
+            // Push a synthetic row — never written to the file.
+            sessions.push(super::model::AgentSession {
+                agent_id: agent_id.clone(),
+                role: "orchestrator".to_string(),
+                model: None,
+                status: "running".to_string(),
+                message: None,
+                client: Some("orchestrator".to_string()),
+                current_project_id: Some(project_id.clone()),
+                current_task_id: None,
+                current_file_path: None,
+                first_seen_at: Some(now.to_string()),
+                last_seen_at: Some(now.to_string()),
+                launch_token_hash: None,
+                launch_token_issued_at: None,
+                session_token_hash: None,
+                session_token_issued_at: None,
+                subagents: Vec::new(),
+                needs_user: None,
+                host: None,
+                parent_agent_id: None,
+                pending_question: None,
+                user_reply: None,
+            });
+        }
+    }
+}
+
 fn generate_session_id(counter: u64) -> String {
     format!("pi-{counter}")
 }
@@ -766,12 +883,17 @@ fn spawn_pi_session_inner(
     let timed_out = Arc::new(AtomicBool::new(false));
     let spawned_at = Instant::now();
 
+    // Injection queue: control paths push ConsoleEntry items here; the reader
+    // thread's EventMapper drains them at the top of every handle_event call.
+    let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
+
     let app_clone = app.clone();
     let sid = session_id.to_string();
     let gen_clone = generation.clone();
     let stdin_clone = stdin.clone();
     let child_clone = child.clone();
     let timed_out_clone = timed_out.clone();
+    let injections_clone = injections.clone();
     let reader_handle = std::thread::spawn(move || {
         read_sidecar_events(
             app_clone,
@@ -782,6 +904,7 @@ fn spawn_pi_session_inner(
             timed_out_clone,
             &sid,
             pigeon_enabled,
+            injections_clone,
         );
     });
 
@@ -807,6 +930,7 @@ fn spawn_pi_session_inner(
         generation,
         timed_out,
         spawned_at,
+        injections,
         reader_handle: Some(reader_handle),
     })
 }
@@ -1142,6 +1266,36 @@ pub(crate) fn send_prompt_to_session(
     Ok(())
 }
 
+/// Push a `ConsoleEntry` into a live session's injection queue. The entry will
+/// be drained into the EventMapper's timeline at the top of the next
+/// `handle_event` call, BEFORE any assistant output of that turn. This is the
+/// ONLY safe way for control paths (steer, spawn, censor-note) to add entries:
+/// writing directly to `MiniActivityStore` is overwritten by the next mapper
+/// `emit_snapshot` (which replaces the full activity from its private entries).
+pub(crate) fn inject_console_entry(
+    app: &AppHandle,
+    session_id: &str,
+    entry: ConsoleEntry,
+) -> Result<(), String> {
+    let state = app
+        .try_state::<PiSidecarState>()
+        .ok_or_else(|| "PiSidecarState not managed".to_string())?;
+    let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = guard
+        .get(session_id)
+        .ok_or_else(|| format!("pi session {session_id} not found"))?;
+    let session = slot
+        .inner
+        .as_ref()
+        .ok_or_else(|| format!("pi session {session_id} has empty slot (spawning?)"))?;
+    session
+        .injections
+        .lock()
+        .map_err(|_| format!("pi session {session_id} injection queue poisoned"))?
+        .push(entry);
+    Ok(())
+}
+
 /// Spawn a **role-aware** pi sidecar session. Thin wrapper over the existing
 /// session machinery that adds role-aware agent-id generation (A/B) and the
 /// default devboule env vars the sidecar reads in `devbouleContext` (Task 1).
@@ -1237,6 +1391,10 @@ struct PiEvent {
     max_attempts: Option<u32>,
     #[serde(default)]
     success: Option<bool>,
+    /// Fix D: the sidecar's `response` event carries `error` (NOT `errorMessage`
+    /// or `finalError` which are other event shapes) when a provider/turn fails.
+    #[serde(default)]
+    error: Option<String>,
     #[serde(rename = "finalError", default)]
     final_error: Option<String>,
     #[serde(default)]
@@ -1310,6 +1468,10 @@ struct EventMapper {
     /// front-evicted by the sliding window). Lets us stream thinking tokens live into
     /// a single entry instead of waiting for `thinking_end`.
     live_thinking_idx: Option<usize>,
+    /// Injection queue shared with control paths. Drained at the top of each
+    /// `handle_event` call so entries pushed by steer/spawn/censor-note land
+    /// in the mapper's timeline before any assistant output of that turn.
+    injections: ConsoleInjections,
 }
 
 /// Cap a string at `cap` CHARS (not bytes) appending `…` when truncated. UTF-8
@@ -1338,6 +1500,24 @@ fn extract_partial_snippet(partial: &serde_json::Value) -> String {
         .unwrap_or_else(|| serde_json::to_string(partial).unwrap_or_default());
     let single = raw.replace(['\n', '\r'], "␤");
     cap_chars(&single, 200)
+}
+
+/// Fix D: pure helper that extracts the response-failure banner text from a
+/// `response` event. Returns `Some(text)` when `success==Some(false)`, `None`
+/// otherwise. Extracted so the 3 unit tests below can call it directly without
+/// an AppHandle.
+fn response_failure_banner(event: &PiEvent) -> Option<String> {
+    if event.event_type == "response" && event.success == Some(false) {
+        Some(
+            event
+                .error
+                .as_deref()
+                .map(|e| format!("Orchestrator turn failed: {e}"))
+                .unwrap_or_else(|| "Orchestrator turn failed".to_string()),
+        )
+    } else {
+        None
+    }
 }
 
 /// Part C: compute the banner text for a compaction / auto-retry / sidecar-error /
@@ -1395,7 +1575,7 @@ fn banner_text_for_event(event: &PiEvent) -> Option<String> {
 }
 
 impl EventMapper {
-    fn new(agent_id: &str) -> Self {
+    fn new(agent_id: &str, injections: ConsoleInjections) -> Self {
         Self {
             agent_id: agent_id.to_string(),
             running: false,
@@ -1409,6 +1589,7 @@ impl EventMapper {
             evicted_count: 0,
             current_role: None,
             live_thinking_idx: None,
+            injections,
         }
     }
 
@@ -1471,6 +1652,24 @@ impl EventMapper {
         format!("{h:02}:{m:02}:{s:02}")
     }
 
+    /// Drain all entries from the injection queue into `self.entries` via
+    /// `push_entry` (cap/index bookkeeping stays consistent). Called at the top
+    /// of each `handle_event` so steer/spawn/censor-note entries appear in the
+    /// timeline before any assistant output of that turn.
+    ///
+    /// Pure over its inputs — directly unit-testable without an AppHandle.
+    fn drain_injections(&mut self) {
+        // Drain into a local Vec first so the MutexGuard (which borrows
+        // self.injections) is dropped before we call push_entry(&mut self).
+        let pending: Vec<ConsoleEntry> = {
+            let mut queue = self.injections.lock().unwrap_or_else(|e| e.into_inner());
+            queue.drain(..).collect()
+        };
+        for entry in pending {
+            self.push_entry(entry);
+        }
+    }
+
     fn build_snapshot(&self) -> ConsoleActivity {
         ConsoleActivity {
             running: Some(self.running),
@@ -1507,11 +1706,19 @@ impl EventMapper {
 
     fn emit_snapshot(&self, app: &AppHandle) {
         let snapshot = self.build_snapshot();
-        let event = MiniActivityEvent::Snapshot {
-            activity: snapshot,
-        };
-        let channel = super::mini_activity::mini_activity_channel(&self.agent_id);
-        let _ = app.emit(&channel, event);
+        // Fix B: write through the MiniActivityStore so `mini_activity_snapshot`
+        // serves real state after remount. The store emits under its own lock —
+        // do NOT also `app.emit` here (that would double-emit). When the store is
+        // absent (headless/unit-test contexts) fall back to direct emit.
+        if let Some(store) = app.try_state::<super::mini_activity::MiniActivityStore>() {
+            store.update(app, &self.agent_id, |a| *a = snapshot);
+        } else {
+            let event = MiniActivityEvent::Snapshot {
+                activity: snapshot,
+            };
+            let channel = super::mini_activity::mini_activity_channel(&self.agent_id);
+            let _ = app.emit(&channel, event);
+        }
     }
 
     fn flush_text_block(&mut self) {
@@ -1699,6 +1906,12 @@ impl EventMapper {
     }
 
     fn handle_event(&mut self, app: &AppHandle, event: &PiEvent) {
+        // Drain any entries injected by control paths (steer, spawn, censor-note)
+        // BEFORE processing the sidecar event. The injection queue is pushed to by
+        // the SAME control paths that deliver the prompt, and the sidecar's first
+        // stdout event (agent_start/ready) arrives right after delivery — so a user
+        // echo drains BEFORE any assistant entry of that turn.
+        self.drain_injections();
         // A: persist `agentRole` from `_devboule` on every event (it survives
         // across events in the same session).
         self.apply_devboule_role(event);
@@ -1841,6 +2054,15 @@ impl EventMapper {
                             time: Self::now_str(),
                         });
                     }
+                // Fix D: a `response` with success==Some(false) means a provider/
+                // turn error — surface the failure so the user sees it instead of a
+                // silent stall.
+                if let Some(text) = response_failure_banner(event) {
+                    self.push_entry(ConsoleEntry::Banner {
+                        text,
+                        time: Self::now_str(),
+                    });
+                }
                 self.emit_snapshot(app);
             }
             "devboule_censor_review" => {
@@ -2260,10 +2482,25 @@ fn compose_censor_review_message(
 /// touching the agent's live/stopped status.
 fn push_censor_note(app: &AppHandle, agent_id: &str, text: &str, style: Option<NodeStyle>) {
     let ts = EventMapper::now_str();
-    let store = app.state::<crate::backend::mini_activity::MiniActivityStore>();
-    store.update(app, agent_id, |a| {
-        push_coder_note(a, text, style, &ts);
-    });
+    // Try the injection queue first — the entry will be drained into the
+    // EventMapper's timeline by the next `handle_event` call. When no live
+    // session exists (review after session death) the mapper is gone, so a
+    // direct store write cannot be clobbered anymore.
+    let injected = inject_console_entry(
+        app,
+        agent_id,
+        ConsoleEntry::Coder {
+            node: style,
+            text: text.to_string(),
+            time: ts,
+        },
+    );
+    if injected.is_err() {
+        let store = app.state::<crate::backend::mini_activity::MiniActivityStore>();
+        store.update(app, agent_id, |a| {
+            push_coder_note(a, text, style, &EventMapper::now_str());
+        });
+    }
 }
 
 /// Detached-thread body for the pi sidecar's `devboule_censor_review` hook. Runs
@@ -2692,10 +2929,11 @@ fn read_sidecar_events(
     timed_out: Arc<AtomicBool>,
     agent_id: &str,
     pigeon_enabled: bool,
+    injections: ConsoleInjections,
 ) {
     let gen = generation.load(Ordering::SeqCst);
     let reader = BufReader::new(stdout);
-    let mut mapper = EventMapper::new(agent_id);
+    let mut mapper = EventMapper::new(agent_id, injections);
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -2741,6 +2979,8 @@ fn read_sidecar_events(
         // (`try_wait` returned `Ok(None)`) — otherwise classified as `Clean`
         // and the session leaks in the map forever.
         let child_alive = try_wait.map(|s| s.is_none()).unwrap_or(false);
+        // last-second injections (steer echo / censor note racing session death) must land in the final snapshot.
+        mapper.drain_injections();
         match classify_sidecar_termination(exit_status, timed_out.load(Ordering::SeqCst)) {
             SidecarTermination::Timeout => {
                 mapper.running = false;
@@ -3045,7 +3285,7 @@ mod tests {
 
     #[test]
     fn event_mapper_uses_session_agent_id_in_channel() {
-        let mapper = EventMapper::new("pi-42");
+        let mapper = EventMapper::new("pi-42", Arc::new(Mutex::new(Vec::new())));
         assert_eq!(mapper.agent_id, "pi-42");
         let expected_channel = super::super::mini_activity::mini_activity_channel("pi-42");
         assert_eq!(expected_channel, "mini-activity://pi-42");
@@ -3210,7 +3450,7 @@ mod tests {
         // A: an event carrying `_devboule.agentRole` must set current_role.
         let line = r#"{"type":"message_start","_devboule":{"agentRole":"orchestrator","projectId":"my-proj","sessionId":"pi-42"}}"#;
         let event: PiEvent = serde_json::from_str(line).unwrap();
-        let mut mapper = EventMapper::new("pi-42");
+        let mut mapper = EventMapper::new("pi-42", Arc::new(Mutex::new(Vec::new())));
         mapper.apply_devboule_role(&event);
         assert_eq!(
             mapper.current_role.as_deref(),
@@ -3222,7 +3462,7 @@ mod tests {
     #[test]
     fn devboule_websearch_emits_websearch_entry() {
         // B: a `devboule.websearch` custom message must produce a WebSearch entry.
-        let mut mapper = EventMapper::new("pi-1");
+        let mut mapper = EventMapper::new("pi-1", Arc::new(Mutex::new(Vec::new())));
         let results = serde_json::json!([
             {"url": "https://a.test", "title": "Alpha", "summary": "about alpha"},
             {"url": "https://b.test", "title": "Beta", "summary": "about beta"}
@@ -3244,7 +3484,7 @@ mod tests {
         // 1) An event with no `_devboule` must not crash and must leave role unset.
         let line = r#"{"type":"message_start"}"#;
         let event: PiEvent = serde_json::from_str(line).unwrap();
-        let mut mapper = EventMapper::new("pi-7");
+        let mut mapper = EventMapper::new("pi-7", Arc::new(Mutex::new(Vec::new())));
         mapper.apply_devboule_role(&event);
         assert!(
             mapper.current_role.is_none(),
@@ -3303,7 +3543,7 @@ mod tests {
     fn entries_cap_sliding_window_never_exceeds_max() {
         // #3: the console entry history must be bounded. Pushing 501 entries
         // into a 500-cap mapper must leave exactly 500 (oldest dropped).
-        let mut mapper = EventMapper::new("pi-cap");
+        let mut mapper = EventMapper::new("pi-cap", Arc::new(Mutex::new(Vec::new())));
         for i in 0..501 {
             mapper.push_entry(ConsoleEntry::Chat {
                 role: "user".to_string(),
@@ -3339,7 +3579,7 @@ mod tests {
     fn thinking_accumulates_to_entry_on_thinking_end() {
         // thinking_start/delta/delta/end must yield exactly one Thinking entry with
         // the concatenated content (thinking precedes text; nothing to flush first).
-        let mut mapper = EventMapper::new("pi-think");
+        let mut mapper = EventMapper::new("pi-think", Arc::new(Mutex::new(Vec::new())));
         mapper.apply_message_delta(&AssistantMessageEvent {
             delta_type: "thinking_start".to_string(),
             delta: None,
@@ -3374,7 +3614,7 @@ mod tests {
         // An unfinished thinking block (no thinking_end) must still be flushed as a
         // Thinking entry when agent_end fires — it must never be silently dropped.
         // agent_end needs an AppHandle, so we exercise the exact flush line it calls.
-        let mut mapper = EventMapper::new("pi-think2");
+        let mut mapper = EventMapper::new("pi-think2", Arc::new(Mutex::new(Vec::new())));
         mapper.apply_message_delta(&AssistantMessageEvent {
             delta_type: "thinking_delta".to_string(),
             delta: Some("partial reasoning".to_string()),
@@ -3395,7 +3635,7 @@ mod tests {
         // that grows with each delta, and `thinking_end` must finalize that same
         // entry WITHOUT pushing a duplicate. After end, `accumulated_thinking` is
         // empty and `live_thinking_idx` is None.
-        let mut mapper = EventMapper::new("pi-think-live");
+        let mut mapper = EventMapper::new("pi-think-live", Arc::new(Mutex::new(Vec::new())));
         mapper.apply_message_delta(&AssistantMessageEvent {
             delta_type: "thinking_start".to_string(),
             delta: None,
@@ -3475,7 +3715,7 @@ mod tests {
         // (decremented by one) so the next delta still updates the SAME entry
         // in place — and `thinking_end` finalizes it without corrupting an
         // unrelated row or duplicating.
-        let mut mapper = EventMapper::new("evict-shift");
+        let mut mapper = EventMapper::new("evict-shift", Arc::new(Mutex::new(Vec::new())));
         // Fill to 498 (cap is 500) — no eviction yet.
         for i in 0..498u32 {
             mapper.push_entry(ConsoleEntry::Chat {
@@ -3573,7 +3813,7 @@ mod tests {
         // `thinking_end`, the tracker must be cleared (not point at a stale row).
         // A later delta re-pushes a fresh live entry; `thinking_end` finalizes
         // that fresh entry without corrupting anything else.
-        let mut mapper = EventMapper::new("evict-clear");
+        let mut mapper = EventMapper::new("evict-clear", Arc::new(Mutex::new(Vec::new())));
         // Fill to 499 so the thinking entry lands at index 499 (cap 500).
         for i in 0..499u32 {
             mapper.push_entry(ConsoleEntry::Chat {
@@ -3671,7 +3911,7 @@ mod tests {
         // `agent_start` arm: flush_thinking_block() FIRST (finalizes the open
         // row via live_thinking_idx), THEN clear the accumulators/index. The
         // flush-before-clear ordering is precisely the FIX C guarantee.
-        let mut mapper = EventMapper::new("orphan-finalize");
+        let mut mapper = EventMapper::new("orphan-finalize", Arc::new(Mutex::new(Vec::new())));
 
         // Open turn 1 thinking and stream "A".
         mapper.apply_message_delta(&AssistantMessageEvent {
@@ -3788,7 +4028,7 @@ mod tests {
 
     #[test]
     fn tool_progress_rewrites_args_row_in_place() {
-        let mut mapper = EventMapper::new("pi-prog");
+        let mut mapper = EventMapper::new("pi-prog", Arc::new(Mutex::new(Vec::new())));
         mapper.active_tool_progress.insert("t1".to_string(), (0, "  args: {}".to_string()));
         mapper.push_entry(ConsoleEntry::Coder {
             node: None,
@@ -3815,7 +4055,7 @@ mod tests {
         // Fill to cap, set a tracker strictly inside the window, then push past the
         // cap. Front-eviction must decrement the stored index so it keeps pointing
         // at the SAME entry, not a stale slot.
-        let mut mapper = EventMapper::new("pi-ev1");
+        let mut mapper = EventMapper::new("pi-ev1", Arc::new(Mutex::new(Vec::new())));
         for i in 0..MAX_CONSOLE_ENTRIES {
             mapper.push_entry(ConsoleEntry::Chat {
                 role: "user".to_string(),
@@ -3853,7 +4093,7 @@ mod tests {
     fn tool_progress_tracker_dropped_when_its_entry_is_evicted() {
         // A tracker pointing near the front, then enough pushes to evict that very
         // entry, must be dropped (index 0 -> evicted on the next push).
-        let mut mapper = EventMapper::new("pi-ev2");
+        let mut mapper = EventMapper::new("pi-ev2", Arc::new(Mutex::new(Vec::new())));
         for i in 0..MAX_CONSOLE_ENTRIES {
             mapper.push_entry(ConsoleEntry::Chat {
                 role: "user".to_string(),
@@ -3879,7 +4119,7 @@ mod tests {
 
     #[test]
     fn tool_progress_restored_on_end() {
-        let mut mapper = EventMapper::new("pi-restore");
+        let mut mapper = EventMapper::new("pi-restore", Arc::new(Mutex::new(Vec::new())));
         mapper.push_entry(ConsoleEntry::Coder {
             node: Some(NodeStyle::Dot),
             text: "🔧 Calling `subagent`".to_string(),
@@ -3913,7 +4153,7 @@ mod tests {
         // A start -> B start (clobbers single slot in the old code) -> B update ->
         // A end (old code nuked the slot, leaving B's row corrupted) -> B update ->
         // B end. With a per-id HashMap, B's row must be restored and the map empty.
-        let mut mapper = EventMapper::new("pi-parallel");
+        let mut mapper = EventMapper::new("pi-parallel", Arc::new(Mutex::new(Vec::new())));
         let args_a = "  args: {\"a\":1}".to_string();
         let args_b = "  args: {\"b\":2}".to_string();
         // A start: Calling(A) + args(A), register tracker A at the args index.
@@ -4850,6 +5090,207 @@ mod tests {
 
             drop(child);
         }
+    }
+
+    // -- overlay_pi_sessions (Fix A) -------------------------------------------
+
+    use crate::backend::model::AgentSession;
+
+    fn make_session(agent_id: &str, status: &str) -> AgentSession {
+        AgentSession {
+            agent_id: agent_id.to_string(),
+            role: String::new(),
+            model: None,
+            status: status.to_string(),
+            message: None,
+            client: None,
+            current_project_id: None,
+            current_task_id: None,
+            current_file_path: None,
+            first_seen_at: None,
+            last_seen_at: None,
+            launch_token_hash: None,
+            launch_token_issued_at: None,
+            session_token_hash: None,
+            session_token_issued_at: None,
+            subagents: Vec::new(),
+            needs_user: None,
+            host: None,
+            parent_agent_id: None,
+            pending_question: None,
+            user_reply: None,
+        }
+    }
+
+    #[test]
+    fn overlay_pi_sessions_adds_synthetic_row_when_no_existing() {
+        let mut sessions = vec![make_session("coder-1", "running")];
+        let live = vec![
+            ("orchestrator-proj1".to_string(), "proj1".to_string()),
+        ];
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions.len(), 2);
+        let orch = sessions.iter().find(|s| s.agent_id == "orchestrator-proj1").unwrap();
+        assert_eq!(orch.status, "running");
+        assert_eq!(orch.client.as_deref(), Some("orchestrator"));
+        assert_eq!(orch.current_project_id.as_deref(), Some("proj1"));
+        assert_eq!(orch.role, "orchestrator");
+    }
+
+    #[test]
+    fn overlay_pi_sessions_refreshes_terminal_status_to_running() {
+        let mut sessions = vec![make_session("orchestrator-proj1", "closed")];
+        let live = vec![
+            ("orchestrator-proj1".to_string(), "proj1".to_string()),
+        ];
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions.len(), 1);
+        let orch = &sessions[0];
+        assert_eq!(orch.status, "running");
+        assert_eq!(orch.last_seen_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(orch.client.as_deref(), Some("orchestrator"));
+    }
+
+    #[test]
+    fn overlay_pi_sessions_leaves_unmatched_ledger_rows_untouched() {
+        let mut sessions = vec![make_session("coder-1", "running")];
+        let live: Vec<(String, String)> = Vec::new();
+        overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "running");
+    }
+
+    // -- response_failure_banner pure helper (Fix D, ITEM 5) --------------------
+
+    fn make_response_event(success: Option<bool>, error: Option<String>) -> PiEvent {
+        PiEvent {
+            event_type: "response".to_string(),
+            oracle_mcp: None,
+            assistant_message_event: None,
+            tool_call_id: None,
+            tool_name: None,
+            args: None,
+            result: None,
+            is_error: None,
+            messages: None,
+            message: None,
+            devboule: None,
+            prompt: None,
+            files: None,
+            diffs: None,
+            reason: None,
+            aborted: None,
+            error_message: None,
+            attempt: None,
+            max_attempts: None,
+            success,
+            error,
+            final_error: None,
+            context: None,
+            count: None,
+            partial_result: None,
+        }
+    }
+
+    #[test]
+    fn response_failure_banner_with_error_message() {
+        let event = make_response_event(Some(false), Some("rate limit exceeded".to_string()));
+        let banner = response_failure_banner(&event);
+        assert_eq!(banner.as_deref(), Some("Orchestrator turn failed: rate limit exceeded"));
+    }
+
+    #[test]
+    fn response_failure_banner_success_true_yields_none() {
+        let event = make_response_event(Some(true), None);
+        assert!(response_failure_banner(&event).is_none());
+    }
+
+    #[test]
+    fn response_failure_banner_no_error_uses_fallback() {
+        let event = make_response_event(Some(false), None);
+        assert_eq!(response_failure_banner(&event).as_deref(), Some("Orchestrator turn failed"));
+    }
+
+    // -- drain_injections (BLOCKER fix) -----------------------------------------
+
+    #[test]
+    fn drain_injections_lands_entries_in_fifo_order() {
+        use std::sync::{Arc, Mutex};
+
+        let injections: ConsoleInjections = Arc::new(Mutex::new(vec![
+            ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: "hello".to_string(),
+                time: "10:00:00".to_string(),
+                msg_id: None,
+            },
+            ConsoleEntry::Coder {
+                node: None,
+                text: "a note".to_string(),
+                time: "10:00:01".to_string(),
+            },
+        ]));
+
+        let mut mapper = EventMapper::new("test", injections.clone());
+        assert!(mapper.entries.is_empty());
+
+        mapper.drain_injections();
+
+        assert_eq!(mapper.entries.len(), 2);
+        match &mapper.entries[0] {
+            ConsoleEntry::Chat { role, text, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(text, "hello");
+            }
+            _ => panic!("expected Chat entry"),
+        }
+        match &mapper.entries[1] {
+            ConsoleEntry::Coder { text, .. } => {
+                assert_eq!(text, "a note");
+            }
+            _ => panic!("expected Coder entry"),
+        }
+        // Queue should be empty after drain.
+        assert!(injections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_injections_survives_build_snapshot() {
+        use std::sync::{Arc, Mutex};
+
+        let injections: ConsoleInjections = Arc::new(Mutex::new(vec![
+            ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: "steer msg".to_string(),
+                time: "11:00:00".to_string(),
+                msg_id: Some("m1".to_string()),
+            },
+        ]));
+
+        let mut mapper = EventMapper::new("test", injections);
+        mapper.drain_injections();
+
+        let snapshot = mapper.build_snapshot();
+        let entries = snapshot.entries.expect("entries should be present");
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            ConsoleEntry::Chat { role, text, msg_id, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(text, "steer msg");
+                assert_eq!(msg_id.as_deref(), Some("m1"));
+            }
+            _ => panic!("expected Chat entry"),
+        }
+    }
+
+    #[test]
+    fn drain_injections_empty_queue_noop() {
+        use std::sync::{Arc, Mutex};
+
+        let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
+        let mut mapper = EventMapper::new("test", injections);
+        mapper.drain_injections();
+        assert!(mapper.entries.is_empty());
     }
 }
 

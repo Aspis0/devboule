@@ -3886,6 +3886,7 @@ export function ProjectsView() {
 								invokeBackendCommand("orchestrator_steer", {
 									agentId: orchestratorAgentId,
 									message: msg,
+									msgId,
 								}).catch((e) => {
 									// Max-recall F1: undelivered — drop the optimistic copy too (a
 									// bubble no echo can drain would contradict the banner forever).

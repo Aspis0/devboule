@@ -53,6 +53,15 @@ pub fn get_agent_live_state(
     live_state.mcp_client_config = mcp_client_config_hint(&app, &projects_dir);
     let ledger = read_agent_ledger(&projects_dir);
     stamp_sessions_from_ledger(&mut live_state.sessions, &ledger);
+    // Fix A: overlay live pi orchestrator sessions that were never recorded in
+    // `.aspis-agents.json` (the pi launch branch early-returns before
+    // `record_launch_pending`). Liveness is checked against the real child process
+    // so rows vanish the moment the sidecar dies — the frontend then relaunches.
+    let now = chrono::Utc::now().to_rfc3339();
+    let live = crate::backend::pi_sidecar::live_orchestrator_sessions(&app);
+    if !live.is_empty() {
+        super::pi_sidecar::overlay_pi_sessions(&mut live_state.sessions, &live, &now);
+    }
     Ok(live_state)
 }
 

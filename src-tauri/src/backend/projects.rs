@@ -41,7 +41,7 @@ use super::project_file::{
 // Re-export prompt-building functions moved to `agent_prompt.rs` (S9 Pass 2a) so that
 // existing call sites — including every test in `mod tests` (which uses `use super::*`) —
 // continue to compile without edits.
-pub(crate) use super::agent_prompt::{cloud_goal_addendum, design_handoff_relative_label, project_agent_prompt};
+pub(crate) use super::agent_prompt::{cloud_goal_addendum, goal_addendum, design_handoff_relative_label, project_agent_prompt};
 // `build_windows_agent_script` and `build_macos_agent_script` are each `#[cfg(...)]`-gated in
 // agent_spawn.rs to their respective platform, so their re-exports must match — an
 // unconditional re-export fails to resolve on the platform where the item was configured out.
@@ -1412,9 +1412,37 @@ fn spawn_pi_orchestrator_session(
     client: &str,
     root_path: &std::path::Path,
     prompt: &str,
+    initial_goal: Option<&str>,
+    initial_goal_msg_id: Option<&str>,
 ) -> Result<ProjectAgentLaunchResult, String> {
     let info =
         crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id))?;
+    // Fix C: inject the Rust-authored user chat echo INTO THE QUEUE BEFORE
+    // delivering the prompt. The queue is drained only by the reader thread's
+    // `handle_event`, which fires after the sidecar receives the prompt via
+    // stdin — so the echo is guaranteed to land in the timeline before any
+    // assistant output of that turn. Injecting AFTER delivery would race the
+    // reader thread's first event. On delivery failure the session is stopped
+    // anyway, so a queued echo on a dead session is harmless.
+    //
+    // The SDK's user message_start echoes the WHOLE persona prompt, so the
+    // EventMapper must KEEP ignoring SDK user messages; the delivery point is
+    // the only place that knows the user-visible text + msgId.
+    if let Some(goal) = initial_goal {
+        let trimmed = goal.trim();
+        if !trimmed.is_empty() {
+            let _ = crate::backend::pi_sidecar::inject_console_entry(
+                app,
+                &info.session_id,
+                crate::backend::mini_activity::ConsoleEntry::Chat {
+                    role: "user".to_string(),
+                    text: trimmed.to_string(),
+                    time: crate::backend::mini_activity::console_now_str(),
+                    msg_id: initial_goal_msg_id.map(|s| s.to_string()),
+                },
+            );
+        }
+    }
     // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
     // this the agent sits idle forever while the UI reports `launched: true`.
     // Only send when there is actual text; fail loudly on delivery error rather
@@ -1429,15 +1457,6 @@ fn spawn_pi_orchestrator_session(
             return Err(e);
         }
     }
-    // Register the orchestrator channel with an initial empty snapshot — matches
-    // the legacy orchestrator's `mini-activity://orchestrator-<id>` channel so the
-    // frontend console renders without React changes (EventMapper uses the same
-    // agent id on every event).
-    let channel = crate::backend::mini_activity::mini_activity_channel(&info.session_id);
-    let event = crate::backend::mini_activity::MiniActivityEvent::Snapshot {
-        activity: crate::backend::mini_activity::ConsoleActivity::empty(),
-    };
-    let _ = app.emit(&channel, event);
     // B13: capture the diff baseline the first time an agent launches for this repo.
     crate::backend::changes::ensure_diff_baseline(root_path);
     Ok(ProjectAgentLaunchResult {
@@ -1739,13 +1758,24 @@ fn prepare_or_launch_project_agent(
             fence_stale_orchestrator(&app, &role, &client, &agent_id, &fence_projects_path);
         }
         return match pi_role {
-            "orchestrator" => spawn_pi_orchestrator_session(
-                &app,
-                &project.metadata.id,
-                &client,
-                &root_path,
-                &prompt,
-            ),
+            "orchestrator" => {
+                // Fix C: the typed goal must reach the pi orchestrator. The pi sidecar
+                // never reads DEVBOULE_GOAL env (that was for the legacy binary), so we
+                // append the goal addendum to the prompt directly.
+                let mut pi_prompt = prompt;
+                if let Some(block) = goal_addendum(input.initial_goal.as_deref()) {
+                    pi_prompt.push_str(&block);
+                }
+                spawn_pi_orchestrator_session(
+                    &app,
+                    &project.metadata.id,
+                    &client,
+                    &root_path,
+                    &pi_prompt,
+                    input.initial_goal.as_deref(),
+                    input.initial_goal_msg_id.as_deref(),
+                )
+            }
             _ => spawn_pi_coder_session(
                 &app,
                 &project.metadata.id,
@@ -4033,6 +4063,7 @@ pub fn orchestrator_steer(
     app: tauri::AppHandle,
     agent_id: String,
     message: String,
+    msg_id: Option<String>,
 ) -> Result<(), String> {
     // Newline-flatten + 2000-char cap — applied before either route below.
     let msg: String = message
@@ -4047,7 +4078,24 @@ pub fn orchestrator_steer(
     // PI ROUTE: if a live pi sidecar session exists for this agent, deliver
     // the steer message via the sidecar's FIFO prompt queue (mid-turn steer).
     if crate::backend::pi_sidecar::pi_session_exists(&app, &agent_id) {
-        return crate::backend::pi_sidecar::send_prompt_to_session(&app, &agent_id, &msg);
+        // Fix C: inject the user echo INTO THE QUEUE BEFORE delivery. The queue
+        // is drained by the reader thread's `handle_event`, which fires after the
+        // sidecar receives the prompt — so the echo appears before any assistant
+        // output. The SDK's user message_start echoes the WHOLE persona prompt,
+        // so the EventMapper must KEEP ignoring SDK user messages; the delivery
+        // point is the only place that knows the user-visible text + msgId.
+        let _ = crate::backend::pi_sidecar::inject_console_entry(
+            &app,
+            &agent_id,
+            crate::backend::mini_activity::ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: msg.clone(),
+                time: crate::backend::mini_activity::console_now_str(),
+                msg_id,
+            },
+        );
+        crate::backend::pi_sidecar::send_prompt_to_session(&app, &agent_id, &msg)?;
+        return Ok(());
     }
     // No live pi session for this agent — there is nothing left to deliver to.
     // (The old fallback silently appended to a steer file that only the
@@ -8628,6 +8676,19 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // No goal / blank goal ⇒ None (a task-board coder launch carries no goal).
         assert!(cloud_goal_addendum("claude", None).is_none());
         assert!(cloud_goal_addendum("claude", Some("   ")).is_none());
+    }
+
+    /// Fix C: the client-agnostic `goal_addendum` returns Some for ANY client
+    /// (including orchestrator) when a non-blank goal is given.
+    #[test]
+    fn goal_addendum_agnostic_returns_some_for_orchestrator() {
+        let block =
+            goal_addendum(Some("Add Stripe billing")).expect("non-blank goal ⇒ Some");
+        assert!(block.contains("Add Stripe billing"));
+        assert!(block.contains("# Your goal for this project"));
+        // Blank / absent ⇒ None.
+        assert!(goal_addendum(None).is_none());
+        assert!(goal_addendum(Some("   ")).is_none());
     }
 
     #[test]
