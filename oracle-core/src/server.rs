@@ -88,11 +88,6 @@ impl AppState {
             Some(file_vectors),
         ))
     }
-
-    /// Build a fresh SqliteStore on demand (fallible — see `engine`).
-    fn sqlite(&self) -> Result<SqliteStore> {
-        SqliteStore::new(&self.sqlite_path)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -343,26 +338,6 @@ impl TextEmbedder for PoolTextEmbedder {
     }
 }
 
-/// Wrapper to adapt `HashQueryEmbedder` to `TextEmbedder` (for watcher callbacks).
-struct HashTextEmbedder;
-
-impl TextEmbedder for HashTextEmbedder {
-    fn embed(
-        &self,
-        texts: &[String],
-        _batch_size: usize,
-        _cancel: &CancelFlag,
-    ) -> Result<Vec<Vec<f32>>> {
-        let dims = crate::config::EMBED_DIMS;
-        texts
-            .iter()
-            .map(|t| {
-                let prefixed = crate::ingest::retrieval_text::query_embedding_text(t, None);
-                Ok(hash_embed(&prefixed, dims))
-            })
-            .collect::<Result<Vec<Vec<f32>>>>()
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Camelize index status — exact port of Python's camelize_index_status
