@@ -7,7 +7,7 @@
 //! reloads on demand (PLAN.md P3).
 
 mod candle_backend;
-mod ort_backend;
+pub mod ort_backend;
 
 pub use candle_backend::CandleEmbedder;
 pub use ort_backend::OrtEmbedder;

@@ -12,6 +12,7 @@ pub mod embedder;
 pub mod ingest;
 pub mod jobs;
 pub mod lance;
+pub mod model_download;
 pub mod onnx_embedder;
 pub mod server;
 pub mod store;
