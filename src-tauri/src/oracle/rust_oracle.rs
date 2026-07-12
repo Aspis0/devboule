@@ -238,4 +238,61 @@ mod live_test {
 
         stop_rust_oracle_server();
     }
+
+    /// Live `/ask` test against a REAL remote LLM (operator-run). The API key is
+    /// read from `ORACLE_LLM_API_KEY` in the env — NEVER hardcoded — so it never
+    /// lands in the repo. Skips if the key is unset. Invoke e.g.:
+    ///   ORACLE_LLM_PROVIDER=deepseek ORACLE_LLM_MODEL=deepseek-chat \
+    ///   ORACLE_LLM_API_KEY=sk-... \
+    ///   cargo test -p aspis-management --lib rust_oracle::live_test::ask_llm_live \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ask_llm_live() {
+        if std::env::var("ORACLE_LLM_API_KEY").map(|k| k.is_empty()).unwrap_or(true) {
+            eprintln!("skipping: ORACLE_LLM_API_KEY not set");
+            return;
+        }
+        let root = std::path::Path::new("..")
+            .canonicalize()
+            .expect("canonicalize repo root");
+        if !root.join("oracle-data/models/qwen3-onnx/onnx/model.onnx").exists() {
+            eprintln!("skipping: model missing");
+            return;
+        }
+
+        let stop = AtomicBool::new(false);
+        ensure_rust_oracle_server(&root, &stop).expect("rust oracle server became ready");
+
+        let (base_url, _port) = crate::oracle::python_oracle::oracle_session_endpoint();
+        let token = crate::oracle::python_oracle::oracle_operator_token();
+        let client = reqwest::blocking::Client::new();
+
+        let resp = client
+            .get(format!("{base_url}/ask"))
+            .query(&[
+                ("q", "What does the Oracle server do and how is an answer produced?"),
+                ("limit", "6"),
+            ])
+            .header("x-oracle-auth-token", token)
+            .timeout(std::time::Duration::from_secs(90))
+            .send()
+            .expect("GET /ask");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().expect("ask json");
+        println!("ASK status: {status}");
+        println!(
+            "  answer_source: {}  llm_provider: {}  llm_model: {}",
+            body["answer_source"], body["llm_provider"], body["llm_model"]
+        );
+        println!("  fallback_reason: {}", body["fallback_reason"]);
+        println!("  not_found: {}", body["not_found"]);
+        let answer = body["answer"].as_str().unwrap_or("");
+        let shown: String = answer.chars().take(600).collect();
+        println!("  answer[..600]: {shown}");
+
+        assert_eq!(status.as_u16(), 200, "ask not 200: {body}");
+        assert!(!answer.trim().is_empty(), "empty answer");
+        stop_rust_oracle_server();
+    }
 }

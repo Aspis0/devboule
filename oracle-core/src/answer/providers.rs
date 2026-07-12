@@ -385,51 +385,71 @@ pub fn generate_with_openai_compatible(
         );
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .default_headers(headers)
-        .build()
-        .map_err(|e| AnswerError::Network(format!("Failed to create HTTP client: {}", e)))?;
-
     let url = chat_completions_url(&config.base_url);
 
-    let response = client.post(&url).json(&body).send().map_err(|e| {
-        AnswerError::Network(format!(
-            "LLM request failed: {}",
-            truncate_err(&e.to_string())
-        ))
-    })?;
+    // reqwest::blocking owns an internal tokio runtime; building/dropping it on a
+    // tokio worker (the axum /ask handler calls this synchronously inside async)
+    // panics with "Cannot drop a runtime ... from within an asynchronous context".
+    // Run the whole blocking HTTP exchange on a dedicated OS thread so the blocking
+    // client never touches the async runtime. Safe from a plain sync caller too.
+    let content: Result<String, AnswerError> = std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<String, AnswerError> {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(60))
+                    .default_headers(headers)
+                    .build()
+                    .map_err(|e| {
+                        AnswerError::Network(format!("Failed to create HTTP client: {}", e))
+                    })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().unwrap_or_default();
-        return Err(AnswerError::Network(format!(
-            "LLM request failed ({}): {}",
-            status,
-            truncate_err(&text)
-        )));
-    }
+                let response = client.post(&url).json(&body).send().map_err(|e| {
+                    AnswerError::Network(format!(
+                        "LLM request failed: {}",
+                        truncate_err(&e.to_string())
+                    ))
+                })?;
 
-    let payload: serde_json::Value = response
-        .json()
-        .map_err(|e| AnswerError::Network(format!("Failed to parse LLM response: {}", e)))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let text = response.text().unwrap_or_default();
+                    return Err(AnswerError::Network(format!(
+                        "LLM request failed ({}): {}",
+                        status,
+                        truncate_err(&text)
+                    )));
+                }
 
-    if let Some(content) = payload
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-    {
-        return Ok(content.to_string());
-    }
-    if let Some(output) = payload.get("output_text").and_then(|o| o.as_str()) {
-        return Ok(output.to_string());
-    }
+                let payload: serde_json::Value = response
+                    .json()
+                    .map_err(|e| {
+                        AnswerError::Network(format!("Failed to parse LLM response: {}", e))
+                    })?;
 
-    Err(AnswerError::Generation(
-        "Remote Oracle LLM response did not include chat content.".to_string(),
-    ))
+                if let Some(content) = payload
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    return Ok(content.to_string());
+                }
+                if let Some(output) = payload.get("output_text").and_then(|o| o.as_str()) {
+                    return Ok(output.to_string());
+                }
+
+                Err(AnswerError::Generation(
+                    "Remote Oracle LLM response did not include chat content.".to_string(),
+                ))
+            })
+            .join()
+            .map_err(|_| {
+                AnswerError::Network("LLM request worker thread panicked.".to_string())
+            })?
+    });
+
+    content
 }
 
 fn truncate_err(s: &str) -> String {
