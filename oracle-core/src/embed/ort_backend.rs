@@ -59,10 +59,21 @@ fn default_ep() -> EpArg {
     }
     #[cfg(target_os = "macos")]
     {
-        EpArg::Coreml
+        // CoreML CANNOT run this Qwen3 ONNX export: its MIL compiler rejects the
+        // model's unbounded/dynamic dimensions ("has unbounded dimension which is
+        // not supported") and embedding hard-fails at session build — confirmed
+        // live, and already flagged in the spike. (Python's Mac "GPU" was PyTorch
+        // MPS, a different runtime that handles dynamic shapes — NOT CoreML via
+        // ONNX, which has no working path for this model.) Default to CPU; a Mac
+        // GPU path would need the candle-Metal backend, not ort. `ORACLE_RS_EP=coreml`
+        // can still force it for experiments.
+        EpArg::Cpu
     }
     #[cfg(target_os = "windows")]
     {
+        // DirectML supports dynamic dimensions (unlike CoreML), so it should run
+        // this export — but it is UNTESTED here (no Windows machine). If it hits
+        // the same graph-compile wall, set ORACLE_RS_EP=cpu.
         EpArg::Directml
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
