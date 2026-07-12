@@ -386,6 +386,7 @@ pub fn on_app_exit() {
     // `Drop` without risking a blocking-client drop panic. On Windows this is what
     // prevents an orphaned server after app close.
     let _ = crate::oracle::python_oracle::kill_python_oracle_child();
+    crate::oracle::rust_oracle::stop_rust_oracle_server();
     delete_discovery();
 }
 
@@ -2516,7 +2517,6 @@ pub fn set_oracle_engine_flag(engine: OracleEngine) {
 // Consumed by the supervisor spawn path in M2.3 (Python subprocess vs
 // in-process oracle-core serve). Allowed dead in M2.2 so the flag plumbing
 // lands as its own reviewable phase; the attribute comes off in M2.3.
-#[allow(dead_code)]
 pub(crate) fn oracle_current_engine() -> OracleEngine {
     OracleEngine::from_u8(ORACLE_ENGINE.load(std::sync::atomic::Ordering::Acquire))
 }

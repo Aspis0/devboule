@@ -498,6 +498,12 @@ pub(crate) fn oracle_agent_token() -> &'static str {
     ORACLE_AGENT_TOKEN.get_or_init(random_token)
 }
 
+/// The resident server's OPERATOR auth token (full-access). Same value the app's
+/// HTTP client sends on every call; the in-process Rust server must validate it.
+pub(crate) fn oracle_operator_token() -> &'static str {
+    &oracle_http_session().auth_token
+}
+
 /// The resident server's loopback base URL (`http://127.0.0.1:<port>`) and port,
 /// used by `oracle_service` to build the discovery file. The base URL is always
 /// loopback by construction (see [`oracle_http_session`]).
@@ -1410,6 +1416,15 @@ pub(crate) fn ensure_oracle_server(root: &Path, stop: &AtomicBool) -> Result<(),
     }
     if oracle_server_ready(root) {
         return Ok(());
+    }
+
+    // M2.3: under the Rust engine, serve oracle-core in-process instead of the
+    // Python subprocess. Everything downstream (readiness probe, discovery,
+    // commands) is unchanged — only the server on the port differs.
+    if crate::backend::oracle_service::oracle_current_engine()
+        == crate::backend::oracle_service::OracleEngine::Rust
+    {
+        return crate::oracle::rust_oracle::ensure_rust_oracle_server(root, stop);
     }
 
     // W4: detect a POISONED start lock distinctly from a clean acquire. A panic

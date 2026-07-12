@@ -281,7 +281,10 @@ mod tests {
             .collect();
         assert_eq!(
             required,
-            ["path", "oldString", "newString"].iter().map(|s| s.to_string()).collect()
+            ["path", "oldString", "newString"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<String>>()
         );
     }
 
