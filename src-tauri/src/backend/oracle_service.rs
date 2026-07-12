@@ -2458,6 +2458,139 @@ pub fn set_oracle_enabled(
     Ok(enabled)
 }
 
+// ── Oracle engine selector (python | rust) — M2 ─────────────────────────────
+// Mirrors the `oracle.enabled` machinery exactly. The runtime engine is read
+// from config.json `oracle.engine` (default "python"); the supervisor consults
+// `oracle_current_engine()` when deciding what to run on the loopback port
+// (Python subprocess vs in-process oracle-core server). Persisted through the
+// same `config_write_lock` + `fs_replace` path. Default is "python" so wiring
+// the Rust engine in never silently switches the live runtime — the owner flips
+// to "rust" explicitly and verifies.
+
+/// AtomicU8 mirror of the persisted engine flag: 0 = python (default), 1 = rust.
+static ORACLE_ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleEngine {
+    Python,
+    Rust,
+}
+
+impl OracleEngine {
+    /// Parse from the config string; unknown/empty falls back to the safe
+    /// default (Python), never an error.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rust" => OracleEngine::Rust,
+            _ => OracleEngine::Python,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OracleEngine::Python => "python",
+            OracleEngine::Rust => "rust",
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            OracleEngine::Python => 0,
+            OracleEngine::Rust => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => OracleEngine::Rust,
+            _ => OracleEngine::Python,
+        }
+    }
+}
+
+pub fn set_oracle_engine_flag(engine: OracleEngine) {
+    // Release pairs with the Acquire load (same discipline as ORACLE_ENABLED).
+    ORACLE_ENGINE.store(engine.as_u8(), std::sync::atomic::Ordering::Release);
+}
+
+// Consumed by the supervisor spawn path in M2.3 (Python subprocess vs
+// in-process oracle-core serve). Allowed dead in M2.2 so the flag plumbing
+// lands as its own reviewable phase; the attribute comes off in M2.3.
+#[allow(dead_code)]
+pub(crate) fn oracle_current_engine() -> OracleEngine {
+    OracleEngine::from_u8(ORACLE_ENGINE.load(std::sync::atomic::Ordering::Acquire))
+}
+
+pub fn oracle_engine_from_value(v: &serde_json::Value) -> OracleEngine {
+    let s = v
+        .get("oracle")
+        .and_then(|o| o.get("engine"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("python");
+    OracleEngine::parse(s)
+}
+
+pub fn read_oracle_engine(app: &tauri::AppHandle) -> OracleEngine {
+    let Some(path) = crate::backend::projects::locate_config_path(app) else {
+        return OracleEngine::Python;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return OracleEngine::Python;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return OracleEngine::Python;
+    };
+    oracle_engine_from_value(&value)
+}
+
+#[tauri::command]
+pub fn get_oracle_engine(app: tauri::AppHandle) -> String {
+    read_oracle_engine(&app).as_str().to_string()
+}
+
+#[tauri::command]
+pub fn set_oracle_engine(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::backend::state::BackendState>,
+    engine: String,
+) -> Result<String, String> {
+    state.ensure_unlocked()?;
+    let parsed = OracleEngine::parse(&engine);
+    let _lock = crate::backend::projects::config_write_lock()
+        .lock()
+        .map_err(|e| format!("config write lock poisoned: {e}"))?;
+    let path = crate::backend::projects::locate_config_path(&app)
+        .ok_or_else(|| "config.json not found".to_string())?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) if !path.exists() => "{}".to_string(),
+        Err(e) => return Err(format!("Could not read config.json: {e}")),
+    };
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    let obj = value.as_object_mut().unwrap();
+    let oracle = obj.entry("oracle").or_insert_with(|| serde_json::json!({}));
+    if !oracle.is_object() {
+        *oracle = serde_json::json!({});
+    }
+    oracle
+        .as_object_mut()
+        .unwrap()
+        .insert("engine".to_string(), serde_json::json!(parsed.as_str()));
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let suffix = format!("{}-{}", std::process::id(), timestamp);
+    let temp = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup = path.with_extension(format!("json.{suffix}.bak"));
+    std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
+    crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
+    set_oracle_engine_flag(parsed);
+    Ok(parsed.as_str().to_string())
+}
+
 #[cfg(test)]
 mod oracle_toggle_tests {
     use super::oracle_enabled_from_value;
@@ -2487,5 +2620,42 @@ mod oracle_toggle_tests {
         assert!(!super::oracle_is_enabled());
         super::set_oracle_enabled_flag(true);
         assert!(super::oracle_is_enabled());
+    }
+
+    // ── Engine selector (M2) ────────────────────────────────────────────────
+    use super::{oracle_engine_from_value, OracleEngine};
+
+    #[test]
+    fn engine_defaults_to_python_when_absent_or_unknown() {
+        assert_eq!(oracle_engine_from_value(&json!({})), OracleEngine::Python);
+        assert_eq!(
+            oracle_engine_from_value(&json!({"oracle": {}})),
+            OracleEngine::Python
+        );
+        assert_eq!(
+            oracle_engine_from_value(&json!({"oracle": {"engine": "nonsense"}})),
+            OracleEngine::Python
+        );
+    }
+
+    #[test]
+    fn engine_parses_known_values_case_insensitively() {
+        assert_eq!(OracleEngine::parse("rust"), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("  RUST "), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("Python"), OracleEngine::Python);
+        assert_eq!(
+            oracle_engine_from_value(&json!({"oracle": {"engine": "rust"}})),
+            OracleEngine::Rust
+        );
+    }
+
+    /// MUTATES PROCESS-GLOBAL STATE: round-trips the ORACLE_ENGINE AtomicU8.
+    /// Restores Python (the default) at the end for other tests in the binary.
+    #[test]
+    fn engine_flag_is_mutable_at_runtime() {
+        super::set_oracle_engine_flag(OracleEngine::Rust);
+        assert_eq!(super::oracle_current_engine(), OracleEngine::Rust);
+        super::set_oracle_engine_flag(OracleEngine::Python);
+        assert_eq!(super::oracle_current_engine(), OracleEngine::Python);
     }
 }

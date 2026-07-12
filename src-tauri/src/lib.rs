@@ -456,6 +456,13 @@ pub fn run() {
             backend::oracle_service::set_oracle_enabled_flag(
                 backend::oracle_service::read_oracle_enabled(app.handle()),
             );
+            // M2: seed the Oracle engine selector (config oracle.engine, default
+            // "python") so the supervisor's on_unlock start path (no AppHandle) can
+            // read it via oracle_current_engine(). Default "python" keeps the
+            // existing Python subprocess behaviour until the owner flips to "rust".
+            backend::oracle_service::set_oracle_engine_flag(
+                backend::oracle_service::read_oracle_engine(app.handle()),
+            );
             // Pigeon mailbox service — OPTIONAL, OFF by default. This is a clean no-op
             // unless config.json has pigeon.enabled=true; when off, the legacy mini
             // dispatch path is untouched.
@@ -571,6 +578,8 @@ pub fn run() {
             backend::pigeon_service::set_pigeon_enabled,
             backend::oracle_service::get_oracle_enabled,
             backend::oracle_service::set_oracle_enabled,
+            backend::oracle_service::get_oracle_engine,
+            backend::oracle_service::set_oracle_engine,
             backend::projects::get_agentic_coverage_languages,
             backend::projects::get_project,
             backend::projects::launch_project_agent_terminal,
