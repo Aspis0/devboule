@@ -502,6 +502,32 @@ fn generic_host_guard_remote_providers() {
     ))
     .is_err());
 
+    // SSRF: partial IPv4 shorthands (getaddrinfo expands 127.1 → 127.0.0.1).
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://127.1/v1/chat/completions"
+    ))
+    .is_err());
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://127.0.1/v1"
+    ))
+    .is_err());
+
+    // SSRF: all-numeric-label host (2 labels, not just 4).
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://10.1/v1"
+    ))
+    .is_err());
+
+    // Numeric subdomain FQDN must still be accepted (alphabetic TLD present).
+    assert!(validate_remote_llm_config(&cfg(
+        "deepseek",
+        "https://192.host.deepseek.com/v1/chat/completions"
+    ))
+    .is_ok());
+
     // SSRF: localhost.
     assert!(validate_remote_llm_config(&cfg(
         "deepseek",

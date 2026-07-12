@@ -289,11 +289,14 @@ fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
     }
 
     let labels: Vec<&str> = host.split('.').collect();
-    let is_quad = labels.len() == 4
+    // Reject any all-numeric host (dotted-decimal IPv4 AND partial shorthands like
+    // `127.1` / `127.0.1`, which getaddrinfo expands to 127.0.0.1). A real FQDN always
+    // has an alphabetic TLD, so an all-numeric-label host is never a legitimate name.
+    let is_numeric_host = !labels.is_empty()
         && labels
             .iter()
             .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
-    if is_quad {
+    if is_numeric_host {
         return Err(AnswerError::PrivacyGate(
             "Remote Oracle LLM base URL must not be a bare IPv4 address.".to_string(),
         ));

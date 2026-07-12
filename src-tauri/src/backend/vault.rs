@@ -1355,9 +1355,12 @@ fn reject_ssrf_remote_host(value: &str) -> Result<(), String> {
         return Err("Oracle LLM base URL must be a remote host (not localhost).".to_string());
     }
     let labels: Vec<&str> = host.split('.').collect();
-    let is_quad = labels.len() == 4
+    // Reject any all-numeric host (dotted-decimal IPv4 AND partial shorthands like
+    // `127.1` / `127.0.1`, which getaddrinfo expands to 127.0.0.1). A real FQDN always
+    // has an alphabetic TLD, so an all-numeric-label host is never a legitimate name.
+    let is_numeric_host = !labels.is_empty()
         && labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
-    if is_quad {
+    if is_numeric_host {
         return Err("Oracle LLM base URL must be a hostname, not an IP literal.".to_string());
     }
     if host_lower == "metadata.google.internal"
@@ -2117,6 +2120,45 @@ mod tests {
                 "SSRF guard must reject trailing-dot host: {bad_url}"
             );
         }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_ipv4_shorthand_loopback_bypasses() {
+        // Partial dotted-decimal shorthands (`127.1`, `127.0.1`, `10.1`) have fewer
+        // than 4 labels, so the old quad-only check missed them. getaddrinfo expands
+        // e.g. `127.1` → `127.0.0.1`, making these real loopback-SSRF vectors.
+        for bad_url in [
+            "https://127.1/v1/chat/completions",
+            "https://127.0.1/v1",
+            "https://10.1/v1",
+        ] {
+            let settings = OracleLlmSettings {
+                provider: "deepseek".into(),
+                model: "deepseek-chat".into(),
+                base_url: Some(bad_url.into()),
+                remote_enabled: true,
+            };
+            assert!(
+                sanitize_oracle_llm_settings(&settings).is_err(),
+                "SSRF guard must reject IPv4 shorthand: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_allows_numeric_subdomain_with_alpha_labels() {
+        // A host with a numeric subdomain label (e.g. `192`) but alphabetic TLD
+        // labels is a legitimate FQDN — the all-numeric check must NOT reject it.
+        let settings = OracleLlmSettings {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: Some("https://192.host.deepseek.com/v1/chat/completions".into()),
+            remote_enabled: true,
+        };
+        assert!(
+            sanitize_oracle_llm_settings(&settings).is_ok(),
+            "numeric subdomain FQDN must be accepted"
+        );
     }
 
     #[test]
