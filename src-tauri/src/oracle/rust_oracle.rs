@@ -91,6 +91,13 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
             query_embedder_hash: false,
         });
 
+        // A just-torn-down server (root switch) may still hold the loopback
+        // socket for a moment; wait for the port to free before rebinding, or
+        // serve() fails with EADDRINUSE and the readiness loop times out.
+        if let Err(e) = crate::oracle::python_oracle::wait_for_oracle_port_free(stop) {
+            return Err(e);
+        }
+
         let (tx, rx) = watch::channel(false);
         tauri::async_runtime::spawn(async move {
             if let Err(e) = oracle_core::server::serve(state, port, rx).await {

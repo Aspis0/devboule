@@ -15,7 +15,7 @@ use crate::answer::AnswerError;
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-const DEFAULT_LLM_MODEL: &str = "voxtral-small-24b-2507";
+const DEFAULT_LLM_MODEL: &str = "gpt-4o-mini";
 pub const LLM_TEMPERATURE: f64 = 0.1;
 const DEFAULT_MAX_TOKENS: u32 = 1500;
 pub const LOCAL_LLM_PROVIDERS: &[&str] = &["omlx", "ollama"];
@@ -332,26 +332,6 @@ fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
 // LLM call
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn answer_json_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "required": ["answer", "citations", "not_found", "suggested_path"],
-        "properties": {
-            "answer": {"type": "string"},
-            "citations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["ref"],
-                    "properties": {"ref": {"type": "string"}}
-                }
-            },
-            "not_found": {"type": "boolean"},
-            "suggested_path": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-        }
-    })
-}
-
 pub fn generate_with_openai_compatible(
     prompt: &str,
     config: &LlmConfig,
@@ -390,62 +370,75 @@ pub fn generate_with_openai_compatible(
     // panics with "Cannot drop a runtime ... from within an asynchronous context".
     // Run the whole blocking HTTP exchange on a dedicated OS thread so the blocking
     // client never touches the async runtime. Safe from a plain sync caller too.
-    let content: Result<String, AnswerError> = std::thread::scope(|scope| {
-        scope
-            .spawn(move || -> Result<String, AnswerError> {
-                let client = Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .default_headers(headers)
-                    .build()
-                    .map_err(|e| {
-                        AnswerError::Network(format!("Failed to create HTTP client: {}", e))
+    //
+    // When a tokio runtime IS current (the async /ask handler), wrap the whole
+    // scoped-thread join in `block_in_place` so tokio can spin a replacement worker
+    // while we wait — a slow LLM (up to the 60 s client timeout) must not pin the
+    // shared worker and starve other tasks.  When NO runtime is current (sync CLI
+    // path) `block_in_place` would panic, so run the scoped-thread directly.
+    let do_request = || -> Result<String, AnswerError> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<String, AnswerError> {
+                    let client = Client::builder()
+                        .timeout(Duration::from_secs(60))
+                        .default_headers(headers)
+                        .build()
+                        .map_err(|e| {
+                            AnswerError::Network(format!("Failed to create HTTP client: {}", e))
+                        })?;
+
+                    let response = client.post(&url).json(&body).send().map_err(|e| {
+                        AnswerError::Network(format!(
+                            "LLM request failed: {}",
+                            truncate_err(&e.to_string())
+                        ))
                     })?;
 
-                let response = client.post(&url).json(&body).send().map_err(|e| {
-                    AnswerError::Network(format!(
-                        "LLM request failed: {}",
-                        truncate_err(&e.to_string())
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let text = response.text().unwrap_or_default();
+                        return Err(AnswerError::Network(format!(
+                            "LLM request failed ({}): {}",
+                            status,
+                            truncate_err(&text)
+                        )));
+                    }
+
+                    let payload: serde_json::Value = response
+                        .json()
+                        .map_err(|e| {
+                            AnswerError::Network(format!("Failed to parse LLM response: {}", e))
+                        })?;
+
+                    if let Some(content) = payload
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        return Ok(content.to_string());
+                    }
+                    if let Some(output) = payload.get("output_text").and_then(|o| o.as_str()) {
+                        return Ok(output.to_string());
+                    }
+
+                    Err(AnswerError::Generation(
+                        "Remote Oracle LLM response did not include chat content.".to_string(),
                     ))
-                })?;
+                })
+                .join()
+                .map_err(|_| {
+                    AnswerError::Network("LLM request worker thread panicked.".to_string())
+                })?
+        })
+    };
 
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let text = response.text().unwrap_or_default();
-                    return Err(AnswerError::Network(format!(
-                        "LLM request failed ({}): {}",
-                        status,
-                        truncate_err(&text)
-                    )));
-                }
-
-                let payload: serde_json::Value = response
-                    .json()
-                    .map_err(|e| {
-                        AnswerError::Network(format!("Failed to parse LLM response: {}", e))
-                    })?;
-
-                if let Some(content) = payload
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("message"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    return Ok(content.to_string());
-                }
-                if let Some(output) = payload.get("output_text").and_then(|o| o.as_str()) {
-                    return Ok(output.to_string());
-                }
-
-                Err(AnswerError::Generation(
-                    "Remote Oracle LLM response did not include chat content.".to_string(),
-                ))
-            })
-            .join()
-            .map_err(|_| {
-                AnswerError::Network("LLM request worker thread panicked.".to_string())
-            })?
-    });
+    let content: Result<String, AnswerError> = match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| do_request()),
+        Err(_) => do_request(),
+    };
 
     content
 }

@@ -1232,8 +1232,6 @@ pub fn oracle_llm_api_key_present() -> bool {
 fn llm_provider_label(provider: &str) -> &'static str {
     match provider.trim().to_ascii_lowercase().as_str() {
         "openai" => "OpenAI",
-        "openrouter" => "OpenRouter",
-        "deepseek" => "DeepSeek",
         "omlx" => "oMLX (local)",
         "ollama" => "Ollama (local)",
         _ => "selected",

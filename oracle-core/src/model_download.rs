@@ -61,16 +61,15 @@ pub fn model_dir(oracle_data_root: &Path) -> PathBuf {
     OrtEmbedder::default_model_dir(oracle_data_root)
 }
 
-/// True when every file of the requested bundle is present and non-empty.
-///
-/// Cheap check (existence + `len() > 0`) — enough to gate "already installed"
-/// without a network round-trip. `ensure` still size-verifies against the
-/// remote Content-Length before skipping a re-download.
+/// True when every file of the requested bundle is present AND above a minimal
+/// plausible size. UI-status only — never use this to SKIP `ensure_qwen3_onnx`
+/// (that path does its own Content-Length verification); a planted 1-byte file
+/// must not read as "installed" enough to bypass the download.
 pub fn model_present(oracle_data_root: &Path, int8: bool) -> bool {
     let dir = model_dir(oracle_data_root);
     bundle_files(int8).iter().all(|rel| {
         let p = dir.join(rel);
-        std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+        std::fs::metadata(&p).map(|m| m.len() > 1024).unwrap_or(false)
     })
 }
 
@@ -79,6 +78,18 @@ fn http_client() -> Result<reqwest::blocking::Client> {
         // Large weights on a slow link: no overall timeout, but a generous
         // connect timeout so a dead host fails fast instead of hanging forever.
         .connect_timeout(Duration::from_secs(30))
+        // Allow cross-host redirects (HF resolve URLs legitimately redirect to
+        // a CDN) but refuse any non-HTTPS hop — HTTPS→HTTP downgrade would
+        // enable MITM model injection / cleartext model delivery.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error("too many redirects");
+            }
+            if attempt.url().scheme() != "https" {
+                return attempt.error("refusing non-https redirect for model download");
+            }
+            attempt.follow()
+        }))
         .build()
         .context("building HTTP client for model download")
 }
@@ -171,6 +182,17 @@ pub fn ensure_qwen3_onnx(
         let dest = dir.join(rel);
         let bytes_total = remote_len(&client, &url);
 
+        // Refuse to download without a Content-Length — HF always sends it,
+        // so a missing value means an unexpected/untrusted server.  An unknown
+        // remote length would bypass the exact-size guard and could allow an
+        // unbounded write (e.g. a planted large payload).
+        let bytes_total = match bytes_total {
+            Some(len) => Some(len),
+            None => bail!(
+                "refusing model download for {rel}: server did not report a Content-Length"
+            ),
+        };
+
         // Skip if the local file already matches the remote size exactly.
         if let Some(expected) = bytes_total {
             if std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == expected && expected > 0 {
@@ -233,13 +255,16 @@ mod tests {
     }
 
     #[test]
-    fn model_present_true_when_all_files_nonempty() {
+    fn model_present_true_when_all_files_large_enough() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = model_dir(tmp.path());
+        // Files must exceed 1024 bytes to count as present (UI-status guard
+        // against planted tiny files; see model_present doc).
+        let payload = vec![0xABu8; 2048];
         for rel in FP32_FILES {
             let p = dir.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"x").unwrap();
+            std::fs::write(&p, &payload).unwrap();
         }
         assert!(model_present(tmp.path(), false));
         // A zero-byte file must NOT count as present.

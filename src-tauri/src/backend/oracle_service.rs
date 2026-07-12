@@ -2588,6 +2588,11 @@ pub fn set_oracle_engine(
     std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
     crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
     set_oracle_engine_flag(parsed);
+    // Drop whatever server is currently bound to the session port so the
+    // supervisor's next reconcile starts the newly-selected engine. Both calls
+    // are idempotent/non-blocking and safe under either engine.
+    crate::oracle::rust_oracle::stop_rust_oracle_server();
+    let _ = crate::oracle::python_oracle::kill_python_oracle_child();
     Ok(parsed.as_str().to_string())
 }
 

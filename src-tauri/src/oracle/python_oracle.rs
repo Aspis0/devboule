@@ -741,7 +741,7 @@ fn oracle_port_is_bindable(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
-fn wait_for_oracle_port_free(stop: &AtomicBool) -> Result<(), String> {
+pub(crate) fn wait_for_oracle_port_free(stop: &AtomicBool) -> Result<(), String> {
     let port = oracle_http_session().port;
     let started = Instant::now();
     loop {
