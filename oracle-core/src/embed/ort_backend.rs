@@ -23,7 +23,7 @@ impl OrtEmbedder {
         // explicitly here so callers don't depend on ambient env state.
         let variant = if int8 { "int8" } else { "fp32" };
         std::env::set_var("ORACLE_RS_ONNX_VARIANT", variant);
-        let (inner, _load_ms) = OnnxEmbedder::load(model_dir, EpArg::Cpu).with_context(|| {
+        let (inner, _load_ms) = OnnxEmbedder::load(model_dir, default_ep()).with_context(|| {
             format!(
                 "loading ONNX embedder ({variant}) from {}",
                 model_dir.display()
@@ -38,6 +38,36 @@ impl OrtEmbedder {
     /// Default on-disk location for the ONNX model bundle.
     pub fn default_model_dir(oracle_data_root: &Path) -> PathBuf {
         oracle_data_root.join("models").join("qwen3-onnx")
+    }
+}
+
+/// The execution provider to request for the current platform: the GPU EP where
+/// one is wired (macOS → CoreML, Windows → DirectML), else CPU. `ort` soft-falls
+/// back to CPU when the GPU EP cannot register (no driver / device unavailable),
+/// so requesting the GPU EP unconditionally is safe and yields "GPU when possible,
+/// else CPU" — mirroring the old Python `choose_device` behavior. `ORACLE_RS_EP`
+/// ("cpu" | "coreml" | "directml") forces a specific EP, like Python's
+/// `ORACLE_EMBED_DEVICE` override (a wrong-platform value fails loudly in `load`).
+fn default_ep() -> EpArg {
+    if let Ok(forced) = std::env::var("ORACLE_RS_EP") {
+        match forced.trim().to_ascii_lowercase().as_str() {
+            "cpu" => return EpArg::Cpu,
+            "coreml" => return EpArg::Coreml,
+            "directml" | "dml" => return EpArg::Directml,
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        EpArg::Coreml
+    }
+    #[cfg(target_os = "windows")]
+    {
+        EpArg::Directml
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        EpArg::Cpu
     }
 }
 

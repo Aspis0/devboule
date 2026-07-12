@@ -40,9 +40,10 @@ pub enum BackendChoice {
     /// candle (fastembed qwen3). `metal` only works on macOS builds with the
     /// `metal` feature; `f16` is only meaningful together with metal.
     Candle { metal: bool, f16: bool },
-    /// ONNX Runtime, CPU EP. `model_dir` holds `onnx/model*.onnx` +
-    /// `tokenizer.json`; `int8` selects the quantized graph (needs its OWN
-    /// index — parity-incompatible with f32-embedded corpora).
+    /// ONNX Runtime with the platform GPU EP auto-selected (macOS → CoreML,
+    /// Windows → DirectML) and automatic CPU fallback. `model_dir` holds
+    /// `onnx/model*.onnx` + `tokenizer.json`; `int8` selects the quantized graph
+    /// (needs its OWN index — parity-incompatible with f32-embedded corpora).
     Ort { model_dir: PathBuf, int8: bool },
 }
 
@@ -64,10 +65,10 @@ pub trait Embedder: Send {
 /// Resolve the default backend for this build/platform.
 ///
 /// macOS + `metal` feature → candle Metal F16 (index-parity proven, model in
-/// the shared HF cache). Everything else → ONNX fp32 CPU (index-parity
-/// proven, the safe cross-platform baseline). `ORACLE_RS_BACKEND=candle|onnx`
+/// the shared HF cache). Everything else → ONNX int8 with the platform GPU EP
+/// auto-selected (CoreML/DirectML) and CPU fallback. `ORACLE_RS_BACKEND=candle|onnx`
 /// overrides; `ORACLE_EMBED_DEVICE=cpu` forces CPU on the candle path
-/// (mirroring the Python env knob).
+/// (mirroring the Python env knob); `ORACLE_RS_EP` forces the ONNX EP.
 pub fn default_backend(ort_model_dir: PathBuf) -> BackendChoice {
     let forced = std::env::var("ORACLE_RS_BACKEND").ok();
     let force_cpu = std::env::var("ORACLE_EMBED_DEVICE")
@@ -79,7 +80,7 @@ pub fn default_backend(ort_model_dir: PathBuf) -> BackendChoice {
         Some(v) if v.eq_ignore_ascii_case("onnx") || v.eq_ignore_ascii_case("ort") => {
             BackendChoice::Ort {
                 model_dir: ort_model_dir,
-                int8: false,
+                int8: true,
             }
         }
         Some(v) if v.eq_ignore_ascii_case("candle") => BackendChoice::Candle {
@@ -92,7 +93,7 @@ pub fn default_backend(ort_model_dir: PathBuf) -> BackendChoice {
         },
         _ => BackendChoice::Ort {
             model_dir: ort_model_dir,
-            int8: false,
+            int8: true,
         },
     }
 }

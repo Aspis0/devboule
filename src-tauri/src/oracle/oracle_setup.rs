@@ -764,7 +764,7 @@ fn rust_model_data_dir(root: &Path) -> PathBuf {
 
 fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
     let data_dir = rust_model_data_dir(root);
-    let present = oracle_core::model_download::model_present(&data_dir, false); // fp32
+    let present = oracle_core::model_download::model_present(&data_dir, true); // int8
     let mut messages = Vec::new();
     if present {
         messages.push("Rust engine: ONNX embedding model is installed.".to_string());
@@ -782,7 +782,7 @@ fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
         deps_ready: true,
         embedder_ready: present,
         ready: present,
-        embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX fp32)".to_string(),
+        embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX int8)".to_string(),
         messages,
     }
 }
@@ -791,7 +791,7 @@ fn install_rust_runtime(root: &Path) -> Result<OracleRuntimeSetup, String> {
     let data_dir = rust_model_data_dir(root);
     // v1: no UI progress channel is wired; log progress to stderr. The UI polls
     // get_oracle_runtime_setup separately and will show `ready` once done.
-    oracle_core::model_download::ensure_qwen3_onnx(&data_dir, false, |p| {
+    oracle_core::model_download::ensure_qwen3_onnx(&data_dir, true, |p| {
         let pct = match p.bytes_total {
             Some(t) if t > 0 => format!("{}%", (p.bytes_done * 100) / t),
             _ => format!("{} bytes", p.bytes_done),

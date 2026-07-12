@@ -17,6 +17,7 @@ pub const ONNX_MODEL_ID: &str = "Qwen3-Embedding-0.6B-ONNX-int8";
 pub enum EpArg {
     Cpu,
     Coreml,
+    Directml,
 }
 
 /// ONNX (`ort`) embedding backend: a compiled session plus a tokenizer.
@@ -77,6 +78,27 @@ impl OnnxEmbedder {
         #[cfg(not(target_os = "macos"))]
         if matches!(ep, EpArg::Coreml) {
             anyhow::bail!("--ep coreml is only supported on macOS builds");
+        }
+
+        // Windows GPU via DirectML (any DX12 GPU). `with_execution_providers` uses
+        // ort's default soft-fallback (error_on_failure = false): if the GPU EP
+        // cannot register (no driver, device busy/absent), ort logs a warning and
+        // silently proceeds on CPU — so this call effectively never errors for an
+        // unavailable GPU, giving us "GPU when possible, else CPU" for free.
+        #[cfg(target_os = "windows")]
+        {
+            use ort::ep;
+            if matches!(ep, EpArg::Directml) {
+                builder = builder
+                    .with_execution_providers([ep::DirectML::default().build()])
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to register DirectML execution provider: {e}")
+                    })?;
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        if matches!(ep, EpArg::Directml) {
+            anyhow::bail!("--ep directml is only supported on Windows builds");
         }
 
         let session = builder.commit_from_file(&model_path).with_context(|| {

@@ -70,10 +70,34 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
     // If the slot is `None` (either empty or just cleared), build state and spawn.
     if guard.is_none() {
         let paths = OracleDataPaths::from_root(root);
-        let model_dir = oracle_core::model_download::model_dir(&paths.root);
+        // The index (sqlite/vectors below) is per-project — that is `paths`. The
+        // ONNX model is NOT: it is one shared file for every indexed project, owned
+        // by the RUNTIME data root (dev: source repo; release: app-data dir) — the
+        // exact place the installer downloads it into
+        // (`oracle_setup::rust_model_data_dir` → `oracle_data_root()`). Resolving it
+        // from the per-project index root instead made every folder need its own
+        // ~2.5GB copy AND silently diverged from the install location, so any folder
+        // the installer never populated served a missing model. Fall back to the
+        // index root only when no runtime root is recorded (tests / unseeded).
+        let model_root = crate::oracle::python_oracle::oracle_data_root()
+            .map(|r| OracleDataPaths::from_root(&r).root)
+            .unwrap_or_else(|| paths.root.clone());
+        let model_dir = oracle_core::model_download::model_dir(&model_root);
+        // Fail LOUD when the shared ONNX model is not installed. The embedder is
+        // lazy-loaded (first /context or /ask), and /health does NOT touch it — so
+        // without this guard the server would bind, pass the readiness probe, and
+        // only 500 on the first real query, leaving Oracle "falsely ready". Bail
+        // here instead so the supervisor keeps Oracle honestly not-ready until the
+        // operator runs Install (which populates this exact `model_root`).
+        if !oracle_core::model_download::model_present(&model_root, true) {
+            return Err(format!(
+                "Rust oracle: ONNX embedding model not installed at {} — run Oracle runtime Install first",
+                model_dir.display()
+            ));
+        }
         let pool = Arc::new(EmbedderPool::new(BackendChoice::Ort {
             model_dir,
-            int8: false,
+            int8: true,
         }));
         let (_base_url, port) = crate::oracle::python_oracle::oracle_session_endpoint();
 

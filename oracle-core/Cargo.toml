@@ -40,10 +40,16 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 http-body-util = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Metal/CoreML are macOS-only — Windows builds must never see them.
+# Metal/CoreML are macOS-only — other targets must never see them.
 ort = { version = "2.0.0-rc.10", features = ["coreml"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
+# DirectML runs on any DX12 GPU (AMD/Intel/NVIDIA) with no CUDA toolkit, so it is
+# the portable Windows GPU EP; it is Windows-only and must not leak to other targets.
+ort = { version = "2.0.0-rc.10", features = ["directml"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+# Linux/other: CPU EP only (no GPU EP feature enabled).
 ort = { version = "2.0.0-rc.10" }
 
 [dev-dependencies]
