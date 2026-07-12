@@ -99,6 +99,29 @@ Process per house rules: TDD; coding via pi (mimo/hy3, exact API signatures past
 - **P12 — Cutover.** Default `oracle.engine=rust`; Python path behind the flag for one release as escape hatch; venv cleanup migration (delete `oracle-data/venv` when rust active, reclaim 2–3 GB); slim `requirements-mcp.txt` (mcp+httpx only) for `aspis_mcp.py`; **surgical `aspis_mcp.py` edit (audit finding #2, BLOCKER)**: remove the top-level `from oracle.server.answerer import …` / `from oracle.server.query_engine import …` imports (aspis_mcp.py:21-22, 1450) AND the in-process fallback bodies (`mcp_oracle_context`/`mcp_oracle_ask`/`make_mcp_engine`), replacing them with a clean "oracle server unreachable" error — a runtime gate is NOT enough, the module-level imports would crash the whole MCP at startup once P13 deletes those modules; drop CLI-fallback + python-spawn code paths; docs.
 - **P13 — Post-cutover max-recall + delete.** After owner sign-off: remove Python runtime-core modules (`server/{routes,main,query_engine,answerer,index_jobs}.py`, `ingestion/` runtime, `store/`, `watcher/`, `bootstrap/{warmup,doctor}.py`) — `aspis_mcp.py` (post-P12 edit) + evals/training stay (dev-only; they import runtime modules, so they run only in a dev checkout with the pre-P13 tree or get their imports vendored — decide at P13, they never ship); remove `oracle_setup.rs` installer + `python_oracle.rs` spawn machinery; final max-recall on the deletion diff (removed-behavior angle is the point here).
 
+### M1 max-recall — deferred tickets (found by the 3-reviewer audit, NOT blocking M2)
+
+These are behavior gaps vs Python that are safe to defer past the cutover (the
+Python engine stays available behind the flag until M3):
+- **OOM → CPU embed fallback**: Python's embedder catches CUDA/MPS OOM, unloads,
+  re-pins to CPU, reloads, retries the batch. The Rust `EmbedderPool` returns an
+  error → the index job fails. Lower risk on the shipped backends (candle Metal
+  / ort CPU) than on torch CUDA, but should be added before a CUDA build.
+- **CKG neighbor expansion in `ask()`** + **`_refresh_ckg_best_effort`**: the CKG
+  subsystem (separate Rust tree-sitter bridge) is out of the port scope; the
+  engine currently has no `expand_ckg_neighbors` path. This is a SILENT `/ask`
+  quality reduction for CKG-enabled workspaces — make the degradation explicit
+  (log once) until CKG is wired.
+- **Adaptive embed batch sizing**: Python scales 4→64 by free VRAM/RAM; Rust uses
+  a fixed 32. Fine as a default; revisit for low-memory machines.
+- **Manifest parse cache**: Python LRU-caches manifest reads keyed on
+  (path,mtime,size); Rust re-reads. Performance only.
+- **Embed-pool lock held across compute** (Sonnet angle-1 F3): a bulk index run
+  blocks live query embedding for the batch duration. Currently accepted as an
+  intentional shared-resource trade-off; revisit if search-during-index latency
+  is a problem (split the load-check from the compute, give the backend its own
+  exclusion).
+
 ### M4 — (separate follow-on plan, not in this scope)
 
 Port `aspis_mcp.py` (10 k LOC) to a Rust stdio-MCP sidecar binary (`rmcp`), shipped with the app, spawned by CLI agents exactly as today. Only then is Python 100 % gone from user machines.
