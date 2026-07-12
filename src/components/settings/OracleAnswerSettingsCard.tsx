@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	KeyRound,
+	PlayCircle,
 	ShieldCheck,
 	StopCircle,
 	CheckCircle2,
@@ -436,6 +437,37 @@ export function OracleAnswerSettingsCard() {
 						<StopCircle className="h-3.5 w-3.5" />
 						Remove key
 					</button>
+					{oracleLlmSettings?.status === "disabled" ? (
+					<button
+						onClick={() => {
+							// Populate the form with a ready-to-save enabled default; do NOT persist.
+							// The user reviews provider/model/key and presses Save LLM to actually
+							// enable. This avoids silently enabling a remote provider or reusing a
+							// stored API key without an explicit Save.
+							const isLocal =
+								llmForm.provider === "omlx" || llmForm.provider === "ollama";
+							const enableForm = {
+								...llmForm,
+								provider: llmForm.provider || "openai",
+								model: llmForm.model.trim() || "gpt-4o-mini",
+								baseUrl:
+									llmForm.baseUrl ||
+									defaultBaseUrls[llmForm.provider || "openai"] ||
+									null,
+								remoteEnabled: !isLocal,
+							};
+							setLlmForm(enableForm);
+							resetSaveFeedback();
+						}}
+						disabled={isLoading}
+						data-help-title="This turns Oracle answer generation back on."
+						data-help-lines="It re-enables answering with the current provider/model, defaulting to a remote OpenAI-compatible endpoint.|Remote providers still need an API key — add one above; local oMLX/Ollama are keyless.|After enabling you can change provider, model, and key, then press Save LLM.|Retrieval always works even without answering."
+						className="inline-flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-sage-dark hover:border-sage/40 disabled:cursor-not-allowed disabled:opacity-60"
+					>
+						<PlayCircle className="h-3.5 w-3.5" />
+						Enable answer LLM
+					</button>
+					) : (
 					<button
 						onClick={() => {
 							void saveOracleLlmSettings(
@@ -450,12 +482,13 @@ export function OracleAnswerSettingsCard() {
 						}}
 						disabled={isLoading}
 						data-help-title="This disables Oracle answer generation."
-						data-help-lines="Oracle will still retrieve relevant chunks but will not call any LLM to generate a summary.|Use this when you only need retrieval or want to free the LLM for other tasks."
+						data-help-lines="Oracle will still retrieve relevant chunks but will not call any LLM to generate a summary.|Use this when you only need retrieval or want to free the LLM for other tasks.|You can re-enable it here at any time."
 						className="inline-flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-500 hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
 					>
 						<StopCircle className="h-3.5 w-3.5" />
 						Disable answer LLM
 					</button>
+					)}
 				</div>
 			</section>
 		</section>
