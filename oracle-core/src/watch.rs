@@ -160,7 +160,7 @@ pub fn is_commit_event(path: &str) -> bool {
     // because it appears AFTER refs/heads/).
     for i in 0..parts.len().saturating_sub(1) {
         if parts[i] == "refs" && parts[i + 1] == "heads" {
-            if parts[..i].iter().any(|p| *p == "logs") {
+            if parts[..i].contains(&"logs") {
                 return false;
             }
             return i + 2 < parts.len(); // need at least one segment after "heads"
@@ -168,7 +168,7 @@ pub fn is_commit_event(path: &str) -> bool {
     }
 
     if name == "HEAD" {
-        return !parts.iter().any(|p| *p == "logs");
+        return !parts.contains(&"logs");
     }
 
     name == "packed-refs"

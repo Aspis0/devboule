@@ -45,7 +45,7 @@ use crate::ingest::retrieval_text::{self, ChunkMeta};
 use crate::store::lance::{LanceRow, LanceStore};
 use crate::store::manifest::{
     self, file_signature, load_manifest, manifest_files_for_root, save_manifest,
-    sync_legacy_manifest_root, ManifestFileEntry,
+    sync_legacy_manifest_root,
 };
 use crate::store::sqlite::{FileChunk, SqliteStore};
 
@@ -345,11 +345,11 @@ fn enrich_chunks(chunks: &mut [serde_json::Value], mtime: &str, file_id: &str) {
 
 /// Yield sub-batches of chunks bounded by `max_chunks` and `max_chars` of
 /// embedding text (mirrors Python's `chunk_batches`).
-fn chunk_batches<'a>(
-    chunks: &'a [serde_json::Value],
+fn chunk_batches(
+    chunks: &[serde_json::Value],
     max_chunks: usize,
     max_chars: usize,
-) -> Vec<Vec<&'a serde_json::Value>> {
+) -> Vec<Vec<&serde_json::Value>> {
     let max_chunks = max_chunks.max(1);
     let max_chars = max_chars.max(1);
     let mut batches = Vec::new();
@@ -642,7 +642,7 @@ pub async fn prune_excluded_chunks(
     let mut manifest = load_manifest(manifest_path);
     {
         let roots = manifest::manifest_roots(&mut manifest);
-        for (root_key, entry) in roots.iter() {
+        for (root_key, _entry) in roots.iter() {
             if root_key == &root.to_string_lossy().to_string() {
                 continue;
             }

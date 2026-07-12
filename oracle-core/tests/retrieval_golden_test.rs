@@ -148,7 +148,7 @@ fn golden_chunk_embedding_texts() {
     let mut tested = 0;
     let mut missing = Vec::new();
 
-    for (_file_path, file_chunks) in &raw_chunks {
+    for file_chunks in raw_chunks.values() {
         for raw in file_chunks {
             let chunk_id = raw.id.clone();
             let expected = match emb.chunks.get(&chunk_id) {

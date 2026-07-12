@@ -152,7 +152,7 @@ pub async fn refresh_clusters(
         }
         rows.push(FileCluster {
             file_id: fid.to_string(),
-            cluster_id: lbl as i64,
+            cluster_id: lbl,
             score: scores[i] as f64,
         });
     }
@@ -248,7 +248,7 @@ fn kmeans_pp_init(data: &[Vec<f32>], k: usize, rng: &mut Rng) -> Vec<Vec<f32>> {
         let total: f32 = min_dists.iter().sum();
         if total <= 0.0 {
             // All remaining points are at zero distance — find an unchosen one.
-            for (i, p) in data.iter().enumerate() {
+            for p in data.iter() {
                 if !centroids.iter().any(|c| c == p) {
                     centroids.push(p.clone());
                     break;

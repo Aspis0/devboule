@@ -25,12 +25,31 @@ const REMOTE_PROVIDERS: &[&str] = &["scaleway", "infomaniak", "mistral"];
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LlmConfig {
     pub provider: String,
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+}
+
+/// Custom Debug redacts `api_key` so it can never leak via `{:?}` into a log.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "[unset]"
+                } else {
+                    "[redacted]"
+                },
+            )
+            .finish()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

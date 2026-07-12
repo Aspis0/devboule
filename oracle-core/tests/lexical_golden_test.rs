@@ -161,7 +161,7 @@ fn golden_top10_order_match() {
     let lexical_fixture = load_lexical_fixture();
 
     // Build a fast lookup: chunk_id → ScoredChunk
-    let chunk_map: HashMap<&str, &ScoredChunk> =
+    let _chunk_map: HashMap<&str, &ScoredChunk> =
         flat_chunks.iter().map(|c| (c.id.as_str(), c)).collect();
 
     for (query, entry) in &lexical_fixture {

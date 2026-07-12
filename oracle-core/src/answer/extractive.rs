@@ -216,7 +216,7 @@ pub fn find_context_ref<'a>(
     None
 }
 
-fn unique_context_refs<'a>(items: Vec<&'a PreparedChunk>) -> Vec<&'a PreparedChunk> {
+fn unique_context_refs(items: Vec<&PreparedChunk>) -> Vec<&PreparedChunk> {
     let mut seen = std::collections::HashSet::new();
     items
         .into_iter()
@@ -552,7 +552,7 @@ pub fn structural_extractive_answer(
         blocks.push(lines.join("\n"));
     }
     let body = blocks.join("\n\n");
-    let file_count = by_file.len();
+    let _file_count = by_file.len();
     let mut symbols: Vec<String> = Vec::new();
     for (_, chunks) in &by_file {
         for c in chunks {
@@ -614,7 +614,7 @@ pub fn best_sentence(text: &str, query: &str) -> Option<String> {
                 .iter()
                 .map(|term| {
                     lower.matches(term.as_str()).count() as i64
-                        * crate::answer::context::term_weight_pub(term) as i64
+                        * crate::answer::context::term_weight_pub(term)
                 })
                 .sum::<i64>()
         })

@@ -398,7 +398,7 @@ impl QueryEngine {
         let mut previews: HashMap<String, ChunkPreview> = HashMap::new();
         for hit in hits {
             if let Some(chunk) = self.sqlite.get_chunk(&hit.id)? {
-                if allowed_file_ids.map_or(true, |ids| ids.contains(&chunk.file_id)) {
+                if allowed_file_ids.is_none_or(|ids| ids.contains(&chunk.file_id)) {
                     let score = hit.score as f64;
                     if score > scores.get(&chunk.file_id).copied().unwrap_or(-1.0) {
                         scores.insert(chunk.file_id.clone(), score);
@@ -519,7 +519,7 @@ impl QueryEngine {
                 let hits = chunk_vectors.search(&query_vec, limit.max(1)).await?;
                 for hit in hits {
                     if let Some(chunk) = self.sqlite.get_chunk(&hit.id)? {
-                        if allowed_file_ids.map_or(true, |ids| ids.contains(&chunk.file_id))
+                        if allowed_file_ids.is_none_or(|ids| ids.contains(&chunk.file_id))
                             && chunk_matches_filters(
                                 &chunk, kind, language, symbols, imports, module,
                             )
@@ -537,7 +537,7 @@ impl QueryEngine {
         let all_chunks = self.sqlite.all_chunks()?;
         let filtered: Vec<FileChunk> = all_chunks
             .into_iter()
-            .filter(|c| allowed_file_ids.map_or(true, |ids| ids.contains(&c.file_id)))
+            .filter(|c| allowed_file_ids.is_none_or(|ids| ids.contains(&c.file_id)))
             .filter(|c| chunk_matches_filters(c, kind, language, symbols, imports, module))
             .collect();
         let scored: Vec<ScoredChunk> = filtered.iter().map(file_chunk_to_scored).collect();

@@ -8,10 +8,9 @@ use oracle_core::config::EMBED_DIMS;
 use oracle_core::embed::CancelFlag;
 use oracle_core::ingest::indexer::{self, IndexStatus, IndexerConfig, TextEmbedder};
 use oracle_core::store::lance::LanceStore;
-use oracle_core::store::manifest::{self, load_manifest, manifest_files_for_root};
+use oracle_core::store::manifest::{load_manifest, manifest_files_for_root};
 use oracle_core::store::sqlite::SqliteStore;
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -538,7 +537,7 @@ async fn test_cancel_mid_run() {
 fn test_sync_text_chunks_no_vectors() {
     let world = TestWorld::new();
     let sqlite = world.sqlite();
-    let vectors = world.vectors();
+    let _vectors = world.vectors();
 
     // Verify lance is empty before
     // (vectors.count() is async, but we haven't written anything, so it's 0)

@@ -4,7 +4,6 @@
 //! (no network binding). Auth env vars are set per-test with a mutex guard
 //! because `env` is process-global.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
@@ -186,7 +185,7 @@ impl TestWorld {
         let sqlite = SqliteStore::new(&paths.metadata).unwrap();
         let chunk_vectors = LanceStore::new(&paths.chunks);
         let node_vectors = LanceStore::new(&paths.vectors);
-        let file_vectors = LanceStore::new(&paths.file_vectors);
+        let _file_vectors = LanceStore::new(&paths.file_vectors);
 
         // Seed data.
         let chunks = test_chunks();
@@ -567,4 +566,86 @@ async fn test_index_status_camelized_keys() {
         idx.get("indexed_files").is_none(),
         "should NOT have snake_case 'indexed_files'"
     );
+}
+
+// ── Max-recall regression tests ─────────────────────────────────────────────
+
+/// Path-traversal hardening: an operator caller must NOT be able to index a
+/// directory outside the workspace (review angle-3 BLOCKER).
+#[tokio::test]
+async fn test_index_run_rejects_root_outside_workspace() {
+    let world = TestWorld::new("op", "ag").await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.py"), "print('x')\n").unwrap();
+
+    let uri = format!(
+        "/index/run?background=true&root={}",
+        outside.path().to_string_lossy()
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("x-oracle-auth-token", "op")
+        .body(Body::empty())
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// The workspace root itself (and None) must still be accepted.
+#[tokio::test]
+async fn test_index_run_accepts_workspace_root() {
+    let world = TestWorld::new("op", "ag").await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/index/run?background=true")
+        .header("x-oracle-auth-token", "op")
+        .body(Body::empty())
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// /runtime reports chunk-store readiness (consumed by the app's live probe).
+#[tokio::test]
+async fn test_runtime_endpoint_shape() {
+    let world = TestWorld::new("op", "ag").await;
+    let req = Request::builder()
+        .uri("/runtime")
+        .header("x-oracle-auth-token", "op")
+        .body(Body::empty())
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert!(body.get("ready").is_some());
+    assert!(body["chunk_store"].get("ready").is_some());
+    assert_eq!(body["ollama"]["server"], "removed");
+}
+
+/// Discovery file carries the AGENT token (never operator) and heartbeatAt.
+#[tokio::test]
+async fn test_discovery_payload_uses_agent_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".oracle-server.json");
+    oracle_core::server::write_discovery_file(
+        &path,
+        "http://127.0.0.1:12345",
+        "AGENT_TOKEN_XYZ",
+        "/ws",
+    )
+    .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["authToken"], "AGENT_TOKEN_XYZ");
+    assert!(v.get("heartbeatAt").is_some());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "discovery file must be owner-only");
+    }
 }

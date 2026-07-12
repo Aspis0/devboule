@@ -123,7 +123,7 @@ fn load_answer_fixtures() -> Vec<AnswerPromptFixture> {
 
 fn flatten_chunks(chunks: &HashMap<String, Vec<ChunkDict>>) -> HashMap<String, &ChunkDict> {
     let mut flat = HashMap::new();
-    for (_file_id, file_chunks) in chunks {
+    for file_chunks in chunks.values() {
         for chunk in file_chunks {
             flat.insert(chunk.id.clone(), chunk);
         }
@@ -200,7 +200,7 @@ fn golden_answer_prompt_byte_equal() {
         let query = &fixture.query;
         let chunk_ids = &fixture.context_chunk_ids;
 
-        let mut context_for_prepared: Vec<RawChunk> = chunk_ids
+        let context_for_prepared: Vec<RawChunk> = chunk_ids
             .iter()
             .enumerate()
             .filter_map(|(i, id)| flat.get(id.as_str()).map(|cd| (i, cd)))

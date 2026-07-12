@@ -230,6 +230,7 @@ fn detect_device() -> Option<&'static str> {
 const ACTIVE_JOB_STATUSES: &[JobStatus] = &[JobStatus::Queued, JobStatus::Running];
 
 /// Inner state protected by the mutex.
+#[derive(Default)]
 struct JobManagerInner {
     job: JobState,
     thread_handle: Option<JoinHandle<()>>,
@@ -241,18 +242,6 @@ struct JobManagerInner {
     cluster_refresh_handle: Option<JoinHandle<()>>,
 }
 
-impl Default for JobManagerInner {
-    fn default() -> Self {
-        Self {
-            job: JobState::default(),
-            thread_handle: None,
-            cluster_refresh_handle: None,
-            cancel_flag: None,
-            watcher: None,
-            watcher_mode: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatcherMode {
@@ -472,18 +461,28 @@ impl OracleIndexJobManager {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-            // Single-flight: if a thread is running, return existing job.
-            if let Some(ref handle) = inner.thread_handle {
-                if !handle.is_finished() {
-                    return inner.job.clone();
-                }
-                // Thread finished — clean up.
-                if let Some(h) = inner.thread_handle.take() {
-                    let _ = h.join();
-                }
+            // Single-flight guard. Two conditions, BOTH under this one lock, so
+            // there is no TOCTOU window between the check and claiming the slot:
+            //   1. a live worker thread (handle not finished), OR
+            //   2. an ACTIVE job status (Queued/Running/paused_*) — this covers
+            //      the gap after we set Queued below but BEFORE thread_handle is
+            //      stored (a second racing call would otherwise see handle==None
+            //      and spawn a second concurrent indexer on the same stores).
+            let thread_alive = inner
+                .thread_handle
+                .as_ref()
+                .map(|h| !h.is_finished())
+                .unwrap_or(false);
+            if thread_alive || ACTIVE_JOB_STATUSES.contains(&inner.job.status) {
+                return inner.job.clone();
+            }
+            // A finished handle from a prior run — reap it.
+            if let Some(h) = inner.thread_handle.take() {
+                let _ = h.join();
             }
 
-            // Set queued state.
+            // Claim the slot: set Queued NOW so any racing caller bounces on the
+            // status check above until this run finishes.
             inner.job = JobState {
                 status: JobStatus::Queued,
                 root: index_root.to_string_lossy().to_string(),
@@ -504,7 +503,7 @@ impl OracleIndexJobManager {
 
         let handle = thread::spawn(move || {
             let embedder_arc = embedder_factory();
-            let mut mgr = OracleIndexJobManager { inner: inner_arc };
+            let mgr = OracleIndexJobManager { inner: inner_arc };
             match mgr.run_once(
                 Some(&root_owned),
                 force,

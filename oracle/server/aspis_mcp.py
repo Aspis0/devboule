@@ -4291,8 +4291,12 @@ def _resolve_oracle_http_target_uncached(projects_dir: Path) -> tuple[str, str] 
                 )
                 return None
             return base, token
-        except (ValueError, OverflowError):
-            pass  # garbage heartbeat → fall through to the pid gate
+        except (ValueError, OverflowError, TypeError):
+            # ValueError: unparseable string; OverflowError: absurd year;
+            # TypeError: a NAIVE timestamp (no tz) — subtracting it from an
+            # aware datetime raises. All → treat as garbage, fall through to
+            # the pid gate rather than crashing every oracle_ask.
+            pass
     # `bool` is an `int` subclass — a corrupt `"pid": true` must not probe pid 1.
     pid = data.get("pid")
     if isinstance(pid, int) and not isinstance(pid, bool) and not _pid_alive(pid):

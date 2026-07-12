@@ -39,7 +39,7 @@ fn pool_load_embed_unload_reload() {
     assert!(!pool.is_loaded());
 
     // Reload on demand still works after an unload.
-    let again = pool.embed(&texts[..1].to_vec(), 8, &cancel).unwrap();
+    let again = pool.embed(&texts[..1], 8, &cancel).unwrap();
     assert_eq!(again.len(), 1);
 
     // Pre-cancelled flag fails fast with a "cancelled" error.

@@ -11,10 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
-use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,9 +26,9 @@ use crate::answer::LlmAnswerer;
 use crate::config::OracleDataPaths;
 use crate::embed::{CancelFlag, EmbedderPool};
 use crate::ingest::indexer::{self, chunk_index_status, TextEmbedder};
-use crate::jobs::{OracleIndexJobManager, StatusResponse};
+use crate::jobs::OracleIndexJobManager;
 use crate::query::engine::{
-    AskResponse, HashQueryEmbedder, HealthResponse, QueryEmbedder, QueryEngine,
+    QueryEmbedder, QueryEngine,
 };
 use crate::store::lance::{hash_embed, LanceStore};
 use crate::store::manifest::{self, load_manifest};
@@ -74,17 +73,25 @@ pub struct AppState {
 
 impl AppState {
     /// Build a `QueryEngine` on demand (cheap to construct).
-    fn engine(&self) -> QueryEngine {
-        let sqlite = SqliteStore::new(&self.sqlite_path).expect("sqlite open");
+    ///
+    /// Fallible: a corrupt/locked/unreadable metadata.sqlite must surface as a
+    /// clean 500, never panic the handler task.
+    fn engine(&self) -> Result<QueryEngine> {
+        let sqlite = SqliteStore::new(&self.sqlite_path)?;
         let vectors = LanceStore::new(&self.vectors_path);
         let chunk_vectors = LanceStore::new(&self.chunk_vectors_path);
         let file_vectors = LanceStore::new(&self.file_vectors_path);
-        QueryEngine::new(sqlite, vectors, Some(chunk_vectors), Some(file_vectors))
+        Ok(QueryEngine::new(
+            sqlite,
+            vectors,
+            Some(chunk_vectors),
+            Some(file_vectors),
+        ))
     }
 
-    /// Build a fresh SqliteStore on demand.
-    fn sqlite(&self) -> SqliteStore {
-        SqliteStore::new(&self.sqlite_path).expect("sqlite open")
+    /// Build a fresh SqliteStore on demand (fallible — see `engine`).
+    fn sqlite(&self) -> Result<SqliteStore> {
+        SqliteStore::new(&self.sqlite_path)
     }
 }
 
@@ -164,6 +171,48 @@ fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode
 fn auth_error(err: (StatusCode, String)) -> Response {
     let (status, detail) = err;
     (status, Json(serde_json::json!({"detail": detail}))).into_response()
+}
+
+/// Map any internal error to a clean 500 JSON body (never a panic/reset).
+fn internal_error<E: std::fmt::Display>(e: E) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"detail": format!("{e}")})),
+    )
+        .into_response()
+}
+
+/// Authorize an index-write `root` parameter against the server's workspace.
+///
+/// Hardening BEYOND the Python server (which resolves any `root` verbatim):
+/// an index write walks + embeds an entire tree into the shared stores, so a
+/// caller-supplied `root` outside the workspace would exfiltrate arbitrary
+/// filesystem content into the queryable index. The app always indexes its
+/// own workspace, so we require the requested root to be the workspace root
+/// or a descendant of it. `None` → the workspace root (the common case).
+fn authorize_index_root(requested: Option<&str>, state: &AppState) -> Result<PathBuf, Response> {
+    let workspace = std::fs::canonicalize(&state.index_root).unwrap_or(state.index_root.clone());
+    let Some(req) = requested.filter(|s| !s.trim().is_empty()) else {
+        return Ok(state.index_root.clone());
+    };
+    let resolved = std::fs::canonicalize(req).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail": format!("root path unusable: {e}")})),
+        )
+            .into_response()
+    })?;
+    if resolved == workspace || resolved.starts_with(&workspace) {
+        Ok(resolved)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "detail": "root is outside the Oracle workspace and cannot be indexed."
+            })),
+        )
+            .into_response())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -305,13 +354,13 @@ impl TextEmbedder for HashTextEmbedder {
         _cancel: &CancelFlag,
     ) -> Result<Vec<Vec<f32>>> {
         let dims = crate::config::EMBED_DIMS;
-        Ok(texts
+        texts
             .iter()
             .map(|t| {
                 let prefixed = crate::ingest::retrieval_text::query_embedding_text(t, None);
                 Ok(hash_embed(&prefixed, dims))
             })
-            .collect::<Result<Vec<Vec<f32>>>>()?)
+            .collect::<Result<Vec<Vec<f32>>>>()
     }
 }
 
@@ -358,7 +407,7 @@ async fn health_handler(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let health = engine.health().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -385,6 +434,108 @@ async fn health_handler(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Handler: GET /runtime — retrieval-runtime readiness (verify_runtime.py)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn runtime_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, Response> {
+    require_operator(&headers, &state).map_err(auth_error)?;
+
+    let vectors_path = state.vectors_path.clone();
+    let chunk_vectors_path = state.chunk_vectors_path.clone();
+    let sqlite_path = state.sqlite_path.clone();
+    let manifest_path = OracleDataPaths::from_root(&state.index_root).manifest;
+
+    let vectors = LanceStore::new(&vectors_path);
+    let chunk_vectors = LanceStore::new(&chunk_vectors_path);
+    let vector_records = vectors.count().await.map_err(internal_error)?;
+    let chunk_vector_records = chunk_vectors.count().await.map_err(internal_error)?;
+
+    let (chunk_files, chunk_records) = tokio::task::spawn_blocking(move || {
+        let sqlite = SqliteStore::new(&sqlite_path)?;
+        Ok::<_, anyhow::Error>((sqlite.chunk_file_count()?, sqlite.chunk_count()?))
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+
+    // AUTHORITATIVE readiness = chunk store (dense retrieval + /ask), never the
+    // legacy node vectors.lancedb. Ready = has vectors AND matching sqlite rows.
+    let chunk_ready = chunk_vector_records > 0 && chunk_records > 0;
+
+    let manifest = load_manifest(&manifest_path);
+    let manifest_files = manifest.files.len();
+    let manifest_root = manifest.root.clone();
+
+    let llm_model =
+        std::env::var("ORACLE_LLM_MODEL").unwrap_or_else(|_| "voxtral-small-24b-2507".to_string());
+
+    Ok(Json(serde_json::json!({
+        "vector_store": {
+            "backend": "lance",
+            "path": vectors_path.to_string_lossy(),
+            "records": vector_records,
+            "ready": vector_records > 0,
+        },
+        "chunk_store": {
+            "backend": "lance",
+            "path": chunk_vectors_path.to_string_lossy(),
+            "manifest_path": manifest_path.to_string_lossy(),
+            "manifest_root": manifest_root,
+            "manifest_files": manifest_files,
+            "files": chunk_files,
+            "records": chunk_records,
+            "vector_records": chunk_vector_records,
+            "ready": chunk_ready,
+        },
+        "ready": chunk_ready,
+        "ollama": {
+            "cli": serde_json::Value::Null,
+            "server": "removed",
+            "model": llm_model,
+            "model_available": false,
+            "models": [],
+            "message": "Local Ollama chat path removed; Oracle answers are API-only.",
+        },
+        "setup_commands": [],
+    })))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Handler: GET /coverage — node source coverage (verify_coverage.py)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn coverage_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, Response> {
+    require_operator(&headers, &state).map_err(auth_error)?;
+    let sqlite_path = state.sqlite_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let sqlite = SqliteStore::new(&sqlite_path)?;
+        let nodes = sqlite.all_nodes()?;
+        let total = nodes.len();
+        let oracle = nodes.iter().filter(|n| n.source == "oracle").count();
+        let percent = if total > 0 {
+            ((oracle as f64 / total as f64) * 10000.0).round() / 100.0
+        } else {
+            0.0
+        };
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "total_nodes": total,
+            "oracle_nodes": oracle,
+            "oracle_percent": percent,
+        }))
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    Ok(Json(result))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Handler: GET /snapshot
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -393,7 +544,7 @@ async fn snapshot_handler(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let snapshot = tokio::task::spawn_blocking(move || {
         let nodes = engine.sqlite.all_nodes()?;
         let dup_groups = engine.duplicates()?;
@@ -476,7 +627,7 @@ async fn run_ask(
     q: &str,
     limit: usize,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let pool = Arc::clone(&state.embedder_pool);
     let q = q.to_string();
     let result = {
@@ -554,7 +705,7 @@ async fn run_context(
     allowed: Option<HashSet<String>>,
     prefer_lexical: bool,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let pool = Arc::clone(&state.embedder_pool);
     let q2 = q.to_string();
     let result = {
@@ -618,7 +769,7 @@ async fn ask_bounded_handler(
     let (q, limit, allowed) = parse_bounded_payload(payload, 5)?;
     let prefer_lexical = state.job_manager.indexing_in_progress();
 
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let pool = Arc::clone(&state.embedder_pool);
     let q = q.to_string();
     let result = {
@@ -730,7 +881,7 @@ async fn node_handler(
     AxPath(node_id): AxPath<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.node(&node_id))
         .await
         .map_err(|_| {
@@ -756,7 +907,7 @@ async fn similar_handler(
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
     let limit = params.limit.unwrap_or(5);
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = engine.similar(&node_id, limit).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -776,7 +927,7 @@ async fn clusters_handler(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.clusters_response())
         .await
         .map_err(|_| {
@@ -806,7 +957,7 @@ async fn cluster_members_handler(
     AxPath(cluster_id): AxPath<i64>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.cluster_members(cluster_id))
         .await
         .map_err(|_| {
@@ -836,7 +987,7 @@ async fn cluster_handler(
     AxPath(name): AxPath<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.cluster(&name))
         .await
         .map_err(|_| {
@@ -866,7 +1017,7 @@ async fn area_handler(
     AxPath(name): AxPath<String>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.area(&name))
         .await
         .map_err(|_| {
@@ -895,7 +1046,7 @@ async fn duplicates_handler(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || engine.duplicates())
         .await
         .map_err(|_| {
@@ -924,7 +1075,7 @@ async fn duplicate_labels_handler(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine();
+    let engine = state.engine().map_err(internal_error)?;
     let result = tokio::task::spawn_blocking(move || {
         let dup_groups = engine.duplicates()?;
         let labels: Vec<serde_json::Value> = dup_groups
@@ -1039,10 +1190,7 @@ async fn index_files_handler(
         let mut file_ids: Vec<String> = manifest_files.keys().cloned().collect();
         file_ids.sort();
         if !needle.is_empty() {
-            file_ids = file_ids
-                .into_iter()
-                .filter(|id| id.to_lowercase().contains(&needle))
-                .collect();
+            file_ids.retain(|id| id.to_lowercase().contains(&needle));
         }
         let total = file_ids.len();
         let page: Vec<String> = file_ids.into_iter().skip(offset).take(limit).collect();
@@ -1074,12 +1222,7 @@ async fn index_sync_handler(
     Query(params): Query<IndexSyncQuery>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let index_root = params
-        .root
-        .as_deref()
-        .map(Path::new)
-        .map(|r| crate::jobs::default_index_root(Some(r)))
-        .unwrap_or_else(|| state.index_root.clone());
+    let index_root = authorize_index_root(params.root.as_deref(), &state)?;
     let paths = OracleDataPaths::from_root(&index_root);
     let sqlite_path = paths.metadata.clone();
     let manifest_path = paths.manifest.clone();
@@ -1109,7 +1252,7 @@ async fn index_run_handler(
     Query(params): Query<IndexRunQuery>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let root = params.root.as_deref().map(Path::new);
+    let index_root = authorize_index_root(params.root.as_deref(), &state)?;
     let force = params.force.unwrap_or(false);
     let max_batches = params.max_batches;
     let idle = params.idle.unwrap_or(true);
@@ -1122,7 +1265,7 @@ async fn index_run_handler(
     if background {
         let pool = Arc::clone(&state.embedder_pool);
         let job_state = state.job_manager.start_background(
-            root,
+            Some(index_root.as_path()),
             force,
             effective_max_batches,
             effective_idle,
@@ -1131,8 +1274,6 @@ async fn index_run_handler(
         return Ok(Json(serde_json::to_value(job_state).unwrap_or_default()));
     }
 
-    let index_root = crate::jobs::default_index_root(root);
-    let paths = OracleDataPaths::from_root(&index_root);
     let pool = Arc::clone(&state.embedder_pool);
     let job_manager = Arc::clone(&state.job_manager);
 
@@ -1168,23 +1309,33 @@ async fn index_watch_start_handler(
     Query(params): Query<IndexWatchStartQuery>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let root = params.root.as_deref().map(Path::new);
+    let index_root = authorize_index_root(params.root.as_deref(), &state)?;
+    let root = Some(index_root.as_path());
     let mode = params.mode.as_deref();
-    let index_root = crate::jobs::default_index_root(root);
 
+    // Watcher-triggered reindex MUST use the real embedder pool, exactly like
+    // the manual "Index now" path and Python (index_jobs.py always embeds with
+    // the real model). A hash embedder here would silently poison the live
+    // vector store with near-random vectors for every auto-reindexed file.
+    // Commit kick = full delta (max_batches=None); fs batch = single
+    // opportunistic batch (max_batches=1), mirroring Python's kick params.
     let job_mgr = Arc::clone(&state.job_manager);
     let jr = index_root.clone();
+    let pool_commit = Arc::clone(&state.embedder_pool);
     let on_commit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = job_mgr.start_background(Some(&jr), false, None, true, || {
-            Arc::new(HashTextEmbedder) as Arc<dyn TextEmbedder>
+        let pool = Arc::clone(&pool_commit);
+        let _ = job_mgr.start_background(Some(&jr), false, None, true, move || {
+            Arc::new(PoolTextEmbedder(pool)) as Arc<dyn TextEmbedder>
         });
     });
 
     let job_mgr2 = Arc::clone(&state.job_manager);
     let jr2 = index_root.clone();
+    let pool_batch = Arc::clone(&state.embedder_pool);
     let on_batch_ready: Arc<dyn Fn(Vec<String>) + Send + Sync> = Arc::new(move |_paths| {
-        let _ = job_mgr2.start_background(Some(&jr2), false, Some(1), true, || {
-            Arc::new(HashTextEmbedder) as Arc<dyn TextEmbedder>
+        let pool = Arc::clone(&pool_batch);
+        let _ = job_mgr2.start_background(Some(&jr2), false, Some(1), true, move || {
+            Arc::new(PoolTextEmbedder(pool)) as Arc<dyn TextEmbedder>
         });
     });
 
@@ -1256,7 +1407,7 @@ fn parse_bounded_payload(
 // Discovery file writer
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct DiscoveryPayload {
     #[serde(rename = "baseUrl")]
     base_url: String,
@@ -1269,6 +1420,45 @@ struct DiscoveryPayload {
     updated_at: String,
     #[serde(rename = "heartbeatAt")]
     heartbeat_at: String,
+}
+
+/// Custom Debug redacts the agent token — the discovery payload must never
+/// leak its bearer credential into a log line.
+impl std::fmt::Debug for DiscoveryPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveryPayload")
+            .field("base_url", &self.base_url)
+            .field("auth_token", &"[redacted]")
+            .field("index_root", &self.index_root)
+            .field("pid", &self.pid)
+            .field("heartbeat_at", &self.heartbeat_at)
+            .finish()
+    }
+}
+
+/// Write bytes to `path` with owner-only perms (0600 on unix) established
+/// AT CREATION — never a world-readable window between create and chmod.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    // A pre-existing file keeps its old mode through OpenOptions; re-assert.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Write the `.oracle-server.json` discovery file with owner-only perms.
@@ -1288,17 +1478,7 @@ pub fn write_discovery_file(
         heartbeat_at: now,
     };
     let text = serde_json::to_string_pretty(&payload)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, &text)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
+    write_owner_only(path, text.as_bytes())
 }
 
 /// Refresh only the heartbeatAt field.
@@ -1312,8 +1492,7 @@ pub fn refresh_discovery_heartbeat(path: &Path) -> Result<()> {
     payload.heartbeat_at = now.clone();
     payload.updated_at = now;
     let out = serde_json::to_string_pretty(&payload)?;
-    std::fs::write(path, out)?;
-    Ok(())
+    write_owner_only(path, out.as_bytes())
 }
 
 /// Delete the discovery file.
@@ -1353,6 +1532,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     let operator_routes = Router::new()
         .route("/health", get(health_handler))
         .route("/snapshot", get(snapshot_handler))
+        .route("/runtime", get(runtime_handler))
+        .route("/coverage", get(coverage_handler))
         .route("/ask", get(ask_get_handler).post(ask_post_handler))
         .route(
             "/context",

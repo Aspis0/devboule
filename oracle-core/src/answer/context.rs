@@ -315,15 +315,15 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
         // NOTE: Python counts CHARS; these are byte offsets, so on multibyte
         // text the window is slightly SHORTER than Python's (never longer).
         // Boundaries are clamped to char boundaries so slicing cannot panic.
-        let py_start = 0_usize.max(position.saturating_sub(limit / 3));
+        let py_start = position.saturating_sub(limit / 3);
         let py_end = floor_char_boundary(text, text.len().min(py_start + limit));
-        let py_start2 = floor_char_boundary(text, 0_usize.max(py_end.saturating_sub(limit)));
+        let py_start2 = floor_char_boundary(text, py_end.saturating_sub(limit));
 
         let window = &lower[py_start2..py_end];
         let mut score: i64 = 0;
         for term in &terms {
             let count = window.matches(term.as_str()).count() as i64;
-            score += count * term_weight(term) as i64;
+            score += count * term_weight(term);
         }
         if score > best_score {
             best_score = score;
@@ -418,7 +418,7 @@ pub fn redact_secret_tokens(text: &str) -> String {
     let re = secret_high_entropy_re();
     let mut entropy_positions: Vec<(usize, usize)> = re
         .find_iter(&redacted)
-        .map(|m| {
+        .filter_map(|m| {
             let token = m.as_str();
             let has_lower = token.chars().any(|c| c.is_lowercase());
             let has_upper = token.chars().any(|c| c.is_uppercase());
@@ -430,7 +430,6 @@ pub fn redact_secret_tokens(text: &str) -> String {
                 None
             }
         })
-        .flatten()
         .collect();
     entropy_positions.reverse();
     for (start, end) in entropy_positions {

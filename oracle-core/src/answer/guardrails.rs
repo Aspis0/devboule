@@ -402,11 +402,9 @@ fn cited_support_text(citations: &[CitationRef], context: &[PreparedChunk]) -> S
 }
 
 fn context_support_text(item: &PreparedChunk) -> String {
-    vec![
-        item.file_source.clone(),
+    [item.file_source.clone(),
         item.chunk_id.clone(),
-        item.text.clone(),
-    ]
+        item.text.clone()]
     .join("\n")
 }
 

@@ -19,15 +19,13 @@ pub fn build_answer_prompt(query: &str, context: &[PreparedChunk]) -> String {
             let start = item.start_char.unwrap_or(0);
             let end = item.end_char.unwrap_or(0);
             let redacted_text = redact_secret_tokens(&item.text);
-            vec![
-                format!("[{}]", item.r#ref),
+            [format!("[{}]", item.r#ref),
                 format!("file_source: {}", item.file_source),
                 format!("chunk_id: {}", item.chunk_id),
                 format!("chunk_index: {}", chunk_index_str),
                 format!("location: chars {}-{}", start, end),
                 "text:".to_string(),
-                redacted_text,
-            ]
+                redacted_text]
             .join("\n")
         })
         .collect();
