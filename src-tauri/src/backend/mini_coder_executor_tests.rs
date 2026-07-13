@@ -4533,3 +4533,16 @@ fn stuck_report_project_id_derived_from_parent_session_for_mcp_directive() {
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["projectId"], "proj-parent");
 }
+
+// B2 (BLOCKER): pure test for the Cloud gate in the directive executor dispatch.
+#[test]
+fn backend_supports_directive_dispatch_cloud_is_rejected() {
+    use super::super::mini_coder::MiniCoderBackendKind;
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Cloud).is_err());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Ollama).is_ok());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Omlx).is_ok());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Codex).is_ok());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Openai).is_ok());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Api).is_ok());
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::AppleFm).is_ok());
+}
