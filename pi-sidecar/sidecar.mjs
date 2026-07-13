@@ -72,20 +72,33 @@ function emitError(context, err) {
 // either `~/.pi/agent/mcp.json` or `~/.pi/mcp.json`. If not, `oracle_ask`
 // (which the Rust side surfaces via the Oracle MCP) will not work. We only
 // check config presence here — actual reachability is the MCP client's concern.
-function isOracleMcpConfigured() {
+// F4: renamed semantics — checks whether ANY aspis MCP server (aspis-management
+// or oracle-figlyph) is configured. Checks:
+// 1. Global: ~/.pi/agent/mcp.json and ~/.pi/mcp.json
+// 2. Project-scoped: <DEVBOULE_PROJECT_ROOT>/.pi/mcp.json and .mcp.json
+// Accepts EITHER server as "MCP configured" so the banner is accurate.
+function isAspisMcpConfigured() {
+	const projectRoot = process.env.DEVBOULE_PROJECT_ROOT || null;
 	try {
 		const candidates = [
 			join(homedir(), ".pi", "agent", "mcp.json"),
 			join(homedir(), ".pi", "mcp.json"),
 		];
+		// F4: also check project-scoped configs.
+		if (projectRoot) {
+			candidates.push(join(projectRoot, ".pi", "mcp.json"));
+			candidates.push(join(projectRoot, ".mcp.json"));
+		}
 		for (const p of candidates) {
 			if (!existsSync(p)) continue;
 			const cfg = JSON.parse(readFileSync(p, "utf8"));
+			// Accept either aspis-management OR oracle-figlyph as "MCP configured".
+			if (cfg?.mcpServers?.["aspis-management"]) return true;
 			if (cfg?.mcpServers?.["oracle-figlyph"]) return true;
 			if (Object.hasOwn(cfg, "oracle-figlyph")) return true;
 		}
 	} catch (e) {
-		console.error("[pi-sidecar] Oracle MCP config check failed:", e);
+		console.error("[pi-sidecar] MCP config check failed:", e);
 	}
 	return false;
 }
@@ -356,6 +369,10 @@ async function main() {
 		sessionManager: SessionManager.inMemory(),
 		authStorage,
 		modelRegistry,
+		// F4: set cwd to the real project root so pi-mcp-adapter discovers
+		// project-local .pi/mcp.json and .mcp.json configs. Falls back to
+		// process.cwd() when DEVBOULE_PROJECT_ROOT is not set (legacy spike).
+		cwd: process.env.DEVBOULE_PROJECT_ROOT || process.cwd(),
 	};
 	if (resolvedModel) {
 		sessionOpts.model = resolvedModel;
@@ -363,6 +380,45 @@ async function main() {
 
 	const { session } = await createAgentSession(sessionOpts);
 	activeSession = session;
+
+	// F4: bind extensions so the session_start event fires and pi-mcp-adapter
+	// initializes its MCP client state. This mirrors what print-mode does
+	// (print-mode.js:48-69). Without this, the adapter's proxy `mcp` tool
+	// exists but its state is forever null → "MCP not initialized".
+	try {
+		await session.bindExtensions({
+			mode: "print",
+			commandContextActions: {
+				waitForIdle: () => session.agent.waitForIdle(),
+				newSession: async (newSessionOptions) => {
+					// Sidecar does not support session switching; no-op.
+				},
+				fork: async () => {
+					// Sidecar does not support fork; no-op.
+					return { cancelled: true };
+				},
+				navigateTree: async () => {
+					// Sidecar does not support tree navigation; no-op.
+					return { cancelled: true };
+				},
+				switchSession: async () => {
+					// Sidecar does not support session switching; no-op.
+				},
+				reload: async () => {
+					// Sidecar does not support reload; no-op.
+				},
+			},
+			onError: (err) => {
+				console.error(`[pi-sidecar] Extension error (${err.extensionPath}): ${err.error}`);
+			},
+		});
+	} catch (err) {
+		emitError("extensions", err);
+		console.error(
+			"[pi-sidecar] bindExtensions failed:",
+			err instanceof Error ? err.message : String(err),
+		);
+	}
 
 	// ---- MCP server logging -----------------------------------------------
 	const mcpServers = session.agent.state.mcpServers;
@@ -377,15 +433,15 @@ async function main() {
 		);
 	}
 
-	// #2: report Oracle MCP availability so the Rust side can warn the user
-	// (via a console banner) that `oracle_ask` will not work without it.
-	const oracleMcpAvailable = isOracleMcpConfigured();
-	if (!oracleMcpAvailable) {
+	// F4: report MCP availability so the Rust side can warn the user
+	// (via a console banner) that aspis tools will not work without it.
+	const aspisMcpAvailable = isAspisMcpConfigured();
+	if (!aspisMcpAvailable) {
 		console.error(
-			"[pi-sidecar] Oracle MCP (oracle-figlyph) NOT configured — oracle_ask will not work.",
+			"[pi-sidecar] Aspis MCP (aspis-management / oracle-figlyph) NOT configured — aspis tools may not work.",
 		);
 	} else {
-		console.error("[pi-sidecar] Oracle MCP (oracle-figlyph) configured.");
+		console.error("[pi-sidecar] Aspis MCP configured.");
 	}
 
 	// ---- Censor hook state -------------------------------------------------
@@ -677,7 +733,7 @@ async function main() {
 		}
 	});
 
-	emit({ type: "ready", oracleMCP: oracleMcpAvailable });
+	emit({ type: "ready", oracleMCP: aspisMcpAvailable });
 
 	console.error(
 		`[pi-sidecar] enrichment active: role=${devbouleContext.agentRole} session=${devbouleContext.sessionId} project=${devbouleContext.projectId}`,

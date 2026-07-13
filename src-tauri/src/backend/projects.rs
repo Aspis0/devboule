@@ -1416,7 +1416,7 @@ fn spawn_pi_orchestrator_session(
     initial_goal_msg_id: Option<&str>,
 ) -> Result<ProjectAgentLaunchResult, String> {
     let info =
-        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id), None)?;
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id), None, Some(root_path))?;
     // Fix C: inject the Rust-authored user chat echo INTO THE QUEUE BEFORE
     // delivering the prompt. The queue is drained only by the reader thread's
     // `handle_event`, which fires after the sidecar receives the prompt via
@@ -1502,7 +1502,7 @@ fn spawn_pi_coder_session(
         other => other,
     };
     let info =
-        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id), Some(agent_id))?;
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id), Some(agent_id), Some(root_path))?;
     // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
     // this the agent sits idle forever while the UI reports `launched: true`.
     // Only send when there is actual text; fail loudly on delivery error rather
@@ -1695,6 +1695,23 @@ fn prepare_or_launch_project_agent(
     } else {
         None
     };
+    // F5: for pi launches, seed the RESOLVED sidecar model into the prompt's
+    // agent_register(model=) placeholder instead of the UI default. The prompt
+    // is composed BEFORE the spawn, so we must resolve the model here. The
+    // resolve_coder_env_for_sidecar call is cheap (vault read + config parse)
+    // and the result is reused by spawn_pi_session_inner anyway.
+    //
+    // The resolved model String lives in the outer scope so the borrow is
+    // valid for the project_agent_prompt call below.
+    let resolved_pi_model: Option<String> = if pi_role.is_some() {
+        let env = crate::backend::pi_sidecar::resolve_coder_env_for_sidecar(&app);
+        Some(env.model)
+    } else {
+        None
+    };
+    let effective_model_hint: Option<&str> = resolved_pi_model
+        .as_deref()
+        .or_else(|| input.model.as_deref());
     let mut prompt = project_agent_prompt(
         &project,
         // ROLE UNTANGLE — the ONE effective role. For codex/claude this is the
@@ -1709,7 +1726,7 @@ fn prepare_or_launch_project_agent(
         task_id.as_deref(),
         &root_path,
         &launch_token,
-        input.model.as_deref(),
+        effective_model_hint,
         // Phase H: the residual-adjudication addendum is gated on a verifier
         // launched with `censorReview: true` (the "Run final review" button).
         // `unwrap_or(false)` keeps every other launch's prompt unchanged.

@@ -610,7 +610,9 @@ fn pi_enabled_unrecognized(value: &str) -> bool {
 /// Read from the Devboule config.json (`localCoderBackend`) + vault API key.
 pub(crate) struct SidecarEnvVars {
     provider: String,
-    model: String,
+    // pub(crate): projects.rs reads the resolved model to seed the persona
+    // prompt's agent_register(model=) placeholder (F5).
+    pub(crate) model: String,
     api_key_env: Option<(String, String)>, // (env_var_name, value)
     base_url: Option<String>,
 }
@@ -861,7 +863,7 @@ fn resolve_sidecar_script(app: &AppHandle) -> Result<std::path::PathBuf, String>
 ///   `writable_paths`.
 /// - `~/.ssh`, `~/.aws`, `/etc`, and other system dirs are NOT writable (absent
 ///   from `writable_paths`) — only the project root, temp, and home are.
-fn pi_sandbox_policy(project_root: &Path) -> SandboxPolicy {
+fn pi_sandbox_policy(project_root: &Path, projects_dir: &Path, _management_root: &Path) -> SandboxPolicy {
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -870,12 +872,34 @@ fn pi_sandbox_policy(project_root: &Path) -> SandboxPolicy {
     let mut policy = SandboxPolicy::deny(project_root.to_path_buf())
         .writable(project_root.to_path_buf())
         .writable(tmpdir)
+        // F3: aspis_mcp python child writes plans/tasks into projects_dir.
+        //
+        // Blast radius (honest): this grant is TREE-WIDE. `.writable(...)` applies
+        // to the entire sandboxed process tree — node plus pi's bash/edit tools, not
+        // just the python MCP child. So any prompt-injected session running on
+        // project A can write project B's bookkeeping files (tasks/state) under
+        // projects_dir, because projects_dir is shared across every managed project.
+        // This is a conscious trade-off: the python MCP child inherits Seatbelt and
+        // MUST write plans/tasks/agents_state under projects_dir, and the alternative
+        // (per-project scoping) would require an aspis_mcp redesign. Note that
+        // claude/codex sessions have NO OS sandbox at all, so this shared grant is
+        // still a strict improvement over those paths. `.git` writes remain denied
+        // by the Seatbelt regex regardless.
+        .writable(projects_dir.to_path_buf())
         .net(NetPolicy::Loopback)
         .rlimits(ResourceLimits {
             cpu_secs: 300,
             addr_space_bytes: Some(8 * 1024 * 1024 * 1024),
-            max_procs: 4,
+            // F3: bump from 4 to 8 — the session tree now includes MCP stdio
+            // servers (python child processes) as children of node.
+            max_procs: 8,
         });
+
+    // management_root is intentionally UNUSED by the policy body today: Seatbelt
+    // grants broad file-read* under the deny default, so the python child can
+    // import the oracle package from management_root without an explicit entry.
+    // The parameter is kept (and named with a leading underscore) to document
+    // intent and preserve call-site arity for future use, not to drive behavior.
 
     // Home is readable + writable so pi can read its own config (keyring caches,
     // ~/.config). Writes remain confined to the project + tmp; sensitive dirs
@@ -905,6 +929,10 @@ fn spawn_pi_session_inner(
     prev_generation: Option<Arc<AtomicU64>>,
     role: Option<&str>,
     project_id: Option<&str>,
+    // F1: the REAL project root (the user's working folder), threaded from
+    // projects.rs. `None` on the legacy spike path falls back to the old
+    // sidecar_dir.parent() derivation.
+    project_root: Option<&Path>,
 ) -> Result<(PiSession, String), String> {
     let script = resolve_sidecar_script(app)?;
     let sidecar_dir = script
@@ -918,10 +946,29 @@ fn spawn_pi_session_inner(
     // Confine pi's edit/write/bash tools to the project directory. Default ON for
     // safety; toggle with DEVBOULE_PI_SANDBOX=false for debugging. On non-macOS
     // wrap/apply_rlimits are no-ops (passthrough), so we only wrap on macOS.
-    let project_root = sidecar_dir
-        .parent()
+    // F1: prefer the explicit project_root over the sidecar-parent fallback.
+    let effective_project_root = project_root
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| sidecar_dir.clone());
+        .unwrap_or_else(|| {
+            sidecar_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| sidecar_dir.clone())
+        });
+
+    // F3: resolve projects_dir and management_root for the sandbox policy and
+    // the MCP config. These use the same resolution chain as claude/codex MCP
+    // wiring. Fail-soft: if resolution fails, proceed without MCP config and
+    // use a minimal sandbox (the session works, just without aspis tools).
+    let mcp_paths = crate::backend::pi_mcp_config::resolve_mcp_paths(app).ok();
+    let (projects_dir, management_root) = mcp_paths
+        .as_ref()
+        .map(|(_, mgr, proj, _)| (proj.clone(), mgr.clone()))
+        .unwrap_or_else(|| {
+            // Fallback: use effective_project_root as both (sandbox stays
+            // correct for the common case; MCP config is skipped).
+            (effective_project_root.clone(), effective_project_root.clone())
+        });
     // Fix 3: use the tolerant opt-out parser (default ON). Previously this did
     // `.map(|v| v == "true").unwrap_or(true)`, which silently DISABLED the macOS
     // Seatbelt sandbox for any value other than the exact string `true`
@@ -930,11 +977,13 @@ fn spawn_pi_session_inner(
     let sandbox_enabled = env_flag_default_on("DEVBOULE_PI_SANDBOX");
     let sandboxed = sandbox_enabled && cfg!(target_os = "macos");
 
-    let policy = pi_sandbox_policy(&project_root);
+    // F3: pass projects_dir (writable for aspis_mcp) and management_root (readable
+    // for python imports) to the sandbox policy.
+    let policy = pi_sandbox_policy(&effective_project_root, &projects_dir, &management_root);
     let script_arg = script.to_string_lossy().into_owned();
     let (program, args): (String, Vec<String>) = if sandboxed {
         let wrapped =
-            crate::backend::sandbox::wrap(&policy, "node", &[script_arg], &project_root);
+            crate::backend::sandbox::wrap(&policy, "node", &[script_arg], &effective_project_root);
         eprintln!("[pi-sidecar] sandbox: enabled (macOS Seatbelt)");
         (wrapped.program, wrapped.args)
     } else {
@@ -973,6 +1022,14 @@ fn spawn_pi_session_inner(
     // path (role == None). The session id is generated before spawn, so the
     // sidecar's event channel never drifts from Rust's session slot.
     cmd.env("DEVBOULE_SESSION_ID", session_id);
+
+    // F1: always set DEVBOULE_PROJECT_ROOT when available. The sidecar uses
+    // this for project-local MCP discovery (.pi/mcp.json under the real
+    // project root, not the pi-sidecar dir). On the legacy spike path (None),
+    // the sidecar falls back to process.cwd().
+    if let Some(ref root) = project_root {
+        cmd.env("DEVBOULE_PROJECT_ROOT", root.as_os_str());
+    }
 
     // Pigeon (unified flag): when OFF (default) the sidecar skips all prompt
     // classification/model-routing and runs each turn on the configured model.
@@ -1020,6 +1077,35 @@ fn spawn_pi_session_inner(
         cmd.env(env_var, key_value);
     }
 
+    // F2: write/merge the project-scoped pi MCP config so the session discovers
+    // aspis-management tools. Fail-SOFT: on error, log a warning and continue
+    // the spawn (a chat without tools is better than no chat).
+    //
+    // NOTE: we cannot surface the failure via `inject_console_entry` here, because
+    // the session slot's `inner` is not populated yet (that happens in
+    // get_or_spawn_session Phase 3, after this fn returns). inject_console_entry
+    // would always err with "has empty slot (spawning?)" and the banner would be
+    // swallowed. Instead we capture the text in `mcp_config_banner` and push it
+    // directly into the injection queue once it exists (we own the queue mid-spawn).
+    let mut mcp_config_banner: Option<String> = None;
+    if let Some(ref root) = project_root {
+        if let Some((ref python, ref mgr_root, ref proj_dir, ref app_bin_str)) = mcp_paths {
+            if let Err(e) = crate::backend::pi_mcp_config::ensure_project_pi_mcp_config(
+                root,
+                python,
+                mgr_root,
+                proj_dir,
+                app_bin_str.as_deref(),
+            ) {
+                eprintln!("[pi-sidecar] F2: MCP config merge failed: {e}");
+                // Surface a console banner so the user sees why aspis tools are absent.
+                mcp_config_banner = Some(format!(
+                    "aspis-management MCP config could not be written: {e}. Aspis tools may be unavailable."
+                ));
+            }
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;
@@ -1056,6 +1142,20 @@ fn spawn_pi_session_inner(
     // Injection queue: control paths push ConsoleEntry items here; the reader
     // thread's EventMapper drains them at the top of every handle_event call.
     let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
+
+    // Push the F2 failure banner (if any) directly into the queue. We are still
+    // mid-spawn and the session slot's `inner` is not populated yet, so
+    // inject_console_entry would fail; we own the queue here, so pushing directly
+    // is correct. The reader thread drains the queue on its first handle_event,
+    // so the banner lands as soon as the session produces an event.
+    if let Some(text) = mcp_config_banner.take() {
+        if let Ok(mut q) = injections.lock() {
+            q.push(super::mini_activity::ConsoleEntry::Banner {
+                text,
+                time: super::mini_activity::console_now_str(),
+            });
+        }
+    }
 
     let app_clone = app.clone();
     let sid = session_id.to_string();
@@ -1230,6 +1330,8 @@ fn get_or_spawn_session(
     session_id_opt: Option<String>,
     role: Option<&str>,
     project_id: Option<&str>,
+    // F1: the real project root, threaded from projects.rs. None on legacy paths.
+    project_root: Option<&Path>,
 ) -> Result<(String, bool), String> {
     let state = app.state::<PiSidecarState>();
 
@@ -1291,7 +1393,7 @@ fn get_or_spawn_session(
     // Lock is now DROPPED — spawn happens without holding the lock.
 
     // Phase 2: spawn outside the lock.
-    let (new_session, resolved_model) = spawn_pi_session_inner(app, &id, prev_gen, role, project_id)?;
+    let (new_session, resolved_model) = spawn_pi_session_inner(app, &id, prev_gen, role, project_id, project_root)?;
 
     // Fix 2: a fresh child process = a fresh generation. Reset this session's
     // anti-loop cap AND delivered-finding set (censor_session_state_reset) so a
@@ -1502,6 +1604,8 @@ pub fn spawn_sidecar_for_role(
     role: &str,
     project_id: Option<&str>,
     explicit_id: Option<&str>,
+    // F1: the real project root, threaded from projects.rs. None on legacy paths.
+    project_root: Option<&Path>,
 ) -> Result<SessionInfo, String> {
     let agent_id = match explicit_id {
         Some(id) => id.to_string(),
@@ -1512,6 +1616,7 @@ pub fn spawn_sidecar_for_role(
         Some(agent_id.clone()),
         Some(role),
         project_id,
+        project_root,
     )?;
     let channel = super::mini_activity::mini_activity_channel(&sid);
     Ok(SessionInfo {
@@ -3928,7 +4033,9 @@ mod tests {
         // Seatbelt regex (RCE-via-planted-hooks guard) even though the project
         // root is writable.
         let root = PathBuf::from("/tmp/aspis-project-root");
-        let policy = pi_sandbox_policy(&root);
+        let projects = PathBuf::from("/tmp/aspis-project-root/projects");
+        let management = PathBuf::from("/tmp/aspis-management");
+        let policy = pi_sandbox_policy(&root, &projects, &management);
         assert!(
             !policy
                 .writable_paths
@@ -3943,11 +4050,58 @@ mod tests {
     fn pi_sandbox_policy_allows_project_write() {
         // The project root must be writable so pi's edit/write/bash land inside it.
         let root = PathBuf::from("/tmp/aspis-project-root");
-        let policy = pi_sandbox_policy(&root);
+        let projects = PathBuf::from("/tmp/aspis-project-root/projects");
+        let management = PathBuf::from("/tmp/aspis-management");
+        let policy = pi_sandbox_policy(&root, &projects, &management);
         assert!(
             policy.writable_paths.contains(&root),
             "project root must be in writable_paths: {:?}",
             policy.writable_paths
+        );
+    }
+
+    // F3: new tests for sandbox policy changes.
+    #[test]
+    fn pi_sandbox_policy_makes_projects_dir_writable() {
+        // F3: aspis_mcp python child writes plans/tasks into projects_dir.
+        let root = PathBuf::from("/tmp/aspis-project-root");
+        let projects = PathBuf::from("/tmp/aspis-project-root/projects");
+        let management = PathBuf::from("/tmp/aspis-management");
+        let policy = pi_sandbox_policy(&root, &projects, &management);
+        assert!(
+            policy.writable_paths.contains(&projects),
+            "projects_dir must be writable: {:?}",
+            policy.writable_paths
+        );
+    }
+
+    #[test]
+    fn pi_sandbox_policy_max_procs_is_eight() {
+        // F3: session tree now includes MCP stdio servers as children of node.
+        let root = PathBuf::from("/tmp/aspis-project-root");
+        let projects = PathBuf::from("/tmp/aspis-project-root/projects");
+        let management = PathBuf::from("/tmp/aspis-management");
+        let policy = pi_sandbox_policy(&root, &projects, &management);
+        assert_eq!(
+            policy.rlimits.max_procs, 8,
+            "max_procs must be 8 (was 4 before F3)"
+        );
+    }
+
+    // F1: the sandbox root is the EXPLICIT project_root when provided, not the
+    // sidecar-parent fallback. This is a pure test of pi_sandbox_policy's
+    // readonly_root field — the preference logic (choose explicit over fallback)
+    // lives in spawn_pi_session_inner, but the policy itself must faithfully
+    // use whatever root the caller passes.
+    #[test]
+    fn pi_sandbox_policy_uses_explicit_root_for_deny() {
+        let explicit = PathBuf::from("/Users/user/Projects/MyApp");
+        let projects = PathBuf::from("/Users/user/Projects/MyApp/projects");
+        let management = PathBuf::from("/Users/user/Projects/Aspis-management");
+        let policy = pi_sandbox_policy(&explicit, &projects, &management);
+        assert_eq!(
+            policy.readonly_root, explicit,
+            "readonly_root must be the explicit project_root"
         );
     }
 
@@ -4758,6 +4912,10 @@ mod tests {
         let now = super::now_ms();
         {
             let mut g = state.persisted.lock().unwrap();
+            // Hermetic count: Default seeds `persisted` from <cwd>/.devboule/
+            // pi-sessions.json; a live app's leftover session would skew the
+            // exact-count assertion below. Start from an empty map.
+            g.clear();
             g.insert(
                 "pi-1".to_string(),
                 PersistedSession {
@@ -4902,6 +5060,14 @@ mod tests {
     fn save_pi_sessions_concurrent_no_data_loss() {
         std::env::set_var("DEVBOULE_PI_PERSIST", "true");
         let state = std::sync::Arc::new(PiSidecarState::default());
+        // Hermetic count: Default seeds `persisted` from <cwd>/.devboule/
+        // pi-sessions.json, so a live app's leftover session would skew the
+        // exact-count assertion below. Start from an empty map.
+        state
+            .persisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let n: usize = 16;
         let root = std::env::temp_dir().join(format!(
             "pi-sessions-conc-{}",

@@ -59,6 +59,7 @@ pub mod oracle_service;
 pub mod pigeon_client;
 pub mod pigeon_service;
 pub mod pi_extensions;
+pub mod pi_mcp_config;
 pub mod pi_sidecar;
 pub mod prompt_routing;
 pub mod plan_approval;
