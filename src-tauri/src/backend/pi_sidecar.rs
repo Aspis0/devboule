@@ -741,32 +741,110 @@ pub(crate) fn resolve_coder_env_for_sidecar(app: &AppHandle) -> SidecarEnvVars {
 
 // ---- sidecar spawn --------------------------------------------------------
 
-/// Resolve the path to the `pi-sidecar/sidecar.mjs` script relative to the app.
-fn resolve_sidecar_script() -> Result<std::path::PathBuf, String> {
-    // Dev path: repo root. Works in `npm run tauri dev` (current_dir = repo).
-    let dev_path = std::env::current_dir()
-        .map_err(|e| format!("Cannot resolve CWD: {e}"))?
-        .join("pi-sidecar")
-        .join("sidecar.mjs");
-    if dev_path.exists() {
-        return Ok(dev_path);
+/// Pure helper: walk an ordered list of candidate `pi-sidecar` directories
+/// looking for `target` (relative to each candidate). Also verifies that a
+/// `node_modules` directory exists as a sibling of the script — the script
+/// imports the pi SDK at startup; a resource copy without node_modules would
+/// die on import with a confusing Node stack trace.
+///
+/// If a candidate has the script but is missing node_modules, it is skipped
+/// (and remembered) so later candidates can still win. Returns the first
+/// fully-valid candidate, or an error listing every path tried.
+fn resolve_sidecar_candidates(
+    candidates: &[PathBuf],
+    target: &str,
+) -> Result<PathBuf, String> {
+    let mut tried = Vec::new();
+    let mut script_without_modules: Option<PathBuf> = None;
+
+    for base in candidates {
+        let script_path = base.join(target);
+        tried.push(script_path.display().to_string());
+
+        if !script_path.exists() {
+            continue;
+        }
+
+        // Script exists — check for sibling node_modules directory.
+        let parent = match script_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        if parent.join("node_modules").is_dir() {
+            return Ok(script_path);
+        }
+
+        // Script found but node_modules missing — remember but keep trying.
+        script_without_modules = Some(script_path);
     }
-    // Packaged build: Tauri bundles pi-sidecar/ via `bundle.resources` in
-    // tauri.conf.json. The resolver var points at the resource dir.
-    // TODO(Phase 5): verify sidecar script path in packaged release, and
-    // consider full bundling with `pkg` for an offline binary.
-    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
-        let resource_path = Path::new(&resource_dir)
-            .join("pi-sidecar")
-            .join("sidecar.mjs");
-        if resource_path.exists() {
-            return Ok(resource_path);
+
+    if let Some(path) = script_without_modules {
+        return Err(format!(
+            "Found sidecar.mjs at {} but its sibling node_modules directory is missing. \
+             Run `npm install` in that directory.",
+            path.display()
+        ));
+    }
+
+    Err(format!(
+        "pi-sidecar/sidecar.mjs not found. Tried: {}. \
+         Run `npm install` in pi-sidecar/ first.",
+        tried.join(", ")
+    ))
+}
+
+/// Resolve the path to the `pi-sidecar/sidecar.mjs` script.
+///
+/// Resolution order (first existing, fully-valid candidate wins):
+/// 1. `cwd/pi-sidecar/sidecar.mjs` — covers repo-root launches and the
+///    packaged-exe-with-project-cwd convention.
+/// 2. (debug-only) `CARGO_MANIFEST_DIR.parent()/pi-sidecar/sidecar.mjs` —
+///    CARGO_MANIFEST_DIR is baked at compile time as the absolute path of
+///    src-tauri, so its parent is the repo root. This is what makes
+///    `npm run tauri dev` work regardless of the process cwd (which is
+///    src-tauri/ under `npm run tauri dev`). Gated behind debug_assertions
+///    so a RELEASE build smoke-tested on the build machine itself does NOT
+///    silently shadow `resource_dir()` — the baked source-tree path exists
+///    locally and would prevent the packaged-resources leg from being
+///    exercised, hiding bundling bugs until end-user machines.
+/// 3. `app.path().resource_dir()/pi-sidecar/sidecar.mjs` — the REAL
+///    packaged-build location (tauri.conf.json bundles `../pi-sidecar` via
+///    bundle.resources; in debug builds it lands under
+///    `target/debug/_up_/pi-sidecar`).
+/// 4. `TAURI_RESOURCE_DIR/pi-sidecar/sidecar.mjs` — NOT a Tauri-provided env
+///    var; kept as an explicit manual override / escape hatch.
+fn resolve_sidecar_script(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let target = "sidecar.mjs";
+
+    let mut candidates = Vec::new();
+
+    // 1. CWD.
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("pi-sidecar"));
+    }
+
+    // 2. (debug-only) Compile-time repo root via CARGO_MANIFEST_DIR.
+    // Gated behind debug_assertions so a release build on the build machine
+    // does NOT shadow resource_dir() with the baked source-tree path.
+    #[cfg(debug_assertions)]
+    {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Some(repo_root) = manifest_dir.parent() {
+            candidates.push(repo_root.join("pi-sidecar"));
         }
     }
-    Err(
-        "pi-sidecar/sidecar.mjs not found. Run `npm install` in pi-sidecar/ first."
-            .to_string(),
-    )
+
+    // 3. Tauri resource_dir (real packaged-build location).
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("pi-sidecar"));
+    }
+
+    // 4. TAURI_RESOURCE_DIR env override (escape hatch, not Tauri-provided).
+    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
+        candidates.push(PathBuf::from(resource_dir).join("pi-sidecar"));
+    }
+
+    resolve_sidecar_candidates(&candidates, target)
 }
 
 /// Build the macOS Seatbelt sandbox policy for a pi sidecar session (decision #11).
@@ -828,7 +906,7 @@ fn spawn_pi_session_inner(
     role: Option<&str>,
     project_id: Option<&str>,
 ) -> Result<(PiSession, String), String> {
-    let script = resolve_sidecar_script()?;
+    let script = resolve_sidecar_script(app)?;
     let sidecar_dir = script
         .parent()
         .ok_or_else(|| "Cannot resolve pi-sidecar directory".to_string())?
@@ -3616,6 +3694,114 @@ mod tests {
     #[test]
     fn max_sessions_constant_is_sane() {
         assert_eq!(MAX_SESSIONS, 8, "MAX_SESSIONS must be 8");
+    }
+
+    // -- resolve_sidecar_candidates (pure candidate-walk) --------------------
+
+    #[test]
+    fn resolve_sidecar_candidates_picks_existing_script_with_modules() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-sidecar-cand-1-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let candidate = tmp.join("pi-sidecar");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("sidecar.mjs"), "").unwrap();
+        std::fs::create_dir(candidate.join("node_modules")).unwrap();
+
+        let result = resolve_sidecar_candidates(&[candidate.clone()], "sidecar.mjs");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), candidate.join("sidecar.mjs"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_sidecar_candidates_skips_script_without_modules() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-sidecar-cand-2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Candidate 1: has script but NO node_modules.
+        let bad = tmp.join("bad");
+        std::fs::create_dir_all(bad.join("pi-sidecar")).unwrap();
+        std::fs::write(bad.join("pi-sidecar").join("sidecar.mjs"), "").unwrap();
+        // Candidate 2: has both.
+        let good = tmp.join("good");
+        std::fs::create_dir_all(good.join("pi-sidecar")).unwrap();
+        std::fs::write(good.join("pi-sidecar").join("sidecar.mjs"), "").unwrap();
+        std::fs::create_dir(good.join("pi-sidecar").join("node_modules")).unwrap();
+
+        // Candidates must be the pi-sidecar dirs themselves (the helper
+        // joins each candidate directly with the target filename).
+        let result = resolve_sidecar_candidates(
+            &[bad.join("pi-sidecar"), good.join("pi-sidecar")],
+            "sidecar.mjs",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            good.join("pi-sidecar").join("sidecar.mjs")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_sidecar_candidates_error_when_only_script_without_modules() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-sidecar-cand-3-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let candidate = tmp.join("pi-sidecar");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("sidecar.mjs"), "").unwrap();
+        // No node_modules.
+
+        let result = resolve_sidecar_candidates(&[candidate.clone()], "sidecar.mjs");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("node_modules"),
+            "error must mention node_modules: {err}"
+        );
+        assert!(
+            err.contains(&candidate.join("sidecar.mjs").display().to_string()),
+            "error must include the path: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_sidecar_candidates_error_lists_all_tried_paths() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-sidecar-cand-4-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Two missing candidates (dirs exist but sidecar.mjs does not).
+        let a = tmp.join("a").join("pi-sidecar");
+        let b = tmp.join("b").join("pi-sidecar");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let result = resolve_sidecar_candidates(&[a.clone(), b.clone()], "sidecar.mjs");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let expected_a = a.join("sidecar.mjs").display().to_string();
+        let expected_b = b.join("sidecar.mjs").display().to_string();
+        assert!(err.contains(&expected_a), "must list first tried path: {err}");
+        assert!(err.contains(&expected_b), "must list second tried path: {err}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -- resolve_coder_env_for_sidecar fallback (decision #10) ----------------

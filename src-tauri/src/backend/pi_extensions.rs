@@ -151,34 +151,78 @@ pub fn resolve_pi_agent_dir(app: &AppHandle) -> Result<ResolvedAgentDir, String>
 // Bundled CLI resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the path to the bundled `pi` CLI entry point.
-/// Mirrors `resolve_sidecar_script` (`pi_sidecar.rs:500-525`).
-fn resolve_bundled_pi_cli() -> Result<PathBuf, String> {
-    // Dev path: repo root → pi-sidecar/node_modules/.bin/pi
-    let dev_path = std::env::current_dir()
-        .map_err(|e| format!("Cannot resolve CWD: {e}"))?
-        .join("pi-sidecar")
-        .join("node_modules")
-        .join(".bin")
-        .join("pi");
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-    // Packaged build: $TAURI_RESOURCE_DIR/pi-sidecar/node_modules/.bin/pi
-    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
-        let resource_path = Path::new(&resource_dir)
-            .join("pi-sidecar")
-            .join("node_modules")
-            .join(".bin")
-            .join("pi");
-        if resource_path.exists() {
-            return Ok(resource_path);
+/// Pure helper: walk an ordered list of candidate `pi-sidecar` directories
+/// looking for `target` (relative to each candidate). No sibling check — the
+/// CLI binary IS inside node_modules. Returns the first existing candidate,
+/// or an error listing every path tried.
+fn resolve_cli_candidates(
+    candidates: &[PathBuf],
+    target: &str,
+) -> Result<PathBuf, String> {
+    let mut tried = Vec::new();
+    for base in candidates {
+        let path = base.join(target);
+        tried.push(path.display().to_string());
+        if path.exists() {
+            return Ok(path);
         }
     }
-    Err(
-        "pi CLI not found at pi-sidecar/node_modules/.bin/pi. Run `npm install` in pi-sidecar/ first."
-            .to_string(),
-    )
+    Err(format!(
+        "pi CLI not found (looked for {target} under each candidate dir). \
+         Tried: {}. Run `npm install` in pi-sidecar/ first.",
+        tried.join(", ")
+    ))
+}
+
+/// Resolve the path to the bundled `pi` CLI entry point.
+///
+/// Resolution order (mirrors `resolve_sidecar_script` in pi_sidecar.rs):
+/// 1. `cwd/pi-sidecar/node_modules/.bin/pi` — covers repo-root launches and
+///    the packaged-exe-with-project-cwd convention.
+/// 2. (debug-only) `CARGO_MANIFEST_DIR.parent()/pi-sidecar/node_modules/.bin/pi`
+///    — CARGO_MANIFEST_DIR is baked at compile time as the absolute path of
+///    src-tauri, so its parent is the repo root. Gated behind debug_assertions
+///    so a release build on the build machine does NOT silently shadow
+///    `resource_dir()` — the baked source-tree path exists locally and would
+///    prevent the packaged-resources leg from being exercised, hiding bundling
+///    bugs until end-user machines.
+/// 3. `app.path().resource_dir()/pi-sidecar/node_modules/.bin/pi` — the REAL
+///    packaged-build location (tauri.conf.json bundles `../pi-sidecar` via
+///    bundle.resources).
+/// 4. `TAURI_RESOURCE_DIR/pi-sidecar/node_modules/.bin/pi` — NOT a Tauri-provided
+///    env var; kept as an explicit manual override / escape hatch.
+fn resolve_bundled_pi_cli(app: &AppHandle) -> Result<PathBuf, String> {
+    let target = Path::new("node_modules").join(".bin").join("pi");
+
+    let mut candidates = Vec::new();
+
+    // 1. CWD.
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("pi-sidecar"));
+    }
+
+    // 2. (debug-only) Compile-time repo root via CARGO_MANIFEST_DIR.
+    // Gated behind debug_assertions so a release build on the build machine
+    // does NOT shadow resource_dir() with the baked source-tree path.
+    #[cfg(debug_assertions)]
+    {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Some(repo_root) = manifest_dir.parent() {
+            candidates.push(repo_root.join("pi-sidecar"));
+        }
+    }
+
+    // 3. Tauri resource_dir (real packaged-build location).
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("pi-sidecar"));
+    }
+
+    // 4. TAURI_RESOURCE_DIR env override (escape hatch, not Tauri-provided).
+    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
+        candidates.push(PathBuf::from(resource_dir).join("pi-sidecar"));
+    }
+
+    resolve_cli_candidates(&candidates, &target.to_string_lossy())
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +412,7 @@ const CLI_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// (avoids pipe-buffer deadlock — BLOCKER 1 fix), and enforces a hard timeout
 /// via a watchdog. Validation is enforced inside (trust boundary).
 fn run_pi_cli_at(
+    app: &AppHandle,
     agent_dir: &Path,
     verb: &str,
     source: &str,
@@ -375,7 +420,7 @@ fn run_pi_cli_at(
     // SECURITY: validate inside the runner (trust boundary — issue 6).
     validate_ext_source(source)?;
 
-    let cli_path = resolve_bundled_pi_cli()?;
+    let cli_path = resolve_bundled_pi_cli(app)?;
 
     let mut cmd = std::process::Command::new("node");
     cmd.arg(&cli_path)
@@ -635,7 +680,7 @@ pub fn bootstrap_extensions_if_needed(app: &AppHandle) {
         }
         // Acquire the global CLI lock (issue 3a).
         let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = run_pi_cli_at(&resolved.path, "install", source) {
+        if let Err(e) = run_pi_cli_at(app, &resolved.path, "install", source) {
             drop(_guard);
             set_bootstrap_status(
                 BootstrapStatus::Failed,
@@ -763,9 +808,10 @@ pub async fn pi_extension_install(app: AppHandle, source: String) -> Result<Stri
     // The MutexGuard must NOT cross the .await, so the entire blocking
     // operation (lock acquisition + CLI run) happens inside spawn_blocking.
     let dir = resolved.path;
+    let app_clone = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        run_pi_cli_at(&dir, "install", &source)
+        run_pi_cli_at(&app_clone, &dir, "install", &source)
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
@@ -782,9 +828,10 @@ pub async fn pi_extension_remove(app: AppHandle, source: String) -> Result<Strin
     }
     let resolved = resolve_pi_agent_dir(&app)?;
     let dir = resolved.path;
+    let app_clone = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        run_pi_cli_at(&dir, "remove", &source)
+        run_pi_cli_at(&app_clone, &dir, "remove", &source)
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
@@ -1524,6 +1571,81 @@ mod tests {
         let cfg = websearch_set_config_inner(&path, "openai").unwrap();
         assert_eq!(cfg.provider, "openai");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- resolve_cli_candidates (pure candidate-walk) -------------------------
+
+    #[test]
+    fn resolve_cli_candidates_picks_existing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-cli-cand-1-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let candidate = tmp.join("pi-sidecar").join("node_modules").join(".bin");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("pi"), "").unwrap();
+
+        let target = Path::new("node_modules").join(".bin").join("pi");
+        let result = resolve_cli_candidates(&[tmp.join("pi-sidecar")], &target.to_string_lossy());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), candidate.join("pi"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_cli_candidates_skips_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-cli-cand-2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Candidate 1: pi-sidecar exists but .bin/pi does not.
+        let missing = tmp.join("missing").join("pi-sidecar");
+        std::fs::create_dir_all(&missing).unwrap();
+        // Candidate 2: has .bin/pi.
+        let good = tmp.join("good").join("pi-sidecar");
+        let bin = good.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("pi"), "").unwrap();
+
+        let target = Path::new("node_modules").join(".bin").join("pi");
+        let result = resolve_cli_candidates(
+            &[missing, good],
+            &target.to_string_lossy(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), bin.join("pi"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_cli_candidates_error_lists_all_tried_paths() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pi-cli-cand-3-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let a = tmp.join("a").join("pi-sidecar");
+        let b = tmp.join("b").join("pi-sidecar");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let target = Path::new("node_modules").join(".bin").join("pi");
+        let expected_a = a.join(&target).display().to_string();
+        let expected_b = b.join(&target).display().to_string();
+        let result = resolve_cli_candidates(&[a, b], &target.to_string_lossy());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains(&expected_a), "must list first tried path: {err}");
+        assert!(err.contains(&expected_b), "must list second tried path: {err}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ---- parse_frontmatter (line-based YAML frontmatter) ----
