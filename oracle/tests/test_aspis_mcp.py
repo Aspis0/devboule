@@ -1883,7 +1883,7 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            self.assertEqual(state["sessions"][0]["status"], "active")
+            self.assertEqual(state["session"]["status"], "active")
 
     def test_privileged_agent_requires_app_launch_token_without_compat_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1985,9 +1985,9 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
 
-            self.assertEqual(state["sessions"][0]["status"], "active")
-            self.assertNotIn("launchTokenHash", state["sessions"][0])
-            self.assertNotIn("sessionTokenHash", state["sessions"][0])
+            self.assertEqual(state["session"]["status"], "active")
+            self.assertNotIn("launchTokenHash", state["session"])
+            self.assertNotIn("sessionTokenHash", state["session"])
             self.assertTrue(state["sessionToken"])
 
     def test_registered_agent_session_token_blocks_spoofed_status_update(self):
@@ -3445,7 +3445,7 @@ root_path: "{escaped_work_root}"
 
                 # Register must preserve the launch-time client even though the
                 # caller did not pass it explicitly.
-                self.assertEqual(registered["sessions"][0]["client"], "codex")
+                self.assertEqual(registered["session"]["client"], "codex")
                 session_token = registered["sessionToken"]
                 self.assertTrue(session_token)
 
@@ -3461,7 +3461,7 @@ root_path: "{escaped_work_root}"
                 )
 
             # Heartbeat must not wipe the client.
-            self.assertEqual(heartbeat["sessions"][0]["client"], "codex")
+            self.assertEqual(heartbeat["session"]["client"], "codex")
 
     def test_explicit_client_is_set_on_public_session_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3480,7 +3480,7 @@ root_path: "{escaped_work_root}"
                 root=root,
             )
 
-            self.assertEqual(state["sessions"][0]["client"], "powershell")
+            self.assertEqual(state["session"]["client"], "powershell")
 
     def test_heartbeat_file_path_persists_current_file_path(self):
         """agent_heartbeat with file_path records currentFilePath on the session.
@@ -3543,7 +3543,7 @@ root_path: "{escaped_work_root}"
 
                 # Right after register, before any file is declared, the field
                 # must be absent/None (no fabricated location for Polis).
-                self.assertIsNone(registered["sessions"][0].get("currentFilePath"))
+                self.assertIsNone(registered["session"].get("currentFilePath"))
 
                 # Heartbeat WITH a file_path records it (normalized: backslashes
                 # folded to forward slashes, a leading "./" stripped).
@@ -3559,7 +3559,7 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
                 self.assertEqual(
-                    heartbeat["sessions"][0]["currentFilePath"],
+                    heartbeat["session"]["currentFilePath"],
                     "src/backend/model.rs",
                 )
 
@@ -3577,7 +3577,7 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
                 self.assertEqual(
-                    heartbeat2["sessions"][0]["currentFilePath"],
+                    heartbeat2["session"]["currentFilePath"],
                     "src/backend/model.rs",
                 )
 
@@ -3607,7 +3607,7 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            self.assertIsNone(heartbeat["sessions"][0].get("currentFilePath"))
+            self.assertIsNone(heartbeat["session"].get("currentFilePath"))
 
 
 class NormalizeModelTests(unittest.TestCase):
@@ -5345,7 +5345,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            self.assertEqual(state["sessions"][0]["model"], "opus")
+            self.assertEqual(state["session"]["model"], "opus")
 
     def test_register_without_model_adds_soft_event(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5360,19 +5360,26 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            # Registration still succeeds; model field defaults to "".
-            self.assertEqual(state["sessions"][0].get("model", ""), "")
+            # Registration still succeeds; model field defaults to "". The compact
+            # ack returns ONLY this agent's own session + a fleet summary (FIX: the
+            # old full-fleet dump drowned small local models). The full fleet
+            # (events, claims, rules) is available via agent_state.
+            self.assertEqual(state["session"].get("model", ""), "")
+            full = handle_tool_call(
+                "agent_state",
+                {"agent_id": "coder-nomodel", "role": "coder"},
+                root=root,
+            )
             # A soft event flags that the agent did not report a model.
-            messages = " ".join(e.get("message", "").lower() for e in state["events"])
-            self.assertIn("model", messages)
+            messages = " ".join(e.get("message", "").lower() for e in full["events"])
             # The soft event uses a DISTINCT event type so the UI/consumers can
             # tell it apart from the normal "register" event.
-            event_types = {e.get("eventType") for e in state["events"]}
+            event_types = {e.get("eventType") for e in full["events"]}
             self.assertIn("register", event_types)
             self.assertIn("register_incomplete", event_types)
             incomplete = next(
                 e
-                for e in state["events"]
+                for e in full["events"]
                 if e.get("eventType") == "register_incomplete"
             )
             self.assertIn("model", incomplete.get("message", "").lower())
@@ -5391,7 +5398,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            event_types = {e.get("eventType") for e in state["events"]}
+            full = handle_tool_call(
+                "agent_state",
+                {"agent_id": "coder-ok", "role": "coder"},
+                root=root,
+            )
+            event_types = {e.get("eventType") for e in full["events"]}
             self.assertIn("register", event_types)
             self.assertNotIn("register_incomplete", event_types)
 
@@ -5409,9 +5421,95 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            session = state["sessions"][0]
+            session = state["session"]
             self.assertEqual(session["subagents"], [])
             self.assertIsNone(session["needsUser"])
+
+    def test_register_and_heartbeat_return_compact_ack(self):
+        """FIX regression: agent_register / agent_heartbeat must return a COMPACT
+        ack (own session + fleet summary), NOT the entire fleet state. The old
+        >100KB dump drowned small local models, which then emitted an empty
+        message and the user saw no reply."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            sample_project(projects)
+            token = "compact-launch-token-0123456789"
+            # Seed a managed launch_pending session (app-issued launch token)
+            # so registration takes the MANAGED path and mints a sessionToken.
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "compact-coder",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registered = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "compact-coder",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            # Top-level compact contract.
+            self.assertIn("sessionToken", registered)
+            self.assertIsNotNone(registered.get("sessionToken"))
+            self.assertIn("version", registered)
+            self.assertIn("updatedAt", registered)
+            self.assertIn("fleet", registered)
+            self.assertEqual(registered["fleet"]["sessions"], 1)
+            self.assertEqual(registered["fleet"]["active"], 1)
+            self.assertIn("note", registered)
+            # "session" is the registering agent's OWN entry, sanitized (no
+            # token-hash fields) — NOT the full sessions list.
+            self.assertIn("session", registered)
+            self.assertIsNotNone(registered["session"])
+            self.assertEqual(registered["session"]["agentId"], "compact-coder")
+            self.assertNotIn("launchTokenHash", registered["session"])
+            self.assertNotIn("launchTokenIssuedAt", registered["session"])
+            self.assertNotIn("sessionTokenHash", registered["session"])
+            self.assertNotIn("sessionTokenIssuedAt", registered["session"])
+            self.assertNotIn("launchConsumedAt", registered["session"])
+            # The full fleet is deliberately NOT dumped.
+            self.assertNotIn("sessions", registered)
+            self.assertNotIn("claims", registered)
+            self.assertNotIn("events", registered)
+            self.assertNotIn("rules", registered)
+
+            # Heartbeat ack also carries the agent's own session.
+            heartbeat = handle_tool_call(
+                "agent_heartbeat",
+                {
+                    "agent_id": "compact-coder",
+                    "status": "active",
+                    "message": "alive",
+                    "session_token": registered["sessionToken"],
+                },
+                root=root,
+            )
+            self.assertIn("session", heartbeat)
+            self.assertEqual(heartbeat["session"]["agentId"], "compact-coder")
+            self.assertEqual(heartbeat["fleet"]["sessions"], 1)
 
     def test_heartbeat_subagents_provided_then_cleared_then_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5439,7 +5537,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 root=root,
             )
             self.assertEqual(
-                hb1["sessions"][0]["subagents"],
+                hb1["session"]["subagents"],
                 [{"label": "explore", "model": "haiku", "count": 2, "role": None}],
             )
             # Absent subagents: leave untouched.
@@ -5449,7 +5547,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 root=root,
             )
             self.assertEqual(
-                hb2["sessions"][0]["subagents"],
+                hb2["session"]["subagents"],
                 [{"label": "explore", "model": "haiku", "count": 2, "role": None}],
             )
             # Empty list clears.
@@ -5463,7 +5561,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            self.assertEqual(hb3["sessions"][0]["subagents"], [])
+            self.assertEqual(hb3["session"]["subagents"], [])
 
     def test_heartbeat_malformed_subagents_leaves_value_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5502,7 +5600,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 root=root,
             )
             self.assertEqual(
-                hb["sessions"][0]["subagents"],
+                hb["session"]["subagents"],
                 [{"label": "explore", "model": "haiku", "count": 2, "role": None}],
             )
 
@@ -5529,7 +5627,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            session = hb["sessions"][0]
+            session = hb["session"]
             self.assertEqual(session["status"], "needs_user")
             needs = session["needsUser"]
             self.assertIsNotNone(needs)
@@ -5562,7 +5660,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            first_since = hb1["sessions"][0]["needsUser"]["since"]
+            first_since = hb1["session"]["needsUser"]["since"]
             hb2 = handle_tool_call(
                 "agent_heartbeat",
                 {
@@ -5572,7 +5670,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            needs = hb2["sessions"][0]["needsUser"]
+            needs = hb2["session"]["needsUser"]
             self.assertEqual(needs["since"], first_since)
             # The message MAY refresh while the transition timestamp is pinned.
             self.assertEqual(needs["message"], "Approve deploy? (still waiting)")
@@ -5600,7 +5698,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                     {"agent_id": agent_id, "status": alias, "message": "need input"},
                     root=root,
                 )
-                session = next(s for s in hb["sessions"] if s["agentId"] == agent_id)
+                session = hb["session"]
                 self.assertEqual(session["status"], "needs_user")
                 self.assertEqual(session["needsUser"]["reason"], alias)
 
@@ -5615,9 +5713,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 {"agent_id": "blk", "status": "blocked", "message": "task blocked"},
                 root=root,
             )
-            blocked_session = next(
-                s for s in hb_blocked["sessions"] if s["agentId"] == "blk"
-            )
+            blocked_session = hb_blocked["session"]
             self.assertEqual(blocked_session["status"], "blocked")
             self.assertIsNone(blocked_session["needsUser"])
 
@@ -5645,7 +5741,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 {"agent_id": "nu-clear", "status": "active", "message": "back to work"},
                 root=root,
             )
-            session = hb["sessions"][0]
+            session = hb["session"]
             self.assertEqual(session["status"], "active")
             self.assertIsNone(session["needsUser"])
 
@@ -5672,7 +5768,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            message = hb["sessions"][0]["needsUser"]["message"]
+            message = hb["session"]["needsUser"]["message"]
             # Control chars collapsed to single spaces by clean_text.
             self.assertNotIn("\n", message)
             self.assertNotIn("\t", message)
@@ -5701,7 +5797,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 {"agent_id": "nu-ws", "status": "needs_user", "message": "   "},
                 root=root,
             )
-            session = hb["sessions"][0]
+            session = hb["session"]
             self.assertEqual(session["status"], "needs_user")
             self.assertEqual(session["needsUser"]["message"], "needs_user")
 
@@ -5719,7 +5815,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            self.assertIsNone(state["sessions"][0]["needsUser"])
+            self.assertIsNone(state["session"]["needsUser"])
 
     def test_public_state_carries_new_fields_and_strips_tokens(self):
         state = {
@@ -5838,7 +5934,7 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             )
             # Reading old state (via agent_register of a new agent) must not raise
             # and must default the legacy session's new fields.
-            state = handle_tool_call(
+            handle_tool_call(
                 "agent_register",
                 {
                     "agent_id": "fresh",
@@ -5848,7 +5944,14 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 },
                 root=root,
             )
-            legacy = next(s for s in state["sessions"] if s["agentId"] == "legacy")
+            # The compact ack returns only the registering agent's own session;
+            # the legacy session lives in the full fleet, fetched via agent_state.
+            full = handle_tool_call(
+                "agent_state",
+                {"agent_id": "fresh", "role": "coder"},
+                root=root,
+            )
+            legacy = next(s for s in full["sessions"] if s["agentId"] == "legacy")
             self.assertEqual(legacy["subagents"], [])
             self.assertIsNone(legacy["needsUser"])
 

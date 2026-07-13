@@ -2105,9 +2105,49 @@ def public_agents_state(
         session.pop("launchTokenIssuedAt", None)
         session.pop("sessionTokenHash", None)
         session.pop("sessionTokenIssuedAt", None)
+        session.pop("launchConsumedAt", None)
     if session_token:
         public["sessionToken"] = session_token
     return public
+
+
+def compact_session_ack(
+    state: dict[str, Any], agent_id: str, session_token: str | None = None
+) -> dict[str, Any]:
+    # COMPACT ACK (FIX): agent_register / agent_heartbeat used to return the
+    # ENTIRE fleet state (public_agents_state) — >100KB of sessions + events +
+    # rules + claims for a real ledger. Small local models (e.g. MLX Qwen 35B)
+    # drown on the next turn and emit an EMPTY message, so the user silently sees
+    # no reply. This returns only the registering agent's OWN sanitized session
+    # plus a tiny fleet summary, keeping the tool result small. Pull the full
+    # fleet from agent_state when needed. The deep copy (json round-trip, like
+    # public_agents_state) means sanitizing never mutates the real state.
+    public = json.loads(json.dumps(state))
+    sessions = public.get("sessions", [])
+    session = next(
+        (item for item in sessions if item.get("agentId") == agent_id), None
+    )
+    if session is not None:
+        session.pop("launchTokenHash", None)
+        session.pop("launchTokenIssuedAt", None)
+        session.pop("sessionTokenHash", None)
+        session.pop("sessionTokenIssuedAt", None)
+        session.pop("launchConsumedAt", None)
+    active = sum(
+        1
+        for s in sessions
+        if str(s.get("status") or "").strip().lower() == "active"
+    )
+    ack: dict[str, Any] = {
+        "version": public.get("version"),
+        "updatedAt": public.get("updatedAt"),
+        "session": session,
+        "fleet": {"sessions": len(sessions), "active": active},
+        "note": "Full fleet state available via agent_state.",
+    }
+    if session_token:
+        ack["sessionToken"] = session_token
+    return ack
 
 
 def default_agents_state() -> dict[str, Any]:
@@ -8020,9 +8060,9 @@ def handle_tool_call(
                     "register_incomplete",
                     "Agent registered without reporting a model; declare `model` at agent_register.",
                 )
-            return public_agents_state(
-                write_agents_state(projects_dir, state),
-                session_token=session_token or None,
+            written = write_agents_state(projects_dir, state)
+            return compact_session_ack(
+                written, agent_id, session_token=session_token or None
             )
 
     if name == "agent_heartbeat":
@@ -8063,7 +8103,7 @@ def handle_tool_call(
                 file_path=args.get("file_path") or args.get("current_file_path"),
                 subagents=subagents_arg,
             )
-            return public_agents_state(write_agents_state(projects_dir, state))
+            return compact_session_ack(write_agents_state(projects_dir, state), agent_id)
 
     if name == "spawn_mini_coder":
         return dispatch_spawn_mini_coder(projects_dir, state_lock, args)
