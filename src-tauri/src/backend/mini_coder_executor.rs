@@ -1298,6 +1298,23 @@ pub(crate) fn mini_model_sampling(
 // role-untangle Phase 2 pure move. Re-imported below so call sites are unchanged.)
 use super::agentic_worker::{should_run_agentic, spawn_agentic_worker};
 
+/// B2 (BLOCKER) pure gate: returns Ok(()) if `kind` can be dispatched by the
+/// directive executor, Err(reason) for kinds that must be routed elsewhere.
+/// Cloud is excluded — it is sidecar-capable only (pi engine); the agentic
+/// transport has no auth-header support, so a Cloud backend would silently
+/// 401-loop until timeout.
+pub(crate) fn backend_supports_directive_dispatch(
+    kind: MiniCoderBackendKind,
+) -> Result<(), &'static str> {
+    if kind == MiniCoderBackendKind::Cloud {
+        return Err(
+            "cloud backend runs via the pi engine; the directive executor does not \
+             support it yet",
+        );
+    }
+    Ok(())
+}
+
 /// Atomically claim a pending directive (under the lock, re-checking status so a
 /// double-claim is impossible), then spawn the one-shot mini PTY OUTSIDE the lock,
 /// then mark it `running` + nest the mini session under its parent. On any spawn or
@@ -1436,6 +1453,22 @@ fn claim_and_launch(
             return;
         }
     };
+    // B2 (BLOCKER): gate Cloud OUT of the directive executor entirely.
+    // Cloud is sidecar-capable (pi_engine) but the agentic_transport::HttpAgentLlm
+    // has NO auth-header support; a Cloud backend with base_url would enter
+    // run_agentic_coder and POST to the remote provider with no Authorization →
+    // silent 401 loop until timeout. The one-shot path also rejects Cloud (see
+    // mini_command_build.rs Cloud arms). Fail fast with the same hard error,
+    // BEFORE any spawn.
+    if backend.kind == MiniCoderBackendKind::Cloud {
+        fail_launching(
+            app,
+            &directive_id,
+            "cloud backend runs via the pi engine; the directive executor does not \
+             support it yet",
+        );
+        return;
+    }
     let backend_kind_label = backend_client_label(&backend);
 
     // Resolve the MCP wiring (management root + projects dir) for the codex
@@ -3012,6 +3045,7 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
         MiniCoderBackendKind::Openai => "openai",
         MiniCoderBackendKind::Omlx => "omlx",
         MiniCoderBackendKind::AppleFm => "appleFm",
+        MiniCoderBackendKind::Cloud => "cloud",
     }
     .to_string()
 }

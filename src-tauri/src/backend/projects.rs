@@ -1703,8 +1703,13 @@ fn prepare_or_launch_project_agent(
     //
     // The resolved model String lives in the outer scope so the borrow is
     // valid for the project_agent_prompt call below.
-    let resolved_pi_model: Option<String> = if pi_role.is_some() {
-        let env = crate::backend::pi_sidecar::resolve_coder_env_for_sidecar(&app);
+    let resolved_pi_model: Option<String> = if let Some(role) = pi_role {
+        // F5 (A2 follow-through): thread the role so the per-role backend row
+        // (mainCoderBackend / miniCoderBackend / verifierBackend) is consulted
+        // BEFORE the cross-role localCoderBackend fallback. The cross-role
+        // fallback itself is unchanged from pre-A2; the only change is the
+        // signature now carries the role.
+        let env = crate::backend::pi_sidecar::resolve_coder_env_for_sidecar(&app, Some(role));
         Some(env.model)
     } else {
         None
@@ -3572,6 +3577,11 @@ fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'s
         K::Openai => "an OpenAI API backend",
         K::Omlx => "a local oMLX (MLX) model",
         K::AppleFm => "an Apple Foundation Models backend",
+        // A1: the cloud mini-coder kind runs via the pi engine (HTTPS remote
+        // provider; the directive executor does not support it yet). Advisory
+        // prose — the coder never drives this kind directly, so the label is
+        // here for completeness rather than to inform a delegation choice.
+        K::Cloud => "a remote HTTPS cloud provider (via the pi engine)",
     }
 }
 

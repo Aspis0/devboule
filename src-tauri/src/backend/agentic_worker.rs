@@ -46,6 +46,11 @@ impl Drop for AgenticInflightGuard {
 /// plain value so the whole decision table (both tiers × policies) is
 /// unit-testable without an AppHandle.
 ///
+/// NOTE (B2): MiniCoderBackendKind::Cloud is excluded UPSTREAM by the executor
+/// gate in `claim_and_launch` (mini_coder_executor.rs) BEFORE this function is
+/// ever reached for a Cloud backend. Do not add a Cloud-specific arm here — the
+/// gate already fails Cloud with a clear error at the dispatch layer.
+///
 /// MINI tier (byte-identical to the pre-Phase-3 behavior): a WRITE directive
 /// with `write_mode == AgenticIterative` and a configured base_url, then the S2
 /// policy — Safe never, Auto only for a registry-confirmed agentic-tier model,

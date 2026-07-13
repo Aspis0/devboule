@@ -86,6 +86,13 @@ export interface CustomAgentClient {
 //     mini POSTs chat-completions to `<baseUrl>/chat/completions`. `model` AND
 //     `baseUrl` are REQUIRED; `baseUrl` is a LOOPBACK http origin (http only, like Ollama).
 //   - "appleFm": Apple's Apple on-device integration; `model` is OPTIONAL.
+//   - "cloud": a remote OpenAI-compatible API (e.g. OpenRouter) the Devboule engine
+//     talks to — `model` AND `baseUrl` are REQUIRED; `baseUrl` is an https NON-loopback
+//     host (SSRF-hardened). The API key is the SHARED vault entry `provider:cloud_llm`
+//     (the same key the orchestrator cloud editor manages), never stored in this config.
+//     Used by the Mini row's "Cloud API" placement and the per-role Cloud API placements
+//     (coder/verifier) which persist a MiniCoderBackend-shaped cloud backend; consent is
+//     required to save (same gate as the orchestrator cloud path).
 // Persisted in config.json; absent means no backend configured (minis then fail
 // cleanly with "no mini-coder backend configured").
 export type MiniCoderBackendKind =
@@ -94,7 +101,8 @@ export type MiniCoderBackendKind =
 	| "codex"
 	| "openai"
 	| "omlx"
-	| "appleFm";
+	| "appleFm"
+	| "cloud";
 
 export interface MiniCoderBackend {
 	kind: MiniCoderBackendKind;

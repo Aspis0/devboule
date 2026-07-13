@@ -203,6 +203,14 @@ export function validateDesignBackend(
 		};
 	}
 
+	if ((draft.kind as string) === "cloud") {
+		return {
+			ok: false,
+			errors: { kind: "Cloud API is not supported for Design LLM." },
+			value: null,
+		};
+	}
+
 	// DesignBackendDraft is structurally a MiniBackendDraft (the remaining kinds are equal),
 	// so this is a safe widening for the shared validator.
 	const miniDraft: MiniBackendDraft = {
@@ -218,7 +226,7 @@ export function validateDesignBackend(
 	const baseValue: DesignLlmBackend | null = result.value
 		? remapValue(
 				result.value as MiniCoderBackend & {
-					kind: Exclude<MiniCoderBackend["kind"], "appleFm">;
+					kind: Exclude<MiniCoderBackend["kind"], "appleFm" | "cloud">;
 				},
 			)
 		: null;
@@ -233,7 +241,9 @@ export function validateDesignBackend(
 // Re-map a normalized MiniCoderBackend onto the DesignLlmBackend shape. They are
 // structurally identical; this preserves only the fields the kind kept (no churn).
 function remapValue(
-	v: MiniCoderBackend & { kind: Exclude<MiniCoderBackend["kind"], "appleFm"> },
+	v: MiniCoderBackend & {
+		kind: Exclude<MiniCoderBackend["kind"], "appleFm" | "cloud">;
+	},
 ): DesignLlmBackend {
 	const out: DesignLlmBackend = { kind: v.kind };
 	if (v.model !== undefined) out.model = v.model;

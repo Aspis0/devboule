@@ -1306,6 +1306,46 @@ pub enum MiniCoderBackendKind {
     /// feeds the prompt over stdin.
     #[serde(rename = "appleFm")]
     AppleFm,
+    /// CLOUD (opt-in): an HTTPS OpenAI-compatible endpoint reachable from a PUBLIC
+    /// provider host (e.g. OpenRouter). `model` AND `base_url` REQUIRED; `command`
+    /// is unused; the base URL is constrained to an HTTPS, NON-loopback public
+    /// host (the inverse of the loopback rule — the two paths must NEVER
+    /// accept/reject the same set, so the URL validation is REUSED FROM
+    /// `super::local_coder::validate_cloud_base_url`, NOT duplicated here, to
+    /// guarantee no drift between the orchestrator's cloud kind and this
+    /// per-role/mini cloud kind).
+    ///
+    /// PRIVACY CONTRACT: like the orchestrator's cloud kind, Cloud sends the
+    /// prompt — which may carry file content — OFF the machine to the
+    /// configured provider. The host UI shows a mandatory consent disclosure
+    /// before this kind can be saved.
+    ///
+    /// EXECUTOR STATUS: this kind is NOT yet executable by the directive
+    /// executor (it runs via the pi engine, see
+    /// `pi_sidecar::map_mini_coder_backend_to_sidecar_env`); the executor's
+    /// `match backend.kind` arms return a clear "directive executor does not
+    /// support it yet" error so a misconfigured spawn fails LOUDLY rather than
+    /// silently downgrading. Future work will wire the cloud launch path.
+    Cloud,
+}
+
+impl MiniCoderBackendKind {
+    /// Lowercase wire token (`ollama`, `api`, `codex`, `openai`, `omlx`,
+    /// `appleFm`, `cloud`). Mirrors the serde rename and the TS discriminator
+    /// so the ledger / rail / log labels can show the runtime verbatim.
+    /// Used by `pi_sidecar::resolve_coder_env_for_sidecar`'s
+    /// non-sidecar-capable-kind diagnostic.
+    pub fn kind_label(self) -> &'static str {
+        match self {
+            MiniCoderBackendKind::Ollama => "ollama",
+            MiniCoderBackendKind::Api => "api",
+            MiniCoderBackendKind::Codex => "codex",
+            MiniCoderBackendKind::Openai => "openai",
+            MiniCoderBackendKind::Omlx => "omlx",
+            MiniCoderBackendKind::AppleFm => "appleFm",
+            MiniCoderBackendKind::Cloud => "cloud",
+        }
+    }
 }
 
 /// The single, global mini-coder backend config persisted in config.json under
@@ -1708,6 +1748,58 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
             let normalized_base = validate_omlx_base_url(&base_url)?;
             Ok(MiniCoderBackend {
                 kind: MiniCoderBackendKind::Omlx,
+                model: Some(model),
+                command: None,
+                base_url: Some(normalized_base),
+                max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+            })
+        }
+        MiniCoderBackendKind::Cloud => {
+            // Cloud mini-coder backend: same HTTPS-NON-loopback rule as the
+            // orchestrator's `LocalCoderBackendKind::Cloud` — REUSE the SAME
+            // validator (`super::local_coder::validate_cloud_base_url`) so the
+            // two surfaces can NEVER drift on accept/reject. `command` is
+            // ignored/dropped (cloud is HTTP only, no shell command line).
+            //
+            // PRIVACY: cloud sends the prompt OFF the machine — the host UI
+            // surfaces a consent disclosure before this kind can be saved (a
+            // separate UI concern, not enforced here).
+            //
+            // API KEY: deliberately NOT a field on this struct — it lives
+            // ONLY in the OS vault under `provider:cloud_llm` (the SAME vault
+            // key the orchestrator's cloud kind uses) and is read at the
+            // sidecar spawn site into the `OPENROUTER_API_KEY` env var. Key
+            // PRESENCE is enforced at the spawn layer (where the vault is
+            // reachable), not in this pure config-shape validator.
+            if model.is_empty() {
+                return Err("Cloud mini-coder backend requires a model tag.".into());
+            }
+            if model.len() > MINI_MODEL_MAX_LEN {
+                return Err(format!(
+                    "Mini-coder model must be at most {MINI_MODEL_MAX_LEN} characters."
+                ));
+            }
+            if !is_valid_model(&model) {
+                return Err(
+                    "Mini-coder model must be a bare tag (letters, digits, . _ : / -).".into(),
+                );
+            }
+            let base_url = backend
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if base_url.is_empty() {
+                return Err("Cloud mini-coder backend requires a base URL.".into());
+            }
+            // REUSE — NOT duplicate — the local_coder cloud validator. The
+            // accept/reject set MUST be byte-for-byte identical so the two
+            // surfaces never disagree on what is a public-provider host vs a
+            // loopback / IP literal / intranet.
+            let normalized_base = super::local_coder::validate_cloud_base_url(&base_url)?;
+            Ok(MiniCoderBackend {
+                kind: MiniCoderBackendKind::Cloud,
                 model: Some(model),
                 command: None,
                 base_url: Some(normalized_base),
@@ -3301,6 +3393,7 @@ mod tests {
             (MiniCoderBackendKind::Codex, "codex"),
             (MiniCoderBackendKind::Openai, "openai"),
             (MiniCoderBackendKind::AppleFm, "appleFm"),
+            (MiniCoderBackendKind::Cloud, "cloud"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));
             let back: MiniCoderBackendKind = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
@@ -3741,6 +3834,213 @@ mod tests {
             .is_err(),
             "model with whitespace must be rejected"
         );
+    }
+
+    // -- A1 cloud kind ---------------------------------------------------------
+    // Cloud mini-coder backend mirrors the orchestrator's
+    // `LocalCoderBackendKind::Cloud` accept/reject set via the SHARED
+    // `super::local_coder::validate_cloud_base_url` validator (the validator is
+    // REUSED, NOT duplicated, so the two surfaces can never drift). These tests
+    // pin the integration: https+FQDN+model accepted; loopback / http / bad-model
+    // / empty-url rejected. They complement (NOT replace) the local_coder unit
+    // tests for the shared validator itself.
+
+    fn cloud(model: Option<&str>, base_url: Option<&str>) -> MiniCoderBackend {
+        MiniCoderBackend {
+            kind: MiniCoderBackendKind::Cloud,
+            model: model.map(|s| s.to_string()),
+            command: Some("dropped".into()), // cloud ignores command
+            base_url: base_url.map(|s| s.to_string()),
+            max_concurrent: None,
+        }
+    }
+
+    #[test]
+    fn cloud_kind_serializes_lowercase_matching_ts() {
+        assert_eq!(
+            serde_json::to_string(&MiniCoderBackendKind::Cloud).unwrap(),
+            "\"cloud\""
+        );
+        let back: MiniCoderBackendKind = serde_json::from_str("\"cloud\"").unwrap();
+        assert_eq!(back, MiniCoderBackendKind::Cloud);
+    }
+
+    #[test]
+    fn cloud_kind_label_returns_wire_token() {
+        assert_eq!(MiniCoderBackendKind::Cloud.kind_label(), "cloud");
+        // Belt-and-suspenders: every variant returns its own wire token.
+        assert_eq!(MiniCoderBackendKind::Ollama.kind_label(), "ollama");
+        assert_eq!(MiniCoderBackendKind::AppleFm.kind_label(), "appleFm");
+    }
+
+    #[test]
+    fn cloud_accepts_https_with_model_and_normalizes() {
+        // Standard happy path: https + FQDN + model.
+        let n = validate_mini_coder_backend(&cloud(
+            Some("gpt-4o-mini"),
+            Some("https://openrouter.ai/api/v1"),
+        ))
+        .expect("https + FQDN + model must be accepted");
+        assert_eq!(n.kind, MiniCoderBackendKind::Cloud);
+        assert_eq!(n.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(n.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        // Trailing slash must be stripped (matches the orchestrator's local_coder
+        // cloud rule — validator is shared, so behavior is identical).
+        let trimmed = validate_mini_coder_backend(&cloud(
+            Some("m"),
+            Some("https://example.com/v1/"),
+        ))
+        .unwrap();
+        assert_eq!(trimmed.base_url.as_deref(), Some("https://example.com/v1"));
+        // model trimmed.
+        let trimmed_model = validate_mini_coder_backend(&cloud(
+            Some("  gpt-4o-mini  "),
+            Some("https://example.com/v1"),
+        ))
+        .unwrap();
+        assert_eq!(trimmed_model.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn cloud_drops_command_and_keeps_only_model_and_base_url() {
+        let n = validate_mini_coder_backend(&cloud(
+            Some("m"),
+            Some("https://example.com/v1"),
+        ))
+        .unwrap();
+        assert_eq!(n.command, None, "command must be dropped for cloud");
+        // JSON serialization round-trip: only kind + model + baseUrl present.
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(json.contains("\"kind\":\"cloud\""), "json: {json}");
+        assert!(json.contains("\"model\":\"m\""), "json: {json}");
+        assert!(json.contains("\"baseUrl\""), "json: {json}");
+        assert!(!json.contains("command"), "command leaked: {json}");
+        let back: MiniCoderBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(n, back);
+    }
+
+    #[test]
+    fn cloud_rejects_loopback_http_and_bad_scheme() {
+        // The SAME accept/reject set as the orchestrator's Cloud kind (shared
+        // validator). Loopback must be rejected: the local kinds (ollama/omlx)
+        // are the loopback path; cloud is intentionally remote-only.
+        //
+        // NOT in the reject list (deliberate, by design of the shared validator):
+        //   - `https://127.0.0.1.evil.com/v1`  — a LEGITIMATE public FQDN owned
+        //     by evil.com. The host string parses as a hostname (label-separator
+        //     `.`, not a loopback IPv4Addr), so the shared validator accepts it.
+        //     The threat model blocks loopback / intranet / IP-literals / userinfo,
+        //     NOT lookalike public suffixed hosts (those are indistinguishable
+        //     from any other public domain at the URL-string level).
+        //   - `https://localhost.evil.com/v1` — same reasoning; a public FQDN.
+        // Complete SSRF protection requires post-DNS-resolution IP filtering
+        // (reject RFC1918 / link-local / loopback RESOLVED IPs in the HTTP
+        // client's connect layer — a custom reqwest resolver). The shared
+        // validator documents this as a deliberate PARTIAL SSRF mitigation
+        // and the post-DNS follow-up is a separate workstream (see the
+        // `PARTIAL SSRF mitigation` comment in `local_coder::validate_cloud_base_url`).
+        // The cloud mini backend MUST agree with the orchestrator's accept set
+        // here (per-role parity) — adding them to the reject list would make
+        // the mini and orchestrator disagree on what is a valid provider host.
+        for bad in [
+            "http://localhost:8000/v1",       // http (cleartext)
+            "http://127.0.0.1:8000/v1",       // http + loopback
+            "http://openrouter.ai/api/v1",    // http (a real provider would never accept http)
+            "https://localhost:8000/v1",      // https + loopback is still loopback
+            "https://127.0.0.1/v1",           // bare loopback IP
+            "ftp://example.com/v1",           // bad scheme
+            "example.com/v1",                 // missing scheme
+            "https://192.168.0.1/v1",         // intranet IP literal
+            "https://example.com@evil.com",   // userinfo trick
+        ] {
+            assert!(
+                validate_mini_coder_backend(&cloud(Some("m"), Some(bad))).is_err(),
+                "cloud base url {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_rejects_ip_literals_and_intranet_names() {
+        // The shared `validate_cloud_base_url` rejects IP literals + `.internal` /
+        // `.local` / `metadata.google.internal` + bare hostnames (no dot). These
+        // cover the SSRF / privacy hardening set; the cloud mini backend MUST
+        // accept the same set the orchestrator accepts, so the rejection surface
+        // must agree.
+        for bad in [
+            "https://1.2.3.4/v1",
+            "https://[::1]/v1",
+            "https://metadata.google.internal/v1",
+            "https://service.internal/v1",
+            "https://nas.local/v1",
+            "https://example", // bare hostname, no dot
+        ] {
+            assert!(
+                validate_mini_coder_backend(&cloud(Some("m"), Some(bad))).is_err(),
+                "cloud base url {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_rejects_empty_model_and_bad_model() {
+        // Empty model.
+        assert!(
+            validate_mini_coder_backend(&cloud(None, Some("https://example.com/v1"))).is_err(),
+            "missing model must be rejected"
+        );
+        assert!(
+            validate_mini_coder_backend(&cloud(Some("   "), Some("https://example.com/v1")))
+                .is_err(),
+            "blank model must be rejected"
+        );
+        // Bad model (whitespace / metachars / leading dash).
+        for bad_model in ["qwen coder", "model;rm", "$(evil)", "-leadinghyphen"] {
+            assert!(
+                validate_mini_coder_backend(&cloud(Some(bad_model), Some("https://example.com/v1")))
+                    .is_err(),
+                "model {bad_model:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_rejects_empty_base_url() {
+        // Missing base_url.
+        assert!(
+            validate_mini_coder_backend(&cloud(Some("m"), None)).is_err(),
+            "missing base url must be rejected"
+        );
+        // Blank base url.
+        assert!(
+            validate_mini_coder_backend(&cloud(Some("m"), Some("   "))).is_err(),
+            "blank base url must be rejected"
+        );
+    }
+
+    #[test]
+    fn cloud_requires_model_and_base_url_via_helper() {
+        // One consolidated test that exercises every "missing" sub-case the
+        // executor would surface as a launch-time error. The two prior tests
+        // cover each axis in isolation; this one asserts the combined
+        // contract: a valid Cloud backend is BOTH (model, https non-loopback).
+        for (model, base_url, expect_ok) in [
+            (Some("m"), Some("https://example.com/v1"), true),
+            (None, Some("https://example.com/v1"), false), // missing model
+            (Some("m"), None, false),                      // missing base_url
+            (Some("m"), Some("http://example.com/v1"), false), // http (not https)
+            (Some("m"), Some("https://localhost/v1"), false),  // loopback
+            (Some("qwen coder"), Some("https://example.com/v1"), false), // bad model
+            (Some(""), Some("https://example.com/v1"), false),  // blank model
+            (Some("m"), Some(""), false),                         // blank base_url
+        ] {
+            let res = validate_mini_coder_backend(&cloud(model, base_url));
+            assert_eq!(
+                res.is_ok(),
+                expect_ok,
+                "cloud(model={model:?}, base_url={base_url:?}) → ok?={expect_ok}, got={res:?}"
+            );
+        }
     }
 
     // ── FIX 4: is_false helper — NO-CHURN round-trip for net_blocked ─────────

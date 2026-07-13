@@ -395,6 +395,30 @@ pub(crate) fn read_main_coder_backend(
     super::projects::read_mini_coder_backend(app)
 }
 
+/// B3 (BLOCKER): read `mainCoderBackend` WITHOUT falling back to the mini's backend.
+/// Used by the PI SIDECAR path for the `coder`/`main-coder` role: on the sidecar path
+/// a cloud backend configured for the mini must never silently widen to the main-coder.
+/// The directive executor's promoted Main tier still uses `read_main_coder_backend`
+/// (which DOES fall back — the executor is the mini's peer and the fallback is correct
+/// there), but the sidecar is an independent launch with per-role privacy semantics.
+///
+/// When `mainCoderBackend` is missing/invalid → returns `None` (caller falls through
+/// to `localCoderBackend` → default chain, same as the other per-role lookups).
+pub(crate) fn read_main_coder_backend_no_fallback(
+    app: &tauri::AppHandle,
+) -> Option<super::mini_coder::MiniCoderBackend> {
+    let path = locate_config_path(app)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    parse_role_backend(&value, "mainCoderBackend")
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Per-role LOCAL backend model (P6b path B) — Main coder + Verifier each get their own
 // `MiniCoderBackend`-shaped local model row, reusing the existing type + validator wholesale.
@@ -495,9 +519,9 @@ fn set_role_backend_key(
 
 /// IMPURE: read the Verifier ENGINE's local model. `verifierBackend` when present + valid;
 /// otherwise INHERIT the Main coder's backend (`read_main_coder_backend` → `mainCoderBackend`
-/// else the mini's). Not yet wired to a launch path — the verifier launch reads this in the
-/// launch-consumption slice; kept `allow(dead_code)` until then.
-#[allow(dead_code)]
+/// else the mini's). Forward-wiring: `pi_sidecar::resolve_coder_env_for_sidecar` will call
+/// this for a `verifier` role when the verifier pi path lands; currently no caller passes
+/// `Some("verifier")` (`pi_route_for_launch` only yields orchestrator/coder/mini).
 pub(crate) fn read_verifier_backend(
     app: &tauri::AppHandle,
 ) -> Option<super::mini_coder::MiniCoderBackend> {
@@ -811,6 +835,28 @@ mod tests {
             apply_role_backend_to_config(&mut not_obj, "mainCoderBackend", Some(&codex_backend()))
                 .is_err(),
             "a non-object config must be rejected, not panic"
+        );
+    }
+
+    // B3 (BLOCKER): parse_role_backend is the core of read_main_coder_backend_no_fallback.
+    // When mainCoderBackend is absent, it returns None — the sidecar falls through to
+    // localCoderBackend/default instead of inheriting the mini's cloud backend.
+    #[test]
+    fn parse_role_backend_absent_main_coder_returns_none_no_fallback() {
+        // Config with only miniCoderBackend set (cloud) — mainCoderBackend absent.
+        // parse_role_backend returns None for mainCoderBackend, proving the no-fallback
+        // reader would NOT return the mini's cloud backend.
+        let config = serde_json::json!({
+            "miniCoderBackend": { "kind": "cloud", "model": "some-model", "baseUrl": "https://openrouter.ai/api/v1" }
+        });
+        assert!(
+            parse_role_backend(&config, "mainCoderBackend").is_none(),
+            "absent mainCoderBackend must return None (no fallback to mini's cloud)"
+        );
+        // The mini's own backend IS present and valid.
+        assert!(
+            parse_role_backend(&config, "miniCoderBackend").is_some(),
+            "miniCoderBackend itself must still be readable"
         );
     }
 }

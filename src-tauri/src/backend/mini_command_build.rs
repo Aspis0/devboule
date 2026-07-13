@@ -275,6 +275,19 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
         MiniCoderBackendKind::AppleFm => {
             return Err("Apple on-device requires macOS 27+.".to_string());
         }
+        MiniCoderBackendKind::Cloud => {
+            // Cloud is a pi-engine backend (HTTPS remote provider); the directive
+            // executor's one-shot PTY/script path cannot drive it today. Fail
+            // LOUDLY here rather than silently downgrading (so a misconfigured
+            // spawn is diagnosed, not hidden behind a `done` from the wrong
+            // backend). The pi sidecar's `map_mini_coder_backend_to_sidecar_env`
+            // handles Cloud correctly.
+            return Err(
+                "cloud backend runs via the pi engine; the directive executor does not \
+                 support it yet"
+                    .to_string(),
+            );
+        }
     };
 
     // FIX 1: close the try opened in the preamble and ALWAYS run cleanup in the
@@ -1053,6 +1066,20 @@ pub(crate) fn build_mini_command_impl(
                     backend.model.as_deref(),
                 );
                 macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+            }
+            MiniCoderBackendKind::Cloud => {
+                // Cloud is a pi-engine backend (HTTPS remote provider); the
+                // directive executor's one-shot /bin/sh script path cannot
+                // drive it today. Fail LOUDLY rather than silently
+                // downgrading — a misconfigured spawn is diagnosed at the
+                // boundary, not hidden behind a `done` from the wrong
+                // backend. The pi sidecar's
+                // `map_mini_coder_backend_to_sidecar_env` handles Cloud.
+                return Err(
+                    "cloud backend runs via the pi engine; the directive executor does \
+                     not support it yet"
+                        .to_string(),
+                );
             }
         })
     })();
