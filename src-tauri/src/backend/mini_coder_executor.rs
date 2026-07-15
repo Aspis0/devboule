@@ -3887,6 +3887,10 @@ fn build_headless_mini_command(
 #[path = "mini_coder_executor_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "rig_executor_tests.rs"]
+mod rig_tests;
+
 // ── Slice 3: unattended_denial_note pure helper ───────────────────────────────
 
 #[cfg(test)]

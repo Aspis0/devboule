@@ -156,6 +156,11 @@ class MockLLMRequestHandler(BaseHTTPRequestHandler):
             isinstance(m, dict) and m.get("role") == "tool" for m in messages
         )
 
+        # Capture the Authorization header for placement-matrix testing.
+        auth_header = self.headers.get("Authorization")
+        if auth_header is not None:
+            self.mock_server.last_auth_header = auth_header
+
         with self.mock_server._lock:
             self.mock_server.request_log.append(
                 {
@@ -559,6 +564,9 @@ class MockLLMServer:
         self.fail_mode: str = "500"
         self._lock = threading.Lock()
         self._base_url: Optional[str] = None
+        # Captures the last Authorization header value received on any request.
+        # Populated by MockLLMRequestHandler._handle_chat_completions.
+        self.last_auth_header: Optional[str] = None
 
     def start(self) -> str:
         """Start the server in a background thread. Returns the base URL."""

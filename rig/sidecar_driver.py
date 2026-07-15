@@ -51,6 +51,17 @@ class SidecarSession:
         repo_root: Path | None = None,
         pigeon_enabled: bool = False,
         env_overrides: dict[str, str] | None = None,
+        # Placement-matrix knobs (backward compatible: defaults unchanged)
+        provider: str = "openai",
+        api_key_env: str = "OPENAI_API_KEY",
+        api_key_value: str = "rig-key",
+        # Hermetic HOME override — default OFF so the sidecar uses the real
+        # agent_dir / real registry. Set to a Path to force HOME for this
+        # session (useful for test_missing_key_fails_loud).
+        home_override: Path | None = None,
+        # Vars that must survive the leakage strip (e.g. EXA_API_KEY for
+        # the live websearch cell). Default: ["EXA_API_KEY"].
+        passthrough_env: list[str] | None = None,
     ):
         """
         Initialize and spawn the sidecar process.
@@ -64,12 +75,23 @@ class SidecarSession:
             repo_root: Repository root (auto-detected from __file__ if None)
             pigeon_enabled: DEVBOULE_PIGEON_ENABLED
             env_overrides: Additional env vars to set/override
+            provider: DEVBOULE_PI_PROVIDER (default "openai")
+            api_key_env: Name of the env var carrying the API key
+                         (default "OPENAI_API_KEY")
+            api_key_value: Value of the API key env var (default "rig-key")
+            home_override: If set, overrides HOME for this session.
+            passthrough_env: Env var names that survive the leakage strip.
         """
         self.session_id = session_id
         self.agent_role = agent_role
         self.mock_base_url = mock_base_url
         self.project_root = project_root.resolve()
         self.agent_dir = agent_dir.resolve()
+        self.provider = provider
+        self.api_key_env = api_key_env
+        self.api_key_value = api_key_value
+        self.home_override = home_override
+        self.passthrough_env = list(passthrough_env or [])
 
         # Resolve repo root (directory containing pi-sidecar/)
         if repo_root is None:
@@ -117,13 +139,19 @@ class SidecarSession:
         for k in keys_to_remove:
             env.pop(k, None)
 
+        # Preserve explicitly-allowed vars from the parent env (e.g. EXA_API_KEY
+        # for the live websearch cell). These survive the leakage strip.
+        for var in self.passthrough_env:
+            if var in os.environ:
+                env[var] = os.environ[var]
+
         # Required env vars
         env.update(
             {
-                "DEVBOULE_PI_PROVIDER": "openai",
+                "DEVBOULE_PI_PROVIDER": self.provider,
                 "DEVBOULE_PI_MODEL": "rig-model",
                 "DEVBOULE_PI_BASE_URL": self.mock_base_url,
-                "OPENAI_API_KEY": "rig-key",
+                self.api_key_env: self.api_key_value,
                 "DEVBOULE_SESSION_ID": self.session_id,
                 "DEVBOULE_AGENT_ROLE": self.agent_role,
                 "DEVBOULE_PROJECT_ID": "rig-project",
@@ -137,6 +165,11 @@ class SidecarSession:
 
         # Apply any overrides
         env.update(self.env_overrides)
+
+        # Hermetic HOME override (default OFF).
+        if self.home_override is not None:
+            env["HOME"] = str(self.home_override)
+
         return env
 
     def _spawn(self) -> None:
