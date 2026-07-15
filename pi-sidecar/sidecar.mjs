@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
+import { Type } from "typebox";
 
 // #5: bound the JSONL framer buffer. A single oversized line (e.g. a 500MB
 // JSONL record) would otherwise accumulate unbounded and OOM the process.
@@ -392,6 +393,13 @@ async function main() {
 		sessionOpts.model = resolvedModel;
 	}
 
+	// Plan tool: only register for the orchestrator role. The plan console is a
+	// planner surface — coder roles must not get the prompt-noise of an unused
+	// tool in their Available-tools section.
+	if (devbouleContext.agentRole === "orchestrator") {
+		sessionOpts.customTools = [buildPlanTool()];
+	}
+
 	const { session } = await createAgentSession(sessionOpts);
 	activeSession = session;
 
@@ -507,7 +515,7 @@ async function main() {
 
 	async function emitDevbouleCustomMessages(event) {
 		if (event.type === "tool_execution_start") {
-			if (event.toolName === "web_search" || event.toolName === "plan") {
+			if (event.toolName === "web_search") {
 				pendingDevbouleArgs.set(event.toolCallId, event.args || {});
 			}
 		}
@@ -528,13 +536,11 @@ async function main() {
 		}
 
 		if (event.type === "tool_execution_end" && event.toolName === "plan" && !event.isError) {
-			const args = pendingDevbouleArgs.get(event.toolCallId) || {};
 			emit({
 				type: "devboule_plan",
 				plan: event.result?.details || {},
 				timestamp: Date.now(),
 			});
-			pendingDevbouleArgs.delete(event.toolCallId);
 		}
 	}
 
@@ -912,6 +918,77 @@ function cleanup(exitCode) {
 		activeTmpDir = null;
 	}
 	process.exit(exitCode);
+}
+
+// ---------------------------------------------------------------------------
+// Plan tool — orchestrator-only custom tool (Task 4)
+// ---------------------------------------------------------------------------
+
+// Schema: title (required) + steps (required, array) + notes (optional string).
+// NOTE: status is a plain optional string (not a Union-of-literals) to avoid
+// anyOf/const JSON Schema which many OpenAI-compatible providers ignore or
+// reject, causing isError:true and a missing devboule_plan event.
+const PlanParameters = Type.Object({
+	title: Type.String({ description: "Plan title" }),
+	steps: Type.Array(
+		Type.Object({
+			text: Type.String({ description: "Step description" }),
+			status: Type.Optional(
+				Type.String({
+					description:
+						'Step status: one of "pending", "in_progress", "done", "skipped". Defaults to "pending".',
+				}),
+			),
+		}),
+		{ description: "Ordered list of steps to execute" },
+	),
+	notes: Type.Optional(
+		Type.String({ description: "Optional notes or context for the plan" }),
+	),
+});
+
+/**
+ * Build the `plan` custom tool definition for the pi SDK.
+ * Exported for unit testing (pi-sidecar/plan-tool.test.mjs).
+ *
+ * The plan tool publishes/updates the agent's current plan to the app's plan
+ * console. Calling it again REPLACES the previous plan (last call wins). It
+ * should be called when starting non-trivial work and when step statuses change.
+ */
+export function buildPlanTool() {
+	return {
+		name: "plan",
+		label: "Plan",
+		description:
+			"Publishes or updates the current plan to the app's plan console. " +
+			"Calling this tool again REPLACES the previous plan (last call wins). " +
+			"Call it when starting non-trivial work and whenever step statuses change.",
+		promptSnippet:
+			"Publish/update the current plan to the plan console (last call wins)",
+		parameters: PlanParameters,
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			// Defensive normalization: only accept known statuses; anything else
+			// (including undefined) falls back to "pending".
+			const ALLOWED = new Set(["pending", "in_progress", "done", "skipped"]);
+			const normalizedSteps = params.steps.map((s) => ({
+				text: s.text,
+				status: ALLOWED.has(s.status) ? s.status : "pending",
+			}));
+			const details = { title: params.title, steps: normalizedSteps };
+			if (params.notes !== undefined && params.notes !== "") {
+				details.notes = params.notes;
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Plan "${params.title}" published (${normalizedSteps.length} steps).`,
+					},
+				],
+				details,
+			};
+		},
+	};
 }
 
 // FIX 3: only auto-start `main()` when this module is the entry point. When
