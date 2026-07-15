@@ -6,14 +6,22 @@ import {
   pickProjectDesign,
   chatMessagesWithMilestones,
   openQuestions,
+  latestPlan,
+  planCardsFromPiPlan,
   steerPickOption,
   steerYouDecide,
   doubtTouchesCard,
   type PlanCard,
+  type PiPlan,
 } from "./plannerModel";
 import type { ConsoleEntry, QuestionEntry } from "../../agents/agentConsoleModel";
 import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
+
+function planEntry(time: string, payload: unknown): ConsoleEntry {
+  // Matches the Rust `serde_json::to_string_pretty` contract: pretty-printed JSON.
+  return { type: "chat", role: "plan", text: JSON.stringify(payload, null, 2), time };
+}
 
 function designEntry(over: Partial<DesignProjectEntry>): DesignProjectEntry {
   return {
@@ -365,5 +373,159 @@ describe("stableOrchestratorAgentId", () => {
     expect(stableOrchestratorAgentId("x".repeat(500))).toBe(
       `orchestrator-${"x".repeat(100)}`,
     );
+  });
+});
+
+// ---- pi plan (orchestrator `plan` tool payload) ------------------------------
+
+function chatEntry(time: string, role: "user" | "assistant", text: string): ConsoleEntry {
+  return { type: "chat", role, text, time };
+}
+
+function validPlanPayload(): PiPlan {
+  return {
+    title: "Build the auth layer",
+    steps: [
+      { text: "Design the token schema", status: "done" },
+      { text: "Implement the refresh flow", status: "in_progress" },
+      { text: "Write integration tests", status: "pending" },
+      { text: "Skip the legacy path", status: "skipped" },
+    ],
+    notes: "See RFC-42 for the token TTL decision",
+  };
+}
+
+describe("latestPlan", () => {
+  it("returns null for undefined / empty / no plan entries", () => {
+    expect(latestPlan(undefined)).toBeNull();
+    expect(latestPlan([])).toBeNull();
+    expect(latestPlan([chatEntry("1", "user", "hi")])).toBeNull();
+  });
+
+  it("parses a valid payload (title / steps / notes)", () => {
+    const p = validPlanPayload();
+    const out = latestPlan([planEntry("1", p)]);
+    expect(out).toEqual(p);
+  });
+
+  it("last plan entry wins over an earlier one", () => {
+    const first = { title: "A", steps: [{ text: "a", status: "pending" }] };
+    const second = { title: "B", steps: [{ text: "b", status: "done" }] };
+    const out = latestPlan([
+      planEntry("1", first),
+      planEntry("2", second),
+    ]);
+    expect(out!.title).toBe("B");
+    expect(out!.steps[0].text).toBe("b");
+  });
+
+  it("malformed JSON in the newest plan entry returns null (no fallback)", () => {
+    const older = validPlanPayload();
+    const out = latestPlan([
+      planEntry("1", older),
+      planEntry("2", "NOT JSON"),
+    ]);
+    expect(out).toBeNull();
+  });
+
+  it("steps with unknown status normalized to 'pending'; empty text dropped", () => {
+    const p = {
+      title: "T",
+      steps: [
+        { text: "a", status: "unknown_status" },
+        { text: "", status: "pending" },
+        { text: "b", status: "done" },
+      ],
+    };
+    const out = latestPlan([planEntry("1", p)]);
+    expect(out!.steps.map((s) => s.status)).toEqual(["pending", "done"]);
+    expect(out!.steps.map((s) => s.text)).toEqual(["a", "b"]);
+  });
+
+  it("notes absent when missing from the payload", () => {
+    const p = { title: "T", steps: [{ text: "a", status: "pending" }] };
+    const out = latestPlan([planEntry("1", p)]);
+    expect(out!.notes).toBeUndefined();
+  });
+
+  it("notes absent when empty string", () => {
+    const p = {
+      title: "T",
+      steps: [{ text: "a", status: "pending" }],
+      notes: "",
+    };
+    const out = latestPlan([planEntry("1", p)]);
+    expect(out!.notes).toBeUndefined();
+  });
+
+  it("returns null when title is not a non-empty string", () => {
+    expect(latestPlan([planEntry("1", { title: "", steps: [] })])).toBeNull();
+    expect(latestPlan([planEntry("1", { title: 42, steps: [] })])).toBeNull();
+    expect(latestPlan([planEntry("1", { title: null, steps: [] })])).toBeNull();
+  });
+
+  it("returns null for a whitespace-only title", () => {
+    expect(latestPlan([planEntry("1", { title: "   ", steps: [] })])).toBeNull();
+    expect(latestPlan([planEntry("1", { title: "\t\n", steps: [] })])).toBeNull();
+  });
+
+  it("returns null when steps is not an array", () => {
+    expect(latestPlan([planEntry("1", { title: "T", steps: "nope" })])).toBeNull();
+    expect(latestPlan([planEntry("1", { title: "T" })])).toBeNull();
+  });
+
+  it("drops non-object step entries, keeps only the valid one (status -> pending)", () => {
+    const p = {
+      title: "T",
+      steps: [null, 42, "string", { text: "ok" }] as unknown[],
+    };
+    const out = latestPlan([planEntry("1", p)]);
+    expect(out!.steps).toHaveLength(1);
+    expect(out!.steps[0].text).toBe("ok");
+    expect(out!.steps[0].status).toBe("pending");
+  });
+});
+
+describe("planCardsFromPiPlan", () => {
+  it("maps all 4 statuses to the 4 states", () => {
+    const plan: PiPlan = {
+      title: "T",
+      steps: [
+        { text: "a", status: "done" },
+        { text: "b", status: "in_progress" },
+        { text: "c", status: "pending" },
+        { text: "d", status: "skipped" },
+      ],
+    };
+    const cards = planCardsFromPiPlan(plan);
+    expect(cards.map((c) => c.state)).toEqual(["done", "forming", "pending", "skipped"]);
+  });
+
+  it("cards are 1-based and title = step text", () => {
+    const plan: PiPlan = {
+      title: "T",
+      steps: [{ text: "alpha", status: "pending" }, { text: "beta", status: "done" }],
+    };
+    const cards = planCardsFromPiPlan(plan);
+    expect(cards.map((c) => c.n)).toEqual([1, 2]);
+    expect(cards.map((c) => c.title)).toEqual(["alpha", "beta"]);
+  });
+
+  it("returns [] for a plan with no steps", () => {
+    expect(planCardsFromPiPlan({ title: "T", steps: [] })).toEqual([]);
+  });
+});
+
+describe("chatMessagesWithMilestones (plan-role filtering)", () => {
+  it("a role:plan chat entry is NOT in the output while surrounding user/assistant entries are", () => {
+    const entries: ConsoleEntry[] = [
+      chatEntry("1", "user", "build auth"),
+      planEntry("2", validPlanPayload()),
+      chatEntry("3", "assistant", "On it"),
+    ];
+    expect(chatMessagesWithMilestones(entries)).toEqual([
+      { role: "user", text: "build auth" },
+      { role: "assistant", text: "On it" },
+    ]);
   });
 });

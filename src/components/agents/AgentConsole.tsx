@@ -703,8 +703,11 @@ export function AgentConsole({ activity }: AgentConsoleProps) {
 	// Kairion `question` entries are surfaced in the planner Plan panel (DoubtPanel), not
 	// in this raw timeline — filter them out here so the console keeps its action/chat
 	// semantics (and TimelineRow never narrows over a doubt shape).
+	// role:"plan" chat entries are structured plan payloads consumed by the planner Plan
+	// stage via `latestPlan` / `planCardsFromPiPlan` — never rendered as a chat bubble.
 	const entries = (activity.entries ?? []).filter(
-		(e): e is Exclude<ConsoleEntry, QuestionEntry> => e.type !== "question",
+		(e): e is Exclude<ConsoleEntry, QuestionEntry> =>
+			e.type !== "question" && !(e.type === "chat" && e.role === "plan"),
 	);
 
 	return (

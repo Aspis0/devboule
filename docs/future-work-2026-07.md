@@ -36,7 +36,11 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   via `createAgentSession customTools` in sidecar.mjs (no extension needed),
   orchestrator-only; plain-string status schema (weak providers reject
   anyOf/const), normalized in execute. Rig scenario un-skipped + negative
-  coder-role cell; 6 node unit tests. Live e2e with a real model still owed.
+  coder-role cell; 6 node unit tests. UI DONE too (`42f8818`): Plan stage
+  renders the pi plan (title/steps/notes, skipped=line-through) when no
+  project tasks exist yet; raw JSON never reaches chat bubbles (planner +
+  AgentConsole filters); drawer auto-expands on first plan. Live e2e with
+  a real model still owed.
 - **`project_claim_task` returns the full `public_agents_state`** — same
   oversized-ack class as the round-5 register bug (110KB into the model
   context). Give it a compact ack like register/heartbeat (aspis_mcp.py).

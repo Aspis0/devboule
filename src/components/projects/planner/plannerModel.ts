@@ -8,7 +8,7 @@ import type {
 
 export type StageView = 'exa' | 'plan' | 'design';
 
-export type PlanCardState = 'done' | 'forming' | 'pending';
+export type PlanCardState = 'done' | 'forming' | 'pending' | 'skipped';
 
 export interface PlanCard {
   n: number;
@@ -181,13 +181,19 @@ export function pickProjectDesign(
  *  coder milestones (tool use: Bash, reads, spawns…) as tiny 'milestone' rows, in
  *  timeline order. The milestone rows are the planner chat's visibility into WHAT
  *  the orchestrator is doing between replies — without them a cloud orchestrator
- *  running tools looks identical to one that hung ("thinking" forever). */
+ *  running tools looks identical to one that hung ("thinking" forever).
+ *
+ *  role:"plan" chat entries are skipped: they are structured data for the Plan stage
+ *  (consumed via `latestPlan` / `planCardsFromPiPlan`), never a chat bubble. */
 export function chatMessagesWithMilestones(
   entries: ConsoleEntry[] | undefined,
 ): PlannerMessage[] {
   const out: PlannerMessage[] = [];
   for (const e of entries ?? []) {
-    if (e.type === "chat")
+    if (e.type === "chat") {
+      // role:"plan" entries are structured plan payloads for the Plan stage, not
+      // conversation — never render them as a chat bubble.
+      if (e.role === "plan") continue;
       out.push(
         // D3: thread the echoed msgId through so `mergePendingSends` can drain
         // the optimistic copy by identity (omit the key entirely when absent).
@@ -195,7 +201,7 @@ export function chatMessagesWithMilestones(
           ? { role: e.role, text: e.text, msgId: e.msgId }
           : { role: e.role, text: e.text },
       );
-    else if (e.type === "coder" || e.type === "spawn")
+    } else if (e.type === "coder" || e.type === "spawn")
       out.push({ role: "milestone", text: e.text });
   }
   return out;
@@ -223,6 +229,109 @@ export function openQuestions(entries: ConsoleEntry[] | undefined): QuestionEntr
  *  parses from an ask_user reply; no new command, no sugar required. Pure + total. */
 export function steerPickOption(question: QuestionEntry, option: QuestionOption): string {
   return `For "${question.text}" — go with ${option.label}.`;
+}
+
+/** The orchestrator's `plan` tool payload (the `devboule_plan` wire contract).
+ *  `status` is always normalized by the sidecar to one of the four values below;
+ *  `notes` is omitted from the payload when empty. Pure + total. */
+export type PiPlanStepStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
+export interface PiPlanStep {
+	text: string;
+	status: PiPlanStepStatus;
+}
+export interface PiPlan {
+	title: string;
+	steps: PiPlanStep[];
+	notes?: string;
+}
+
+/** Scan a console timeline BACKWARDS for the newest role:"plan" chat entry (last call
+ *  wins — the tool contract). JSON.parse(e.text) inside try/catch; a malformed payload
+ *  or a shape that fails validation (title not a non-empty string, steps not an array)
+ *  returns null — a newer corrupt payload must NOT resurrect a stale plan. Normalizes
+ *  each step: non-string/empty text → drop; status outside the 4 values → 'pending'.
+ *  `notes` only when a non-empty string. Pure + total, never throws. */
+export function latestPlan(entries: ConsoleEntry[] | undefined): PiPlan | null {
+	if (!entries) return null;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i];
+		if (e.type !== 'chat' || e.role !== 'plan') continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(e.text);
+		} catch {
+			return null;
+		}
+		if (
+			typeof parsed !== 'object' ||
+			parsed === null ||
+			Array.isArray(parsed)
+		) {
+			return null;
+		}
+		const p = parsed as Record<string, unknown>;
+		const title = p['title'];
+		const steps = p['steps'];
+		if (typeof title !== 'string' || title.trim().length === 0) return null;
+		if (!Array.isArray(steps)) return null;
+		const normalizedSteps: PiPlanStep[] = [];
+		for (const raw of steps as unknown[]) {
+			if (
+				typeof raw !== 'object' ||
+				raw === null ||
+				Array.isArray(raw)
+			) {
+				continue;
+			}
+			const s = raw as Record<string, unknown>;
+			const text = s['text'];
+			if (typeof text !== 'string' || text.trim().length === 0) continue;
+			const status = s['status'];
+			const statusNorm:
+				| 'pending'
+				| 'in_progress'
+				| 'done'
+				| 'skipped' =
+				status === 'pending'
+					? 'pending'
+					: status === 'in_progress'
+						? 'in_progress'
+						: status === 'done'
+							? 'done'
+							: status === 'skipped'
+								? 'skipped'
+								: 'pending';
+			normalizedSteps.push({ text, status: statusNorm });
+		}
+		const notes = p['notes'];
+		const out: PiPlan = {
+			title: title.trim(),
+			steps: normalizedSteps,
+		};
+		if (typeof notes === 'string' && notes.trim().length > 0) {
+			out.notes = notes.trim();
+		}
+		return out;
+	}
+	return null;
+}
+
+/** Turn a pi plan (title + steps) into PlanCards for the Plan stage. Steps are 1-based;
+ *  status 'done'→'done', 'in_progress'→'forming', 'pending'→'pending', 'skipped'→'skipped'.
+ *  A plan with no steps yields []. Pure + total. */
+export function planCardsFromPiPlan(plan: PiPlan): PlanCard[] {
+	return plan.steps.map((step, index) => {
+		const n = index + 1;
+		const state: PlanCardState =
+			step.status === 'done'
+				? 'done'
+				: step.status === 'in_progress'
+					? 'forming'
+					: step.status === 'skipped'
+						? 'skipped'
+						: 'pending';
+		return { n, title: step.text, state };
+	});
 }
 
 /** The plain steer line "you decide" rides: hand the fork back to the orchestrator to

@@ -9,20 +9,29 @@ interface StagePlanProps {
   onHoverTask?: (n: number | null) => void;
   /** Single-column layout for the narrowed right panel (default keeps the 2-col grid). */
   singleColumn?: boolean;
+  /** Title of the pi plan (when no project tasks exist yet). Shown next to the PLAN label. */
+  planTitle?: string;
+  /** Optional notes from the pi plan; rendered as a muted italic line under the grid. */
+  planNotes?: string;
 }
 
-export const StagePlan = ({ cards, highlightedTaskNums, onHoverTask, singleColumn }: StagePlanProps) => {
+export const StagePlan = ({ cards, highlightedTaskNums, onHoverTask, singleColumn, planTitle, planNotes }: StagePlanProps) => {
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }} className="pp-view-enter">
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className="pp-mono" style={{ fontSize: 9.5, letterSpacing: '.14em', color: '#A89F90' }}>PLAN</span>
-        <span className="pp-mono" style={{ color: '#C0894F' }}>{cards.length} tasks</span>
+        {planTitle ? (
+          <span className="pp-mono" style={{ color: '#3B362F', letterSpacing: 'normal', fontSize: 11.5 }}>{planTitle}</span>
+        ) : (
+          <span className="pp-mono" style={{ color: '#C0894F' }}>{cards.length} tasks</span>
+        )}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: singleColumn ? '1fr' : '1fr 1fr', gap: 7 }}>
         {cards.map((card, index) => {
           const linked = highlightedTaskNums?.has(card.n) ?? false;
           const isDone = card.state === 'done';
           const isForming = card.state === 'forming';
+          const isSkipped = card.state === 'skipped';
           const delay = (index * 0.15 + 0.1) + 's';
 
           let cardStyle: React.CSSProperties = {
@@ -72,6 +81,9 @@ export const StagePlan = ({ cards, highlightedTaskNums, onHoverTask, singleColum
           const badgeBg = isDone ? '#C0894F' : isForming ? '#F1E4D2' : '#F1ECE2';
           const badgeColor = isDone ? '#FBF6EF' : isForming ? '#C0894F' : '#B3AB9C';
           const titleColor = isDone ? '#3B362F' : isForming ? '#9c8d77' : '#B3AB9C';
+          const titleStyle: React.CSSProperties = isSkipped
+            ? { fontSize: 11.5, color: titleColor, textDecoration: 'line-through' }
+            : { fontSize: 11.5, color: titleColor };
 
           const badgeStyle: React.CSSProperties = {
             width: 18,
@@ -95,7 +107,7 @@ export const StagePlan = ({ cards, highlightedTaskNums, onHoverTask, singleColum
               onMouseLeave={onHoverTask ? () => onHoverTask(null) : undefined}
             >
               <span className="pp-mono" style={badgeStyle}>{card.n}</span>
-              <span style={{ fontSize: 11.5, color: titleColor }}>{card.title}</span>
+              <span style={titleStyle}>{card.title}</span>
               {isDone && <Check size={13} color="#5E9A86" style={{ marginLeft: 'auto' }} />}
               {isForming && (
                 <span style={{ position: 'absolute', inset: 0, background: 'linear-gradient(90deg,transparent,rgba(192,137,79,.16),transparent)', backgroundSize: '200% 100%', animation: 'pp-shimmer 1.8s linear infinite' }} />
@@ -104,6 +116,11 @@ export const StagePlan = ({ cards, highlightedTaskNums, onHoverTask, singleColum
           );
         })}
       </div>
+      {planNotes && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#A89F90', fontStyle: 'italic' }}>
+          {planNotes}
+        </div>
+      )}
     </div>
   );
 };

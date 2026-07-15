@@ -26,6 +26,12 @@ interface PlannerPlanModeProps {
 	plannerModelLabel: string;
 	live: boolean;
 	planCards: PlanCard[];
+	/** Title of the pi plan (when no project tasks exist yet). Forwarded to StagePlan.
+	 *  Absent when real project tasks are driving the view. */
+	planTitle?: string;
+	/** Optional notes from the pi plan (when no project tasks exist yet). Forwarded to
+	 *  StagePlan. Absent when real project tasks are driving the view. */
+	planNotes?: string;
 	// Kairion (ORCHESTRATOR-ONLY): the orchestrator's open doubts. Empty => the Plan view
 	// renders task-cards only (degrades to a plain plan with no left doubt panel).
 	questions: QuestionEntry[];
@@ -97,6 +103,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 		plannerModelLabel,
 		live,
 		planCards,
+		planTitle,
+		planNotes,
 		questions,
 		pages,
 		findings,
@@ -203,20 +211,25 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 	// Auto-expand the drawer when something worth showing appears. Doubts are the HARD
 	// exception: an incoming doubt MUST always surface — even if the user collapsed the
 	// drawer by hand — unanswered doubts are never hidden by a collapsed drawer.
+	// Same convention for plan-content: a fresh pi plan (or any stage content) arriving
+	// mid-session forces the drawer open, unless the user has manually toggled (userToggled).
 	const prevLive = useRef(live);
 	const prevArtifact = useRef(artifactActive);
 	const prevQuestionsLen = useRef(questions.length);
+	const prevHasContent = useRef(stageHasContent);
 	useEffect(() => {
 		if (questions.length > prevQuestionsLen.current) {
 			setStageExpanded(true);
 		} else if (!userToggled.current) {
 			if (live && !prevLive.current) setStageExpanded(true);
 			if (artifactActive && !prevArtifact.current) setStageExpanded(true);
+			if (stageHasContent && !prevHasContent.current) setStageExpanded(true);
 		}
 		prevLive.current = live;
 		prevArtifact.current = artifactActive;
 		prevQuestionsLen.current = questions.length;
-	}, [live, artifactActive, questions.length]);
+		prevHasContent.current = stageHasContent;
+	}, [live, artifactActive, questions.length, stageHasContent]);
 
 	// Kairion doubt<->task link: hovering a doubt highlights its task card(s) and vice-versa.
 	// One source of hover at a time; the derived Sets feed both panels.
@@ -515,12 +528,14 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 												singleColumn
 												highlightedTaskNums={highlightedTaskNums}
 												onHoverTask={setHoveredCardN}
+												planTitle={planTitle}
+												planNotes={planNotes}
 											/>
 										</div>
 									</div>
 								) : (
 									// Degrade: no doubts -> the plan task-cards alone, exactly as before.
-									<StagePlan cards={planCards} />
+									<StagePlan cards={planCards} planTitle={planTitle} planNotes={planNotes} />
 								))}
 							{view === "design" && (
 								<StageDesign

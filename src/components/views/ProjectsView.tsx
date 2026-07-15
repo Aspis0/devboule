@@ -23,6 +23,8 @@ import { PlannerPlanMode } from "../projects/planner/PlannerPlanMode";
 import {
 	derivePlanCards,
 	latestWeb,
+	latestPlan,
+	planCardsFromPiPlan,
 	pickProjectDesign,
 	chatMessagesWithMilestones,
 	mergePendingSends,
@@ -1272,6 +1274,12 @@ export function ProjectsView() {
 	const orchestratorConsole = useAgentConsole(plannerActivityAgentId);
 	const plannerWeb = useMemo(
 		() => latestWeb(orchestratorConsole.entries),
+		[orchestratorConsole.entries],
+	);
+	// The orchestrator's pi plan (the `plan` tool payload), scanned from the console.
+	// This is the pre-submit fallback: shown when there are no project tasks yet.
+	const piPlan = useMemo(
+		() => latestPlan(orchestratorConsole.entries),
 		[orchestratorConsole.entries],
 	);
 	// Kairion (ORCHESTRATOR-ONLY): the live orchestrator's open doubts, upserted by id.
@@ -3765,7 +3773,9 @@ export function ProjectsView() {
 								: plannerOrchestratorClient
 						}
 						live={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
-						planCards={derivePlanCards(currentProject?.state.tasks ?? [])}
+						planCards={currentProject?.state.tasks && currentProject.state.tasks.length > 0 ? derivePlanCards(currentProject.state.tasks) : piPlan ? planCardsFromPiPlan(piPlan) : []}
+						planTitle={currentProject?.state.tasks && currentProject.state.tasks.length > 0 ? undefined : piPlan ? piPlan.title : undefined}
+						planNotes={currentProject?.state.tasks && currentProject.state.tasks.length > 0 ? undefined : piPlan ? piPlan.notes : undefined}
 						questions={plannerQuestions}
 						pages={plannerWeb.pages}
 						findings={plannerWeb.findings}
