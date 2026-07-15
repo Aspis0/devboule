@@ -108,9 +108,11 @@ class SidecarSession:
         """Build the environment for the sidecar process."""
         env = os.environ.copy()
 
-        # Remove Devboule/OpenAI/OpenRouter leakage
+        # Remove Devboule/OpenAI/OpenRouter/Aspis leakage
         keys_to_remove = [
-            k for k in env if k.startswith(("DEVBOULE_", "OPENAI_", "OPENROUTER_"))
+            k
+            for k in env
+            if k.startswith(("DEVBOULE_", "OPENAI_", "OPENROUTER_", "ASPIS_"))
         ]
         for k in keys_to_remove:
             env.pop(k, None)
@@ -207,6 +209,10 @@ class SidecarSession:
     def events(self) -> list[SidecarEvent]:
         """All events received so far (including during wait)."""
         return list(self._events)
+
+    def is_alive(self) -> bool:
+        """Return True if the sidecar subprocess is still running."""
+        return self._proc is not None and self._proc.poll() is None
 
     def send_prompt(self, text: str) -> None:
         """Send a prompt command to the sidecar."""

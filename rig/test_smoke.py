@@ -79,7 +79,7 @@ def test_ciao_smoke():
                     scan_index = session.events.index(event) + 1
 
                     # R3: check process liveness while waiting
-                    if session._proc and session._proc.poll() is not None:
+                    if not session.is_alive():
                         raise RuntimeError(
                             f"Sidecar process exited unexpectedly (returncode={session._proc.returncode}).\n"
                             f"{session.dump_state()}"
@@ -220,7 +220,7 @@ def test_provider_failure_surfaces_error():
                     scan_index = session.events.index(event) + 1
 
                     # R3: check process liveness while waiting
-                    if session._proc and session._proc.poll() is not None:
+                    if not session.is_alive():
                         raise RuntimeError(
                             f"Sidecar process exited unexpectedly (returncode={session._proc.returncode}).\n"
                             f"{session.dump_state()}"
@@ -294,9 +294,11 @@ def _extract_assistant_text_from_event(event_data: dict) -> str:
         ):
             content = msg["content"]
             if isinstance(content, list):
+                parts = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        return block.get("text", "")
+                        parts.append(block.get("text", ""))
+                return "".join(parts)
             elif isinstance(content, str):
                 return content
 
@@ -308,9 +310,11 @@ def _extract_assistant_text_from_event(event_data: dict) -> str:
     if etype == "assistant":
         content = event_data.get("content")
         if isinstance(content, list):
+            parts = []
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    return block.get("text", "")
+                    parts.append(block.get("text", ""))
+            return "".join(parts)
 
     # text_start/text_end events
     if etype in ("text_start", "text_end"):
