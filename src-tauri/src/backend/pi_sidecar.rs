@@ -1983,6 +1983,15 @@ struct PiEvent {
     /// progress). Tool-dependent shape; extracted like `tool_execution_end`'s result.
     #[serde(rename = "partialResult", default)]
     partial_result: Option<serde_json::Value>,
+    /// Devboule websearch/plan first-class events (replaces the dead sendMessage echo).
+    /// `devboule_websearch`: emitted by the sidecar when web_search completes.
+    /// `devboule_plan`: emitted by the sidecar when plan completes.
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    results: Option<serde_json::Value>,
+    #[serde(default)]
+    plan: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2720,6 +2729,27 @@ impl EventMapper {
                         );
                     }
                 }
+            }
+            "devboule_websearch" => {
+                // First-class websearch event (replaces the dead sendMessage echo).
+                // The sidecar emits this on tool_execution_end for web_search;
+                // the old sendMessage path never surfaced in the event stream.
+                let query = event.query.as_deref().unwrap_or("");
+                let results = event
+                    .results
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                self.handle_devboule_websearch(query, &results);
+                self.emit_snapshot(app);
+            }
+            "devboule_plan" => {
+                // First-class plan event (replaces the dead sendMessage echo).
+                let plan = event
+                    .plan
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                self.handle_devboule_plan(&plan);
+                self.emit_snapshot(app);
             }
             "compaction_start" | "compaction_end" | "auto_retry_start"
             | "auto_retry_end" | "error" | "queue_dropped" => {
@@ -4473,6 +4503,30 @@ mod tests {
             }
             other => panic!("expected WebSearch entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn devboule_websearch_first_class_event_deserializes_and_maps() {
+        // The sidecar now emits `{type:"devboule_websearch", query, results, timestamp}`
+        // as a first-class event (replaces the dead sendMessage echo). Parse it
+        // and verify handle_event maps it to a WebSearch console entry.
+        let line = r#"{"type":"devboule_websearch","query":"anthropic claude","results":{"queries":["anthropic claude"],"totalResults":5,"successfulQueries":1},"timestamp":1234567890}"#;
+        let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_websearch event");
+        assert_eq!(event.event_type, "devboule_websearch");
+        assert_eq!(event.query.as_deref(), Some("anthropic claude"));
+        assert!(event.results.is_some());
+        assert!(event.query.is_some());
+    }
+
+    #[test]
+    fn devboule_plan_first_class_event_deserializes_and_maps() {
+        // The sidecar now emits `{type:"devboule_plan", plan, timestamp}` as a
+        // first-class event. Verify it parses and handle_event maps it to a
+        // ConsoleEntry::Chat with role="plan".
+        let line = r#"{"type":"devboule_plan","plan":{"steps":["a","b"],"confidence":0.9},"timestamp":1234567890}"#;
+        let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_plan event");
+        assert_eq!(event.event_type, "devboule_plan");
+        assert!(event.plan.is_some());
     }
 
     #[test]
@@ -6375,6 +6429,9 @@ mod tests {
             context: None,
             count: None,
             partial_result: None,
+            query: None,
+            results: None,
+            plan: None,
         }
     }
 

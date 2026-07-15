@@ -486,56 +486,55 @@ async function main() {
 		});
 	}
 
-	// Devboule custom messages: web_search + plan tool results are echoed
-	// back as user-role messages so the Rust EventMapper can inject them
-	// into ConsoleActivity for PlannerPlanMode.
+	// Devboule custom events: web_search + plan tool results are emitted as
+	// first-class sidecar events so the Rust EventMapper can inject them into
+	// ConsoleActivity for PlannerPlanMode.
 	//
-	// IMPORTANT: queue these BEFORE forwarding the event to Rust (emit
-	// below). sendMessage must precede emit so the custom message is queued
-	// into the SAME turn's event stream, not delayed to the next turn.
-	async function echoDevbouleCustomMessages(event) {
-		if (
-			event.type === "tool_execution_end" &&
-			event.toolName === "web_search"
-		) {
-			try {
-				await session.sendMessage({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify({
-								type: "devboule.websearch",
-								query: event.args?.query || "",
-								results: event.result?.details || {},
-								timestamp: Date.now(),
-							}),
-						},
-					],
-				});
-			} catch {
-				/* best-effort, don't break the stream */
+	// PROVEN: the previous approach of using session.sendMessage() to inject a
+	// user-role message was DEAD — sendMessage() never surfaces in the stdout
+	// event stream (verified live: 0 mentions across 2 turns). The Rust
+	// handle_devboule_custom_message path can never fire on this channel.
+	//
+	// Fix: emit first-class events directly on stdout. These are handled by
+	// type in pi_sidecar.rs handle_event, exactly like devboule_censor_review.
+	// The sendMessage echo is removed; the Rust message-detection path is kept
+	// for back-compat with any other injector.
+	//
+	// NOTE: tool_execution_end does NOT carry args (only result), so we capture
+	// args on tool_execution_start via pendingDevbouleArgs (same pattern as
+	// pendingToolPaths used by the censor hook) and read them on tool_execution_end.
+	const pendingDevbouleArgs = new Map(); // toolCallId → args
+
+	async function emitDevbouleCustomMessages(event) {
+		if (event.type === "tool_execution_start") {
+			if (event.toolName === "web_search" || event.toolName === "plan") {
+				pendingDevbouleArgs.set(event.toolCallId, event.args || {});
 			}
 		}
 
-		if (event.type === "tool_execution_end" && event.toolName === "plan") {
-			try {
-				await session.sendMessage({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify({
-								type: "devboule.plan",
-								plan: event.result?.details || {},
-								timestamp: Date.now(),
-							}),
-						},
-					],
-				});
-			} catch {
-				/* best-effort */
-			}
+		if (
+			event.type === "tool_execution_end" &&
+			event.toolName === "web_search" &&
+			!event.isError
+		) {
+			const args = pendingDevbouleArgs.get(event.toolCallId) || {};
+			emit({
+				type: "devboule_websearch",
+				query: args.query || "",
+				results: event.result?.details || {},
+				timestamp: Date.now(),
+			});
+			pendingDevbouleArgs.delete(event.toolCallId);
+		}
+
+		if (event.type === "tool_execution_end" && event.toolName === "plan" && !event.isError) {
+			const args = pendingDevbouleArgs.get(event.toolCallId) || {};
+			emit({
+				type: "devboule_plan",
+				plan: event.result?.details || {},
+				timestamp: Date.now(),
+			});
+			pendingDevbouleArgs.delete(event.toolCallId);
 		}
 	}
 
@@ -629,7 +628,7 @@ async function main() {
 				sessionId: devbouleContext.sessionId || session?.id,
 			},
 		};
-		await echoDevbouleCustomMessages(event);
+		await emitDevbouleCustomMessages(event);
 		emit(enriched);
 		captureCensorToolPath(event);
 		correlateCensorPatch(event);
