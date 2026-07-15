@@ -45,6 +45,13 @@ const MAX_BUFFER_LEN = 10 * 1024 * 1024; // 10MB
 // ever reused). It is reset on every `main()` entry.
 let devbouleContext;
 
+// Track whether the current in-flight turn has failed (provider error, retries exhausted).
+// Set by the global event subscription when auto_retry_end(success:false) or error event is seen.
+let currentTurnFailed = false;
+
+// S2: capture the real error detail from auto_retry_end(finalError).
+let currentTurnError = null;
+
 // ---------------------------------------------------------------------------
 // JSONL helpers
 // ---------------------------------------------------------------------------
@@ -236,14 +243,18 @@ async function applyPigeonRouting(session, modelRegistry, classification) {
  * Phase 2 Pigeon: classify the prompt via Rust (await the `classified` response),
  * then apply the tier→model routing and run the turn in pi.
  */
-export async function handlePromptCommand(cmd, session, modelRegistry, pigeonEnabled = false) {
+export async function handlePromptCommand(
+	cmd,
+	session,
+	modelRegistry,
+	pigeonEnabled = false,
+) {
 	if (!pigeonEnabled) {
 		// Pigeon OFF (default): no classification, no model switch, no redirect —
 		// run the turn on the spawn-time configured model.
 		await session.prompt(cmd.message, {
 			streamingBehavior: cmd.streamingBehavior,
 		});
-		emit({ type: "response", command: "prompt", success: true });
 		return;
 	}
 
@@ -252,11 +263,6 @@ export async function handlePromptCommand(cmd, session, modelRegistry, pigeonEna
 	await applyPigeonRouting(session, modelRegistry, classification);
 	await session.prompt(cmd.message, {
 		streamingBehavior: cmd.streamingBehavior,
-	});
-	emit({
-		type: "response",
-		command: "prompt",
-		success: true,
 	});
 }
 
@@ -409,7 +415,9 @@ async function main() {
 				},
 			},
 			onError: (err) => {
-				console.error(`[pi-sidecar] Extension error (${err.extensionPath}): ${err.error}`);
+				console.error(
+					`[pi-sidecar] Extension error (${err.extensionPath}): ${err.error}`,
+				);
 			},
 		});
 	} catch (err) {
@@ -455,6 +463,20 @@ async function main() {
 	let isReviewTurn = false;
 
 	// ---- subscribe helpers (close over main() locals) ----------------------
+
+	/**
+	 * S3: Emit the prompt response event. Used by both drainPromptQueue and
+	 * the stdin "prompt" handler to avoid copy-paste.
+	 * Throws errors are NOT caught here — callers handle them separately.
+	 */
+	function emitPromptResponse(success, error) {
+		emit({
+			type: "response",
+			command: "prompt",
+			success,
+			error: error || (success ? undefined : "Provider error or retries exhausted"),
+		});
+	}
 
 	// Devboule custom messages: web_search + plan tool results are echoed
 	// back as user-role messages so the Rust EventMapper can inject them
@@ -574,6 +596,23 @@ async function main() {
 
 	// ---- subscribe to all events and forward as JSONL ---------------------
 	session.subscribe(async (event) => {
+		// S4: update failure flags SYNCHRONOUSLY at the top of the callback
+		// (before any await), so the flag is set in the same tick the event is
+		// delivered, avoiding microtask interleaving with session.prompt().
+		if (promptInFlight) {
+			if (event.type === "auto_retry_end" && event.success === false) {
+				currentTurnFailed = true;
+				// S2: capture the real error detail from the event
+				currentTurnError = event.finalError || null;
+			}
+			// S1: defensive — the SDK never emits type:"error" through the
+			// session bus, but keep the branch in case that changes.
+			else if (event.type === "error") {
+				// defensive: SDK has no "error" event today
+				currentTurnFailed = true;
+			}
+		}
+
 		const enriched = {
 			...event,
 			_devboule: {
@@ -605,15 +644,24 @@ async function main() {
 		while (promptQueue.length > 0) {
 			const nextCmd = promptQueue.shift();
 			promptInFlight = true;
+			currentTurnFailed = false;
+			currentTurnError = null;
 			try {
-				await handlePromptCommand(nextCmd, session, modelRegistry, pigeonEnabled);
+				await handlePromptCommand(
+					nextCmd,
+					session,
+					modelRegistry,
+					pigeonEnabled,
+				);
+
+				// Emit response based on whether the turn failed
+				if (currentTurnFailed) {
+					emitPromptResponse(false, currentTurnError || "Provider error or retries exhausted");
+				} else {
+					emitPromptResponse(true);
+				}
 			} catch (err) {
-				emit({
-					type: "response",
-					command: "prompt",
-					success: false,
-					error: err instanceof Error ? err.message : String(err),
-				});
+				emitPromptResponse(false, err instanceof Error ? err.message : String(err));
 			} finally {
 				promptInFlight = false;
 			}
@@ -680,17 +728,21 @@ async function main() {
 					break;
 				}
 				promptInFlight = true;
+				currentTurnFailed = false;
+				currentTurnError = null;
 				try {
 					// Phase 2 Pigeon: classify BEFORE prompting (handlePromptCommand
 					// awaits the Rust `classified` response, then applies routing).
 					await handlePromptCommand(cmd, session, modelRegistry, pigeonEnabled);
+
+					// Emit response based on whether the turn failed
+					if (currentTurnFailed) {
+						emitPromptResponse(false, currentTurnError || "Provider error or retries exhausted");
+					} else {
+						emitPromptResponse(true);
+					}
 				} catch (err) {
-					emit({
-						type: "response",
-						command: "prompt",
-						success: false,
-						error: err instanceof Error ? err.message : String(err),
-					});
+					emitPromptResponse(false, err instanceof Error ? err.message : String(err));
 				} finally {
 					promptInFlight = false;
 					// Fix 1: process any prompts that queued while this turn ran.
@@ -861,7 +913,10 @@ function cleanup(exitCode) {
 // path to the executed script's real path: `realpathSync` resolves relative /
 // symlink paths (e.g. macOS /tmp -> /private/tmp) so the guard is robust to how
 // the file is invoked, unlike a naive `pathToFileURL(process.argv[1])` compare.
-if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
+if (
+	process.argv[1] &&
+	fileURLToPath(import.meta.url) === realpathSync(process.argv[1])
+) {
 	process.on("SIGTERM", () => cleanup(0));
 
 	process.on("unhandledRejection", (reason) => {
