@@ -302,12 +302,20 @@ function buildCustomModelsJson() {
 	const model = process.env.DEVBOULE_PI_MODEL || "gpt-4o";
 
 	// Minimal config: only the Devboule provider. No user keys leaked.
+	// BUG FIX (P3): previously `apiKey` was hardcoded to OPENAI_API_KEY||"dummy"
+	// regardless of provider — so Cloud roles (openrouter) always sent
+	// `Bearer dummy` and got 401. Select the key by provider; openrouter falls
+	// back to OPENAI_API_KEY for local/ollama cases, then "dummy".
+	const apiKey =
+		provider === "openrouter"
+			? process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "dummy"
+			: process.env.OPENAI_API_KEY || "dummy";
 	const minimalModels = {
 		providers: {
 			[provider]: {
 				baseUrl,
 				api: "openai-completions",
-				apiKey: process.env.OPENAI_API_KEY || "dummy",
+				apiKey,
 				compat: {
 					supportsDeveloperRole: false,
 					supportsReasoningEffort: false,
