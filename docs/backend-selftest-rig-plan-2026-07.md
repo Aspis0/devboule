@@ -85,11 +85,87 @@ Run the P2 scenarios across placements, per role:
   (round-6 invariant), coder does NOT inherit mini's cloud backend.
 Not every cell every run: smoke set (local-only, ~2 min) vs full matrix (opt-in).
 
-### P4 — Make it the standing gate
-- One command (`cargo test --ignored rig_smoke` or `npm run rig:smoke`) + docs.
-- Standing rule: every future fix round runs the rig BEFORE asking owner e2e; new bug
-  found live → first step is a new rig scenario that reproduces it.
+### P4 — Make it the standing gate — DONE 2026-07-15 (`0be5de2`)
+- `npm run rig:smoke` / `rig:rust` / `rig` + "Standing gate" section in rig/README.md.
+- Standing rule active: every future fix round runs the rig BEFORE asking owner e2e; new
+  bug found live → first step is a new rig scenario that reproduces it.
 - CI-ability deferred (needs oMLX or the mock provider on the runner).
+
+## P5 — The coder lane (owner-mandated 2026-07-15)
+
+P0–P4 covered the ORCHESTRATOR lane. P5 covers everything downstream: main coder →
+mini coder, with every durable surface the UI feeds on asserted at each hop —
+activity/console, kanban tasks, fleet rows, task-dependency arrows.
+
+**Ground truth (inventory §1/§3 + frontend consumers, disk-verified 2026-07-15):**
+two distinct coder paths that must NOT be conflated — (a) the **directive executor
+path** (MCP `spawn_main_coder`/`spawn_mini_coder` → `.aspis-agents.json` directive →
+`run_pass` 1.5s tick → PTY or agentic worker; cloud kind rejected loudly) and (b) the
+**pi sidecar path** (`spawn_pi_coder_session` → `spawn_sidecar_for_role("main-coder"|
+"mini-coder")`). UI feeds: mini console = `mini_activity_snapshot` (hydrates from
+bridge file `.devboule-activity/<id>.jsonl`, 300ms tail) → `useAgentConsole`; kanban =
+project tasks state (`project_claim_task`/`project_update_status` etc. → TaskCard/
+projectWorkspaceModel); fleet rows = `get_agent_live_state` → `agentRowModel`
+(AgentsView); frecce = `TaskDependencyArrows` over task `deps` on the board.
+
+### P5a — Mini-coder work simulation end-to-end (directive path, python rig)
+The full choreography a real work session produces, against the mock LLM:
+`spawn_mini_coder` (MCP, forged orchestrator session) → directive row appears in
+`.aspis-agents.json` (assert fleet-visible: the row that AgentsView renders) →
+executor claims → agentic worker against mock → emit-edits → `apply_emitted_edits`
+mutates the sandbox file → result file → `mini_coder_result` → activity events.
+Assert at EVERY hop the durable channel, not the internal: fleet row status
+transitions (queued→running→done), `mini_activity_snapshot` timeline entries
+(spawn/coder/banner kinds), bridge file exists and replays (restart-durability:
+re-read snapshot after killing nothing — hydrate-on-miss path), result content.
+Negative cells: cloud directive rejected loudly (already covered in Layer B — link,
+don't duplicate); malformed emit-edits → allowlist/cap violations surface as errors
+not silent skips.
+
+### P5b — Kanban + arrows: task lifecycle choreography (python rig)
+MCP choreography from a forged coder session: `project_next_task` → `project_claim_task`
+(task → wip; **known bug: returns full 110KB `public_agents_state` — FIX IN THIS PHASE**,
+compact ack like register/heartbeat, then the scenario asserts ack <4096B, same guard
+class as round 5) → `project_update_status` (wip→done) → `project_create_followup`
+(new task with `deps` on the finished one). Assert the PROJECT STATE the UI renders:
+tasks array statuses (kanban columns), `deps` edges present (what TaskDependencyArrows
+draws), `project_append_note` lands. Negative: claim on paused project (covered — link),
+double-claim same task, update_status on a task the session doesn't own.
+
+### P5c — Pi coder lane: role parity + console durability (python rig + product fix)
+Spawn the sidecar with `DEVBOULE_AGENT_ROLE=main-coder` and `mini-coder` (the rig
+driver already does roles): assert role-scoped tool surface (plan tool ABSENT — covered;
+censor hook ACTIVE on .rs writes for coder roles), turn round-trip, and the TWO known
+product gaps in this lane, each as a scenario that pins CURRENT behavior first:
+1. **Bridge file for pi coders** (backlog §3): pi coder sessions never write
+   `.devboule-activity/<id>.jsonl` → console lost on restart. FIX (write-through on
+   the Rust event arms, same writer the directive minis use), then flip the scenario
+   from pin-the-gap to assert-durability.
+2. **Steer no-op** (backlog §3): `mini_coder_steer` targets directive rows only → pi
+   coder steer goes nowhere. Scenario asserts the current explicit error/no-op; the
+   routing fix is a DESIGN decision (route by session kind) — pin now, fix only with
+   owner go.
+
+### P5d — Blind-spot write-throughs (small product fixes, Rust + rig cells)
+The inventory §3 event-only channels, each a small write-through + one rig cell:
+`mini://stuck` → persist a `lastStuckReport` readable via snapshot;
+`censor://scan-started` + `censor://mini-findings` summary → durable censor state;
+`agent-terminal://<id>` ring exposure (read command). Each makes a today-invisible
+flow assertable; do them one at a time, cheapest first.
+
+### P5e — UI-model unit coverage from rig fixtures (vitest)
+Record REAL snapshots produced by P5a/P5b runs (activity snapshot JSON, tasks state,
+fleet rows) as fixtures; vitest the frontend models against them: `agentConsoleModel`
+apply/tail semantics, `agentRowModel` row derivation (status/kind/attention),
+`projectWorkspaceModel` kanban columns, task-deps → arrows input. This is the same
+pattern as plannerModel: the rig proves the backend emits it, vitest proves the UI
+model consumes it — the seam in between is one recorded fixture, versioned in rig/.
+
+### P5 execution order
+P5b first (pure MCP choreography, fixes the 110KB claim bug — highest value/cost),
+then P5a (executor simulation), P5c (pi lane + bridge fix), P5d one-by-one, P5e last
+(needs the fixtures the others produce). Standing gate applies: every phase lands with
+its rig cells green in `npm run rig`.
 
 ## What the rig can NOT cover (stays owner e2e, but the list is now short)
 - Real GUI rendering/interaction (React state, focus, banners visually).
