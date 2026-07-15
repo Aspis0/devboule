@@ -8346,7 +8346,22 @@ def handle_tool_call(
                 task_id,
                 task.get("status"),
             )
-            return public_agents_state(write_agents_state(projects_dir, state))
+            # COMPACT ACK (FIX, round-5 class): the original returned the ENTIRE
+            # fleet state (public_agents_state) — >100KB of sessions + events +
+            # rules + claims — which drowned small local models. Return only the
+            # agent's own sanitized session + fleet summary + the claim outcome
+            # the caller actually needs. The deep copy (json round-trip, like
+            # compact_session_ack) means sanitizing never mutates the real state.
+            saved = write_agents_state(projects_dir, state)
+            ack = compact_session_ack(saved, agent_id)
+            # Claim confirmation — the caller needs the lease outcome, not the fleet.
+            ack["claim"] = {
+                "projectId": project_id,
+                "taskId": task_id,
+                "status": claim_status,
+                "leaseUntil": lease_until,
+            }
+            return ack
 
     if name == "project_update_status":
         agent_id = normalize_agent_id(args.get("agent_id"))

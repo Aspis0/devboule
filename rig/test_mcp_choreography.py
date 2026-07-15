@@ -173,7 +173,10 @@ def test_register_claim_choreography():
             )
 
             # ---- Step 4: project_claim_task ----
-            claim_result, _ = client.call_tool(
+            # Contract (round-5 class fix): claim_task now returns a COMPACT ack
+            # (own sanitized session + fleet summary) plus a "claim" key with the
+            # lease outcome — NOT the full fleet state.
+            claim_result, claim_raw_len = client.call_tool(
                 "project_claim_task",
                 {
                     "project_id": ACTIVE_PROJECT_ID,
@@ -184,17 +187,48 @@ def test_register_claim_choreography():
                 },
                 timeout=10,
             )
-            # claim returns public_agents_state; verify the claim was recorded
-            claims = claim_result.get("claims", [])
+            # Compact-ack shape: sanitized session + fleet summary + claim key.
+            claim_session = claim_result.get("session", {})
+            for leak_key in (
+                "launchTokenHash",
+                "launchTokenIssuedAt",
+                "sessionTokenHash",
+                "launchConsumedAt",
+            ):
+                assert leak_key not in claim_session, (
+                    f"claim compact ack leaked {leak_key} in session"
+                )
+            fleet = claim_result.get("fleet", {})
+            assert "sessions" in fleet and "active" in fleet, (
+                f"claim ack missing fleet summary; keys: {list(claim_result.keys())}"
+            )
+            # The "claim" key carries the lease outcome the caller needs.
+            assert "claim" in claim_result, (
+                f"claim ack missing 'claim' key; keys: {list(claim_result.keys())}"
+            )
+            claim = claim_result["claim"]
+            assert claim.get("projectId") == ACTIVE_PROJECT_ID
+            assert claim.get("taskId") == "T1"
+            assert claim.get("status") in ("claimed", "wip"), (
+                f"unexpected claim status: {claim.get('status')}"
+            )
+            assert claim.get("leaseUntil"), "claim ack missing leaseUntil"
+            # RAW response size guard (round-5: ack must be < 4 KB)
+            assert claim_raw_len < 4096, (
+                f"claim ack too large: {claim_raw_len} bytes (expected < 4096)"
+            )
+            # On-disk truth still records the claim — preserves the original
+            # invariant through the durable channel instead of the ack.
+            disk_state = _read_agents_state(projects_dir)
             active_claims = [
                 c
-                for c in claims
+                for c in disk_state.get("claims", [])
                 if c.get("agentId") == AGENT_ID
                 and c.get("taskId") == "T1"
                 and c.get("projectId") == ACTIVE_PROJECT_ID
             ]
             assert len(active_claims) == 1, (
-                f"expected exactly 1 claim for T1, got {len(active_claims)}"
+                f"expected exactly 1 claim for T1 on disk, got {len(active_claims)}"
             )
             assert active_claims[0].get("role") == AGENT_ROLE
 

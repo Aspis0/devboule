@@ -553,7 +553,9 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            self.assertEqual(state["claims"][0]["taskId"], "T1")
+            # COMPACT ACK (round-5 class fix): project_claim_task now returns a
+            # compact ack with a "claim" key carrying the lease outcome.
+            self.assertEqual(state["claim"]["taskId"], "T1")
 
             with self.assertRaises(McpError):
                 handle_tool_call(
@@ -961,7 +963,9 @@ root_path: "{escaped_work_root}"
             )
 
             self.assertEqual(project["state"]["tasks"][0]["status"], "wip")
-            self.assertEqual(state["claims"][0]["status"], "wip")
+            # COMPACT ACK (round-5 class fix): project_claim_task now returns a
+            # compact ack with a "claim" key carrying the lease outcome.
+            self.assertEqual(state["claim"]["status"], "wip")
             self.assertTrue(
                 any(
                     "moved it to wip" in note["text"]
@@ -1326,9 +1330,13 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-
-            self.assertEqual(len(state["claims"]), 1)
-            self.assertEqual(state["claims"][0]["agentId"], "fresh-coder")
+            # COMPACT ACK (round-5 class fix): project_claim_task now returns a
+            # compact ack; the ledger is asserted via on-disk state.
+            on_disk = json.loads(
+                (projects / AGENTS_STATE_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(on_disk["claims"]), 1)
+            self.assertEqual(on_disk["claims"][0]["agentId"], "fresh-coder")
 
     def test_agent_state_reconciles_missing_task_to_blocked_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4152,7 +4160,9 @@ class OrchestratorRoleTests(unittest.TestCase):
                 root=root,
             )
             # Same as coder: claiming a todo auto-advances it to wip.
-            self.assertEqual(claimed["claims"][0]["status"], "wip")
+            # COMPACT ACK (round-5 class fix): project_claim_task now returns a
+            # compact ack with a "claim" key carrying the lease outcome.
+            self.assertEqual(claimed["claim"]["status"], "wip")
             reviewed = handle_tool_call(
                 "project_update_status",
                 {
@@ -4962,10 +4972,12 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                 },
                 root=root,
             )
-            self.assertTrue(any(c.get("taskId") == "T1" for c in claimed["claims"]))
+            # COMPACT ACK (round-5 class fix): project_claim_task now returns a
+            # compact ack; the ledger is asserted via on-disk state.
             on_disk = json.loads(
                 (projects / AGENTS_STATE_FILE).read_text(encoding="utf-8")
             )
+            self.assertTrue(any(c.get("taskId") == "T1" for c in on_disk["claims"]))
             session = next(
                 s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy"
             )
@@ -5510,6 +5522,109 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             self.assertIn("session", heartbeat)
             self.assertEqual(heartbeat["session"]["agentId"], "compact-coder")
             self.assertEqual(heartbeat["fleet"]["sessions"], 1)
+
+    def test_claim_task_returns_compact_ack_with_lease(self):
+        """FIX regression: project_claim_task must return a COMPACT ack (own session
+        + fleet summary) plus a "claim" key carrying the lease outcome — NOT the
+        entire fleet state. Mirrors the round-5 compact_session_ack fix. Asserts
+        the shape and a size bound against a fat multi-session fixture."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            sample_project(projects)
+            token = "compact-claim-launch-token-0123456789"
+            # Seed a managed launch_pending session so registration mints a
+            # sessionToken (managed path), and seed several extra sessions so the
+            # ack is non-trivial but still compact.
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "claim-coder",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            },
+                            # Extra sessions to make the fleet non-trivial.
+                            {
+                                "agentId": "other-coder",
+                                "role": "coder",
+                                "status": "active",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                            },
+                            {
+                                "agentId": "verifier-1",
+                                "role": "verifier",
+                                "status": "idle",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                            },
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registered = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "claim-coder",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            claim_result = handle_tool_call(
+                "project_claim_task",
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "agent_id": "claim-coder",
+                    "role": "coder",
+                    "session_token": registered["sessionToken"],
+                },
+                root=root,
+            )
+            # Top-level compact contract: own session + fleet summary + claim key.
+            self.assertIn("session", claim_result)
+            self.assertEqual(claim_result["session"]["agentId"], "claim-coder")
+            self.assertIn("fleet", claim_result)
+            self.assertGreaterEqual(claim_result["fleet"]["sessions"], 3)
+            # Sensitive fields must NOT leak in the compact session.
+            for leak_key in (
+                "launchTokenHash",
+                "launchTokenIssuedAt",
+                "sessionTokenHash",
+                "sessionTokenIssuedAt",
+                "launchConsumedAt",
+            ):
+                self.assertNotIn(leak_key, claim_result["session"])
+            # The full fleet is deliberately NOT dumped.
+            self.assertNotIn("sessions", claim_result)
+            self.assertNotIn("claims", claim_result)
+            self.assertNotIn("events", claim_result)
+            self.assertNotIn("rules", claim_result)
+            # The "claim" key carries the lease outcome the caller needs.
+            self.assertIn("claim", claim_result)
+            claim = claim_result["claim"]
+            self.assertEqual(claim.get("projectId"), "scrna-seq")
+            self.assertEqual(claim.get("taskId"), "T1")
+            # Coder claims a todo task -> auto-advances to wip.
+            self.assertEqual(claim.get("status"), "wip")
+            self.assertIn("leaseUntil", claim)
+            self.assertTrue(claim["leaseUntil"])
+            # Size bound: even with a fat multi-session fixture the ack must be
+            # comfortably under 4 KB (round-5 contract).
+            self.assertLess(len(json.dumps(claim_result)), 4096)
 
     def test_heartbeat_subagents_provided_then_cleared_then_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
