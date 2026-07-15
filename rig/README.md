@@ -6,11 +6,34 @@ against a mock OpenAI-compatible server — no Tauri app, no GUI, no real LLM.
 ## Quick Start
 
 ```bash
-# From repo root
-RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v
+# From repo root — Layer A (python, ~50s) and Layer B (Rust executor integration)
+npm run rig:smoke   # RIG=1 pytest rig/ -v
+npm run rig:rust    # cargo test rig_tests -- --ignored (4 integration tests)
+npm run rig         # both
 ```
 
+Or directly: `RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v`.
 Requires `RIG=1` environment variable (prevents accidental runs in normal CI).
+
+Opt-in live cells (real network/keys, normally skipped):
+- `RIG_LIVE=1` — websearch live scenario (Exa MCP, keyless) + plan-console probe.
+
+## Standing gate (house rule, P4 — 2026-07-15)
+
+The rig is the **mandatory pre-e2e gate** for backend work:
+
+1. **Every fix round runs `npm run rig` BEFORE asking the owner for live e2e.**
+   Owner time is the scarcest resource; the rig catches the silent-success /
+   dead-channel / wrong-auth bug classes headlessly.
+2. **Every new bug found live becomes a rig scenario FIRST**, then gets fixed —
+   the scenario must fail on the buggy code and pass on the fix (same TDD rule
+   as regression tests). Six product bugs were found this way in P1–P3.
+3. New backend surfaces (sidecar events, MCP tools, placement kinds) ship with a
+   rig scenario in the same round, or an explicit note in
+   `docs/future-work-2026-07.md` saying why not.
+
+What the rig cannot cover (stays owner e2e): real GUI rendering, macOS
+Keychain/App Nap, packaged-build resource paths, true `npm run tauri dev` env.
 
 ## Files
 

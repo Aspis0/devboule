@@ -9,7 +9,10 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "rig:smoke": "RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v",
+    "rig:rust": "cargo test --manifest-path src-tauri/Cargo.toml rig_tests -- --ignored",
+    "rig": "npm run rig:smoke && npm run rig:rust"
   },
   "dependencies": {
     "@fontsource-variable/instrument-sans": "^5.2.8",

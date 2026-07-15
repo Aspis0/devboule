@@ -7,13 +7,12 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
 
 ## 1. Self-test rig (docs/backend-selftest-rig-plan-2026-07.md)
 
-- **P4 — standing gate**: one command (`npm run rig:smoke` or runbook in
-  README) + the standing rule: every fix round runs the rig BEFORE owner e2e;
-  every new live bug becomes a rig scenario first. Small, high leverage.
-- **devboule_websearch/plan channel fix** — in flight 2026-07-15 (kat, may
-  need re-dispatch on 429): first-class stdout events replacing the dead
-  `session.sendMessage` echo + Rust arms + live test. If not landed, this is
-  the top item.
+- ~~**P4 — standing gate**~~ **DONE 2026-07-15**: `npm run rig:smoke` /
+  `rig:rust` / `rig` in package.json + "Standing gate" section in
+  `rig/README.md` (rig before owner e2e; live bug → rig scenario first).
+- ~~**devboule_websearch/plan channel fix**~~ **DONE 2026-07-15** (`bd4a9fc`):
+  first-class stdout events devboule_websearch/devboule_plan + Rust arms +
+  live test.
 - **Layer B extensions** (Rust `#[ignore]` tests): goal-delivery through the
   real Rust spawn path (initial_goal_msg_id echo ordering); the full
   devboule_plan → ConsoleEntry chain; censor-after-write with a real cheap
