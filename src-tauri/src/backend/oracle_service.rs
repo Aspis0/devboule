@@ -2459,14 +2459,15 @@ pub fn set_oracle_enabled(
     Ok(enabled)
 }
 
-// ── Oracle engine selector (python | rust) — M2 ─────────────────────────────
+// ── Oracle engine selector (rust only — python retired in M3) ──────────────
 // Mirrors the `oracle.enabled` machinery exactly. The runtime engine is read
-// from config.json `oracle.engine` (default "python"); the supervisor consults
+// from config.json `oracle.engine` (default "rust"); the supervisor consults
 // `oracle_current_engine()` when deciding what to run on the loopback port
-// (Python subprocess vs in-process oracle-core server). Persisted through the
-// same `config_write_lock` + `fs_replace` path. Default is "python" so wiring
-// the Rust engine in never silently switches the live runtime — the owner flips
-// to "rust" explicitly and verifies.
+// (in-process oracle-core server). Persisted through the
+// same `config_write_lock` + `fs_replace` path. Default is "rust" — the
+// Python variant was removed in M3 and is no longer a reachable value from
+// config or UI input (the variant enum member is retained until the next
+// phase deletes the python spawn machinery).
 
 /// AtomicU8 mirror of the persisted engine flag: 0 = python (default), 1 = rust.
 static ORACLE_ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -2479,11 +2480,19 @@ pub enum OracleEngine {
 
 impl OracleEngine {
     /// Parse from the config string; unknown/empty falls back to the safe
-    /// default (Python), never an error.
+    /// default (Rust), never an error. "python" is retired (M3) and is
+    /// coerced to Rust with a runtime warning.
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "rust" => OracleEngine::Rust,
-            _ => OracleEngine::Python,
+            "python" => {
+                eprintln!(
+                    "[oracle] config oracle.engine=python is retired (the Python \
+                    engine was removed in M3); using rust"
+                );
+                OracleEngine::Rust
+            }
+            _ => OracleEngine::Rust,
         }
     }
 
@@ -2494,6 +2503,9 @@ impl OracleEngine {
         }
     }
 
+    /// Transitional encoding: Python variant still maps to 0 (for the
+    /// persisted enum round-trip) but from_u8(0) resolves to Rust since the
+    /// Python engine is retired. Rust maps to 1.
     fn as_u8(self) -> u8 {
         match self {
             OracleEngine::Python => 0,
@@ -2501,10 +2513,12 @@ impl OracleEngine {
         }
     }
 
+    /// Decodes the persisted u8 back to an engine. Both 0 and 1 map to Rust
+    /// because the Python variant is no longer reachable from config/UI input.
     fn from_u8(v: u8) -> Self {
         match v {
             1 => OracleEngine::Rust,
-            _ => OracleEngine::Python,
+            _ => OracleEngine::Rust,
         }
     }
 }
@@ -2526,19 +2540,19 @@ pub fn oracle_engine_from_value(v: &serde_json::Value) -> OracleEngine {
         .get("oracle")
         .and_then(|o| o.get("engine"))
         .and_then(|e| e.as_str())
-        .unwrap_or("python");
+        .unwrap_or("rust");
     OracleEngine::parse(s)
 }
 
 pub fn read_oracle_engine(app: &tauri::AppHandle) -> OracleEngine {
     let Some(path) = crate::backend::projects::locate_config_path(app) else {
-        return OracleEngine::Python;
+        return OracleEngine::Rust;
     };
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return OracleEngine::Python;
+        return OracleEngine::Rust;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return OracleEngine::Python;
+        return OracleEngine::Rust;
     };
     oracle_engine_from_value(&value)
 }
@@ -2631,15 +2645,15 @@ mod oracle_toggle_tests {
     use super::{oracle_engine_from_value, OracleEngine};
 
     #[test]
-    fn engine_defaults_to_python_when_absent_or_unknown() {
-        assert_eq!(oracle_engine_from_value(&json!({})), OracleEngine::Python);
+    fn engine_defaults_to_rust_when_absent_or_unknown() {
+        assert_eq!(oracle_engine_from_value(&json!({})), OracleEngine::Rust);
         assert_eq!(
             oracle_engine_from_value(&json!({"oracle": {}})),
-            OracleEngine::Python
+            OracleEngine::Rust
         );
         assert_eq!(
             oracle_engine_from_value(&json!({"oracle": {"engine": "nonsense"}})),
-            OracleEngine::Python
+            OracleEngine::Rust
         );
     }
 
@@ -2647,20 +2661,43 @@ mod oracle_toggle_tests {
     fn engine_parses_known_values_case_insensitively() {
         assert_eq!(OracleEngine::parse("rust"), OracleEngine::Rust);
         assert_eq!(OracleEngine::parse("  RUST "), OracleEngine::Rust);
-        assert_eq!(OracleEngine::parse("Python"), OracleEngine::Python);
+        assert_eq!(OracleEngine::parse("Python"), OracleEngine::Rust);
         assert_eq!(
             oracle_engine_from_value(&json!({"oracle": {"engine": "rust"}})),
             OracleEngine::Rust
         );
     }
 
+    /// RETIRED python input is coerced to Rust (not an error).
+    #[test]
+    fn parse_python_is_coerced_to_rust() {
+        assert_eq!(OracleEngine::parse("python"), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("PYTHON"), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("  python  "), OracleEngine::Rust);
+    }
+
+    /// Unknown / garbage input falls back to the Rust default.
+    #[test]
+    fn parse_garbage_falls_back_to_rust() {
+        assert_eq!(OracleEngine::parse(""), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("garbage"), OracleEngine::Rust);
+        assert_eq!(OracleEngine::parse("rusty"), OracleEngine::Rust);
+    }
+
+    /// RETIRED encoding 0 resolves to Rust (python variant retained for the
+    /// persisted enum round-trip but no longer reachable from config/UI).
+    #[test]
+    fn from_u8_zero_is_rust() {
+        assert_eq!(OracleEngine::from_u8(0), OracleEngine::Rust);
+    }
+
     /// MUTATES PROCESS-GLOBAL STATE: round-trips the ORACLE_ENGINE AtomicU8.
-    /// Restores Python (the default) at the end for other tests in the binary.
+    /// Restores Rust (the default) at the end for other tests in the binary.
     #[test]
     fn engine_flag_is_mutable_at_runtime() {
         super::set_oracle_engine_flag(OracleEngine::Rust);
         assert_eq!(super::oracle_current_engine(), OracleEngine::Rust);
-        super::set_oracle_engine_flag(OracleEngine::Python);
-        assert_eq!(super::oracle_current_engine(), OracleEngine::Python);
+        super::set_oracle_engine_flag(OracleEngine::Rust);
+        assert_eq!(super::oracle_current_engine(), OracleEngine::Rust);
     }
 }
