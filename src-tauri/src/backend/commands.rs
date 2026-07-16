@@ -1700,17 +1700,15 @@ pub fn save_oracle_llm_settings(
 ) -> Result<OracleLlmSettingsStatus, String> {
     state.ensure_unlocked()?;
     let status = vault::save_oracle_llm_settings(&settings, api_key.as_deref())?;
-    // The resident Oracle server captures the LLM credentials in its spawn env (see
-    // oracle::python_oracle::spawn_oracle_server) and never re-reads the vault, so an
-    // already-running server would keep its STALE key after a save. We must NOT tear
-    // it down synchronously here: `stop_python_oracle_runtime` does `child.kill()` +
-    // `child.wait()`, and a slow reap (pipe-reader threads / OS) would BLOCK this
-    // Tauri command, freezing the UI (it looks like a crash right after entering the
-    // key). Instead set a lightweight "needs restart" flag and return immediately;
-    // the supervisor (oracle_service, ~10s tick) observes it and tears the server
-    // down OFF the UI thread, then respawns with the fresh credentials. The next
-    // /ask also respawns on demand. This command now returns within ~100ms
-    // regardless of server state.
+    // The resident Oracle server captures the LLM credentials at (re)spawn time
+    // (rust_oracle::apply_llm_env_in_process, run inside ensure_rust_oracle_server)
+    // and never re-reads the vault, so an already-running server would keep its
+    // STALE key after a save. We do NOT tear it down synchronously here — that
+    // would block this Tauri command and freeze the UI. Instead set a lightweight
+    // "needs restart" flag and return immediately; the supervisor (oracle_service,
+    // ~10s tick) observes it, stops the in-process server OFF the UI thread, and
+    // the same tick's ensure respawns it with the fresh credentials. This command
+    // returns within ~100ms regardless of server state.
     crate::backend::oracle_service::request_llm_restart();
     Ok(status)
 }

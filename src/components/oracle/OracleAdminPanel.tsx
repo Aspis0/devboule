@@ -1366,7 +1366,7 @@ export function OracleRuntimeSetupBanner({
   const steps: { label: string; done: boolean }[] = [
     { label: "Python 3.9+", done: !checking && setup.pythonFound },
     { label: "Virtual env", done: setup.venvReady },
-    { label: "LanceDB + deps", done: setup.depsReady },
+    { label: "MCP deps", done: setup.depsReady },
     { label: "Qwen3 embedder", done: setup.embedderReady },
   ];
   return (
@@ -1377,7 +1377,7 @@ export function OracleRuntimeSetupBanner({
           : "border-amber/25 bg-amber/[0.07]"
       }`}
       data-help-title="This sets up the local retrieval runtime."
-      data-help-lines="Oracle retrieval needs Python with LanceDB and the Qwen3 embedding model.|This is separate from the answer model: retrieval is always local, answers prefer a remote API key.|Installing downloads roughly 1-2 GB and can take several minutes on first run.|If Python is missing, install Python 3 first, then run setup."
+      data-help-lines="Oracle retrieval runs in-app (Rust) and needs the Qwen3 embedding model, plus a small Python helper venv for the agent MCP server.|This is separate from the answer model: retrieval is always local, answers prefer a remote API key.|Installing downloads the embedding model (a few hundred MB) and can take a few minutes on first run.|If Python is missing, install Python 3 first, then run setup."
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
@@ -1395,12 +1395,12 @@ export function OracleRuntimeSetupBanner({
               "First startup can be slow on a busy machine. We're still verifying the local Python runtime — no action needed yet."
             ) : (
               <>
-                Oracle search runs fully on your machine. One click installs{" "}
-                <span className="font-semibold">LanceDB</span> (the local vector
-                store) and the{" "}
+                Oracle search runs fully on your machine (in-app Rust engine).
+                One click installs the{" "}
                 <span className="font-mono">{setup.embedModel}</span> embedding
-                model — separate from the answer model, retrieval is always
-                local. First install downloads ~1–2 GB and needs about{" "}
+                model and a small Python helper venv for the agent MCP server —
+                separate from the answer model, retrieval is always local. First
+                install downloads a few hundred MB and needs about{" "}
                 <span className="font-semibold">
                   {ORACLE_RUNTIME_DISK_GB} GB free disk
                 </span>

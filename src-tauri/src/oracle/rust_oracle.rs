@@ -32,6 +32,43 @@ fn slot() -> &'static Mutex<Option<RustServer>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
+/// Push the vault-resolved Oracle LLM settings into the process env, where the
+/// in-process answerer reads them per request (`LlmAnswerer::from_env` →
+/// `ORACLE_LLM_{PROVIDER,MODEL,BASE_URL,API_KEY}`). In-process mirror of the
+/// deleted python-subprocess `apply_llm_env`.
+///
+/// When remote answering is DISABLED (config `None`), the vars are REMOVED so a
+/// previously-injected key cannot keep answering remotely after the operator
+/// turns it off. Empty `base_url`/`api_key` are removed rather than set-empty so
+/// `normalize_llm_config`'s env fallbacks behave the same as "absent".
+/// The key value itself is never logged (see `OracleLlmRuntimeConfig`'s Debug).
+fn apply_llm_env_in_process() {
+    match crate::oracle::commands::resolve_oracle_llm_runtime_config() {
+        Some(config) => {
+            std::env::set_var("ORACLE_LLM_PROVIDER", &config.provider);
+            std::env::set_var("ORACLE_LLM_MODEL", &config.model);
+            match config.base_url.as_deref() {
+                Some(url) if !url.is_empty() => std::env::set_var("ORACLE_LLM_BASE_URL", url),
+                _ => std::env::remove_var("ORACLE_LLM_BASE_URL"),
+            }
+            match config.api_key.as_deref() {
+                Some(key) if !key.is_empty() => std::env::set_var("ORACLE_LLM_API_KEY", key),
+                _ => std::env::remove_var("ORACLE_LLM_API_KEY"),
+            }
+        }
+        None => {
+            for var in [
+                "ORACLE_LLM_PROVIDER",
+                "ORACLE_LLM_MODEL",
+                "ORACLE_LLM_BASE_URL",
+                "ORACLE_LLM_API_KEY",
+            ] {
+                std::env::remove_var(var);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -70,6 +107,16 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
 
     // If the slot is `None` (either empty or just cleared), build state and spawn.
     if guard.is_none() {
+        // Inject the vault-resolved LLM settings into the PROCESS env before the
+        // server spawns. The in-process answerer reads ORACLE_LLM_* per request
+        // (`LlmAnswerer::from_env`) — this is the in-process mirror of the deleted
+        // python-subprocess `apply_llm_env` (spawn-time injection). Without it the
+        // in-app LLM settings NEVER reach the answerer and /ask silently degrades
+        // to extractive forever. A locked vault degrades to "no key" (extractive),
+        // exactly like the subprocess path; saving LLM settings requests a restart
+        // (LLM_RESTART_REQUESTED → stop + this ensure), which re-runs the injection
+        // with the fresh values.
+        apply_llm_env_in_process();
         let paths = OracleDataPaths::from_root(root);
         // The index (sqlite/vectors below) is per-project — that is `paths`. The
         // ONNX model is NOT: it is one shared file for every indexed project, owned

@@ -18,3 +18,11 @@
 #
 httpx
 mcp[cli]
+#
+# Pigeon (`pigeon/dispatcher.py`, spawned by `backend/pigeon_service.rs` when
+# `pigeon.enabled=true`) runs on this SAME venv (`resolve_oracle_runtime_python`).
+# It needs fastapi + aiosqlite (+ pydantic/uvicorn, already pulled in by
+# fastapi / mcp[cli]) — without these the slim venv would break the optional
+# Pigeon mailbox with a ModuleNotFoundError deep in the subprocess.
+fastapi
+aiosqlite

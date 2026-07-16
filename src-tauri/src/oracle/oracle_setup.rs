@@ -549,35 +549,27 @@ pub fn is_fat_runtime_venv(root: &Path) -> bool {
     if !venv.exists() {
         return false;
     }
-    // Check both Unix and Windows venv layouts.
-    let unix_site_packages = venv.join("lib");
-    let windows_site_packages = venv.join("Lib");
-    // Walk the site-packages tree looking for a `torch` directory.
-    fn has_torch_in_lib(lib_dir: &Path) -> bool {
-        if !lib_dir.exists() {
-            return false;
-        }
-        for entry in std::fs::read_dir(lib_dir).ok().into_iter().flatten() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                let path_str = path.to_string_lossy();
-                // Match `<version>/site-packages/torch` on Unix.
-                if path_str.contains("site-packages") && path.join("torch").is_dir() {
-                    return true;
-                }
-                // Recurse into sub-directories that might be site-packages.
-                if has_torch_in_lib(&path) {
-                    return true;
-                }
-            }
-        }
-        false
+    // The two canonical venv layouts, checked EXACTLY (no substring matching,
+    // no unbounded recursion):
+    //   Windows: <venv>/Lib/site-packages/torch
+    //   Unix:    <venv>/lib/<pythonX.Y>/site-packages/torch
+    if venv
+        .join("Lib")
+        .join("site-packages")
+        .join("torch")
+        .is_dir()
+    {
+        return true;
     }
-    has_torch_in_lib(&unix_site_packages) || windows_site_packages.join("torch").is_dir()
+    let unix_lib = venv.join("lib");
+    for entry in std::fs::read_dir(&unix_lib).ok().into_iter().flatten() {
+        let Ok(entry) = entry else { continue };
+        let candidate = entry.path().join("site-packages").join("torch");
+        if candidate.is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Delete the venv directory under `root`. Used during the M3 migration when a

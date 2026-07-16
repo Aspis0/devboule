@@ -516,7 +516,7 @@ describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
     messages: [],
   };
 
-  it("shows the required disk space and a one-click install for LanceDB + the Qwen embedder", async () => {
+  it("shows the required disk space and a one-click install for the embedding model + MCP venv", async () => {
     const onInstall = vi.fn();
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -537,8 +537,10 @@ describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
     // Required disk space must be stated up front (download + installed deps).
     expect(text).toMatch(/disk/i);
     expect(text).toMatch(/GB/);
-    // The two installed pieces are named so the user knows what they get.
-    expect(text).toMatch(/LanceDB/);
+    // The two installed pieces are named so the user knows what they get
+    // (M3: the in-app Rust engine owns retrieval — the install is the embedding
+    // model + the slim MCP helper venv, not LanceDB-via-Python).
+    expect(text).toMatch(/MCP/);
     expect(text).toMatch(/embedder|embedding/i);
     // One-click install affordance.
     const button = container.querySelector("button");
