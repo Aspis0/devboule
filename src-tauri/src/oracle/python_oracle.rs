@@ -183,15 +183,18 @@ fn redacted_api_key(api_key: &Option<String>) -> Option<&'static str> {
     api_key.as_ref().map(|_| "[redacted]")
 }
 
-/// Whether `root` holds BOTH the `oracle/` package source AND a complete index
-/// (sqlite + vectors). Test-only: Bug A removed the production caller (it was the
-/// upfront gate in `run_python_oracle` that wrongly blocked Ask, since the
-/// workspace/index root never holds the package). The live integration tests
-/// still use it to decide whether the local checkout can serve a real snapshot,
-/// so it is gated to `#[cfg(test)]` to avoid a dead-code warning in app builds.
+/// Whether `root` holds the `oracle/server/aspis_mcp.py` package source marker
+/// (the only Python file that survives M3 — the MCP server; the rest of the
+/// oracle package is deleted in M3 and the MCP server itself is ported to Rust
+/// only in M4) AND a complete index (sqlite + vectors). Test-only: Bug A removed
+/// the production caller (it was the upfront gate in `run_python_oracle` that
+/// wrongly blocked Ask, since the workspace/index root never holds the package).
+/// The live integration tests still use it to decide whether the local checkout
+/// can serve a real snapshot, so it is gated to `#[cfg(test)]` to avoid a
+/// dead-code warning in app builds.
 #[cfg(test)]
 pub fn python_oracle_available(root: &Path) -> bool {
-    root.join("oracle").join("cli.py").exists()
+    root.join("oracle").join("server").join("aspis_mcp.py").exists()
         && root.join("oracle-data").join("metadata.sqlite").exists()
         && oracle_vector_path(root).is_some()
 }
@@ -448,8 +451,11 @@ pub fn find_oracle_package_root(graph_root: Option<PathBuf>) -> Option<PathBuf> 
 }
 
 pub fn oracle_package_present(root: &Path) -> bool {
-    root.join("oracle").join("cli.py").exists()
-        && root.join("oracle").join("requirements.txt").exists()
+    // The marker is `oracle/server/aspis_mcp.py` — the only Python file that
+    // survives M3 (the MCP server; the rest of the oracle package is deleted in
+    // M3 and the server itself is ported to Rust only in M4). aspis_mcp.py is a
+    // ~10k-line file unique to this layout, strong enough as a sole marker.
+    root.join("oracle").join("server").join("aspis_mcp.py").exists()
 }
 
 fn add_candidate_with_ancestors(candidates: &mut Vec<PathBuf>, path: PathBuf) {
@@ -2704,12 +2710,13 @@ mod tests {
         assert!(!runtime_chunk_store_ready(&serde_json::json!({})));
     }
 
-    /// Build a temp dir holding the `oracle/` package SOURCE (cli.py +
-    /// requirements.txt) so `oracle_package_present` is satisfied.
+    /// Build a temp dir holding the `oracle/server/aspis_mcp.py` package SOURCE
+    /// marker (the only Python file that survives M3 — the MCP server; the rest
+    /// of the oracle package is deleted in M3 and the server is ported to Rust
+    /// only in M4) so `oracle_package_present` is satisfied.
     fn make_package_source(dir: &Path) {
-        fs::create_dir_all(dir.join("oracle")).unwrap();
-        fs::write(dir.join("oracle").join("cli.py"), "").unwrap();
-        fs::write(dir.join("oracle").join("requirements.txt"), "").unwrap();
+        fs::create_dir_all(dir.join("oracle").join("server")).unwrap();
+        fs::write(dir.join("oracle").join("server").join("aspis_mcp.py"), "").unwrap();
     }
 
     /// Add a (complete) `oracle-data/venv` under `dir`: the OS-specific venv python
@@ -3130,13 +3137,13 @@ mod tests {
     }
 
     #[test]
-    fn python_oracle_availability_requires_cli_and_data_files() {
+    fn python_oracle_availability_requires_marker_and_data_files() {
         let root =
             std::env::temp_dir().join(format!("aspis-python-oracle-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("oracle")).unwrap();
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
         fs::create_dir_all(root.join("oracle-data")).unwrap();
-        fs::write(root.join("oracle").join("cli.py"), "").unwrap();
+        fs::write(root.join("oracle").join("server").join("aspis_mcp.py"), "").unwrap();
         fs::write(root.join("oracle-data").join("metadata.sqlite"), "").unwrap();
 
         assert!(!python_oracle_available(&root));
