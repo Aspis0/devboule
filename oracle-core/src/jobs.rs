@@ -22,9 +22,11 @@
 //! 2. **Embed device detection**: `resolve_min_free_gb` in Python calls
 //!    `embedding_device()` to detect CUDA/MPS/CPU. The Rust version uses a
 //!    simple env-var heuristic since the device is resolved at pool load time.
-//! 3. **CKG refresh**: the Python path calls `_refresh_ckg_best_effort` which
-//!    invokes an external binary via `ASPIS_APP_BIN`. This is not ported —
-//!    the Rust best-effort hook calls only `_refresh_clusters_best_effort`.
+//! 3. **CKG refresh**: ported — the Rust job manager now calls `_refresh_ckg_best_effort`
+//!    which spawns a named thread running an injectable hook (`set_ckg_refresh_hook`).
+//!    The app wires the closure to `crate::backend::ckg::build_ckg_graph` →
+//!    `oracle_core::store::ckg::CkgStore::replace_all`. Unlike the Python path
+//!    (which shells `<ASPIS_APP_BIN> ckg`), everything runs in-process here.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -240,6 +242,14 @@ struct JobManagerInner {
     /// Fire-and-forget cluster-refresh worker (Python daemon-thread parity);
     /// kept so tests and shutdown can wait for it deterministically.
     cluster_refresh_handle: Option<JoinHandle<()>>,
+    /// Injected hook invoked by `_refresh_ckg_best_effort` on a named thread.
+    /// Set by the app layer (src-tauri/src/oracle/rust_oracle.rs); None when
+    /// no in-process CKG builder is wired (mirrors Python's ASPIS_APP_BIN
+    /// no-op).
+    ckg_refresh_hook: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    /// Handle for the most recent CKG-refresh thread, so tests and orderly
+    /// shutdown can wait for it deterministically.
+    ckg_refresh_handle: Option<JoinHandle<()>>,
 }
 
 
@@ -438,6 +448,10 @@ impl OracleIndexJobManager {
 
             // Best-effort cluster refresh on a daemon thread.
             self._refresh_clusters_best_effort(&index_root, &sqlite, &chunk_vectors, &file_vectors);
+
+            // Best-effort CKG full-rebuild on a named thread. No-op when no hook
+            // is wired (mirrors Python's ASPIS_APP_BIN no-op).
+            self._refresh_ckg_best_effort(&index_root);
 
             Ok(result_job)
         })();
@@ -775,5 +789,104 @@ impl OracleIndexJobManager {
         if let Some(h) = handle {
             let _ = h.join();
         }
+    }
+
+    /// Inject the CKG-refresh hook. Called once by the app layer (rust_oracle.rs)
+    /// to wire the in-process `crate::backend::ckg::build_ckg_graph` → CkgStore
+    /// writer. After this, `_refresh_ckg_best_effort` will fire on a named thread
+    /// after every successful index run.
+    pub fn set_ckg_refresh_hook(&self, hook: Arc<dyn Fn(&Path) + Send + Sync>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.ckg_refresh_hook = Some(hook);
+    }
+
+    /// Best-effort full CKG rebuild on a named thread, right after a successful
+    /// index run. Mirrors `index_jobs.py::_refresh_ckg_best_effort`.
+    ///
+    /// No-op when no hook is wired (mirrors Python's `ASPIS_APP_BIN` no-op).
+    /// The hook itself is responsible for catching its own errors; we ALSO wrap
+    /// the call in `catch_unwind` so a panic in the hook cannot kill the
+    /// process — the CKG is auxiliary and must NEVER break the vector index.
+    fn _refresh_ckg_best_effort(&self, index_root: &Path) {
+        let hook = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.ckg_refresh_hook.clone()
+        };
+        let Some(hook) = hook else {
+            return;
+        };
+        let root = index_root.to_path_buf();
+        let handle = thread::spawn(move || {
+            // Named thread so it shows up in thread dumps / debug output.
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hook(&root)
+            })) {
+                eprintln!("[jobs] CKG refresh panicked: {:?}", e);
+            }
+        });
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Reap a previous refresh worker before replacing the handle.
+        if let Some(prev) = inner.ckg_refresh_handle.take() {
+            if prev.is_finished() {
+                let _ = prev.join();
+            } else {
+                // Still running: detach it (Python daemon-thread behavior).
+                drop(prev);
+            }
+        }
+        inner.ckg_refresh_handle = Some(handle);
+    }
+
+    /// Block until the most recent best-effort CKG refresh finishes.
+    /// Used by tests and orderly shutdown.
+    pub fn wait_for_ckg_refresh(&self) {
+        let handle = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.ckg_refresh_handle.take()
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Drive `_refresh_ckg_best_effort` directly with an injected hook that
+    /// records the root it was called with. Verifies:
+    ///   - the hook fires with the right root
+    ///   - `wait_for_ckg_refresh` joins it
+    #[test]
+    fn test_ckg_refresh_hook_fires_and_joins() {
+        let mgr = OracleIndexJobManager::new();
+        let called_with = Arc::new(AtomicUsize::new(0));
+        let hook_root = Arc::new(Mutex::new(PathBuf::new()));
+
+        let hook = {
+            let called = Arc::clone(&called_with);
+            let root = Arc::clone(&hook_root);
+            move |p: &Path| {
+                called.fetch_add(1, Ordering::SeqCst);
+                *root.lock().unwrap() = p.to_path_buf();
+            }
+        };
+
+        mgr.set_ckg_refresh_hook(Arc::new(hook));
+
+        let test_root = PathBuf::from("/tmp/ckg-test-root");
+        mgr._refresh_ckg_best_effort(&test_root);
+
+        // The hook should not have run synchronously (it's on a thread).
+        assert_eq!(called_with.load(Ordering::SeqCst), 0);
+
+        // Wait for the refresh to finish.
+        mgr.wait_for_ckg_refresh();
+
+        assert_eq!(called_with.load(Ordering::SeqCst), 1);
+        assert_eq!(*hook_root.lock().unwrap(), test_root);
     }
 }

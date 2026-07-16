@@ -14,6 +14,7 @@ use oracle_core::config::OracleDataPaths;
 use oracle_core::embed::{BackendChoice, EmbedderPool};
 use oracle_core::jobs::OracleIndexJobManager;
 use oracle_core::server::AppState;
+use oracle_core::store::ckg::{CkgEdgeRow, CkgNodeRow};
 
 use tokio::sync::watch;
 
@@ -114,6 +115,83 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
             index_root: root.to_path_buf(),
             query_embedder_hash: false,
         });
+
+        // Wire the CKG-refresh hook so the job manager fires a full CKG rebuild
+        // on a named thread after every successful index run. Mirrors
+        // `index_jobs.py::_refresh_ckg_best_effort` (daemon thread, all errors
+        // swallowed, full rebuild via replace_all). The CKG DB lives at
+        // `<server oracle-data dir>/ckg.sqlite`, overridable by env CKG_DB_PATH
+        // — parity with `oracle/config.py::CKG_DB_PATH`.
+        let ckg_db_path = std::env::var("CKG_DB_PATH")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| paths.root.join("ckg.sqlite"));
+        let ckg_hook = {
+            let db_path = ckg_db_path.clone();
+            move |index_root: &Path| {
+                match crate::backend::ckg::build_ckg_graph(index_root) {
+                    Ok(graph) => {
+                        // Attach src_file to each edge: use the src node's
+                        // `file` (falling back to the edge src id), mirroring
+                        // `oracle/ingestion/ckg_index.py::_attach_src_file`.
+                        let mut node_file: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        for n in &graph.nodes {
+                            node_file.insert(n.id.clone(), n.file.clone());
+                        }
+                        let node_rows: Vec<CkgNodeRow> = graph
+                            .nodes
+                            .iter()
+                            .map(|n| CkgNodeRow {
+                                id: n.id.clone(),
+                                kind: n.kind.clone(),
+                                name: n.name.clone(),
+                                file: n.file.clone(),
+                                start_line: Some(n.start_line as i64),
+                                end_line: Some(n.end_line as i64),
+                                lang: Some(n.lang.clone()),
+                            })
+                            .collect();
+                        let edge_rows: Vec<CkgEdgeRow> = graph
+                            .edges
+                            .iter()
+                            .map(|e| CkgEdgeRow {
+                                src: e.src.clone(),
+                                dst: e.dst.clone(),
+                                kind: e.kind.clone(),
+                                src_file: node_file
+                                    .get(&e.src)
+                                    .cloned()
+                                    .unwrap_or_else(|| e.src.clone()),
+                            })
+                            .collect();
+                        match oracle_core::store::ckg::CkgStore::new(&db_path) {
+                            Ok(store) => {
+                                if let Err(e) = store.replace_all(&node_rows, &edge_rows) {
+                                    eprintln!(
+                                        "[rust-oracle] CKG replace_all failed: {e}"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[rust-oracle] CKG rebuilt: {} nodes, {} edges",
+                                        node_rows.len(),
+                                        edge_rows.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[rust-oracle] CKG store new failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[rust-oracle] CKG build_ckg_graph failed: {e}");
+                    }
+                }
+            }
+        };
+        state.job_manager.set_ckg_refresh_hook(Arc::new(ckg_hook));
 
         // A just-torn-down server (root switch) may still hold the loopback
         // socket for a moment; wait for the port to free before rebinding, or
@@ -325,5 +403,73 @@ mod live_test {
         assert_eq!(status.as_u16(), 200, "ask not 200: {body}");
         assert!(!answer.trim().is_empty(), "empty answer");
         stop_rust_oracle_server();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Pure helper for the node→row / edge-srcFile mapping, mirroring
+    /// `oracle/ingestion/ckg_index.py::_attach_src_file`.
+    ///
+    /// CONTAIN edge: srcFile = src node's `file`.
+    /// Unknown src: srcFile falls back to the edge src id.
+    #[test]
+    fn test_attach_src_file_mapping() {
+        // Fixture mirroring `test_build_ckg_attaches_src_file_and_loads`.
+        let nodes = vec![
+            crate::backend::ckg::CkgNode {
+                id: "a.py".to_string(),
+                kind: "FILE".to_string(),
+                name: None,
+                file: "a.py".to_string(),
+                start_line: 1,
+                end_line: 5,
+                lang: "Python".to_string(),
+            },
+            crate::backend::ckg::CkgNode {
+                id: "a.py#2-3-0".to_string(),
+                kind: "function_definition".to_string(),
+                name: Some("foo".to_string()),
+                file: "a.py".to_string(),
+                start_line: 2,
+                end_line: 3,
+                lang: "Python".to_string(),
+            },
+        ];
+        let edges = vec![
+            crate::backend::ckg::CkgEdge {
+                src: "a.py".to_string(),
+                dst: "a.py#2-3-0".to_string(),
+                kind: "CONTAIN".to_string(),
+            },
+            // Edge whose src is unknown (no matching node) — must fall back to src id.
+            crate::backend::ckg::CkgEdge {
+                src: "unknown-node".to_string(),
+                dst: "a.py".to_string(),
+                kind: "IMPORT".to_string(),
+            },
+        ];
+
+        // Build the node_file map (mirrors _attach_src_file).
+        let mut node_file: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for n in &nodes {
+            node_file.insert(n.id.clone(), n.file.clone());
+        }
+
+        let src_files: Vec<String> = edges
+            .iter()
+            .map(|e| {
+                node_file
+                    .get(&e.src)
+                    .cloned()
+                    .unwrap_or_else(|| e.src.clone())
+            })
+            .collect();
+
+        // CONTAIN edge: srcFile = src node's `file` = "a.py".
+        assert_eq!(src_files[0], "a.py");
+        // Unknown src: falls back to src id.
+        assert_eq!(src_files[1], "unknown-node");
     }
 }
