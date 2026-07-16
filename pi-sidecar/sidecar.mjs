@@ -477,6 +477,12 @@ async function main() {
 	const editedRsFiles = new Map(); // filePath → { patch? }
 	const pendingToolPaths = new Map(); // toolCallId → filePath (from tool_execution_start)
 	let isReviewTurn = false;
+	// True from the moment a censor review is SCHEDULED (agent_end) until its
+	// event has been emitted. Covers the whole window — isReviewTurn alone only
+	// covers the body of triggerCensorReview, leaving the setTimeout(0) +
+	// 500ms-delay gap where a stdin close would cleanup(0) and silently drop
+	// the devboule_censor_review event (review MAJOR on c6aa4e4).
+	let censorPending = false;
 
 	// ---- subscribe helpers (close over main() locals) ----------------------
 
@@ -588,8 +594,17 @@ async function main() {
 				isReviewTurn = false;
 				editedRsFiles.clear();
 			} else if (editedRsFiles.size > 0 && !stdinClosed && censorEnabled) {
-				// Defer so the outer session.prompt() fully resolves first
-				setTimeout(() => triggerCensorReview(), 0);
+				// Defer so the outer session.prompt() fully resolves first.
+				// censorPending is set HERE (not inside triggerCensorReview) so the
+				// stdin-close exit paths see it before the timer fires. The .catch
+				// keeps a review failure from escalating to the global
+				// unhandledRejection handler (which would cleanup(1) the sidecar).
+				censorPending = true;
+				setTimeout(() => {
+					triggerCensorReview().catch((e) => {
+						console.error("[pi-sidecar] censor: review trigger failed:", e);
+					});
+				}, 0);
 			}
 		}
 	}
@@ -600,45 +615,61 @@ async function main() {
 	// killing the sidecar at agent_end (rig product bug #8 — the censor
 	// review channel was dead in production).
 	async function triggerCensorReview() {
-		const files = [...editedRsFiles.entries()];
-		editedRsFiles.clear();
+		try {
+			const files = [...editedRsFiles.entries()];
+			editedRsFiles.clear();
 
-		if (files.length === 0) return;
+			if (files.length === 0) return;
 
-		isReviewTurn = true;
+			isReviewTurn = true;
 
-		// Small delay to let the agent settle.
-		if (CENSOR_REVIEW_DELAY_MS > 0) {
-			await new Promise((r) => setTimeout(r, CENSOR_REVIEW_DELAY_MS));
+			// Small delay to let the agent settle.
+			if (CENSOR_REVIEW_DELAY_MS > 0) {
+				await new Promise((r) => setTimeout(r, CENSOR_REVIEW_DELAY_MS));
+			}
+
+			const reviewPrompt = composeCensorReviewPrompt(files);
+			const filePaths = files.map(([fp]) => fp);
+			const diffs = files
+				.filter(([, info]) => info.patch)
+				.map(([fp, info]) => `--- ${fp}\n${info.patch}`);
+
+			// #8: do NOT call `session.prompt()` from inside the subscribe callback —
+			// the pi SDK may not support reentrant prompts and it deadlocks/panics.
+			// Instead, surface the review request as an OUTGOING JSONL line that Rust
+			// renders in the console. Actual review execution is deferred to Phase 5.
+			// TODO(Phase 5): drive the Censor review from Rust (it owns the prompt).
+			console.error(
+				"[pi-sidecar] censor: emitting review trigger for",
+				files.length,
+				"file(s)",
+			);
+			emit({
+				type: "devboule_censor_review",
+				prompt: reviewPrompt,
+				files: filePaths,
+				diffs,
+			});
+		} finally {
+			isReviewTurn = false;
+			censorPending = false;
+			// If stdin closed while this review was in flight, the stdin-end
+			// handler deferred its exit to us — finish it now that the event is
+			// out (mirrors handleStdinCloseAtAgentEnd's drained-queue condition).
+			if (stdinClosed && !promptInFlight && promptQueue.length === 0) {
+				clearTimeout(stdinGraceTimer);
+				setImmediate(() => cleanup(0));
+			}
 		}
-
-		const reviewPrompt = composeCensorReviewPrompt(files);
-		const filePaths = files.map(([fp]) => fp);
-		const diffs = files
-			.filter(([, info]) => info.patch)
-			.map(([fp, info]) => `--- ${fp}\n${info.patch}`);
-
-		// #8: do NOT call `session.prompt()` from inside the subscribe callback —
-		// the pi SDK may not support reentrant prompts and it deadlocks/panics.
-		// Instead, surface the review request as an OUTGOING JSONL line that Rust
-		// renders in the console. Actual review execution is deferred to Phase 5.
-		// TODO(Phase 5): drive the Censor review from Rust (it owns the prompt).
-		console.error(
-			"[pi-sidecar] censor: emitting review trigger for",
-			files.length,
-			"file(s)",
-		);
-		emit({
-			type: "devboule_censor_review",
-			prompt: reviewPrompt,
-			files: filePaths,
-			diffs,
-		});
-		isReviewTurn = false;
 	}
 
 	function handleStdinCloseAtAgentEnd(event) {
-		if (stdinClosed && event.type === "agent_end" && !isReviewTurn) {
+		if (
+			stdinClosed &&
+			event.type === "agent_end" &&
+			!isReviewTurn &&
+			!censorPending
+		) {
 			clearTimeout(stdinGraceTimer);
 			// Fix 1: if prompts are queued (arrived while a turn was in flight),
 			// the prompt handler's finally will shift + run the next one. Don't exit
@@ -834,7 +865,12 @@ async function main() {
 
 	process.stdin.on("end", () => {
 		stdinClosed = true;
-		if (promptInFlight) {
+		// censorPending: a scheduled/in-flight censor review must get to emit its
+		// devboule_censor_review event before we exit — an immediate cleanup(0)
+		// here killed the pending setTimeout silently (review MAJOR on c6aa4e4).
+		// triggerCensorReview's finally performs the exit once the event is out;
+		// the grace timer stays as the upper bound.
+		if (promptInFlight || censorPending) {
 			stdinGraceTimer = setTimeout(() => cleanup(0), 120_000);
 		} else {
 			cleanup(0);

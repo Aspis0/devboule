@@ -30,9 +30,7 @@ Three cells, all RIG=1 gated:
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -54,7 +52,7 @@ if os.environ.get("RIG") != "1":
 from rig.mock_llm import MockLLMServer  # noqa: E402
 from rig.world import build_world_in_temp  # noqa: E402
 from rig.sidecar_driver import SidecarSession  # noqa: E402
-from rig.mcp_client import McpStdioClient, McpError  # noqa: E402
+from rig.mcp_client import McpStdioClient  # noqa: E402
 from rig.world import make_projects_dir, forge_agent_launch  # noqa: E402
 
 # Repo root (two levels up from rig/)
