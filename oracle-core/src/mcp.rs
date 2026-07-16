@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use rmcp::{
     ErrorData as McpError, ServiceExt, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::{Json, Parameters}},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
     schemars, serde::Deserialize,
     tool, tool_handler, tool_router,
@@ -80,7 +80,7 @@ impl OracleMcp {
     pub async fn oracle_ask(
         &self,
         Parameters(args): Parameters<AskArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let emb = self.inner.embedder();
         let kind = none_if_empty(&args.kind);
@@ -105,14 +105,15 @@ impl OracleMcp {
             .await
             .map_err(internal)?;
         let value = serde_json::to_value(&resp).map_err(|e| internal_msg(&e))?;
-        Ok(Json(value))
+        let text = serde_json::to_string(&value).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Returns semantically relevant text chunks. Pre-filter with kind/language/symbols.")]
     pub async fn oracle_context(
         &self,
         Parameters(args): Parameters<ContextArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let emb = self.inner.embedder();
         let kind = none_if_empty(&args.kind);
@@ -137,14 +138,15 @@ impl OracleMcp {
             .await
             .map_err(internal)?;
         let envelope = serde_json::json!({ "query": args.query, "chunks": chunks });
-        Ok(Json(envelope))
+        let text = serde_json::to_string(&envelope).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "PRECISE: find EXACT symbols (functions, structs, classes) by name. Returns kind, symbol_name, signature, language, and exact line ranges (line_start, line_end) — open the file at that line.")]
     pub async fn oracle_find(
         &self,
         Parameters(args): Parameters<FindArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let emb = self.inner.embedder();
         let kind = none_if_empty(&args.kind);
@@ -172,41 +174,45 @@ impl OracleMcp {
             "chunks": chunks,
             "hint": "Each chunk has kind, symbol_name, signature, language, line_start, line_end — use these to decide which files to open.",
         });
-        Ok(Json(envelope))
+        let text = serde_json::to_string(&envelope).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Get the full record of a component by ID.")]
     pub async fn oracle_node(
         &self,
         Parameters(args): Parameters<NodeArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let card = engine.node(&args.id).map_err(internal)?;
         let value = serde_json::to_value(&card).map_err(|e| internal_msg(&e))?;
-        Ok(Json(value))
+        let text = serde_json::to_string(&value).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "Find similar components before duplicating logic.")]
     pub async fn oracle_similar(
         &self,
         Parameters(args): Parameters<SimilarArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let limit = args.limit.unwrap_or(5);
         let entries = engine.similar(&args.id, limit).await.map_err(internal)?;
         let value = serde_json::to_value(&entries).map_err(|e| internal_msg(&e))?;
-        Ok(Json(value))
+        let text = serde_json::to_string(&value).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "List components with the same label in different areas.")]
     pub async fn oracle_duplicates(
         &self,
         Parameters(_args): Parameters<NoArgs>,
-    ) -> Result<Json<Value>, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
         let groups = engine.duplicates().map_err(internal)?;
         let value = serde_json::to_value(&groups).map_err(|e| internal_msg(&e))?;
-        Ok(Json(value))
+        let text = serde_json::to_string(&value).map_err(|e| internal_msg(&e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
 

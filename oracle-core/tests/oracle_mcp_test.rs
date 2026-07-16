@@ -15,8 +15,20 @@ use oracle_core::query::engine::HashQueryEmbedder;
 use oracle_core::store::lance::{hash_embed, LanceRow, LanceStore};
 use oracle_core::store::sqlite::{FileChunk, NodeCard, SqliteStore};
 use oracle_core::mcp::{OracleInner, OracleMcp};
-use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::Tool;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Tool};
+
+/// Extract the first text content block from a `CallToolResult` and parse it
+/// as JSON (the handlers serialise their `serde_json::Value` to a string and
+/// wrap it as text content — no output schema is advertised).
+fn call_json(res: &CallToolResult) -> serde_json::Value {
+    let text = res
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("tool result has a text content block");
+    serde_json::from_str(&text).expect("tool result text is valid JSON")
+}
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -185,10 +197,11 @@ async fn oracle_mcp_end_to_end() {
         language: String::new(),
         limit: Some(10),
     };
-    let Json(value) = server
+    let res = server
         .oracle_find(Parameters(args))
         .await
         .expect("oracle_find should succeed");
+    let value = call_json(&res);
 
     let obj = value.as_object().expect("oracle_find returns an object");
     for key in ["query", "kind", "language", "chunks", "hint"] {
@@ -218,10 +231,11 @@ async fn oracle_mcp_end_to_end() {
         imports: vec![],
         module: String::new(),
     };
-    let Json(value) = server
+    let res = server
         .oracle_context(Parameters(args))
         .await
         .expect("oracle_context should succeed");
+    let value = call_json(&res);
 
     let obj = value.as_object().expect("oracle_context returns an object");
     for key in ["query", "chunks"] {
@@ -238,10 +252,11 @@ async fn oracle_mcp_end_to_end() {
     let args = oracle_core::mcp::NodeArgs {
         id: "src/main.rs".to_string(),
     };
-    let Json(value) = server
+    let res = server
         .oracle_node(Parameters(args))
         .await
         .expect("oracle_node should succeed for a seeded card");
+    let value = call_json(&res);
     let obj = value.as_object().expect("oracle_node returns an object");
     assert_eq!(obj["id"], serde_json::json!("src/main.rs"));
     assert_eq!(obj["label"], serde_json::json!("main"));
@@ -251,17 +266,19 @@ async fn oracle_mcp_end_to_end() {
         id: "src/main.rs".to_string(),
         limit: Some(5),
     };
-    let Json(value) = server
+    let res = server
         .oracle_similar(Parameters(args))
         .await
         .expect("oracle_similar should succeed");
+    let value = call_json(&res);
     assert!(value.is_array(), "oracle_similar returns an array");
 
     // ── oracle_duplicates returns groups ───────────────────────────────
     let args = oracle_core::mcp::NoArgs {};
-    let Json(value) = server
+    let res = server
         .oracle_duplicates(Parameters(args))
         .await
         .expect("oracle_duplicates should succeed");
+    let value = call_json(&res);
     assert!(value.is_array(), "oracle_duplicates returns an array");
 }
