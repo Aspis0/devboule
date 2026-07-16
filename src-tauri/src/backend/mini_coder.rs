@@ -1422,7 +1422,7 @@ pub struct MiniCoderBackend {
     /// `resolve_coder_chain_for_sidecar`). Emitted to the sidecar as `DEVBOULE_PI_MODEL_CHAIN`.
     /// Ignored by the sidecar until B2.2 consumes it. `None` (the common case) keeps
     /// today's single-model behavior.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallbacks: Option<Vec<FallbackModel>>,
 }
 

@@ -1820,7 +1820,22 @@ fn prepare_or_launch_project_agent(
             let fence_projects_path = ensure_projects_dir(&app)?;
             fence_stale_orchestrator(&app, &role, &client, &agent_id, &fence_projects_path);
         }
-        return match pi_role {
+        // pi agents register via MCP with the prompt-embedded token; without this
+        // pending row the server rejects registration (live-confirmed 2026-07-16).
+        // Mirrors the legacy call below. `record_launch_pending` runs AFTER the
+        // stale-orchestrator fence above (structural order enforced by test)
+        // and BEFORE the `match pi_role` dispatch.
+        record_launch_pending(
+            &app,
+            &project.metadata.id,
+            &project.metadata.title,
+            &agent_id,
+            &role,
+            task_id.as_deref(),
+            Some(client.as_str()),
+            &launch_token_hash,
+        )?;
+        let launch_result = match pi_role {
             "orchestrator" => {
                 // Fix C: the typed goal must reach the pi orchestrator. The pi sidecar
                 // never reads DEVBOULE_GOAL env (that was for the legacy binary), so we
@@ -1865,6 +1880,12 @@ fn prepare_or_launch_project_agent(
                 )
             }
         };
+        if launch_result.is_err() {
+            // Don't strand a pending ghost row when the spawn fails — mirrors the
+            // legacy preflight-failure cleanup below.
+            super::agents::mark_agent_session_closed_public(&app, &agent_id);
+        }
+        return launch_result;
     }
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
@@ -11498,6 +11519,28 @@ mod fence_stale_orchestrator_tests {
             "fence_stale_orchestrator call in the pi launch path is inside a \
              line comment — the fence is dead code and the bug would regress: {}",
             full_line
+        );
+
+        // 4. record_launch_pending must appear AFTER fence_stale_orchestrator
+        //    (so the fence truncates the predecessor's steer inbox before the
+        //    new generation's pending row is written) and BEFORE the `match
+        //    pi_role` dispatch. Same string-position style as item 1.
+        let rlpi_idx = between
+            .find("record_launch_pending(")
+            .unwrap_or_else(|| panic!(
+                "expected `record_launch_pending(` call in pi launch path between \
+                 pi_route_for_launch and match pi_role, but not found"
+            ));
+        assert!(
+            rlpi_idx > call_idx,
+            "record_launch_pending must appear AFTER fence_stale_orchestrator \
+             in the pi launch path (fence must truncate before the new \
+             pending row is written)"
+        );
+        assert!(
+            rlpi_idx < match_pi_role_idx - pi_route_idx,
+            "record_launch_pending must appear BEFORE `match pi_role` in the \
+             pi launch path"
         );
     }
 }

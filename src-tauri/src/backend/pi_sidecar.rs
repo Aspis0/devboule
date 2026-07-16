@@ -133,7 +133,11 @@ impl PiSidecarState {
 
 /// Return (agent_id, project_id) for every live pi orchestrator session whose
 /// child process is still alive. Used by `get_agent_live_state` to overlay
-/// transient pi sessions onto the agent-state file (which never records them).
+/// transient pi sessions onto the agent-state file. Pi sessions DO get a
+/// sessions row via `record_launch_pending` (since 2026-07-16); the overlay
+/// masks that persisted row with live state while the sidecar is alive. When
+/// the sidecar dies, `mark_agent_session_closed_public` closes the row so the
+/// overlay no longer has a live source to mask.
 /// The liveness check is the real child `try_wait()` — a dead process means the
 /// row disappears on the next poll, so the frontend correctly relaunches.
 /// Result of scanning live pi sessions for the agent-state overlay. One entry
@@ -149,9 +153,13 @@ pub(crate) struct LivePiSession {
 
 /// Return a `LivePiSession` for every live pi sidecar session whose child
 /// process is still alive. Used by `get_agent_live_state` to overlay transient
-/// pi sessions onto the agent-state file (which never records them). The
-/// liveness check is the real child `try_wait()` — a dead process means the
-/// row disappears on the next poll, so the frontend correctly relaunches.
+/// pi sessions onto the agent-state file. Pi sessions DO get a sessions row
+/// via `record_launch_pending` (since 2026-07-16); the overlay masks that
+/// persisted row with live state while the sidecar is alive. When the sidecar
+/// dies, `mark_agent_session_closed_public` closes the row so the overlay no
+/// longer has a live source to mask. The liveness check is the real child
+/// `try_wait()` — a dead process means the row disappears on the next poll,
+/// so the frontend correctly relaunches.
 pub(crate) fn live_pi_sessions(app: &AppHandle) -> Vec<LivePiSession> {
     let state = match app.try_state::<PiSidecarState>() {
         Some(s) => s,
@@ -3984,6 +3992,9 @@ fn read_sidecar_events(
                 });
                 mapper.emit_snapshot(&app);
                 persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                // Close the persisted session row so it does not resurface as a
+                // ghost once the read-time overlay stops masking it.
+                crate::backend::agents::mark_agent_session_closed_public(&app, agent_id);
                 // F7: reset censor anti-loop state so a stable-id respawn doesn't
                 // inherit stale counters/delivered-ids from the dead session.
                 censor_session_state_reset(agent_id);
@@ -3999,6 +4010,9 @@ fn read_sidecar_events(
                 });
                 mapper.emit_snapshot(&app);
                 persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                // Close the persisted session row so it does not resurface as a
+                // ghost once the read-time overlay stops masking it.
+                crate::backend::agents::mark_agent_session_closed_public(&app, agent_id);
                 censor_session_state_reset(agent_id);
                 remove_session_if_same_generation(&app, agent_id, gen, &generation);
             }
@@ -4012,6 +4026,9 @@ fn read_sidecar_events(
                     eprintln!(
                         "[pi-sidecar] pi sidecar stdout closed but child still alive — removing session {agent_id}"
                     );
+                    // Close the persisted session row so it does not resurface as a
+                    // ghost once the read-time overlay stops masking it.
+                    crate::backend::agents::mark_agent_session_closed_public(&app, agent_id);
                     remove_session_if_same_generation(&app, agent_id, gen, &generation);
                     persist_session_status(&app, agent_id, SessionStatus::Crashed);
                     censor_session_state_reset(agent_id);
@@ -4019,6 +4036,9 @@ fn read_sidecar_events(
                     mapper.running = false;
                     mapper.emit_snapshot(&app);
                     persist_session_status(&app, agent_id, SessionStatus::Stopped);
+                    // Close the persisted session row so it does not resurface as a
+                    // ghost once the read-time overlay stops masking it.
+                    crate::backend::agents::mark_agent_session_closed_public(&app, agent_id);
                     censor_session_state_reset(agent_id);
                 }
             }
