@@ -3,9 +3,8 @@ use super::oracle_error::{
     merge_live_server_check, merge_provider_check, OracleDoctorReport, OracleError,
 };
 use super::python_oracle::{
-    find_oracle_package_root, probe_oracle_live_server, run_python_oracle,
-    run_python_oracle_doctor, run_python_oracle_http_get, run_python_oracle_http_post,
-    strip_windows_verbatim_prefix,
+    find_oracle_package_root, probe_oracle_live_server, run_python_oracle_http_get,
+    run_python_oracle_http_post, strip_windows_verbatim_prefix,
 };
 use crate::backend::state::BackendState;
 use crate::backend::vault;
@@ -140,191 +139,16 @@ fn oracle_index_root() -> Result<std::path::PathBuf, OracleError> {
     current_oracle_index_root()
 }
 
-async fn try_python_oracle_with_llm<T: serde::de::DeserializeOwned + Send + 'static>(
-    command: &str,
-    args: &[String],
-    llm_config: Option<&super::python_oracle::OracleLlmRuntimeConfig>,
-) -> Result<T, OracleError> {
-    // Query the SAME root the indexing commands AND the resident-server
-    // supervisor use: the user-selected workspace (index root) from preferences,
-    // via the single shared resolver. There is NO fallback to the graph root any
-    // more — an unset/invalid root is a typed NoWorkspaceRoot error, surfaced to
-    // the UI instead of silently answering from stale graph.json data.
-    let root = oracle_index_root()?;
-    // The Oracle call is blocking (it builds/uses a reqwest::blocking client and
-    // may wait up to 90s). Move it off the tokio async worker onto a blocking
-    // thread so the executor is never blocked and no blocking client is ever
-    // touched on an async worker. All args are owned/Send, so we move them in.
-    let command_owned = command.to_string();
-    let args_owned = args.to_vec();
-    let llm_config_owned = llm_config.cloned();
-
-    // F6: bound concurrent Oracle invocations. Each ask can hold a tokio
-    // blocking-pool slot for the full hard cap; adversarial rapid clicking could
-    // otherwise queue enough blocked slots to starve the pool. A tiny RAII permit
-    // (a static atomic counter) caps in-flight asks and returns a clear, typed
-    // "busy" error instead of piling on more blocking slots. The common single-ask
-    // case acquires the permit with no contention.
-    //
-    // W2 (honest guarantee): the permit bounds concurrent COMMANDS, not the tails of
-    // detached workers. It is released when THIS command returns — which, on a cap
-    // timeout, happens while the detached worker may still be UNWINDING (flipping
-    // `cancel`, killing/draining its child). So effective concurrency can briefly
-    // exceed `MAX_CONCURRENT_ORACLE_ASKS` by the number of winding-down worker tails.
-    // This is an ACCEPTED tradeoff: holding the permit for the full detached-worker
-    // lifetime would block the next user ask behind a zombie tail and hurt UX. The
-    // permit's job is to cap actively-waiting commands (the pool-starvation vector),
-    // and the cancel + budgeted-timeout machinery keeps each tail short.
-    let _permit = match OracleAskPermit::try_acquire() {
-        Some(permit) => permit,
-        None => {
-            return Err(OracleError::new(
-                super::oracle_error::OracleErrorKind::ServerUnavailable,
-                "Oracle is busy with another request. Try again in a moment.",
-            ));
-        }
-    };
-
-    // HARD BOUND: the blocking Oracle call is internally bounded by the
-    // server-readiness wait + the per-request reqwest timeout, but a pathological
-    // combination (repeated readiness failures, a stalled fallback, a wedged
-    // child, an OS call that never returns) could in principle keep the work
-    // pending far longer than any user will wait. Enforce an ABSOLUTE cap so the
-    // COMMAND always returns within `ORACLE_CALL_HARD_TIMEOUT`, even if the
-    // underlying blocking work is still running. The cap is applied inside the
-    // blocking task with std `recv_timeout` (no extra async-runtime dependency,
-    // and Tauri's `async_runtime` does not re-export tokio's `time`): the heavy
-    // `run_python_oracle` runs on its own worker thread, and we stop waiting on it
-    // once the deadline elapses.
-    //
-    // F1: we no longer merely abandon the worker on timeout. The worker shares a
-    // `cancel` flag with this waiter; when the deadline fires we set `cancel=true`,
-    // and the worker checks it before each remaining expensive step (the in-lock
-    // readiness re-probe and the CLI subprocess fallback) and kills any child it
-    // has spawned. So the orphaned worker winds down promptly (well inside the
-    // cap's headroom) instead of running the old ~270s tail, and repeated timed-out
-    // asks can no longer pile up unbounded threads/subprocesses. The user still
-    // sees a typed, actionable error instead of an endless "Querying Oracle…".
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker_cancel = std::sync::Arc::clone(&cancel);
-        // W1: the SAME absolute deadline the `recv_timeout` cap below waits on. The
-        // worker's non-interruptible `reqwest::blocking` `/ask` request budgets its
-        // own timeout against this so a doomed worker cannot overrun the cap by a
-        // full `PYTHON_ORACLE_TIMEOUT` — only by clock slack. Computed here (a few
-        // microseconds before both the worker spawn and the recv_timeout) so the two
-        // deadlines coincide.
-        let worker_deadline =
-            std::time::Instant::now() + super::python_oracle::ORACLE_CALL_HARD_TIMEOUT;
-        // The worker is detached: if it outlives the deadline we drop the receiver
-        // and return; its eventual `tx.send` then fails silently (Err ignored).
-        std::thread::spawn(move || {
-            let outcome = run_python_oracle::<T>(
-                &root,
-                &command_owned,
-                &args_owned,
-                llm_config_owned.as_ref(),
-                &worker_cancel,
-                Some(worker_deadline),
-            );
-            let _ = tx.send(outcome);
-        });
-        match rx.recv_timeout(super::python_oracle::ORACLE_CALL_HARD_TIMEOUT) {
-            // The worker answered (Ok or a typed Err from the Oracle itself).
-            Ok(outcome) => Ok(outcome),
-            // F1: the cap fired. Flip the shared flag so the detached worker bails
-            // before/within its next expensive step and frees its resources.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                Err(WorkerWaitFailure::Timeout)
-            }
-            // F3: the worker thread dropped its sender without sending — it
-            // panicked. This is an internal failure, NOT a timeout; surface it
-            // distinctly so a crash is never masked as "did not respond in time".
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(WorkerWaitFailure::WorkerFailed)
-            }
-        }
-    })
-    .await
-    .map_err(|e| OracleError::internal_sanitized(format!("Python Oracle task failed: {e}")))?;
-    let result = match result {
-        Ok(result) => result,
-        Err(WorkerWaitFailure::Timeout) => {
-            return Err(OracleError::server_unavailable(
-                "Oracle did not respond in time.",
-            ));
-        }
-        // F3: distinct from a timeout — the worker thread died (panic) before
-        // answering. A panic also poisons any Mutex the worker held
-        // (`oracle_server_start_lock`, `oracle_cli_fallback_lock`); both recover via
-        // `lock().unwrap_or_else(|e| e.into_inner())`, so future asks are not wedged.
-        Err(WorkerWaitFailure::WorkerFailed) => {
-            return Err(OracleError::internal("Oracle worker failed unexpectedly."));
-        }
-    };
-    // A Python/HTTP failure is now propagated as a typed error (classified into
-    // ServerUnavailable / PythonError / …) instead of being swallowed into a
-    // silent graph.json fallback.
-    result.map_err(OracleError::from_python)
-}
-
-/// How the bounded wait on the detached Oracle worker ended without a real answer.
-/// Splitting these (F3) keeps a worker PANIC (`Disconnected`) from being reported
-/// to the user as the benign "did not respond in time" TIMEOUT.
-enum WorkerWaitFailure {
-    /// The hard cap elapsed before the worker answered. `cancel` has been set.
-    Timeout,
-    /// The worker thread dropped its sender without answering — it panicked.
-    WorkerFailed,
-}
-
-/// Maximum number of concurrent Oracle ask/query invocations (F6). Two leaves the
-/// common single-ask case unconstrained while a second concurrent ask is still
-/// allowed (e.g. a snapshot refresh racing a user ask), but a burst of adversarial
-/// clicks cannot queue an unbounded number of blocking-pool slots each holding the
-/// full hard cap.
-const MAX_CONCURRENT_ORACLE_ASKS: usize = 2;
-
-static IN_FLIGHT_ORACLE_ASKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// RAII permit bounding concurrent Oracle invocations. Acquired with a single
-/// non-blocking CAS-style increment; if the cap is already reached the increment
-/// is rolled back and `None` is returned so the caller surfaces a "busy" error
-/// rather than queueing another blocking slot. The slot is released on drop on
-/// EVERY path (early return, timeout, worker failure, panic unwind).
-struct OracleAskPermit;
-
-impl OracleAskPermit {
-    fn try_acquire() -> Option<Self> {
-        // Reserve a slot optimistically, then validate against the cap. On overflow
-        // roll the reservation back so a rejected ask never permanently consumes a
-        // slot. `fetch_add`/`fetch_sub` on a single counter keeps this lock-free.
-        let prior = IN_FLIGHT_ORACLE_ASKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if prior >= MAX_CONCURRENT_ORACLE_ASKS {
-            IN_FLIGHT_ORACLE_ASKS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            return None;
-        }
-        Some(OracleAskPermit)
-    }
-}
-
-impl Drop for OracleAskPermit {
-    fn drop(&mut self) {
-        IN_FLIGHT_ORACLE_ASKS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
 /// P2: shared bounded path for the READ-ONLY Oracle status/detail GET endpoints
 /// (`/snapshot`, `/coverage`, `/runtime`, `/node/…`, `/similar/…`,
 /// `/duplicate-labels`). It deliberately does NOT go through `try_python_oracle`:
 ///
-/// * It does NOT acquire an [`OracleAskPermit`] — those two permits guard only the
-///   genuine `/ask` answer path, so a burst of boot polls (the runtime/snapshot/
-///   coverage "Checking vector runtime" step) can never exhaust them and make a
-///   real ask fail with "Oracle is busy".
+/// * The previous P13 ask-permit machinery (a 2-slot RAII guard around the HTTP
+///   ask path) was removed when the Python subprocess / permit dance went away;
+///   the HTTP path now goes straight through. The boot-poll surge on unlock
+///   (runtime/snapshot/coverage "Checking vector runtime") hits this readonly
+///   gate instead of the ask path, so a burst of boot polls can never starve a
+///   real ask; ask-side backpressure is left to the in-process reqwest client.
 /// * It does NOT fall through to the heavy `oracle.cli` subprocess fallback. The
 ///   underlying `run_python_oracle_http_get` first runs the cheap, bounded (5s)
 ///   readiness probe ([`require_oracle_server_ready`]); a not-ready server returns
@@ -366,15 +190,20 @@ async fn oracle_http_get_blocking<T: serde::de::DeserializeOwned + Send + 'stati
         .map_err(|e| format!("Oracle HTTP task failed: {e}"))?
 }
 
-/// Run a blocking Oracle HTTP POST off the tokio async worker (see
-/// [`oracle_http_get_blocking`]).
+/// Run a blocking Oracle HTTP POST off the tokio async worker. The blocking
+/// reqwest client is constructed, used and (eventually) returned to its static
+/// home entirely on a `spawn_blocking` thread, never on the async executor.
 async fn oracle_http_post_blocking<T: serde::de::DeserializeOwned + Send + 'static>(
     root: std::path::PathBuf,
     path: String,
+    body: Option<serde_json::Value>,
+    llm_config: Option<super::python_oracle::OracleLlmRuntimeConfig>,
 ) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(move || run_python_oracle_http_post::<T>(&root, &path))
-        .await
-        .map_err(|e| format!("Oracle HTTP task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        run_python_oracle_http_post::<T>(&root, &path, body.as_ref(), llm_config.as_ref())
+    })
+    .await
+    .map_err(|e| format!("Oracle HTTP task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -548,53 +377,6 @@ mod tests {
         assert!(
             !text.starts_with(r"\\?\"),
             "verbatim prefix leaked into resolved root: {text}"
-        );
-    }
-
-    #[test]
-    fn ask_permit_caps_concurrency_and_releases_on_drop() {
-        // P2: the ask permit guards ONLY the genuine `/ask` answer path. It must
-        // cap concurrent acquisitions at MAX_CONCURRENT_ORACLE_ASKS and fully
-        // release on drop so a later ask is not wedged. The read-only status polls
-        // (snapshot/coverage/runtime/node/similar/duplicates) go through
-        // `oracle_readonly_get`, which NEVER acquires this permit — so a burst of
-        // boot polls cannot exhaust it and make a real ask return "busy". This test
-        // locks the cap+release semantics that isolation depends on.
-        let baseline = IN_FLIGHT_ORACLE_ASKS.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(baseline, 0, "no permits should be held at rest");
-
-        let mut permits: Vec<_> = (0..MAX_CONCURRENT_ORACLE_ASKS)
-            .map(|_| OracleAskPermit::try_acquire().expect("under the cap must acquire"))
-            .collect();
-        // The cap is now reached: a further acquire is refused (→ "busy"), it does
-        // NOT queue another blocking slot.
-        assert!(
-            OracleAskPermit::try_acquire().is_none(),
-            "acquiring past the cap must be refused"
-        );
-        // Dropping ONE (popping it off the vec, leaving the others held) frees
-        // exactly one slot.
-        drop(permits.pop().expect("at least one permit held"));
-        assert_eq!(
-            IN_FLIGHT_ORACLE_ASKS.load(std::sync::atomic::Ordering::SeqCst),
-            MAX_CONCURRENT_ORACLE_ASKS - 1,
-            "drop must release exactly one permit"
-        );
-        // The freed slot is immediately reusable (no leak on the rejected path).
-        {
-            let _reused = OracleAskPermit::try_acquire().expect("a freed slot is reusable");
-            assert_eq!(
-                IN_FLIGHT_ORACLE_ASKS.load(std::sync::atomic::Ordering::SeqCst),
-                MAX_CONCURRENT_ORACLE_ASKS,
-                "reacquiring fills the cap again"
-            );
-        }
-        // Release everything and confirm the counter returns exactly to baseline.
-        drop(permits);
-        assert_eq!(
-            IN_FLIGHT_ORACLE_ASKS.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "all permits released ⇒ counter back to zero (no leak)"
         );
     }
 
@@ -1038,19 +820,31 @@ pub async fn ask_oracle(
 ) -> Result<OracleAnswer, OracleError> {
     require_oracle_auth(&auth_state)?;
 
+    // FIX: HTTP-only path. The Python subprocess `run_python_oracle` was deleted in M3;
+    // all operator commands now address the in-process resident server via its HTTP
+    // interface. The `try_python_oracle_with_llm` wrapper (which spawned a detached
+    // worker around the deleted fn) is also gone — `ask_oracle` now POSTs directly to
+    // `/ask` (the OPERATOR endpoint: full-corpus, operator token) on the resident
+    // server, failing loud (STARTING / unreachable) when the server is not ready,
+    // instead of silently falling through to a subprocess. NOT `/ask-bounded`: that
+    // is the AGENT endpoint whose `allowed_file_ids` scope FAIL-CLOSES to empty when
+    // absent — the operator ask would always answer "not found in corpus".
+    let index_root = oracle_index_root()?;
     let limit = limit.unwrap_or(8);
+    let body = serde_json::json!({
+        "query": query,
+        "limit": limit,
+    });
     let llm_config = resolve_oracle_llm_runtime_config();
-    try_python_oracle_with_llm::<OracleAnswer>(
-        "ask",
-        &[
-            "--query".into(),
-            query.clone(),
-            "--limit".into(),
-            limit.to_string(),
-        ],
-        llm_config.as_ref(),
+    let result: OracleAnswer = oracle_http_post_blocking::<OracleAnswer>(
+        index_root,
+        "/ask".to_string(),
+        Some(body),
+        llm_config,
     )
     .await
+    .map_err(OracleError::from_python)?;
+    Ok(result)
 }
 
 /// PURE aggregation of Oracle `/context` retrieval chunks into the top-`k` DISTINCT
@@ -1411,10 +1205,11 @@ pub async fn get_oracle_index_status(
     require_graph_auth_and_enabled(&auth_state)?;
     // FIX: address the SAME resident server the supervisor and `ask_oracle` use —
     // the one started against the WORKSPACE index root. Passing the package/code
-    // root here (the old `require_oracle_root(&state)`) made `ensure_oracle_server`
-    // /`oracle_server_ready` never match the supervisor-started server (whose
-    // `server_root` is the workspace), waiting 60s then killing+respawning against
-    // the wrong root — a kill/restart loop fighting the supervisor.
+    // root here (the old `require_oracle_root(&state)`) made
+    // `ensure_rust_oracle_server` / `oracle_server_ready` never match the
+    // supervisor-started server (whose `server_root` is the workspace), waiting
+    // 60s then killing+respawning against the wrong root — a kill/restart loop
+    // fighting the supervisor.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
     oracle_http_get_blocking(
         index_root.clone(),
@@ -1484,9 +1279,8 @@ pub async fn get_oracle_indexed_files(
 /// Process-wide single-flight lock for the Oracle doctor. The doctor loads the
 /// real ~1-2GB embedding model; a double-click (or two windows) firing
 /// `get_oracle_doctor` concurrently would spawn two model loads and OOM a weak
-/// machine. Mirrors the `ORACLE_SERVER_START_LOCK` idiom in `python_oracle.rs`,
-/// but uses the async `tauri::async_runtime::Mutex` (a tokio mutex re-export) so
-/// the held guard can be held across the `.await` of the blocking doctor task.
+/// machine. Uses the async `tauri::async_runtime::Mutex` (a tokio mutex re-export)
+/// so the held guard can be held across the `.await` of the blocking doctor task.
 ///
 /// COALESCE (not reject): concurrent callers serialize on `.lock().await` rather
 /// than being rejected with a "already running" error. The second caller waits
@@ -1584,24 +1378,26 @@ pub async fn get_oracle_doctor(
     // The code root that owns the `oracle` package + venv. Use the package finder
     // (not the data-ready finder) so the doctor runs even before the first index
     // exists. Thread the INDEX root in as the extra candidate hint, exactly like
-    // `run_python_oracle` does on the ask path — otherwise (debug builds only,
-    // release ignores the hint) the doctor's candidate search can resolve a
+    // `try_python_oracle_with_llm` does on the ask path — otherwise (debug builds
+    // only, release ignores the hint) the doctor's candidate search can resolve a
     // DIFFERENT package root than ask when the dev cwd isn't the repo root,
     // reporting "runtime not installed" while asks succeed.
     let code_root = find_oracle_package_root(Some(index_root.clone())).ok_or_else(|| {
         OracleError::server_unavailable("The Oracle Python runtime is not installed.")
     })?;
 
-    // The doctor builds a reqwest-free blocking subprocess (model load can take
-    // ~30-60s); keep it off the tokio async worker. The live-server probe needs
-    // the SAME index root, so clone it before the closure moves its copy in.
+    // The doctor is now Rust-native (M3): `model_present` probes the bundled
+    // embedder ONCE up-front (cheap, no model-load), then a live `/runtime`
+    // probe confirms the resident server is ready-to-answer. This is the "truthful
+    // shape" — a green doctor means Oracle can actually answer `/ask` right now.
+    // Run off the async worker (it touches the filesystem and does a blocking
+    // reqwest probe).
     let probe_root = index_root.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
-        run_python_oracle_doctor(&code_root, &index_root)
+        super::python_oracle::run_python_oracle_doctor(&code_root, &index_root)
     })
     .await
-    .map_err(|e| OracleError::internal_sanitized(format!("Oracle doctor task failed: {e}")))?
-    .map_err(OracleError::from_python)?;
+    .map_err(|e| OracleError::internal_sanitized(format!("Oracle doctor task failed: {e}")))??;
 
     // Fill the LIVE-server check the Python placeholder left for us: probe the
     // resident server's (now-fast) /health + /runtime for a ready CHUNK store.
@@ -1660,6 +1456,8 @@ pub async fn sync_oracle_text_chunks(
     oracle_http_post_blocking(
         index_root.clone(),
         format!("/index/sync?{}", oracle_root_query(&index_root)),
+        None,
+        None,
     )
     .await
 }
@@ -1689,7 +1487,7 @@ pub async fn start_oracle_index_job(
         idle.unwrap_or(true),
         manual.unwrap_or(false),
     );
-    oracle_http_post_blocking(index_root, path).await
+    oracle_http_post_blocking(index_root, path, None, None).await
 }
 
 #[tauri::command]
@@ -1703,6 +1501,8 @@ pub async fn start_oracle_index_watcher(
     oracle_http_post_blocking(
         index_root.clone(),
         format!("/index/watch/start?{}", oracle_root_query(&index_root)),
+        None,
+        None,
     )
     .await
 }
@@ -1715,7 +1515,7 @@ pub async fn stop_oracle_index_watcher(
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
-    let result = oracle_http_post_blocking(index_root, "/index/watch/stop".to_string()).await;
+    let result = oracle_http_post_blocking(index_root, "/index/watch/stop".to_string(), None, None).await;
     // FIX: re-arm the supervisor's one-shot watcher flag on a successful manual
     // stop, so the next supervisor tick can re-start the watcher (respecting the
     // autoWatch pref). Without this, the one-shot stays armed and the watcher is

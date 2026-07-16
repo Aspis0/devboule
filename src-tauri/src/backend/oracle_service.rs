@@ -1,8 +1,7 @@
 //! Resident, app-supervised Oracle HTTP server (Step 4b).
 //!
-//! The Oracle retrieval server (`python -m oracle.server.main`) runs as a
-//! resident process tied to the APP PROCESS lifecycle (NOT the vault lock). Once
-//! a workspace index is available the supervisor brings it up and publishes a
+//! The Oracle retrieval server runs in-process (rust-only, since M3). Once a
+//! workspace index is available the supervisor brings it up and publishes a
 //! discovery file so MCP thin-clients can find it. The server, the supervisor,
 //! and the discovery file then KEEP RUNNING across a vault lock — they are torn
 //! down only when the app process EXITS (see [`on_app_exit`]).
@@ -40,7 +39,7 @@ use serde::Serialize;
 
 use crate::oracle::oracle_setup::install_in_progress;
 use crate::oracle::python_oracle::{
-    ensure_oracle_server, oracle_agent_token, oracle_server_ready, oracle_session_endpoint,
+    oracle_agent_token, oracle_server_ready, oracle_session_endpoint,
     run_python_oracle_http_post,
 };
 
@@ -138,8 +137,10 @@ struct Supervisor {
     /// handle, signals stop, and does a BOUNDED join (outside the slot lock) before
     /// spawning a replacement, so at most one supervisor is ever actively (re)spawning
     /// (the single-instance invariant). The bounded join is near-instant because the
-    /// loop honors the stop flag inside its bring-up wait (see
-    /// `wait_for_oracle_server_ready`'s and `wait_for_oracle_port_free`'s abort).
+    /// loop honors the stop flag inside its bring-up wait (the supervisor defers to
+    /// `rust_oracle::ensure_rust_oracle_server`, which polls the stop flag; the
+    /// in-process HTTP commands use `require_oracle_server_ready`, bounded by
+    /// `wait_for_oracle_port_free`'s abort).
     handle: JoinHandle<()>,
 }
 
@@ -314,9 +315,9 @@ fn try_claim_watcher_start(flag: &AtomicBool) -> bool {
 ///
 /// This MUST NOT block the caller: `unlock_after_verification` runs on the
 /// command's thread and a COLD server start loads the embedding model (~30-60s);
-/// doing that synchronously would freeze the unlock. `ensure_oracle_server` also
-/// builds/uses the blocking reqwest client, which must never run on a tokio async
-/// worker. The supervisor thread owns both concerns: it does the (blocking)
+/// doing that synchronously would freeze the unlock. `ensure_rust_oracle_server`
+/// also builds/uses the blocking reqwest client, which must never run on a tokio
+/// async worker. The supervisor thread owns both concerns: it does the (blocking)
 /// bring-up + publish off the caller's thread, and re-publishes/restarts on its
 /// poll loop. The operator `/ask` path lazily starts the server on demand anyway,
 /// so a slow first tick never blocks a query either.
@@ -380,12 +381,11 @@ pub fn on_app_exit() {
     // away. (`stop_supervisor` also sets the per-thread stop flag.)
     EXITING.store(true, Ordering::SeqCst);
     stop_supervisor();
-    // Kill the resident server child. NO network I/O (the courtesy watcher-stop
-    // HTTP is intentionally skipped here): `kill_python_oracle_child` only kills +
-    // bounded-reaps the child, so this is safe during tokio runtime teardown / from
-    // `Drop` without risking a blocking-client drop panic. On Windows this is what
-    // prevents an orphaned server after app close.
-    let _ = crate::oracle::python_oracle::kill_python_oracle_child();
+    // Stop the resident server. NO network I/O (the courtesy watcher-stop
+    // HTTP is intentionally skipped here). `stop_rust_oracle_server` only signals
+    // the in-process task to shut down, so this is safe during tokio runtime
+    // teardown / from `Drop` without risking a blocking-client drop panic. On
+    // Windows this is what prevents an orphaned server after app close.
     crate::oracle::rust_oracle::stop_rust_oracle_server();
     delete_discovery();
 }
@@ -422,10 +422,11 @@ pub(crate) fn reset_watcher_armed() {
 ///     intervening lock) → leave it in place and return; no second supervisor.
 ///
 /// This join is the REAL mechanism, not a no-op: because the slot is retained across a
-/// stop, the previous thread is always present to be joined. `oracle_server_start_lock`
-/// (+ the stop-honoring bring-up waits — `wait_for_oracle_server_ready` /
-/// `wait_for_oracle_port_free`, which abort within ~one poll slice on the stop flag)
-/// are the SERIALIZATION BACKSTOP that makes the brief overlap / empty-slot window safe.
+/// stop, the previous thread is always present to be joined. The supervisor defers
+/// bring-up to `rust_oracle::ensure_rust_oracle_server` (which checks the stop flag
+/// on every tick), and `wait_for_oracle_port_free` aborts within ~one poll slice on
+/// the stop flag — together those are the SERIALIZATION BACKSTOP that makes the
+/// brief overlap / empty-slot window safe.
 ///
 /// `on_unlock` calls this on the unlock command thread, which MUST stay responsive, so
 /// the join is bounded AND performed OUTSIDE the slot lock (Fix #1): if the old thread
@@ -463,7 +464,8 @@ fn start_supervisor() {
     // signalled (by stop_supervisor/on_lock) OR has finished; set the flag idempotently
     // to be safe, then bounded-join so it is no longer (re)spawning before we start the
     // replacement. The brief empty-slot window here is safe: unlock is UI-serialized and
-    // `oracle_server_start_lock` (+ the stop-honoring bring-up waits) backstop any
+    // the `rust_oracle::ensure_rust_oracle_server` stop-flag checks (+ the
+    // `wait_for_oracle_port_free` abort) backstop any
     // double-spawn — and on_lock/stop_supervisor can now run without stalling on the
     // slot mutex because we are NOT holding it.
     if let Some(previous) = previous {
@@ -471,7 +473,8 @@ fn start_supervisor() {
         if !bounded_join(previous.handle, SUPERVISOR_JOIN_TIMEOUT) {
             // Degraded path: the old thread did not exit within the bound. It has been
             // signalled and will exit on its next flag check; a brief overlap is safe
-            // (ensure_oracle_server is serialized + the stopping thread will not spawn).
+            // (`ensure_rust_oracle_server` checks the stop flag, so the stopping
+            // thread will not respawn against the same port).
             // Logged WITHOUT any path/secret — purely a diagnostic count.
             eprintln!(
                 "oracle supervisor: previous instance did not exit within {SUPERVISOR_JOIN_TIMEOUT:?}; \
@@ -521,9 +524,10 @@ fn bounded_join(handle: JoinHandle<()>, timeout: Duration) -> bool {
 ///
 /// `on_app_exit` is the only caller now (the lock path no longer stops the
 /// supervisor). It must stay responsive even though the supervisor may be inside a
-/// blocking `ensure_oracle_server` (a cold model load is ~30-60s); joining would
-/// hang the shutdown that whole time. Instead we set the stop flag (honored after
-/// the current blocking op) and detach: the thread exits on its next flag check.
+/// blocking `ensure_rust_oracle_server` (a cold model load is ~30-60s); joining
+/// would hang the shutdown that whole time. Instead we set the stop flag (honored
+/// after the current blocking op) and detach: the thread exits on its next flag
+/// check.
 /// A stopping supervisor refuses to publish (it re-checks `stop` + `EXITING` in
 /// [`reconcile_once`]), so it cannot resurrect a discovery file `on_app_exit`
 /// deleted.
@@ -618,8 +622,8 @@ fn wait_for_next_tick(stop: &AtomicBool, restart: &AtomicBool, interval: Duratio
 /// block the respawn on the vault being unlocked.
 ///
 /// The `stop` flag is re-checked immediately before every publish: a stop/exit may
-/// arrive during the blocking `ensure_oracle_server`, and `on_app_exit` deletes the
-/// discovery file. Refusing to publish once stopping prevents this thread from
+/// arrive during the blocking `ensure_rust_oracle_server`, and `on_app_exit` deletes
+/// the discovery file. Refusing to publish once stopping prevents this thread from
 /// resurrecting a stale file after that deletion.
 fn reconcile_once(stop: &AtomicBool) {
     let Some(root) = index_root() else {
@@ -634,23 +638,25 @@ fn reconcile_once(stop: &AtomicBool) {
     // teardown): tear the resident server down HERE, off the UI thread, so the
     // restart below respawns it with the fresh key. Claim the flag atomically so
     // two briefly-overlapping ticks cannot both kill+respawn; the loser sees it
-    // already cleared and does nothing. kill_python_oracle_child does NO network
-    // I/O and is safe on this thread. After the kill the server is not ready, so
+    // already cleared and does nothing. stop_rust_oracle_server does NO network
+    // I/O and is safe on this thread. After the stop the server is not ready, so
     // should_restart fires below and respawns it on this same tick.
     if LLM_RESTART_REQUESTED
         .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        let _ = crate::oracle::python_oracle::kill_python_oracle_child();
+        crate::oracle::rust_oracle::stop_rust_oracle_server();
     }
 
     let mut server_ready = oracle_server_ready(&root);
     if should_restart(true, true, mid_install, server_ready) {
-        // Cold/dead server: (re)start it. ensure_oracle_server waits for ready and
-        // honors `stop` — a superseded/stopping supervisor aborts the (re)spawn and
-        // releases the start lock promptly (returns the Aborted error) so two
+        // Cold/dead server: (re)start it. `ensure_rust_oracle_server` waits for ready
+        // and honors `stop` — a superseded/stopping supervisor aborts the (re)spawn
+        // and releases the start lock promptly (returns the Aborted error) so two
         // supervisors never spawn two servers (the double-spawn root cause).
-        if ensure_oracle_server(&root, stop).is_ok() && !stop.load(Ordering::SeqCst) {
+        if crate::oracle::rust_oracle::ensure_rust_oracle_server(&root, stop).is_ok()
+            && !stop.load(Ordering::SeqCst)
+        {
             server_ready = true;
             let _ = publish_discovery(&root);
         }
@@ -719,7 +725,7 @@ fn maybe_start_watcher_and_warm(root: &Path, server_ready: bool) {
     let watch_start_url = build_watch_start_url(&root_query, prefs.index_mode.as_deref());
     // Start the watcher (idempotent server-side). On failure, RESET the flag so
     // the next tick retries, and return WITHOUT firing the warm run.
-    if run_python_oracle_http_post::<serde_json::Value>(root, &watch_start_url).is_err() {
+    if run_python_oracle_http_post::<serde_json::Value>(root, &watch_start_url, None, None).is_err() {
         WATCHER_STARTED.store(false, Ordering::SeqCst);
         return;
     }
@@ -738,6 +744,8 @@ fn maybe_start_watcher_and_warm(root: &Path, server_ready: bool) {
     let _ = run_python_oracle_http_post::<serde_json::Value>(
         root,
         &format!("/index/run?{root_query}&force=false&background=true&manual=true"),
+        None,
+        None,
     );
 }
 
@@ -916,7 +924,7 @@ fn run_commit_index_kick(project_root: &Path) {
     }
     let root_query = format!("root={}", urlencoding::encode(&root.to_string_lossy()));
     let url = format!("/index/run?{root_query}&force=false&background=true");
-    if let Err(e) = run_python_oracle_http_post::<serde_json::Value>(&root, &url) {
+    if let Err(e) = run_python_oracle_http_post::<serde_json::Value>(&root, &url, None, None) {
         eprintln!("[oracle] notify_local_commit: index kick failed (best-effort) — {e}");
     }
 }
@@ -933,16 +941,12 @@ fn run_commit_index_kick(project_root: &Path) {
 /// race). The lock also serializes two briefly-overlapping supervisors writing the
 /// same target/backup. NOTE: publishing is NOT suppressed by a vault lock — the
 /// discovery file is meant to persist across a lock (always-on agent MCP).
-/// The pid to publish in the discovery file. Max-recall finding (2026-07-02):
-/// this must be the PYTHON SERVER's pid, not our own — the MCP children
-/// liveness-gate the field to skip a dead target, and `std::process::id()`
-/// (the app) is alive even when the server child crashed/hung, so the gate
-/// watched the wrong process. Falls back to the app pid only when no child is
-/// tracked (still a truthful "the supervisor lives" signal, and better than
-/// 0/absent for older readers of this file). Extracted so a unit test pins the
-/// child-pid linkage against a regression back to the app pid.
+/// The pid to publish in the discovery file. Since M3 the server runs
+/// in-process (rust_oracle), so the pid is always the app's own pid.
+/// This is the truthful "the supervisor lives" signal, and sufficient for
+/// the MCP children liveness-gate (the server is the app process itself).
 fn discovery_pid() -> u32 {
-    crate::oracle::python_oracle::oracle_child_pid().unwrap_or_else(std::process::id)
+    std::process::id()
 }
 
 fn publish_discovery(root: &Path) -> Result<(), String> {
@@ -1214,42 +1218,21 @@ fn current_user_sid_string() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oracle::python_oracle::{random_token, stop_python_oracle_runtime};
+    use crate::oracle::python_oracle::random_token;
 
     /// Serializes the tests that mutate the process-wide `EXITING` / `PROJECTS_DIR`
     /// statics so they don't clobber each other under the parallel test runner.
     static GLOBAL_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Max-recall regression pin: the discovery file must publish the tracked
-    /// PYTHON CHILD's pid (the process the MCP liveness gate needs to watch),
-    /// falling back to the app's own pid only when no child is tracked. Guards
-    /// against a regression back to a bare `std::process::id()`.
+    /// Max-recall regression pin (post-M3): since M3 the server runs in-process,
+    /// so `discovery_pid()` must return the app's own pid (no child tracking).
+    /// This guards against a regression back to a stale `std::process::id()`
+    /// fallback or a deleted child-pid accessor.
     #[test]
-    fn discovery_pid_publishes_the_tracked_child_not_the_app() {
-        // Spawn a real short-lived child to own a genuine OS pid.
-        let child = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
-                .spawn()
-        } else {
-            std::process::Command::new("sleep").arg("30").spawn()
-        }
-        .expect("spawn test child");
-        let child_pid = child.id();
-        assert_ne!(child_pid, std::process::id());
-
-        let previous =
-            crate::oracle::python_oracle::swap_oracle_child_for_test(Some(child));
-        let published = discovery_pid();
-        // Restore the registry BEFORE asserting so a failure cannot leak state,
-        // then reap the test child.
-        let mut test_child =
-            crate::oracle::python_oracle::swap_oracle_child_for_test(previous);
-        if let Some(ref mut c) = test_child {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        assert_eq!(published, child_pid);
+    fn discovery_pid_returns_app_pid() {
+        // Since M3 the resident server is in-process; discovery_pid() must
+        // always return the app's own pid.
+        assert_eq!(discovery_pid(), std::process::id());
     }
 
     #[test]
@@ -2171,7 +2154,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         init(dir.clone());
 
-        ensure_oracle_server(&root, &AtomicBool::new(false)).expect("resident server start");
+        crate::oracle::rust_oracle::ensure_rust_oracle_server(&root, &AtomicBool::new(false)).expect("resident server start");
         assert!(oracle_server_ready(&root), "server must be ready");
 
         publish_discovery(&root).expect("publish discovery");
@@ -2184,8 +2167,8 @@ mod tests {
             .starts_with("http://127.0.0.1:"));
         assert_eq!(value["authToken"].as_str().unwrap(), oracle_agent_token());
 
-        // Kill the child; the predicate must then say "restart".
-        stop_python_oracle_runtime().expect("stop server");
+        // Stop the server; the predicate must then say "restart".
+        crate::oracle::rust_oracle::stop_rust_oracle_server();
         // Give the OS a moment to drop the port.
         std::thread::sleep(Duration::from_millis(500));
         assert!(
@@ -2460,31 +2443,30 @@ pub fn set_oracle_enabled(
 }
 
 // ── Oracle engine selector (rust only — python retired in M3) ──────────────
-// Mirrors the `oracle.enabled` machinery exactly. The runtime engine is read
-// from config.json `oracle.engine` (default "rust"); the supervisor consults
-// `oracle_current_engine()` when deciding what to run on the loopback port
-// (in-process oracle-core server). Persisted through the
-// same `config_write_lock` + `fs_replace` path. Default is "rust" — the
-// Python variant was removed in M3 and is no longer a reachable value from
-// config or UI input (the variant enum member is retained until the next
-// phase deletes the python spawn machinery).
+// The runtime engine is read from config.json `oracle.engine` (default
+// "rust"). The Python engine was removed in M3 and is no longer reachable
+// from config or UI input — "python" parses to Rust with a runtime warning
+// and the persisted `oracle.engine` key is still round-tripped through the
+// same `config_write_lock` + `fs_replace` path so on-disk layouts stay
+// backwards compatible. The in-process flag pipeline (AtomicU8 +
+// oracle_current_engine) was deleted with the python spawn machinery; the
+// single remaining engine is fixed at Rust.
 
-/// AtomicU8 mirror of the persisted engine flag: 0 = python (default), 1 = rust.
-static ORACLE_ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
+/// The persisted engine (P13b). Only Rust is reachable; the enum is kept as
+/// a thin named constant so the persisted config key survives without an
+/// "unknown string" fallback path. `parse` still coerces "python" to Rust
+/// for backwards compatibility with configs written before M3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleEngine {
-    Python,
     Rust,
 }
 
 impl OracleEngine {
-    /// Parse from the config string; unknown/empty falls back to the safe
-    /// default (Rust), never an error. "python" is retired (M3) and is
-    /// coerced to Rust with a runtime warning.
+    /// Parse from the config string; "rust" / unknown / empty all collapse to
+    /// Rust (never an error). "python" is retired (M3) and is coerced to Rust
+    /// with a runtime warning so legacy configs keep loading.
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "rust" => OracleEngine::Rust,
             "python" => {
                 eprintln!(
                     "[oracle] config oracle.engine=python is retired (the Python \
@@ -2497,42 +2479,8 @@ impl OracleEngine {
     }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            OracleEngine::Python => "python",
-            OracleEngine::Rust => "rust",
-        }
+        "rust"
     }
-
-    /// Transitional encoding: Python variant still maps to 0 (for the
-    /// persisted enum round-trip) but from_u8(0) resolves to Rust since the
-    /// Python engine is retired. Rust maps to 1.
-    fn as_u8(self) -> u8 {
-        match self {
-            OracleEngine::Python => 0,
-            OracleEngine::Rust => 1,
-        }
-    }
-
-    /// Decodes the persisted u8 back to an engine. Both 0 and 1 map to Rust
-    /// because the Python variant is no longer reachable from config/UI input.
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => OracleEngine::Rust,
-            _ => OracleEngine::Rust,
-        }
-    }
-}
-
-pub fn set_oracle_engine_flag(engine: OracleEngine) {
-    // Release pairs with the Acquire load (same discipline as ORACLE_ENABLED).
-    ORACLE_ENGINE.store(engine.as_u8(), std::sync::atomic::Ordering::Release);
-}
-
-// Consumed by the supervisor spawn path in M2.3 (Python subprocess vs
-// in-process oracle-core serve). Allowed dead in M2.2 so the flag plumbing
-// lands as its own reviewable phase; the attribute comes off in M2.3.
-pub(crate) fn oracle_current_engine() -> OracleEngine {
-    OracleEngine::from_u8(ORACLE_ENGINE.load(std::sync::atomic::Ordering::Acquire))
 }
 
 pub fn oracle_engine_from_value(v: &serde_json::Value) -> OracleEngine {
@@ -2601,12 +2549,10 @@ pub fn set_oracle_engine(
     let backup = path.with_extension(format!("json.{suffix}.bak"));
     std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
     crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
-    set_oracle_engine_flag(parsed);
     // Drop whatever server is currently bound to the session port so the
-    // supervisor's next reconcile starts the newly-selected engine. Both calls
-    // are idempotent/non-blocking and safe under either engine.
+    // supervisor's next reconcile starts the freshly-saved engine. Only the
+    // in-process rust server exists now (python variant retired in M3).
     crate::oracle::rust_oracle::stop_rust_oracle_server();
-    let _ = crate::oracle::python_oracle::kill_python_oracle_child();
     Ok(parsed.as_str().to_string())
 }
 
@@ -2682,22 +2628,5 @@ mod oracle_toggle_tests {
         assert_eq!(OracleEngine::parse(""), OracleEngine::Rust);
         assert_eq!(OracleEngine::parse("garbage"), OracleEngine::Rust);
         assert_eq!(OracleEngine::parse("rusty"), OracleEngine::Rust);
-    }
-
-    /// RETIRED encoding 0 resolves to Rust (python variant retained for the
-    /// persisted enum round-trip but no longer reachable from config/UI).
-    #[test]
-    fn from_u8_zero_is_rust() {
-        assert_eq!(OracleEngine::from_u8(0), OracleEngine::Rust);
-    }
-
-    /// MUTATES PROCESS-GLOBAL STATE: round-trips the ORACLE_ENGINE AtomicU8.
-    /// Restores Rust (the default) at the end for other tests in the binary.
-    #[test]
-    fn engine_flag_is_mutable_at_runtime() {
-        super::set_oracle_engine_flag(OracleEngine::Rust);
-        assert_eq!(super::oracle_current_engine(), OracleEngine::Rust);
-        super::set_oracle_engine_flag(OracleEngine::Rust);
-        assert_eq!(super::oracle_current_engine(), OracleEngine::Rust);
     }
 }

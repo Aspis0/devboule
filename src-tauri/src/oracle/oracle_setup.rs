@@ -1,11 +1,11 @@
-//! Cross-platform bootstrap for the local Oracle Python runtime.
+//! Cross-platform bootstrap for the local Oracle runtime.
 //!
 //! The app is remote-first for *answers*, but retrieval is mandatory: it needs
-//! the Qwen3 embedding model and LanceDB. Those must install automatically on
-//! Windows AND macOS. This module resolves a Python interpreter, creates a
-//! virtual environment, `pip install`s `oracle/requirements.txt` (LanceDB +
-//! sentence-transformers + deps) into it, and warms the embedder so retrieval
-//! works offline afterwards.
+//! the Qwen3 embedding model (ONNX int8, rust-only) and LanceDB. The Rust engine
+//! (`oracle-core`) runs in-process and downloads the ONNX model automatically.
+//! The slim MCP venv (under `oracle-data/venv`) is created here and populated
+//! with `oracle/requirements-mcp.txt` (httpx + mcp[cli]) so the project-management
+//! MCP server (`oracle/server/aspis_mcp.py`) can be launched by `cli_agents`.
 //!
 //! Cross-platform note: the venv layout and the `python3`/`py -3` resolution are
 //! handled per-OS. The macOS path is written without a Mac to test and is
@@ -19,23 +19,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::python_oracle::{
-    apply_no_window, find_oracle_package_root, oracle_data_root, run_with_timeout,
-    stop_python_oracle_runtime, ProcessOutput,
+    apply_no_window, find_oracle_package_root, oracle_data_root, run_with_timeout, ProcessOutput,
 };
 
 /// Embedding model the retrieval layer depends on (mirrors `oracle/config.py`).
 pub const EMBED_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 /// torch + the model are large; allow a generous install window.
 const PIP_TIMEOUT: Duration = Duration::from_secs(2400);
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(900);
 /// Generous so a loaded/slow dev machine does not FALSE-timeout on a trivial
 /// `py -3 --version`. A real, present interpreter answers in well under a second;
 /// the headroom only matters when the box is thrashing, in which case we prefer a
 /// soft "still checking" outcome over a scary "no Python found".
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// stdout sentinel the readiness probe prefixes its JSON with, so module import
-/// chatter cannot be mistaken for the result.
-const CHECK_SENTINEL: &str = "ORACLE_RUNTIME_CHECK ";
 /// Written into the venv only after a full, successful install. A bare
 /// interpreter file is NOT treated as a usable runtime without this.
 const VENV_COMPLETE_MARKER: &str = ".oracle-runtime-complete";
@@ -78,9 +73,9 @@ pub struct OracleRuntimeSetup {
     pub python_version: Option<String>,
     /// The Oracle virtual environment exists.
     pub venv_ready: bool,
-    /// LanceDB + sentence-transformers import successfully in the venv.
+    /// The slim MCP deps (httpx + mcp[cli]) import successfully in the venv.
     pub deps_ready: bool,
-    /// The Qwen3 embedding model is downloaded and cached locally.
+    /// The Qwen3 embedding model (ONNX int8) is downloaded and cached locally.
     pub embedder_ready: bool,
     /// Everything the retrieval layer needs is present.
     pub ready: bool,
@@ -147,7 +142,10 @@ pub fn venv_python(venv: &Path) -> PathBuf {
 /// to the user's app-data dir, i.e. a local-privilege threat that is OUTSIDE this
 /// boundary (an attacker with that access already controls the account). This is
 /// the deliberate edge of the guarantee, not an oversight.
-fn venv_complete(root: &Path) -> bool {
+/// Whether the slim MCP venv at `<root>/oracle-data/venv` is fully installed
+/// (the completion marker file is present). Used by the Rust-native doctor and
+/// the runtime-status probe.
+pub(crate) fn venv_complete(root: &Path) -> bool {
     let venv = oracle_venv_dir(root);
     venv_python(&venv).exists() && venv.join(VENV_COMPLETE_MARKER).exists()
 }
@@ -428,18 +426,6 @@ fn probe_python_outcome(argv: &[String]) -> ProbeOutcome {
     classify_probe_outcome(run_result)
 }
 
-/// Version-only wrapper used where the caller already KNOWS the interpreter
-/// exists (e.g. the completed venv python) and only wants its banner. A
-/// timeout/transient failure collapses to `None` here exactly as before — the
-/// tri-state matters only for *system* detection, where it drives the soft vs.
-/// hard "no Python" message.
-fn probe_python_version(argv: &[String]) -> Option<String> {
-    match probe_python_outcome(argv) {
-        ProbeOutcome::Found(version) => Some(version),
-        ProbeOutcome::NotPython | ProbeOutcome::Inconclusive => None,
-    }
-}
-
 /// Detect a usable system Python across the ordered candidates, preserving the
 /// busy/timeout signal: if no candidate is `Found` but one timed out / failed to
 /// spawn, the result is `Inconclusive` rather than a false `NotFound`.
@@ -463,141 +449,46 @@ fn detect_system_python() -> PythonDetection {
 
 // --- status -----------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-struct WarmupCheck {
-    #[serde(default)]
-    lancedb: bool,
-    #[serde(default, rename = "sentenceTransformers")]
-    sentence_transformers: bool,
-    #[serde(default, rename = "embedderCached")]
-    embedder_cached: bool,
+/// Report the current status of the Oracle runtime. Since M3 the engine is
+/// always Rust (ONNX in-process), so there is no Python subprocess to probe.
+/// The status reflects the ONNX model presence + the slim MCP venv readiness.
+pub fn current_oracle_runtime_setup() -> OracleRuntimeSetup {
+    match oracle_data_root() {
+        Some(root) => rust_runtime_setup_status(&root),
+        None => OracleRuntimeSetup::unavailable(
+            "Could not locate the bundled oracle/ package next to the app.",
+        ),
+    }
 }
 
-/// Run the cheap readiness probe with a given interpreter argv prefix (e.g.
-/// `["python3"]` or `["py", "-3"]` or the venv python path). `root` is the DATA
-/// root (cwd); the `oracle` package is imported via PYTHONPATH = the package root
-/// so the probe works even in a release build where the writable data root holds
-/// no source.
-fn warmup_check(python_argv: &[String], root: &Path) -> Option<WarmupCheck> {
-    if python_argv.is_empty() {
-        return None;
-    }
-    let mut args: Vec<String> = python_argv[1..].to_vec();
-    args.extend([
-        "-m".to_string(),
-        "oracle.bootstrap.warmup".to_string(),
-        "--check".to_string(),
-    ]);
-    // FIX 2: PYTHONPATH = package/import root so `-m oracle...` imports regardless
-    // of cwd (release: data root != package root). If the package root cannot be
-    // located, the probe could only fail as an opaque `ModuleNotFoundError`, so we
-    // short-circuit to a not-ready status instead of spawning a doomed process.
-    let Some(package_root) = find_oracle_package_root(None) else {
-        return None;
-    };
-    let mut command = Command::new(&python_argv[0]);
-    command
-        .args(&args)
-        .current_dir(root)
-        .env("PYTHONPATH", &package_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_no_window(&mut command);
-    let output = run_with_timeout(command, PROBE_TIMEOUT, None).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse only the sentinel-prefixed line, so import-time chatter that happens
-    // to contain a `{` cannot be mistaken for the result.
-    let json = stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.trim_start().strip_prefix(CHECK_SENTINEL))?;
-    serde_json::from_str(json.trim()).ok()
-}
-
-pub fn oracle_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
-    let venv = oracle_venv_dir(root);
-    let venv_py = venv_python(&venv);
-    // Only a fully-installed venv counts; a half-installed one must not be used.
+fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
+    let data_dir = rust_model_data_dir(root);
+    let model_present = oracle_core::model_download::model_present(&data_dir, true); // int8
     let venv_ready = venv_complete(root);
-
-    // Check the interpreter that would actually run Oracle: the venv when it is
-    // complete, otherwise the detected system Python. This is what makes a
-    // machine with deps already in system Python report "ready" without a venv.
-    // `checking` is set only when system detection could not reach a verdict
-    // because the machine was busy (a probe timed out / failed to spawn). A
-    // complete venv is a definitive positive, so it never sets `checking`.
-    let (python_found, checking, python_command, python_version, check) = if venv_ready {
-        let argv = vec![venv_py.to_string_lossy().to_string()];
-        let version = probe_python_version(&argv);
-        let check = warmup_check(&argv, root);
-        (
-            true,
-            false,
-            Some(venv_py.to_string_lossy().to_string()),
-            version,
-            check,
-        )
-    } else {
-        match detect_system_python() {
-            PythonDetection::Found { argv, version } => {
-                let check = warmup_check(&argv, root);
-                (true, false, Some(argv.join(" ")), Some(version), check)
-            }
-            // The probe RAN and found no Python ≥3.10 — a definitive negative.
-            PythonDetection::NotFound => (false, false, None, None, None),
-            // The probe timed out / could not spawn (machine busy). NOT a
-            // definitive negative: surface a soft "still checking" status so the
-            // UI does not scare the user into installing a Python they already
-            // have.
-            PythonDetection::Inconclusive => (false, true, None, None, None),
-        }
-    };
-
-    let deps_ready = check
-        .as_ref()
-        .map(|c| c.lancedb && c.sentence_transformers)
-        .unwrap_or(false);
-    let embedder_ready = deps_ready && check.as_ref().map(|c| c.embedder_cached).unwrap_or(false);
-    // A venv is not required: if the resolved interpreter already has the deps
-    // and the cached model, retrieval works.
-    let ready = python_found && deps_ready && embedder_ready;
-
     let mut messages = Vec::new();
-    if checking {
-        // SOFT path: detection was inconclusive (busy machine), so do NOT claim
-        // Python is missing. Tell the user it is still being checked.
-        messages.push(
-            "Still checking the local runtime (first startup can be slow on a busy machine). Retry in a moment.".to_string(),
-        );
-    } else if !python_found {
-        // HARD path: detection actually RAN and found no Python ≥3.10.
-        messages.push(
-            "No Python 3.10+ interpreter found. Install Python 3.10+ to enable local Oracle retrieval."
-                .to_string(),
-        );
-    } else if !deps_ready {
-        messages.push(
-            "Oracle dependencies (LanceDB / embedder) are missing or incomplete.".to_string(),
-        );
-    } else if !embedder_ready {
-        messages.push("The Qwen3 embedding model is not downloaded yet.".to_string());
+    if model_present {
+        messages.push("Rust engine: ONNX embedding model is installed.".to_string());
     } else {
-        messages.push("Oracle retrieval runtime is ready.".to_string());
+        messages.push("Rust engine: ONNX embedding model not downloaded yet.".to_string());
     }
-
+    if venv_ready {
+        messages.push("Slim MCP venv: installed and ready.".to_string());
+    } else {
+        messages.push("Slim MCP venv: not yet installed.".to_string());
+    }
+    let ready = model_present && venv_ready;
     OracleRuntimeSetup {
-        python_found,
-        checking,
-        python_command,
-        python_version,
+        // The Rust engine needs no Python — report the Python-specific gates as
+        // satisfied so the existing UI does not show a spurious "install Python 3".
+        python_found: true,
+        checking: false,
+        python_command: None,
+        python_version: None,
         venv_ready,
-        deps_ready,
-        embedder_ready,
+        deps_ready: venv_ready,
+        embedder_ready: model_present,
         ready,
-        embed_model: EMBED_MODEL.to_string(),
+        embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX int8)".to_string(),
         messages,
     }
 }
@@ -645,37 +536,72 @@ fn run_pip(venv_py: &Path, pip_args: &[&str], root: &Path) -> Result<(), String>
     Ok(())
 }
 
-fn run_warmup(venv_py: &Path, data_root: &Path, package_root: &Path) -> Result<(), String> {
-    let mut command = Command::new(venv_py);
-    command
-        .args(["-m", "oracle.bootstrap.warmup"])
-        .current_dir(data_root)
-        // PYTHONPATH = package/import root so `-m oracle...` imports even when the
-        // writable data root holds no source (release).
-        .env("PYTHONPATH", package_root)
-        .env("ORACLE_ALLOW_HF_DOWNLOAD", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_no_window(&mut command);
-    let output = run_with_timeout(command, WARMUP_TIMEOUT, None)?;
-    if !output.status.success() {
-        return Err(format!(
-            "Warming the Qwen3 embedding model failed: {}",
-            tail(&output.stderr)
-        ));
+/// Detect whether `root` holds a legacy "fat" runtime venv (the old torch-based
+/// venv that used to live under `oracle-data/venv`). Returns `true` when any
+/// `site-packages/torch` directory is present.
+///
+/// This is used to detect a venv that needs to be REPLACED during the M3
+/// fat→slim migration: the old venv consumed 2-3 GB (torch + transformers),
+/// the new slim venv only needs httpx + mcp[cli] (~50 MB). When detected, the
+/// old venv is deleted and recreated slim.
+pub fn is_fat_runtime_venv(root: &Path) -> bool {
+    let venv = oracle_venv_dir(root);
+    if !venv.exists() {
+        return false;
     }
-    Ok(())
+    // Check both Unix and Windows venv layouts.
+    let unix_site_packages = venv.join("lib");
+    let windows_site_packages = venv.join("Lib");
+    // Walk the site-packages tree looking for a `torch` directory.
+    fn has_torch_in_lib(lib_dir: &Path) -> bool {
+        if !lib_dir.exists() {
+            return false;
+        }
+        for entry in std::fs::read_dir(lib_dir).ok().into_iter().flatten() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                let path_str = path.to_string_lossy();
+                // Match `<version>/site-packages/torch` on Unix.
+                if path_str.contains("site-packages") && path.join("torch").is_dir() {
+                    return true;
+                }
+                // Recurse into sub-directories that might be site-packages.
+                if has_torch_in_lib(&path) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    has_torch_in_lib(&unix_site_packages) || windows_site_packages.join("torch").is_dir()
 }
 
-/// Create the venv (if needed), install requirements, and warm the embedder.
+/// Delete the venv directory under `root`. Used during the M3 migration when a
+/// legacy fat venv is detected and must be replaced with the slim MCP venv.
+fn delete_venv(root: &Path) -> Result<(), String> {
+    let venv = oracle_venv_dir(root);
+    if !venv.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&venv)
+        .map_err(|e| format!("Could not delete legacy venv at {}: {e}", venv.display()))
+}
+
+/// Create the venv (if needed), install requirements, and mark it complete.
 /// Long-running (minutes) and network-bound; callers should run it off the UI
 /// thread. Idempotent: an already-installed runtime only re-checks/repairs.
 ///
 /// `data_root` is the WRITABLE runtime home — the venv is created under
 /// `data_root/oracle-data/venv`. `package_root` is the (possibly read-only,
-/// bundled) `oracle/` source — `requirements.txt` is read from there and it is
-/// the PYTHONPATH for the warmup import. In dev both are the same source repo; in
-/// release they differ (writable app-data vs. read-only bundle).
+/// bundled) `oracle/` source — `requirements-mcp.txt` is read from there.
+///
+/// MIGRATION (fat→slim): if the existing venv contains a `torch` install (the
+/// old fat runtime from M2.x), it is deleted and recreated slim to reclaim the
+/// ~2-3 GB that torch consumed.
 pub fn run_oracle_runtime_bootstrap(
     data_root: &Path,
     package_root: &Path,
@@ -694,8 +620,20 @@ pub fn run_oracle_runtime_bootstrap(
     // Stop any running Oracle server so pip is not overwriting an interpreter
     // that another process has mapped, and clear the completion marker so a
     // failure below leaves the venv correctly flagged as incomplete.
-    let _ = stop_python_oracle_runtime();
     let _ = std::fs::remove_file(&marker);
+
+    // MIGRATION: detect a legacy fat venv (torch present) and replace it.
+    if is_fat_runtime_venv(data_root) {
+        eprintln!(
+            "[oracle-setup] M3 migration: detected legacy fat venv (torch present) at {}; \
+             deleting and recreating slim MCP venv",
+            venv.display()
+        );
+        delete_venv(data_root)?;
+        messages.push(
+            "M3 migration: replaced legacy fat venv (torch + embedder) with slim MCP venv.".to_string(),
+        );
+    }
 
     if !venv_py.exists() {
         let (argv, version) = match detect_system_python() {
@@ -724,11 +662,11 @@ pub fn run_oracle_runtime_bootstrap(
         messages.push("Reusing the existing Oracle virtual environment.".to_string());
     }
 
-    // requirements.txt lives next to the `oracle/` SOURCE (package root), which in
+    // requirements-mcp.txt lives next to the `oracle/` SOURCE (package root), which in
     // release is the read-only bundle — never the writable data root.
-    let requirements = package_root.join("oracle").join("requirements.txt");
+    let requirements = package_root.join("oracle").join("requirements-mcp.txt");
     if !requirements.exists() {
-        return Err("oracle/requirements.txt is missing next to the app.".to_string());
+        return Err("oracle/requirements-mcp.txt is missing next to the app.".to_string());
     }
     run_pip(&venv_py, &["install", "--upgrade", "pip"], data_root)?;
     run_pip(
@@ -736,16 +674,13 @@ pub fn run_oracle_runtime_bootstrap(
         &["install", "-r", &requirements.to_string_lossy()],
         data_root,
     )?;
-    messages.push("Installed LanceDB, the Qwen3 embedder and dependencies.".to_string());
-
-    run_warmup(&venv_py, data_root, package_root)?;
-    messages.push("Downloaded and warmed the Qwen3 embedding model.".to_string());
+    messages.push("Installed slim MCP deps (httpx + mcp[cli]).".to_string());
 
     // Mark the venv usable only now that every step succeeded.
     std::fs::write(&marker, b"ok")
         .map_err(|e| format!("Could not finalize the Oracle runtime: {e}"))?;
 
-    let mut status = oracle_runtime_setup_status(data_root);
+    let mut status = rust_runtime_setup_status(data_root);
     let mut combined = messages;
     combined.append(&mut status.messages);
     status.messages = combined;
@@ -758,74 +693,14 @@ pub fn run_oracle_runtime_bootstrap(
 /// under, derived identically to the in-process server
 /// (`OracleDataPaths::from_root(root).root`). `root` is the workspace/data root
 /// returned by `oracle_data_root()`.
-fn rust_model_data_dir(root: &Path) -> PathBuf {
+/// The data directory the bundled ONNX embedder model lives under (under
+/// `<root>/oracle-data/models/...`). Used by the Rust-native doctor to probe
+/// model presence without loading it.
+pub(crate) fn rust_model_data_dir(root: &Path) -> PathBuf {
     oracle_core::config::OracleDataPaths::from_root(root).root
 }
 
-fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
-    let data_dir = rust_model_data_dir(root);
-    let present = oracle_core::model_download::model_present(&data_dir, true); // int8
-    let mut messages = Vec::new();
-    if present {
-        messages.push("Rust engine: ONNX embedding model is installed.".to_string());
-    } else {
-        messages.push("Rust engine: ONNX embedding model not downloaded yet.".to_string());
-    }
-    OracleRuntimeSetup {
-        // The Rust engine needs no Python — report the Python-specific gates as
-        // satisfied so the existing UI does not show a spurious "install Python 3".
-        python_found: true,
-        checking: false,
-        python_command: None,
-        python_version: None,
-        venv_ready: true,
-        deps_ready: true,
-        embedder_ready: present,
-        ready: present,
-        embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX int8)".to_string(),
-        messages,
-    }
-}
-
-fn install_rust_runtime(root: &Path) -> Result<OracleRuntimeSetup, String> {
-    let data_dir = rust_model_data_dir(root);
-    // v1: no UI progress channel is wired; log progress to stderr. The UI polls
-    // get_oracle_runtime_setup separately and will show `ready` once done.
-    oracle_core::model_download::ensure_qwen3_onnx(&data_dir, true, |p| {
-        let pct = match p.bytes_total {
-            Some(t) if t > 0 => format!("{}%", (p.bytes_done * 100) / t),
-            _ => format!("{} bytes", p.bytes_done),
-        };
-        eprintln!(
-            "[rust-oracle model] {} ({}/{}) {}",
-            p.file, p.index, p.total_files, pct
-        );
-    })
-    .map_err(|e| format!("ONNX model download failed: {e:#}"))?;
-    Ok(rust_runtime_setup_status(root))
-}
-
 // --- public entry points ---------------------------------------------------
-
-/// Resolve the writable data root (where the venv lives) and return the current
-/// setup status (no install). Status is read from the DATA root, NOT the package
-/// root, because the installed runtime lives under the data root.
-pub fn current_oracle_runtime_setup() -> OracleRuntimeSetup {
-    match oracle_data_root() {
-        Some(root) => {
-            if crate::backend::oracle_service::oracle_current_engine()
-                == crate::backend::oracle_service::OracleEngine::Rust
-            {
-                rust_runtime_setup_status(&root)
-            } else {
-                oracle_runtime_setup_status(&root)
-            }
-        }
-        None => OracleRuntimeSetup::unavailable(
-            "Could not locate the bundled oracle/ package next to the app.",
-        ),
-    }
-}
 
 /// Resolve the data root (venv home) + package root (source) and run the full
 /// bootstrap. The venv is installed under the data root; the package source and
@@ -834,15 +709,32 @@ pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
     let data_root = oracle_data_root().ok_or_else(|| {
         "Could not locate a writable location for the Oracle runtime.".to_string()
     })?;
-    if crate::backend::oracle_service::oracle_current_engine()
-        == crate::backend::oracle_service::OracleEngine::Rust
-    {
-        return install_rust_runtime(&data_root);
-    }
+    // The package root is needed for the requirements file + migration check.
     let package_root = find_oracle_package_root(None).ok_or_else(|| {
         "Could not locate the bundled oracle/ package next to the app.".to_string()
     })?;
-    run_oracle_runtime_bootstrap(&data_root, &package_root)
+    // Run the bootstrap (creates/reuses venv, installs requirements-mcp.txt,
+    // handles fat→slim migration). The ONNX model install is separate and
+    // triggered by the supervisor when the engine is Rust.
+    let status = run_oracle_runtime_bootstrap(&data_root, &package_root)?;
+    // If the model is not yet present, trigger the ONNX download now so the
+    // overall status reflects readiness.
+    let data_dir = rust_model_data_dir(&data_root);
+    if !oracle_core::model_download::model_present(&data_dir, true) {
+        eprintln!("[oracle-setup] ONNX model not present; downloading...");
+        oracle_core::model_download::ensure_qwen3_onnx(&data_dir, true, |p| {
+            let pct = match p.bytes_total {
+                Some(t) if t > 0 => format!("{}%", (p.bytes_done * 100) / t),
+                _ => format!("{} bytes", p.bytes_done),
+            };
+            eprintln!(
+                "[rust-oracle model] {} ({}/{}) {}",
+                p.file, p.index, p.total_files, pct
+            );
+        })
+        .map_err(|e| format!("ONNX model download failed: {e:#}"))?;
+    }
+    Ok(rust_runtime_setup_status(&data_root))
 }
 
 fn tail(bytes: &[u8]) -> String {
@@ -1050,9 +942,9 @@ mod tests {
     }
 
     /// End-to-end exercise of the REAL install the "Install runtime" button runs:
-    /// resolve the package root, create a fresh venv, `pip install` the full
-    /// `requirements.txt` (torch + LanceDB + the embedder — multi-GB), and warm
-    /// the model. `#[ignore]` because it is network-bound and slow; run it
+    /// resolve the package root, create a fresh venv, `pip install` the slim
+    /// `requirements-mcp.txt` (httpx + mcp[cli]), and mark complete.
+    /// `#[ignore]` because it is network-bound and slow; run it
     /// explicitly to validate the venv path that the cheap status probe never
     /// touches:
     ///   cargo test --lib -- --ignored --nocapture install_runtime_end_to_end
@@ -1097,9 +989,12 @@ mod tests {
         assert!(status.venv_ready, "status should report the venv as ready");
         assert!(
             status.deps_ready,
-            "LanceDB + sentence-transformers must import"
+            "httpx + mcp must import"
         );
-        assert!(status.embedder_ready, "the Qwen3 embedder must be cached");
+        assert!(
+            status.embedder_ready,
+            "the ONNX embedder must be cached"
+        );
         assert!(
             status.ready,
             "the runtime must be fully ready after install"
@@ -1119,7 +1014,98 @@ mod tests {
             s.python_found,
             "python gates reported satisfied under rust engine"
         );
-        assert!(s.venv_ready && s.deps_ready);
+        // M3: venv_ready/deps_ready now report the SLIM MCP venv truthfully —
+        // an absent data dir has no venv, so both must be false.
+        assert!(!s.venv_ready && !s.deps_ready);
         assert!(s.embed_model.contains("ONNX"));
+    }
+
+    /// Test the fat→slim migration detection helper with a temp dir.
+    /// Creates both Unix and Windows venv layouts and asserts the detection
+    /// correctly identifies the presence/absence of `torch`.
+    #[test]
+    fn fat_venv_detection_unix_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-fat-venv-unix-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let venv = oracle_venv_dir(&dir);
+        // Unix layout: lib/python3.x/site-packages/torch
+        let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+        std::fs::create_dir_all(site_packages.join("torch")).unwrap();
+        // Write the completion marker so venv_complete would return true.
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("bin").join("python3"), "").unwrap();
+        std::fs::write(venv.join(VENV_COMPLETE_MARKER), b"ok").unwrap();
+
+        assert!(
+            is_fat_runtime_venv(&dir),
+            "Unix layout with torch must be detected as fat venv"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fat_venv_detection_windows_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-fat-venv-win-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let venv = oracle_venv_dir(&dir);
+        // Windows layout: Lib/site-packages/torch
+        let site_packages = venv.join("Lib").join("site-packages");
+        std::fs::create_dir_all(site_packages.join("torch")).unwrap();
+        std::fs::create_dir_all(venv.join("Scripts")).unwrap();
+        std::fs::write(venv.join("Scripts").join("python.exe"), "").unwrap();
+        std::fs::write(venv.join(VENV_COMPLETE_MARKER), b"ok").unwrap();
+
+        assert!(
+            is_fat_runtime_venv(&dir),
+            "Windows layout with torch must be detected as fat venv"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fat_venv_detection_slim_venv() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-slim-venv-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let venv = oracle_venv_dir(&dir);
+        // Slim venv: no torch, just httpx + mcp
+        let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+        std::fs::create_dir_all(site_packages.join("httpx")).unwrap();
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("bin").join("python3"), "").unwrap();
+        std::fs::write(venv.join(VENV_COMPLETE_MARKER), b"ok").unwrap();
+
+        assert!(
+            !is_fat_runtime_venv(&dir),
+            "Slim venv without torch must NOT be detected as fat venv"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fat_venv_detection_no_venv() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-no-venv-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            !is_fat_runtime_venv(&dir),
+            "Non-existent venv must NOT be detected as fat venv"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

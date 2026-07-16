@@ -325,7 +325,7 @@ pub enum LiveServerProbe {
 impl OracleDoctorReport {
     /// Recompute the overall `ok` as the AND of all checks. Call after mutating
     /// any check (e.g. the provider merge).
-    fn recompute_ok(&mut self) {
+    pub(crate) fn recompute_ok(&mut self) {
         self.ok = self.checks.iter().all(|check| check.ok);
     }
 }

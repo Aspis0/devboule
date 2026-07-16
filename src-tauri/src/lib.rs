@@ -458,13 +458,10 @@ pub fn run() {
             backend::oracle_service::set_oracle_enabled_flag(
                 backend::oracle_service::read_oracle_enabled(app.handle()),
             );
-            // M2: seed the Oracle engine selector (config oracle.engine, default
-            // "python") so the supervisor's on_unlock start path (no AppHandle) can
-            // read it via oracle_current_engine(). Default "python" keeps the
-            // existing Python subprocess behaviour until the owner flips to "rust".
-            backend::oracle_service::set_oracle_engine_flag(
-                backend::oracle_service::read_oracle_engine(app.handle()),
-            );
+            // M2 retired, M3 deleted: the runtime engine was always Rust after P13b
+            // (the Python spawn machinery is gone). The persisted `oracle.engine`
+            // config key is still read on the next launch via `read_oracle_engine`
+            // but no in-process flag mirror / supervisor probe remains.
             // Pigeon mailbox service — OPTIONAL, OFF by default. This is a clean no-op
             // unless config.json has pigeon.enabled=true; when off, the legacy mini
             // dispatch path is untouched.

@@ -1,11 +1,11 @@
 //! The app-side Oracle/GPU coordinator (core).
 //!
 //! Owns the process-global GPU/compute arbitration state and the PURE decision policies. This first
-//! slice is self-contained — the §4c compute-concurrency counter (RAII permit, mirroring
-//! `oracle::commands::OracleAskPermit`) plus the pure embed-device + index-burst-deferral policies.
-//! Wiring these into the live spawn path (`mini_coder_executor`) and the Oracle (re)spawn
-//! (`oracle_service`, embed-device env) is a deliberate follow-on. `devboule-coder` is a separate
-//! binary and reaches this state only over MCP, so the coordinator lives app-side.
+//! slice is self-contained — the §4c compute-concurrency counter (RAII permit) plus the pure
+//! embed-device + index-burst-deferral policies. Wiring these into the live spawn path
+//! (`mini_coder_executor`) and the Oracle (re)spawn (`oracle_service`, embed-device env) is a
+//! deliberate follow-on. `devboule-coder` is a separate binary and reaches this state only over
+//! MCP, so the coordinator lives app-side.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -42,7 +42,7 @@ impl OracleCoordinator {
         self.active_local_decodes.load(Ordering::Acquire)
     }
 
-    /// Try to acquire a compute slot for a local decode. Mirrors `OracleAskPermit`: increment
+    /// Try to acquire a compute slot for a local decode. Increment
     /// optimistically, validate against the live cap, roll back + return `None` on overflow so a
     /// rejected acquire never permanently consumes a slot. `cap == 0` never rejects.
     pub fn try_acquire_decode(&self) -> Option<ComputePermit> {

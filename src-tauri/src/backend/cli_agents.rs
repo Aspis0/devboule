@@ -13,10 +13,13 @@
 //! auth token is ever baked in — the AGENT token is read from the discovery file
 //! at runtime by the MCP server. Nothing here logs or persists any secret.
 //!
-//! Cross-platform: the home directory and the venv interpreter layout are resolved
-//! per-OS by reused helpers (`USERPROFILE` on Windows, `HOME` on Unix; the venv
-//! python via `resolve_oracle_python`). The macOS path is UNVERIFIED on real
-//! hardware — it follows the standard POSIX layout.
+//! Cross-platform: the home directory and the slim-MCP-venv interpreter layout
+//! are resolved per-OS by reused helpers (`USERPROFILE` on Windows, `HOME` on
+//! Unix; the venv python via `resolve_oracle_python`). The macOS path is
+//! UNVERIFIED on real hardware — it follows the standard POSIX layout. The venv
+//! itself is now SLIM (httpx + mcp[cli] from `oracle/requirements-mcp.txt`)
+//! and exists ONLY to launch `oracle/server/aspis_mcp.py`; the embedding model
+//! lives in-process in the Rust engine and never touches this venv.
 
 use std::path::{Path, PathBuf};
 
@@ -57,9 +60,12 @@ pub struct CliAgentsStatus {
     pub root: Option<String>,
     /// Resolved projects dir passed as `--projects-dir`.
     pub projects_dir: Option<String>,
-    /// The local Oracle retrieval runtime (venv + embedder) is installed. When
-    /// false, the registered `command` points at a python that cannot import
-    /// `mcp`, so the UI must warn the operator to install the runtime first.
+    /// The slim MCP venv is installed (httpx + mcp[cli] from
+    /// `oracle/requirements-mcp.txt`; used ONLY to launch
+    /// `oracle/server/aspis_mcp.py`). When false, the registered `command`
+    /// points at a python that cannot import `mcp`, so the UI must warn the
+    /// operator to install the runtime first. Embedding is in-process in the
+    /// Rust engine — this venv never carries torch / sentence-transformers.
     pub runtime_ready: bool,
     /// Non-fatal advisory for the operator. Carries the real reason when a status
     /// could not be fully resolved (e.g. the user home directory was not found,
