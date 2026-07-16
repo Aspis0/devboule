@@ -18,10 +18,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from oracle.server.answerer import answer_from_context
-from oracle.server.query_engine import lexical_chunk_context
-from oracle.store.lance_store import LanceStore
-from oracle.store.sqlite_store import SQLiteStore
 from oracle.store.ckg_store import CkgStore
 from oracle.config import CKG_DB_PATH
 
@@ -296,8 +292,6 @@ SCW_ZONES = (
     "pl-waw-3",
 )
 SCW_REGIONS = ("fr-par", "nl-ams", "pl-waw")
-_MCP_ENGINE_CACHE: dict[str, Any] = {}
-_MCP_INDEX_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # SINGLE SOURCE OF TRUTH: role rules live in oracle/server/role_rules.json
 # (English only, 4 roles). Edit the JSON, not this module — it is loaded
@@ -813,11 +807,7 @@ TOOLS = [
                 "default": False,
                 "description": "Group results by file instead of a flat list. Each file gets a total_score and its matching chunks.",
             },
-            "expand_ckg": {
-                "type": "boolean",
-                "default": False,
-                "description": "Expand retrieval to include neighbor files from the Code Knowledge Graph (IMPORT/CONTAIN edges).",
-            },
+            # expand_ckg: not ported to the Rust engine, deferred to PLAN.md M1 max-recall "CKG expansion" ticket; removed from TOOLS schema, args ignored.
         },
     },
     {
@@ -1470,20 +1460,91 @@ def mcp_oracle_paths(projects_dir: Path) -> dict[str, Path]:
     }
 
 
-def make_mcp_engine(projects_dir: Path):
-    paths = mcp_oracle_paths(projects_dir)
-    cache_key = str(paths["root"])
-    engine = _MCP_ENGINE_CACHE.get(cache_key)
-    if engine is None:
-        from oracle.server.query_engine import QueryEngine
+# ── Vendored manifest helpers (M3-P12c) ────────────────────────────────────
+# SECURITY-CRITICAL: the two helpers below are byte-identical copies of the
+# corresponding functions in `oracle.ingestion.chunk_index` (1509, 1518, 1528,
+# 1550). The ingestion module is being deleted in M3 (the oracle runtime is
+# Rust in-app), but `oracle_allowed_file_ids` (the per-project scope that
+# guards every oracle_ask / oracle_context HTTP call) reads the same on-disk
+# manifest the Rust indexer writes. Vendoring keeps the SECURITY contract
+# local to the MCP server so the read path cannot widen or shrink an agent's
+# allowed-file-id set due to a refactor.
+#
+# The `create=True` branch of `manifest_files_for_root` is dropped because no
+# call site in `aspis_mcp.py` writes to the manifest — every caller is a
+# read-only scope query (oracle/server/aspis_mcp.py:1527, 1620, 1623, 1625,
+# all pre-delete). The remaining branch is the create=False path: an absent
+# root entry is treated as "no files indexed for this root yet", which is the
+# only behavior the MCP side ever needs.
+def _manifest_load(path: Path) -> dict:
+    if not path.exists():
+        return {"files": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {"files": {}}
 
-        engine = QueryEngine(
-            SQLiteStore(paths["sqlite"]),
-            LanceStore(paths["vectors"]),
-            LanceStore(paths["chunks"]),
-        )
-        _MCP_ENGINE_CACHE[cache_key] = engine
-    return engine
+
+def _manifest_roots(manifest: dict) -> dict:
+    roots = manifest.setdefault("roots", {})
+    legacy_root = manifest.get("root")
+    legacy_files = manifest.get("files")
+    if legacy_root and isinstance(legacy_files, dict) and legacy_root not in roots:
+        roots[legacy_root] = {"files": legacy_files}
+    manifest["version"] = 2
+    return roots
+
+
+def _manifest_strip_verbatim_prefix(value: str) -> str:
+    r"""Strip the Windows extended-length / verbatim prefix (``\\?\`` and
+    ``\\?\UNC\``) from a path STRING so the same workspace has a single canonical
+    manifest identity.
+
+    P4 root cause: ``Path.resolve()`` on Windows can return a ``\\?\C:\…`` form,
+    while the app normally passes the plain ``C:\…`` form. Keyed verbatim, the
+    manifest ended up with BOTH ``C:\Users\…\aspis bio`` (fully indexed) and a
+    stale ``\\?\C:\Users\…\aspis bio`` (32 files) — the Python side treated the
+    verbatim form as a brand-new workspace and re-embedded ~1169 "pending" files
+    every run ("always indexing"). Collapsing the two forms to one key makes an
+    already-indexed workspace look already-indexed regardless of which form a
+    given call resolved to. Mirrors the Rust ``strip_windows_verbatim_prefix``.
+    No-op on non-Windows path strings.
+    """
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[len("\\\\?\\UNC\\") :]
+    if value.startswith("\\\\?\\"):
+        return value[len("\\\\?\\") :]
+    return value
+
+
+def _manifest_files_for_root(manifest: dict, root: Path) -> dict:
+    root_key = _manifest_strip_verbatim_prefix(str(root))
+    roots = _manifest_roots(manifest)
+    # P4: prune a stale verbatim-prefixed duplicate of THIS root. If a previous run
+    # recorded the same workspace under its `\\?\`-prefixed form, merge its file
+    # entries into the canonical key (preferring already-present canonical entries)
+    # and drop the duplicate, so the workspace is no longer seen as "new" and is not
+    # needlessly re-embedded. Only entries that collapse to `root_key` are touched.
+    for existing_key in list(roots.keys()):
+        if existing_key == root_key:
+            continue
+        if _manifest_strip_verbatim_prefix(existing_key) != root_key:
+            continue
+        duplicate = roots.pop(existing_key)
+        if not isinstance(duplicate, dict):
+            continue
+        canonical = roots.setdefault(root_key, {"files": {}})
+        canonical_files = canonical.setdefault("files", {})
+        for file_id, record in duplicate.get("files", {}).items():
+            canonical_files.setdefault(file_id, record)
+    entry = roots.get(root_key)
+    if entry is None:
+        # create=True branch dropped — the MCP side never writes the manifest.
+        return {}
+    files = entry.setdefault("files", {})
+    manifest["root"] = root_key
+    manifest["files"] = files
+    return files
 
 
 def oracle_index_root_for_args(projects_dir: Path, args: dict[str, Any]) -> Path:
@@ -1495,87 +1556,6 @@ def oracle_index_root_for_args(projects_dir: Path, args: dict[str, Any]) -> Path
         if root_path:
             return validate_project_work_root(Path(root_path), management_root)
     return management_root
-
-
-def ensure_oracle_index_ready(
-    projects_dir: Path, args: dict[str, Any]
-) -> dict[str, Any]:
-    root = oracle_index_root_for_args(projects_dir, args)
-    if not root.is_dir():
-        # PRIVACY: basename only — the absolute path would leak the OS username.
-        raise McpError(f"Oracle index root '{root.name}' does not exist on disk.")
-    mcp_debug(projects_dir, f"oracle_index root={root}")
-    cache_key = str(root)
-    cached = _MCP_INDEX_STATUS_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached[0] < 15:
-        mcp_debug(projects_dir, "oracle_index cache hit")
-        status = cached[1]
-    else:
-        mcp_debug(projects_dir, "oracle_index import begin")
-        from oracle.ingestion.chunk_index import (
-            collect_text_files,
-            file_needs_index,
-            load_manifest,
-            manifest_files_for_root,
-            priority_rank,
-        )
-
-        mcp_debug(projects_dir, "oracle_index status begin")
-        paths = mcp_oracle_paths(projects_dir)
-        manifest_path = paths["root"] / "oracle-data" / "chunk-index-manifest.json"
-        manifest = load_manifest(manifest_path)
-        manifest_files = manifest_files_for_root(manifest, root, create=False)
-        sqlite = SQLiteStore(paths["sqlite"])
-        output_paths = {
-            paths["sqlite"].resolve(),
-            paths["chunks"].resolve(),
-            manifest_path.resolve(),
-        }
-        files = [
-            path
-            for path in collect_text_files(root)
-            if path.resolve() not in output_paths
-        ]
-        expected = {path.relative_to(root).as_posix() for path in files}
-        indexed = set(manifest_files)
-        pending = sorted(
-            expected - indexed, key=lambda item: (priority_rank(item), item)
-        )
-        stale = []
-        for path in files:
-            file_id = path.relative_to(root).as_posix()
-            if file_id in indexed and file_needs_index(
-                path, root, manifest_files, sqlite
-            ):
-                stale.append(file_id)
-        status = {
-            # PRIVACY: store only the basename. This dict is forwarded into the
-            # oracle_ask / oracle_context MCP responses; an absolute root would
-            # leak the OS username + machine layout to the agent.
-            "root": root.name,
-            "expected_files": len(expected),
-            "indexed_files": len(indexed & expected),
-            "pending_files": len(pending),
-            "stale_files": len(stale),
-            "sqlite_chunks": sqlite.chunk_count(),
-            "first_pending": pending[:12],
-            "first_stale": stale[:12],
-        }
-        mcp_debug(projects_dir, "oracle_index status ok")
-        _MCP_INDEX_STATUS_CACHE[cache_key] = (time.monotonic(), status)
-    if int(status.get("expected_files") or 0) > 0 and (
-        int(status.get("indexed_files") or 0) == 0
-        or int(status.get("sqlite_chunks") or 0) == 0
-    ):
-        # PRIVACY: no absolute paths in the message (the index root may reveal a
-        # user home directory). Keep it ACTIONABLE for an agent operator.
-        raise McpError(
-            "Oracle index not ready — open Devboule -> Oracle -> Index now "
-            "(or wait for the resident indexer). "
-            f"(indexed={status.get('indexed_files')} "
-            f"pending={status.get('pending_files')} stale={status.get('stale_files')})"
-        )
-    return status
 
 
 def enforce_mini_oracle_project_scope(
@@ -1606,9 +1586,7 @@ def oracle_allowed_file_ids(
 ) -> set[str] | None:
     paths = mcp_oracle_paths(projects_dir)
     manifest_path = paths["root"] / "oracle-data" / "chunk-index-manifest.json"
-    from oracle.ingestion.chunk_index import load_manifest, manifest_files_for_root
-
-    manifest = load_manifest(manifest_path)
+    manifest = _manifest_load(manifest_path)
     management_root = management_root_from_projects_dir(projects_dir).resolve()
 
     project_id = str(args.get("project_id") or "").strip()
@@ -1617,12 +1595,12 @@ def oracle_allowed_file_ids(
         # indexed project work roots. Default to the management root only, so an
         # agent without an explicit project scope cannot read another project's
         # corpus (or its embedded files) through oracle_ask / oracle_context.
-        return set(manifest_files_for_root(manifest, management_root, create=False))
+        return set(_manifest_files_for_root(manifest, management_root))
 
     root = oracle_index_root_for_args(projects_dir, args)
-    allowed = set(manifest_files_for_root(manifest, root, create=False))
+    allowed = set(_manifest_files_for_root(manifest, root))
     if root != management_root:
-        allowed.update(manifest_files_for_root(manifest, management_root, create=False))
+        allowed.update(_manifest_files_for_root(manifest, management_root))
     return allowed
 
 
@@ -3691,119 +3669,6 @@ def oracle_llm_config_from_app_vault() -> dict[str, Any] | None:
     return runtime_settings
 
 
-def mcp_oracle_context(
-    engine: Any,
-    query: str,
-    limit: int,
-    allowed_file_ids: set[str] | None = None,
-    # ── Phase 3: pre-filtering ──
-    kind: str | None = None,
-    language: str | None = None,
-    symbols: list[str] | None = None,
-    imports: list[str] | None = None,
-    module: str | None = None,
-) -> list[dict]:
-    if os.getenv("ASPIS_MCP_DENSE_CONTEXT", "").strip() == "1":
-        return engine.context(
-            query,
-            limit,
-            allowed_file_ids=allowed_file_ids,
-            kind=kind,
-            language=language,
-            symbols=symbols,
-            imports=imports,
-            module=module,
-        )
-    chunks = engine.sqlite.all_chunks()
-    if allowed_file_ids is not None:
-        chunks = [chunk for chunk in chunks if chunk["file_id"] in allowed_file_ids]
-    # Apply pre-filters
-    chunks = [
-        c
-        for c in chunks
-        if engine._chunk_matches_filters(c, kind, language, symbols, imports, module)
-    ]
-    return lexical_chunk_context(query, chunks, max(1, limit))
-
-
-def _parse_filter_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Extract filtering parameters from MCP tool arguments."""
-    kind = str(args.get("kind", "")).strip() or None
-    language = str(args.get("language", "")).strip() or None
-    symbols: list[str] | None = args.get("symbols") if args.get("symbols") else None
-    imports: list[str] | None = args.get("imports") if args.get("imports") else None
-    module = str(args.get("module", "")).strip() or None
-    group_by_file = bool(args.get("group_by_file"))
-    expand_ckg = bool(args.get("expand_ckg"))
-    return {
-        "kind": kind,
-        "language": language,
-        "symbols": symbols,
-        "imports": imports,
-        "module": module,
-        "group_by_file": group_by_file,
-        "expand_ckg": expand_ckg,
-    }
-
-
-def mcp_oracle_ask(
-    engine: Any,
-    query: str,
-    limit: int,
-    allowed_file_ids: set[str] | None = None,
-    # ── Phase 3-4: filtering & grouping ──
-    kind: str | None = None,
-    language: str | None = None,
-    symbols: list[str] | None = None,
-    imports: list[str] | None = None,
-    module: str | None = None,
-    group_by_file: bool = False,
-    expand_ckg: bool = False,
-) -> dict:
-    if os.getenv("ASPIS_MCP_DENSE_ASK", "").strip() == "1":
-        return engine.ask(
-            query,
-            limit,
-            llm_config=oracle_llm_config_from_app_vault(),
-            allowed_file_ids=allowed_file_ids,
-            kind=kind,
-            language=language,
-            symbols=symbols,
-            imports=imports,
-            module=module,
-            group_by_file=group_by_file,
-            expand_ckg_neighbors=expand_ckg,
-        )
-    chunks = mcp_oracle_context(
-        engine,
-        query,
-        max(1, limit),
-        allowed_file_ids=allowed_file_ids,
-        kind=kind,
-        language=language,
-        symbols=symbols,
-        imports=imports,
-        module=module,
-    )
-    generated = answer_from_context(
-        query, chunks, llm_config=oracle_llm_config_from_app_vault()
-    )
-    return {
-        "mode": "oracle-mcp-bounded",
-        "query": query,
-        "summary": generated["answer"],
-        "answer": generated["answer"],
-        "citations": generated["citations"],
-        "not_found": generated["not_found"],
-        "suggested_path": generated["suggested_path"],
-        "answer_source": generated.get("answer_source"),
-        "fallback_reason": generated.get("fallback_reason"),
-        "llm_provider": generated.get("llm_provider"),
-        "llm_model": generated.get("llm_model"),
-        "results": [mcp_chunk_result(chunk) for chunk in chunks[: max(1, limit)]],
-    }
-
-
 def _http_readiness_placeholder() -> dict[str, Any]:
     # FIX 4: on the HTTP path the resident server owns the (possibly
     # different-root) index and is only published once ready; the LOCAL gate
@@ -3821,11 +3686,10 @@ def _http_readiness_placeholder() -> dict[str, Any]:
 def _safe_index_root(value: Any) -> str | None:
     """Reduce any index-status `root` to a basename before it reaches an agent.
 
-    PRIVACY (FIX 1b, defense-in-depth): `ensure_oracle_index_ready` already
-    stores a basename, but the oracle_ask/oracle_context responses forward
-    whatever the status dict carries (including the HTTP placeholder, or a
-    future/patched producer). An absolute path here would leak the OS username
-    + machine layout, so we collapse anything path-shaped to its final
+    PRIVACY (FIX 1b, defense-in-depth): the oracle_ask/oracle_context responses
+    forward whatever the status dict carries (including the HTTP placeholder,
+    or a future/patched producer). An absolute path here would leak the OS
+    username + machine layout, so we collapse anything path-shaped to its final
     component and pass through None unchanged.
     """
     if not value:
@@ -3834,19 +3698,59 @@ def _safe_index_root(value: Any) -> str | None:
 
 
 def _require_concrete_scope(allowed_file_ids: set[str] | None) -> None:
-    """FIX 6 + FIX 3: a bounded Oracle query requires a concrete (non-None) scope
-    set on BOTH the HTTP and the in-process path.
+    """FIX 6 + FIX 3: a bounded Oracle query requires a concrete (non-None) scope.
 
-    On HTTP, `_scope_payload` maps None -> empty list (no docs); the in-process
-    `mcp_oracle_context` maps None -> FULL corpus. Either way a None scope is a
-    scope-escalation bug: over HTTP it silently diverges from in-process, and
-    in-process it would WIDEN to the entire corpus (reading other projects).
-    The callers always pass a concrete set (oracle_allowed_file_ids never
-    returns None today), so a None is a bug; we fail closed by raising in both
-    dispatch paths rather than reading the wrong / full scope.
+    On HTTP, `_scope_payload` maps None -> empty list (no docs) — the resident
+    server would silently return no documents for a missing scope instead of
+    surfacing the agent's missing scope intent. The callers always pass a
+    concrete set (oracle_allowed_file_ids never returns None today), so a None
+    is a bug; we fail closed by raising rather than silently reading the wrong /
+    empty scope.
     """
     if allowed_file_ids is None:
         raise McpError("Oracle bounded scope must be a concrete set, not None.")
+
+
+# ── M3-P12c: Oracle routing is HTTP-only — there is no in-process fallback ──
+# The oracle runtime lives in the Aspis Management app (Rust). The MCP server
+# is a thin client: it forwards `oracle_ask` / `oracle_context` to the resident
+# HTTP server, forwarding the locally-computed `allowed_file_ids` scope
+# verbatim (the server never widens it). If no HTTP target resolves or the
+# HTTP call fails, we raise McpError — there is no second engine to fall back
+# on, and silently dropping the query would mask a real outage.
+_UNREACHABLE_MESSAGE = (
+    "Oracle server unreachable — open the Aspis Management app "
+    "(the resident Oracle server answers this tool; there is no "
+    "in-process fallback anymore)."
+)
+
+
+def _parse_filter_args(args: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract the bounded filters from an oracle_ask/context tool args dict.
+
+    Returns a dict carrying only the non-trivial filter values so the HTTP
+    engine can include them in the POST body ONLY when non-None/non-False
+    (keeps the body byte-identical for unfiltered calls — old servers).
+    """
+    if args is None:
+        return {}
+    out: dict[str, Any] = {}
+    # str-or-None: empty/blank stays None (no filter).
+    for key in ("kind", "language", "module"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()
+    # list-or-None: empty/blank stays None.
+    for key in ("symbols", "imports"):
+        val = args.get(key)
+        if isinstance(val, list) and val:
+            filtered = [str(v).strip() for v in val if str(v).strip()]
+            if filtered:
+                out[key] = filtered
+    # bool: only forward when True (default False on the schema).
+    if args.get("group_by_file") is True:
+        out["group_by_file"] = True
+    return out
 
 
 def dispatch_oracle_context(
@@ -3858,48 +3762,43 @@ def dispatch_oracle_context(
 ) -> tuple[list[dict], dict[str, Any]]:
     """Return (context chunks, index_status) via the resident HTTP server.
 
-    FIX 4: readiness is owned here. When an HTTP target resolves, retrieval is
-    routed through the HTTP engine (single embedder) with the SAME locally
-    computed `allowed_file_ids` scope and the LOCAL readiness gate is SKIPPED
-    (the resident server is authoritative). On any HTTP failure we log
-    (redacted) and fall back to the in-process engine — and ONLY then run the
-    fail-closed LOCAL `ensure_oracle_index_ready` gate, so an empty in-process
-    index still surfaces the actionable not-ready error. With no target the
-    in-process path runs the gate too. The in-process engine (and its lazy
-    embedder) is only built on the fallback / no-target path.
+    Contract (M3-P12c): HTTP-only. The locally-computed `allowed_file_ids`
+    scope is forwarded verbatim to the resident server (the server never
+    widens it). When no HTTP target resolves (env override absent, no
+    discovery file, dead pid) OR the HTTP call raises OracleHttpError, this
+    function raises McpError — there is no in-process engine to fall back to,
+    so an outage must surface to the operator rather than silently drop the
+    query. The HTTP success path returns `_http_readiness_placeholder()`
+    because the resident server owns readiness (it is only published once the
+    index is actually ready).
     """
-    args = args or {}
-    # FIX 3 + FIX 6: a None scope is fail-closed on BOTH paths. Over HTTP it
-    # would send an empty scope; in-process `mcp_oracle_context` maps None to the
-    # FULL corpus (scope escalation). Guarding here, before the path split,
-    # makes both paths reject a missing scope identically.
+    # FIX 3 + FIX 6: a None scope is fail-closed on the HTTP path: the
+    # resident server would send an empty scope back (no documents) for a
+    # missing scope, silently diverging from what the agent intended. Reject
+    # here so the agent sees a clear error instead of an empty result.
     _require_concrete_scope(allowed_file_ids)
     target = resolve_oracle_http_target(projects_dir)
-    if target is not None:
-        base_url, token = target
-        try:
-            chunks = HttpOracleEngine(base_url, token).context(
-                query, limit, allowed_file_ids=allowed_file_ids
-            )
-            return chunks, _http_readiness_placeholder()
-        except OracleHttpError as exc:
-            logger.warning(
-                "Oracle HTTP context failed, using in-process fallback: %s", exc
-            )
-    index_status = ensure_oracle_index_ready(projects_dir, args)
-    engine = make_mcp_engine(projects_dir)
-    filters = _parse_filter_args(args)
-    return mcp_oracle_context(
-        engine,
-        query,
-        limit,
-        allowed_file_ids=allowed_file_ids,
-        kind=filters["kind"],
-        language=filters["language"],
-        symbols=filters["symbols"],
-        imports=filters["imports"],
-        module=filters["module"],
-    ), index_status
+    if target is None:
+        raise McpError(_UNREACHABLE_MESSAGE)
+    base_url, token = target
+    try:
+        filters = _parse_filter_args(args)
+        chunks = HttpOracleEngine(base_url, token).context(
+            query,
+            limit,
+            allowed_file_ids=allowed_file_ids,
+            **filters,
+        )
+    except OracleHttpError as exc:
+        # PRIVACY: log the endpoint PATH (generic) and exception class — never
+        # base_url, token, query text, or any absolute path. Surface the
+        # unreachable error to the caller so the operator sees the outage
+        # instead of getting a silently dropped query.
+        logger.warning(
+            "Oracle HTTP context failed, no in-process fallback: %s", exc
+        )
+        raise McpError(_UNREACHABLE_MESSAGE) from exc
+    return chunks, _http_readiness_placeholder()
 
 
 def dispatch_oracle_ask(
@@ -3909,39 +3808,36 @@ def dispatch_oracle_ask(
     allowed_file_ids: set[str] | None,
     args: dict[str, Any] | None = None,
 ) -> tuple[dict, dict[str, Any]]:
-    """Return (answer dict, index_status). Same routing/fallback/readiness
-    contract as `dispatch_oracle_context`.
+    """Return (answer dict, index_status). Same HTTP-only contract as
+    `dispatch_oracle_context` (M3-P12c): no in-process fallback, no-target and
+    HTTP-failure both raise McpError pointing the operator at the Aspis
+    Management app. The resident server is authoritative for readiness; the
+    success path returns `_http_readiness_placeholder()`.
     """
-    args = args or {}
-    # FIX 3 + FIX 6: fail-closed on a None scope before the path split (see
-    # dispatch_oracle_context) — in-process None would widen to the full corpus.
+    # FIX 3 + FIX 6: fail-closed on a None scope before the HTTP call (see
+    # dispatch_oracle_context) — the resident server would silently return no
+    # documents for a missing scope.
     _require_concrete_scope(allowed_file_ids)
     target = resolve_oracle_http_target(projects_dir)
-    if target is not None:
-        base_url, token = target
-        try:
-            answer = HttpOracleEngine(base_url, token).ask(
-                query, limit, allowed_file_ids=allowed_file_ids
-            )
-            return answer, _http_readiness_placeholder()
-        except OracleHttpError as exc:
-            logger.warning("Oracle HTTP ask failed, using in-process fallback: %s", exc)
-    index_status = ensure_oracle_index_ready(projects_dir, args)
-    engine = make_mcp_engine(projects_dir)
-    filters = _parse_filter_args(args)
-    return mcp_oracle_ask(
-        engine,
-        query,
-        limit,
-        allowed_file_ids=allowed_file_ids,
-        kind=filters["kind"],
-        language=filters["language"],
-        symbols=filters["symbols"],
-        imports=filters["imports"],
-        module=filters["module"],
-        group_by_file=filters["group_by_file"],
-        expand_ckg=filters["expand_ckg"],
-    ), index_status
+    if target is None:
+        raise McpError(_UNREACHABLE_MESSAGE)
+    base_url, token = target
+    try:
+        filters = _parse_filter_args(args)
+        answer = HttpOracleEngine(base_url, token).ask(
+            query,
+            limit,
+            allowed_file_ids=allowed_file_ids,
+            **filters,
+        )
+    except OracleHttpError as exc:
+        # PRIVACY: log endpoint PATH + exception class only — never base_url,
+        # token, query text, or absolute path.
+        logger.warning(
+            "Oracle HTTP ask failed, no in-process fallback: %s", exc
+        )
+        raise McpError(_UNREACHABLE_MESSAGE) from exc
+    return answer, _http_readiness_placeholder()
 
 
 def mcp_chunk_result(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -3997,7 +3893,7 @@ def import_httpx():
         import httpx
     except Exception as exc:  # pragma: no cover
         raise McpError(
-            "Install oracle/requirements.txt; provider MCP tools need httpx."
+            "Install oracle/requirements-mcp.txt; provider MCP tools need httpx."
         ) from exc
     return httpx
 
@@ -4241,15 +4137,16 @@ def _await_mini_directive_pigeon(
 class OracleHttpError(Exception):
     """Raised inside the thin-client when an HTTP Oracle call fails.
 
-    The handler catches it, logs (redacted) and falls back to the in-process
-    engine for that single call. It is never surfaced to the agent.
+    The handler catches it, logs (redacted), and surfaces it to the agent as
+    a McpError pointing at the Aspis Management app (M3-P12c — there is no
+    in-process fallback anymore, so a transport failure cannot be hidden).
     """
 
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # FIX 8: short TTL cache of the resolved (base_url, token) keyed on the
-# projects_dir string, mirroring _MCP_INDEX_STATUS_CACHE. resolve_* is called on
-# every oracle_ask/oracle_context, so a per-call stat+read+json-parse is wasteful.
+# projects_dir string. resolve_* is called on every oracle_ask/oracle_context,
+# so a per-call stat+read+json-parse is wasteful.
 _MCP_ORACLE_TARGET_CACHE: dict[str, tuple[float, tuple[str, str] | None]] = {}
 _ORACLE_TARGET_TTL_SECONDS = 5.0
 
@@ -4437,12 +4334,13 @@ def _pid_alive(pid: int) -> bool:
 class HttpOracleEngine:
     """Thin-client engine: routes retrieval through the resident HTTP server.
 
-    Exposes `context`/`ask` with the SAME signatures as the in-process
-    QueryEngine so the MCP handler can use either interchangeably. The locally
-    computed `allowed_file_ids` scope is forwarded verbatim; the server never
-    widens it. An empty scope short-circuits to a grounded-empty result without
-    a network call. Any transport/HTTP failure raises OracleHttpError so the
-    handler can fall back to the in-process engine.
+    Exposes `context`/`ask` mirroring the historical in-process engine shape so
+    the dispatch functions stay readable, but the MCP is HTTP-only (M3-P12c).
+    The locally computed `allowed_file_ids` scope is forwarded verbatim; the
+    server never widens it. An empty scope short-circuits to a grounded-empty
+    result without a network call. Any transport/HTTP failure raises
+    OracleHttpError so the handler can surface the outage to the operator
+    (there is no in-process fallback to mask it).
 
     PRIVACY: this client never logs the auth token or absolute paths.
     """
@@ -4539,15 +4437,37 @@ class HttpOracleEngine:
         return data
 
     def context(
-        self, query: str, limit: int = 8, allowed_file_ids: set[str] | None = None
+        self,
+        query: str,
+        limit: int = 8,
+        allowed_file_ids: set[str] | None = None,
+        kind: str | None = None,
+        language: str | None = None,
+        symbols: list[str] | None = None,
+        imports: list[str] | None = None,
+        module: str | None = None,
     ) -> list[dict]:
         scope = self._scope_payload(allowed_file_ids)
         if not scope:
             return []
-        data = self._post(
-            "/context-bounded",
-            {"query": query, "limit": int(limit), "allowed_file_ids": scope},
-        )
+        payload: dict[str, Any] = {
+            "query": query,
+            "limit": int(limit),
+            "allowed_file_ids": scope,
+        }
+        # Only forward non-None filters so the body stays byte-identical for
+        # unfiltered calls (old servers).
+        if kind:
+            payload["kind"] = kind
+        if language:
+            payload["language"] = language
+        if symbols:
+            payload["symbols"] = symbols
+        if imports:
+            payload["imports"] = imports
+        if module:
+            payload["module"] = module
+        data = self._post("/context-bounded", payload)
         # FIX 3: the server contract is a dict with a `chunks` list. A missing or
         # non-list `chunks` is a malformed response -> fall back in-process.
         chunks = data.get("chunks")
@@ -4563,16 +4483,23 @@ class HttpOracleEngine:
         limit: int = 5,
         llm_config: dict | None = None,
         allowed_file_ids: set[str] | None = None,
+        kind: str | None = None,
+        language: str | None = None,
+        symbols: list[str] | None = None,
+        imports: list[str] | None = None,
+        module: str | None = None,
+        group_by_file: bool = False,
     ) -> dict:
         # llm_config is intentionally NOT forwarded: the resident server derives
         # provider config server-side only (see routes.server_side_llm_config),
         # so the thin-client cannot inject a provider/api_key. Mirrors /ask.
         scope = self._scope_payload(allowed_file_ids)
         if not scope:
-            # FIX 7: mirror the EXACT key set of the in-process empty-scope
-            # `mcp_oracle_ask` result so an agent sees an identical shape whether
-            # the app is open (HTTP path) or closed (in-process). Safe defaults
-            # for the LLM provenance fields (no answer was generated).
+            # FIX 7: empty-scope grounded response. The shape mirrors the
+            # historical in-process empty-scope result so an agent sees an
+            # identical answer envelope whether the app is open or closed.
+            # Safe defaults for the LLM provenance fields (no answer was
+            # generated).
             return {
                 "mode": "oracle-http-bounded",
                 "query": query,
@@ -4587,10 +4514,26 @@ class HttpOracleEngine:
                 "llm_model": None,
                 "results": [],
             }
-        return self._post(
-            "/ask-bounded",
-            {"query": query, "limit": int(limit), "allowed_file_ids": scope},
-        )
+        payload: dict[str, Any] = {
+            "query": query,
+            "limit": int(limit),
+            "allowed_file_ids": scope,
+        }
+        # Only forward non-None filters and group_by_file when True so the body
+        # stays byte-identical for unfiltered calls (old servers).
+        if kind:
+            payload["kind"] = kind
+        if language:
+            payload["language"] = language
+        if symbols:
+            payload["symbols"] = symbols
+        if imports:
+            payload["imports"] = imports
+        if module:
+            payload["module"] = module
+        if group_by_file:
+            payload["group_by_file"] = True
+        return self._post("/ask-bounded", payload)
 
 
 def sanitize_provider_error(message: str) -> str:
@@ -9216,10 +9159,11 @@ def handle_tool_call(
 
     if name == "oracle_ask":
         agent_id, role = require_agent_tool(projects_dir, args, name)
-        # FIX 4: dispatch owns readiness. On the HTTP path the resident server
-        # is authoritative (LOCAL gate skipped); only the in-process / fallback
-        # path runs the fail-closed LOCAL `ensure_oracle_index_ready`. The scope
-        # is computed locally and forwarded; the resident server never widens it.
+        # M3-P12c: dispatch is HTTP-only — the resident server owns readiness
+        # (no local gate). The scope is computed locally and forwarded; the
+        # resident server never widens it. On no-target or HTTP failure the
+        # dispatch raises McpError — propagate it untouched so the agent sees
+        # the actionable "open the Aspis Management app" error.
         result, index_status = dispatch_oracle_ask(
             projects_dir,
             clean_text(args.get("query"), "Query", 2000),
@@ -9267,8 +9211,10 @@ def handle_tool_call(
             args.get("project_id") or None,
         )
         mcp_debug(projects_dir, "oracle_context audit ok")
-        # FIX 4: dispatch owns readiness (HTTP path trusts the resident server;
-        # only the in-process / fallback path runs the LOCAL fail-closed gate).
+        # M3-P12c: dispatch is HTTP-only — the resident server owns readiness
+        # (no local gate). On no-target or HTTP failure the dispatch raises
+        # McpError — propagate it untouched so the agent sees the actionable
+        # "open the Aspis Management app" error.
         chunks, index_status = dispatch_oracle_context(
             projects_dir,
             query,
@@ -9427,7 +9373,7 @@ def create_mcp_server(
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
-            "Install oracle/requirements.txt to run the Devboule MCP server."
+            "Install oracle/requirements-mcp.txt to run the Devboule MCP server."
         ) from exc
 
     server = FastMCP("devboule")

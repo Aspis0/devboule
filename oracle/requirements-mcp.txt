@@ -1,0 +1,20 @@
+# Slim venv for `oracle/server/aspis_mcp.py` after M3 — the oracle runtime is
+# Rust in-app (no Python query engine / SQLite store / Lance store / answerer /
+# chunk_index / ingest). aspis_mcp.py is the project-management MCP server; it
+# talks to the resident HTTP oracle (Rust) and to the local CKG (sqlite3 stdlib
+# in `oracle/store/ckg_store.py`). Anything else (embedder, eval bench, CLI,
+# ingestion, training, evals, watcher, …) is gone from this surface area, so
+# the wider `oracle/requirements.txt` is NOT a dependency of this server.
+#
+# Surviving third-party imports in `aspis_mcp.py`:
+#   - `httpx`              — lazy, the thin HTTP client to the resident Oracle
+#                            (oracle/server/aspis_mcp.py:3861 `import_httpx`).
+#   - `mcp.server.fastmcp` — lazy, the FastMCP server in
+#                            `aspis_mcp.create_mcp_server` (line 9297). The
+#                            `[cli]` extra pulls in `uvicorn`/CLI tooling used
+#                            by the standard `mcp run` entry point.
+#
+# Everything else (sqlite3, pathlib, json, …) is stdlib.
+#
+httpx
+mcp[cli]

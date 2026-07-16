@@ -649,3 +649,100 @@ async fn test_discovery_payload_uses_agent_token() {
         assert_eq!(mode, 0o600, "discovery file must be owner-only");
     }
 }
+
+// ── Bounded-filter cap and filter-forwarding tests ─────────────────────────
+
+/// symbols exceeding the cap (MAX_BOUNDED_FILTER_ENTRIES == 64) must return 400
+/// mentioning the cap — regression for M3-P12c unbounded-list hardening.
+#[tokio::test]
+async fn test_context_bounded_too_many_symbols_returns_400() {
+    let world = TestWorld::new("op", "ag").await;
+    let symbols: Vec<String> = (0..65).map(|i| format!("sym{}", i)).collect();
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": [],
+        "symbols": symbols
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("symbols") && detail.contains("64"),
+        "detail should mention 'symbols' and the cap 64, got: {}",
+        detail
+    );
+}
+
+/// A bounded request with kind/language/symbols/module filters present must be
+/// accepted (200) and return the standard chunks-shaped response.
+#[tokio::test]
+async fn test_context_bounded_filters_accepted() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": [],
+        "kind": "function",
+        "language": "rust",
+        "symbols": ["main", "handle_request"],
+        "module": "src"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert_eq!(body["query"], "Scaleway GPU");
+    assert!(body["chunks"].is_array());
+}
+
+/// group_by_file:true must be forwarded without error (200) with the standard
+/// chunks-shaped response.
+#[tokio::test]
+async fn test_ask_bounded_group_by_file_accepted() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": [],
+        "group_by_file": true
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ask-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert_eq!(body["query"], "Scaleway GPU");
+    // /ask-bounded returns the ASK envelope (answer/citations), not the
+    // /context-bounded chunks shape.
+    assert!(body["answer"].is_string());
+    assert!(body["citations"].is_array());
+}

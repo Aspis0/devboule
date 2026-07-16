@@ -21,6 +21,7 @@ from unittest.mock import patch
 import oracle.config as oracle_config
 from oracle.server.aspis_mcp import (
     HttpOracleEngine,
+    McpError,
     handle_tool_call,
     resolve_oracle_http_target,
 )
@@ -254,14 +255,12 @@ class ThinClientRoutingTests(unittest.TestCase):
             os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
             os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
             with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py", "b.py"}):
-                        with patch("oracle.server.aspis_mcp.make_mcp_engine", side_effect=AssertionError("in-process engine must not be built on HTTP path")):
-                            result = handle_tool_call(
-                                "oracle_context",
-                                {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
-                                root=root,
-                            )
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py", "b.py"}):
+                    result = handle_tool_call(
+                        "oracle_context",
+                        {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
+                        root=root,
+                    )
         self.assertEqual(result["chunks"], [{"chunk_id": "c1"}])
         self.assertEqual(len(recorder.calls), 1)
         call = recorder.calls[0]
@@ -279,31 +278,23 @@ class ThinClientRoutingTests(unittest.TestCase):
             os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
             os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
             with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"only.py"}):
-                        with patch("oracle.server.aspis_mcp.make_mcp_engine", side_effect=AssertionError("in-process engine must not be built on HTTP path")):
-                            result = handle_tool_call(
-                                "oracle_ask",
-                                {"query": "what", "limit": 3, "agent_id": "thin-agent", "role": "orchestrator"},
-                                root=root,
-                            )
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"only.py"}):
+                    result = handle_tool_call(
+                        "oracle_ask",
+                        {"query": "what", "limit": 3, "agent_id": "thin-agent", "role": "orchestrator"},
+                        root=root,
+                    )
         self.assertEqual(result["answer"], "from-http")
         call = recorder.calls[0]
         self.assertTrue(call["url"].endswith("/ask-bounded"))
         self.assertEqual(call["json"]["allowed_file_ids"], ["only.py"])
 
-    def test_http_failure_falls_back_to_in_process(self):
+    def test_http_failure_raises_mcp_error_no_fallback(self):
+        # M3-P12c: the in-process fallback engine is gone. A transport-level
+        # failure on the HTTP Oracle path must surface as McpError pointing
+        # the operator at the Aspis Management app — there is no second engine
+        # to silently mask the outage.
         recorder = _Recorder(None, raise_exc=ConnectionError("refused"))
-
-        class FakeEngine:
-            def __init__(self):
-                self.context_called = False
-
-            def context(self, query, limit=8, allowed_file_ids=None):
-                self.context_called = True
-                return [{"chunk_id": "local-1", "file_source": "a.py"}]
-
-        fake = FakeEngine()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
@@ -311,47 +302,42 @@ class ThinClientRoutingTests(unittest.TestCase):
             os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
             os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
             with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                        with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=fake):
-                            with patch.dict(os.environ, {"ASPIS_MCP_DENSE_CONTEXT": "1"}):
-                                result = handle_tool_call(
-                                    "oracle_context",
-                                    {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
-                                    root=root,
-                                )
-        self.assertTrue(fake.context_called)
-        self.assertEqual(result["chunks"][0]["chunk_id"], "local-1")
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                    with self.assertRaises(McpError) as ctx:
+                        handle_tool_call(
+                            "oracle_context",
+                            {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
+                            root=root,
+                        )
+        self.assertIn("Oracle server unreachable", str(ctx.exception))
+        self.assertIn("Aspis Management app", str(ctx.exception))
+        self.assertIn("no in-process fallback", str(ctx.exception))
 
-    def test_no_target_uses_in_process(self):
-        class FakeEngine:
-            def __init__(self):
-                self.context_called = False
-
-            def context(self, query, limit=8, allowed_file_ids=None):
-                self.context_called = True
-                return [{"chunk_id": "local-only", "file_source": "a.py"}]
-
-        fake = FakeEngine()
+    def test_no_target_raises_mcp_error_no_fallback(self):
+        # M3-P12c: with no HTTP target resolving (no env override, no discovery
+        # file), the dispatch raises McpError instead of falling back to the
+        # deleted in-process engine.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
             self._register(root)
             # No env override, no discovery file.
             with patch("oracle.server.aspis_mcp.import_httpx", side_effect=AssertionError("HTTP must not be used with no target")):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                        with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=fake):
-                            with patch.dict(os.environ, {"ASPIS_MCP_DENSE_CONTEXT": "1"}):
-                                result = handle_tool_call(
-                                    "oracle_context",
-                                    {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
-                                    root=root,
-                                )
-        self.assertTrue(fake.context_called)
-        self.assertEqual(result["chunks"][0]["chunk_id"], "local-only")
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                    with self.assertRaises(McpError) as ctx:
+                        handle_tool_call(
+                            "oracle_context",
+                            {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
+                            root=root,
+                        )
+        self.assertIn("Oracle server unreachable", str(ctx.exception))
+        self.assertIn("Aspis Management app", str(ctx.exception))
+        self.assertIn("no in-process fallback", str(ctx.exception))
 
     def test_thin_client_logger_never_emits_token_or_absolute_path(self):
+        # M3-P12c: HTTP-failure logs still must not leak the auth token, base URL,
+        # or any absolute path. The dispatch surfaces an unreachable McpError;
+        # the warning log emits only the endpoint PATH + exception class.
         recorder = _Recorder(None, raise_exc=ConnectionError("connection refused"))
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
@@ -359,11 +345,6 @@ class ThinClientRoutingTests(unittest.TestCase):
         logger.addHandler(handler)
         old_level = logger.level
         logger.setLevel(logging.DEBUG)
-
-        class FakeEngine:
-            def context(self, query, limit=8, allowed_file_ids=None):
-                return [{"chunk_id": "local", "file_source": "a.py"}]
-
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -372,20 +353,19 @@ class ThinClientRoutingTests(unittest.TestCase):
                 os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
                 os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "super-secret-token-value"
                 with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                    with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                        with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                            with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()):
-                                with patch.dict(os.environ, {"ASPIS_MCP_DENSE_CONTEXT": "1"}):
-                                    handle_tool_call(
-                                        "oracle_context",
-                                        {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
-                                        root=root,
-                                    )
+                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                        with self.assertRaises(McpError):
+                            handle_tool_call(
+                                "oracle_context",
+                                {"query": "where", "limit": 2, "agent_id": "thin-agent", "role": "orchestrator"},
+                                root=root,
+                            )
         finally:
             logger.removeHandler(handler)
             logger.setLevel(old_level)
         logs = stream.getvalue()
         self.assertNotIn("super-secret-token-value", logs)
+        self.assertNotIn("127.0.0.1", logs)
         self.assertNotIn("C:\\", logs)
         self.assertNotIn("/home/", logs)
 
@@ -887,7 +867,13 @@ class HttpStatusClassificationTests(unittest.TestCase):
 
 
 class DispatchReadinessTests(unittest.TestCase):
-    """FIX 4: HTTP path must NOT gate on the LOCAL readiness check."""
+    """M3-P12c: dispatch is HTTP-only; readiness lives on the resident server.
+
+    The local readiness gate (`ensure_oracle_index_ready`) and the in-process
+    engine (`make_mcp_engine`) are GONE. The dispatch surface is now: target
+    resolves -> HTTP call -> return; target missing OR HTTP fails -> raise
+    McpError pointing at the Aspis Management app.
+    """
 
     def setUp(self):
         os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
@@ -905,7 +891,11 @@ class DispatchReadinessTests(unittest.TestCase):
             root=root,
         )
 
-    def test_empty_local_index_does_not_block_http_path(self):
+    def test_http_path_succeeds_regardless_of_local_index_state(self):
+        # The resident server is authoritative for readiness; the MCP side
+        # never gates on a local index. We must not consult the (deleted)
+        # `ensure_oracle_index_ready` or `make_mcp_engine` here — the
+        # assertions below prove neither is referenced on the success path.
         recorder = _Recorder({"query": "q", "chunks": [{"chunk_id": "c1"}]})
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -913,39 +903,71 @@ class DispatchReadinessTests(unittest.TestCase):
             self._register(root)
             os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
             os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
-            # ensure_oracle_index_ready would raise on an empty local index; it
-            # must NOT be consulted on the HTTP path.
             from oracle.server.aspis_mcp import McpError
 
+            # Defensive: these names no longer exist. If anything ever patches
+            # them back in, the call would AttributeError — explicitly fail so
+            # the regression is loud.
+            for deleted in (
+                "oracle.server.aspis_mcp.ensure_oracle_index_ready",
+                "oracle.server.aspis_mcp.make_mcp_engine",
+            ):
+                self.assertFalse(
+                    hasattr(__import__("oracle.server.aspis_mcp", fromlist=["x"]), deleted.split(".")[-1]),
+                    f"{deleted} must not be re-introduced on the HTTP path",
+                )
             with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", side_effect=McpError("Oracle index not ready")):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                        with patch("oracle.server.aspis_mcp.make_mcp_engine", side_effect=AssertionError("no in-process on HTTP path")):
-                            result = handle_tool_call(
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                    # If the dispatch ever tries to consult the deleted local
+                    # readiness gate, the AttributeError on the bare name below
+                    # makes the regression obvious.
+                    with patch(
+                        "oracle.server.aspis_mcp._require_concrete_scope",
+                        side_effect=McpError("scope guard tripped"),
+                    ):
+                        with self.assertRaises(McpError):
+                            # scope guard tripped first, but if it weren't we'd
+                            # route to HTTP — the test asserts we do NOT take
+                            # any local index path.
+                            handle_tool_call(
                                 "oracle_context",
                                 {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
                                 root=root,
                             )
+                    # Now real call with the scope guard intact — proves the
+                    # HTTP path returns the recorder's response without ever
+                    # looking at the local index.
+                    result = handle_tool_call(
+                        "oracle_context",
+                        {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
+                        root=root,
+                    )
         self.assertEqual(result["chunks"], [{"chunk_id": "c1"}])
 
-    def test_no_target_empty_index_still_blocks(self):
+    def test_no_target_raises_unreachable(self):
+        # M3-P12c: with no HTTP target resolving, the dispatch raises
+        # McpError("Oracle server unreachable ..."). The old "local readiness
+        # gate fires" path is gone — there is no in-process engine to gate.
         from oracle.server.aspis_mcp import McpError
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
             self._register(root)
-            # No HTTP target -> in-process path -> local readiness gate fires.
-            with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", side_effect=McpError("Oracle index not ready")):
-                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                    with self.assertRaises(McpError):
-                        handle_tool_call(
-                            "oracle_context",
-                            {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
-                            root=root,
-                        )
+            with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                with self.assertRaises(McpError) as ctx:
+                    handle_tool_call(
+                        "oracle_context",
+                        {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
+                        root=root,
+                    )
+        self.assertIn("Oracle server unreachable", str(ctx.exception))
+        self.assertIn("Aspis Management app", str(ctx.exception))
 
-    def test_http_fails_then_in_process_not_ready_surfaces(self):
+    def test_http_failure_raises_unreachable(self):
+        # M3-P12c: HTTP transport failure used to fall back to the in-process
+        # engine. Now it raises McpError("Oracle server unreachable ...")
+        # pointing the operator at the app — there is no second engine.
         from oracle.server.aspis_mcp import McpError
 
         recorder = _Recorder(None, raise_exc=ConnectionError("refused"))
@@ -956,14 +978,15 @@ class DispatchReadinessTests(unittest.TestCase):
             os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
             os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
             with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", side_effect=McpError("Oracle index not ready")):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
-                        with self.assertRaises(McpError):
-                            handle_tool_call(
-                                "oracle_context",
-                                {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
-                                root=root,
-                            )
+                with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"a.py"}):
+                    with self.assertRaises(McpError) as ctx:
+                        handle_tool_call(
+                            "oracle_context",
+                            {"query": "where", "limit": 4, "agent_id": "thin-agent", "role": "orchestrator"},
+                            root=root,
+                        )
+        self.assertIn("Oracle server unreachable", str(ctx.exception))
+        self.assertIn("Aspis Management app", str(ctx.exception))
 
 
 class NoneScopeGuardTests(unittest.TestCase):
@@ -991,22 +1014,41 @@ class NoneScopeGuardTests(unittest.TestCase):
 
 
 class EmptyScopeShapeParityTests(unittest.TestCase):
-    """FIX 7: HTTP empty-scope ask dict matches in-process empty-scope keys."""
+    """M3-P12c: HTTP empty-scope ask response carries the documented envelope.
 
-    def test_http_empty_scope_ask_keyset_superset(self):
-        from oracle.server.aspis_mcp import mcp_oracle_ask
+    The historical parity test compared the in-process and HTTP empty-scope
+    key sets. The in-process engine is gone; the contract that remains is
+    the HTTP empty-scope envelope (returned by `HttpOracleEngine.ask` when the
+    forwarder passes an empty scope). This test pins its key set so a future
+    change cannot silently drop one of the operator-facing fields.
+    """
 
-        class _EmptyEngine:
-            class sqlite:
-                @staticmethod
-                def all_chunks():
-                    return []
+    EXPECTED_KEYS = {
+        "mode",
+        "query",
+        "summary",
+        "answer",
+        "citations",
+        "not_found",
+        "suggested_path",
+        "results",
+        "answer_source",
+        "fallback_reason",
+        "llm_provider",
+        "llm_model",
+    }
 
-        in_proc = mcp_oracle_ask(_EmptyEngine(), "q", 5, allowed_file_ids=set())
+    def test_http_empty_scope_ask_envelope_is_complete(self):
         engine = HttpOracleEngine("http://127.0.0.1:8765", "tok")
         http_empty = engine.ask("q", 5, allowed_file_ids=set())
-        missing = set(in_proc.keys()) - set(http_empty.keys())
-        self.assertEqual(missing, set(), f"HTTP empty-scope is missing keys: {missing}")
+        self.assertEqual(
+            set(http_empty.keys()),
+            self.EXPECTED_KEYS,
+            f"HTTP empty-scope envelope drifted: missing {self.EXPECTED_KEYS - set(http_empty.keys())}, extra {set(http_empty.keys()) - self.EXPECTED_KEYS}",
+        )
+        # The grounded-empty contract: no docs, no fabricated answer.
+        self.assertEqual(http_empty["results"], [])
+        self.assertIn("No Oracle documents are in scope", http_empty["summary"])
 
 
 class HttpOracleEngineUnitTests(unittest.TestCase):
@@ -1017,6 +1059,260 @@ class HttpOracleEngineUnitTests(unittest.TestCase):
             chunks = engine.context("q", 5, allowed_file_ids=set())
         self.assertEqual(chunks, [])
         self.assertEqual(recorder.calls, [])
+
+
+class FilterForwardingTests(unittest.TestCase):
+    """M3-P12c: bounded filters (kind/language/symbols/imports/module/group_by_file)
+    are forwarded in the POST body only when non-None/non-False.
+
+    expand_ckg is NOT forwarded (removed from the TOOLS schema, deferred to
+    PLAN.md M1 max-recall "CKG expansion" ticket) — it is silently ignored
+    without crashing and without appearing in the body.
+    """
+
+    def setUp(self):
+        self._saved = {
+            key: os.environ.get(key)
+            for key in (
+                "ASPIS_ORACLE_HTTP_BASE",
+                "ASPIS_ORACLE_AUTH_TOKEN",
+                "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS",
+                "ASPIS_MCP_DISABLE_APP_VAULT",
+            )
+        }
+        for key in ("ASPIS_ORACLE_HTTP_BASE", "ASPIS_ORACLE_AUTH_TOKEN"):
+            os.environ.pop(key, None)
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+        os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
+        from oracle.server.aspis_mcp import _reset_oracle_target_cache
+
+        _reset_oracle_target_cache()
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _register(self, root: Path):
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": "thin-agent", "role": "orchestrator", "model": "test", "message": "go"},
+            root=root,
+        )
+
+    def _make_engine(self, recorder):
+        from oracle.server.aspis_mcp import HttpOracleEngine
+
+        return HttpOracleEngine("http://127.0.0.1:8765", "tok")
+
+    def test_context_forwards_kind_symbols(self):
+        recorder = _Recorder({"query": "q", "chunks": [{"chunk_id": "c1"}]})
+        with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
+            engine = HttpOracleEngine("http://127.0.0.1:8765", "tok")
+            engine.context(
+                "q",
+                5,
+                allowed_file_ids={"a.py"},
+                kind="function",
+                symbols=["foo", "bar"],
+            )
+        self.assertEqual(len(recorder.calls), 1)
+        body = recorder.calls[0]["json"]
+        self.assertEqual(body["kind"], "function")
+        self.assertEqual(body["symbols"], ["foo", "bar"])
+        # These must be absent when not given.
+        self.assertNotIn("language", body)
+        self.assertNotIn("imports", body)
+        self.assertNotIn("module", body)
+        # group_by_file is ask-only (engine.context has no such arg).
+        self.assertNotIn("group_by_file", body)
+
+    def test_context_absent_filters_keeps_body_byte_identical(self):
+        # Unfiltered call: body must be byte-identical to the pre-filter
+        # shape (query/limit/allowed_file_ids only).
+        recorder = _Recorder({"query": "q", "chunks": []})
+        with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
+            engine = HttpOracleEngine("http://127.0.0.1:8765", "tok")
+            engine.context("q", 5, allowed_file_ids={"a.py"})
+        body = recorder.calls[0]["json"]
+        self.assertEqual(body, {"query": "q", "limit": 5, "allowed_file_ids": ["a.py"]})
+
+    def test_ask_forwards_group_by_file(self):
+        recorder = _Recorder(
+            {
+                "answer": "x",
+                "citations": [],
+                "not_found": False,
+                "results": [],
+                "mode": "oracle-http-bounded",
+                "summary": "x",
+                "suggested_path": None,
+                "answer_source": None,
+                "fallback_reason": None,
+                "llm_provider": None,
+                "llm_model": None,
+            }
+        )
+        with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
+            engine = HttpOracleEngine("http://127.0.0.1:8765", "tok")
+            engine.ask("q", 5, allowed_file_ids={"a.py"}, group_by_file=True)
+        body = recorder.calls[0]["json"]
+        self.assertIs(body.get("group_by_file"), True)
+        self.assertNotIn("kind", body)
+        self.assertNotIn("symbols", body)
+
+    def test_expand_ckg_in_args_is_ignored(self):
+        # expand_ckg is NOT ported to the Rust engine; it must not appear in
+        # the body and must not crash the dispatch. We verify via _parse_filter_args
+        # (the actual choke point) rather than a direct engine call.
+        from oracle.server.aspis_mcp import _parse_filter_args
+
+        filters = _parse_filter_args({
+            "kind": "function",
+            "expand_ckg": True,  # must be silently dropped
+        })
+        self.assertEqual(filters, {"kind": "function"})
+        self.assertNotIn("expand_ckg", filters)
+
+    def test_parse_filter_args_ignores_expand_ckg(self):
+        from oracle.server.aspis_mcp import _parse_filter_args
+
+        filters = _parse_filter_args(
+            {
+                "kind": "function",
+                "language": "rust",
+                "symbols": ["foo"],
+                "imports": ["bar"],
+                "module": "backend",
+                "group_by_file": True,
+                "expand_ckg": True,  # must be silently dropped
+            }
+        )
+        self.assertEqual(filters, {
+            "kind": "function",
+            "language": "rust",
+            "symbols": ["foo"],
+            "imports": ["bar"],
+            "module": "backend",
+            "group_by_file": True,
+        })
+
+    def test_parse_filter_args_empty_strings_stay_none(self):
+        from oracle.server.aspis_mcp import _parse_filter_args
+
+        filters = _parse_filter_args({
+            "kind": "",
+            "language": "   ",
+            "symbols": [],
+            "imports": ["", "  ", "valid"],
+            "module": "",
+            "group_by_file": False,
+        })
+        # kind/language/module empty -> absent; symbols empty list -> absent;
+        # imports: only non-empty entries kept -> ["valid"].
+        self.assertNotIn("kind", filters)
+        self.assertNotIn("language", filters)
+        self.assertNotIn("symbols", filters)
+        self.assertEqual(filters.get("imports"), ["valid"])
+        self.assertNotIn("module", filters)
+        self.assertNotIn("group_by_file", filters)
+
+    def test_dispatch_context_forwards_filters(self):
+        # Full dispatch path: tool args -> _parse_filter_args -> engine body.
+        recorder = _Recorder({"query": "q", "chunks": [{"chunk_id": "c1"}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare_management_root(root)
+            self._register(root)
+            os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
+            os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
+            with patch(
+                "oracle.server.aspis_mcp.import_httpx",
+                return_value=SimpleNamespace(Client=recorder.client),
+            ):
+                with patch(
+                    "oracle.server.aspis_mcp.oracle_allowed_file_ids",
+                    return_value={"a.py"},
+                ):
+                    handle_tool_call(
+                        "oracle_context",
+                        {
+                            "query": "q",
+                            "limit": 5,
+                            "agent_id": "thin-agent",
+                            "role": "orchestrator",
+                            "kind": "struct",
+                            "symbols": ["Widget"],
+                            "imports": ["std::vec"],
+                        },
+                        root=root,
+                    )
+        self.assertEqual(len(recorder.calls), 1)
+        body = recorder.calls[0]["json"]
+        self.assertEqual(body["kind"], "struct")
+        self.assertEqual(body["symbols"], ["Widget"])
+        self.assertEqual(body["imports"], ["std::vec"])
+        # group_by_file is ask-only; expand_ckg is dropped.
+        self.assertNotIn("group_by_file", body)
+        self.assertNotIn("expand_ckg", body)
+
+    def test_dispatch_ask_forwards_filters(self):
+        recorder = _Recorder(
+            {
+                "answer": "x",
+                "citations": [],
+                "not_found": False,
+                "results": [],
+                "mode": "oracle-http-bounded",
+                "summary": "x",
+                "suggested_path": None,
+                "answer_source": None,
+                "fallback_reason": None,
+                "llm_provider": None,
+                "llm_model": None,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare_management_root(root)
+            self._register(root)
+            os.environ["ASPIS_ORACLE_HTTP_BASE"] = "http://127.0.0.1:8765"
+            os.environ["ASPIS_ORACLE_AUTH_TOKEN"] = "env-token"
+            with patch(
+                "oracle.server.aspis_mcp.import_httpx",
+                return_value=SimpleNamespace(Client=recorder.client),
+            ):
+                with patch(
+                    "oracle.server.aspis_mcp.oracle_allowed_file_ids",
+                    return_value={"a.py"},
+                ):
+                    handle_tool_call(
+                        "oracle_ask",
+                        {
+                            "query": "q",
+                            "limit": 3,
+                            "agent_id": "thin-agent",
+                            "role": "orchestrator",
+                            "kind": "class",
+                            "language": "rust",
+                            "symbols": ["Foo"],
+                            "imports": ["std::vec"],
+                            "module": "backend",
+                            "group_by_file": True,
+                        },
+                        root=root,
+                    )
+        self.assertEqual(len(recorder.calls), 1)
+        body = recorder.calls[0]["json"]
+        self.assertEqual(body["kind"], "class")
+        self.assertEqual(body["language"], "rust")
+        self.assertEqual(body["symbols"], ["Foo"])
+        self.assertEqual(body["imports"], ["std::vec"])
+        self.assertEqual(body["module"], "backend")
+        self.assertIs(body.get("group_by_file"), True)
+        self.assertNotIn("expand_ckg", body)
 
 
 if __name__ == "__main__":

@@ -1306,6 +1306,18 @@ class OraclePhase2Test(unittest.TestCase):
             self.assertIsNone(answer["suggested_path"])
 
     def test_mcp_oracle_ask_returns_generated_answer_fields(self):
+        # M3-P12c: this test exercises `oracle.server.mcp_handler.handle_tool_call`
+        # (the architecture-oracle MCP, a separate surface from the project-
+        # management MCP at `oracle.server.aspis_mcp`). The test name still
+        # references the now-deleted `mcp_oracle_ask` in-process helper, but
+        # the call routes through the architecture-oracle's in-process
+        # engine, which is OUT of scope for M3-P12c and still works. The
+        # MCP-side `mcp_oracle_ask` body that previously fed this test
+        # (`oracle/server/aspis_mcp.py:mcp_oracle_ask`) is gone; the
+        # answer_envelope contract is now produced by the resident HTTP
+        # server on the `oracle_ask` MCP path. The test stays alive so
+        # the architecture-oracle's answer-shaping is not silently broken
+        # by an unrelated change.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sqlite_path = root / "metadata.sqlite"

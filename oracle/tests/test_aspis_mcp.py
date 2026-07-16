@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from oracle.server.aspis_mcp import (
@@ -62,7 +63,6 @@ from oracle.server.aspis_mcp import (
     MINI_CODER_MAX_STEER_LEN,
     MINI_CODER_MAX_STEER_QUEUE,
     dispose_censor_finding,
-    ensure_oracle_index_ready,
     handle_tool_call,
     read_censor_open_findings,
     validate_censor_rel_path,
@@ -84,6 +84,53 @@ from oracle.server.aspis_mcp import (
     MAX_PLAN_TASKS,
 )
 from oracle.store.sqlite_store import SQLiteStore
+
+
+class _Recorder:
+    """HTTP recorder: captures every POST body so a test can assert scope/auth/url.
+
+    Mirrors the helper in test_thin_client.py (kept duplicated here so the two
+    test files don't have a hidden import dependency). With `raise_exc` set, the
+    fake `Client.post` raises that exception instead of returning a response
+    — exercises the dispatch's HTTP-failure branch (M3-P12c: surfaces McpError).
+    """
+
+    def __init__(self, response_json, raise_exc=None, status_code=200):
+        self.response_json = response_json
+        self.raise_exc = raise_exc
+        self.status_code = status_code
+        self.calls = []
+
+    def client(self, *args, **kwargs):
+        recorder = self
+
+        class _Client:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+            def post(self_inner, url, headers=None, json=None):
+                recorder.calls.append({"url": url, "headers": headers, "json": json})
+                if recorder.raise_exc is not None:
+                    raise recorder.raise_exc
+
+                class _Resp:
+                    status_code = recorder.status_code
+                    content = b"x"
+                    request = SimpleNamespace(url=url)
+
+                    def raise_for_status(self_resp):
+                        if recorder.status_code >= 400:
+                            raise RuntimeError(f"HTTP {recorder.status_code}")
+
+                    def json(self_resp):
+                        return recorder.response_json
+
+                return _Resp()
+
+        return _Client()
 
 
 def prepare_management_root(root: Path) -> Path:
@@ -158,70 +205,77 @@ class AspisMcpProjectTests(unittest.TestCase):
         else:
             os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = self._old_disable_app_vault
 
-    def test_oracle_index_readiness_allows_stale_incremental_files(self):
+    def test_oracle_ask_uses_http_path_with_locally_computed_scope(self):
+        # M3-P12c: there is no in-process engine anymore. The dispatch is
+        # HTTP-only — the LLM runs on the resident server, so app-vault
+        # LLM config is read there, NOT here. The MCP side only computes the
+        # scope (`oracle_allowed_file_ids`) and forwards it; the resident
+        # server widens/narrows nothing. We assert the HTTP contract here.
+
+        recorder = _Recorder(
+            {
+                "mode": "oracle-http-bounded",
+                "query": "how do agents use oracle",
+                "answer": "from-http",
+                "citations": [],
+                "not_found": False,
+                "suggested_path": None,
+                "results": [],
+                "answer_source": "http",
+                "fallback_reason": None,
+                "llm_provider": "scaleway",
+                "llm_model": "voxtral-small-24b-2507",
+            }
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            projects_dir = root / "projects"
-            projects_dir.mkdir()
-            source = root / "live.py"
-            source.write_text("print('new')\n", encoding="utf-8")
-            with patch.dict(os.environ, {"ASPIS_MANAGEMENT_ROOT": ""}, clear=False):
-                paths = mcp_oracle_paths(projects_dir)
-                manifest = {
-                    "version": 2,
-                    "roots": {
-                        str(root.resolve()): {
-                            "files": {
-                                "live.py": {
-                                    "size": 1,
-                                    "mtime_ns": 1,
-                                    "chunks": 1,
-                                    "chunk_profile": "old",
-                                }
-                            }
-                        }
-                    },
-                }
-                (paths["root"] / "oracle-data").mkdir(parents=True, exist_ok=True)
-                (
-                    paths["root"] / "oracle-data" / "chunk-index-manifest.json"
-                ).write_text(
-                    json.dumps(manifest),
-                    encoding="utf-8",
-                )
-                SQLiteStore(paths["sqlite"]).replace_chunks_for_files(
-                    ["live.py"],
-                    [
-                        {
-                            "id": "live.py#chunk-0000",
-                            "file_id": "live.py",
-                            "chunk_index": 0,
-                            "start_char": 0,
-                            "end_char": 13,
-                            "text": "print('old')",
-                            "file_sorgente": "live.py",
-                            "ultima_modifica": "2026-05-29T00:00:00Z",
-                            "embedding_dims": 1024,
-                        }
-                    ],
-                )
-
-                status = ensure_oracle_index_ready(projects_dir, {})
-
-            self.assertEqual(status["indexed_files"], 1)
-            self.assertEqual(status["stale_files"], 1)
-            self.assertEqual(status["pending_files"], 0)
-
-    def test_oracle_index_readiness_rejects_empty_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects_dir = root / "projects"
-            projects_dir.mkdir()
-            (root / "live.py").write_text("print('new')\n", encoding="utf-8")
-
-            with patch.dict(os.environ, {"ASPIS_MANAGEMENT_ROOT": ""}, clear=False):
-                with self.assertRaises(McpError):
-                    ensure_oracle_index_ready(projects_dir, {})
+            prepare_management_root(root)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "oracle-agent",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "asking",
+                },
+                root=root,
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ASPIS_ORACLE_HTTP_BASE": "http://127.0.0.1:8765",
+                    "ASPIS_ORACLE_AUTH_TOKEN": "env-token",
+                },
+            ):
+                with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
+                    with patch(
+                        "oracle.server.aspis_mcp.oracle_allowed_file_ids",
+                        return_value={"oracle/server/aspis_mcp.py"},
+                    ):
+                        result = handle_tool_call(
+                            "oracle_ask",
+                            {
+                                "query": "how do agents use oracle",
+                                "limit": 3,
+                                "agent_id": "oracle-agent",
+                                "role": "orchestrator",
+                            },
+                            root=root,
+                        )
+        # HTTP path: the locally-computed scope is forwarded verbatim; the
+        # server returns the answer envelope (LLM is server-side now).
+        self.assertEqual(result["answer"], "from-http")
+        self.assertEqual(result["llm_provider"], "scaleway")
+        self.assertEqual(result["llm_model"], "voxtral-small-24b-2507")
+        # The HTTP path returned the placeholder index_status, so the
+        # tool-side response carries `source: resident-server` and None root.
+        self.assertEqual(result["index_status"]["indexedFiles"], None)
+        # The local scope was forwarded: the recorder saw the same set.
+        self.assertEqual(len(recorder.calls), 1)
+        call = recorder.calls[0]
+        self.assertTrue(call["url"].endswith("/ask-bounded"))
+        self.assertEqual(call["json"]["allowed_file_ids"], ["oracle/server/aspis_mcp.py"])
 
     def test_project_oracle_scope_includes_management_mcp_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3118,88 +3172,6 @@ root_path: "{escaped_work_root}"
 
             self.assertTrue((projects / ".aspis-agents.json").exists())
 
-    def test_oracle_ask_uses_app_vault_llm_settings_for_agents(self):
-        settings = {
-            "provider": "scaleway",
-            "model": "voxtral-small-24b-2507",
-            "baseUrl": "https://api.scaleway.ai/v1/chat/completions",
-            "remoteEnabled": True,
-        }
-
-        class FakeEngine:
-            def ask(self, query, limit=5, llm_config=None, allowed_file_ids=None):
-                return {
-                    "query": query,
-                    "limit": limit,
-                    "llm_config": llm_config,
-                    "allowed_file_ids": sorted(allowed_file_ids or []),
-                }
-
-        def fake_secret(account: str):
-            if account == "oracle:llm_settings":
-                import json
-
-                return json.dumps(settings)
-            if account == "provider:infomaniak":
-                return "infomaniak-test-token"
-            if account == "provider:scaleway_ai":
-                return "scaleway-test-token"
-            return None
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            prepare_management_root(root)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "oracle-agent",
-                    "role": "orchestrator",
-                    "model": "test",
-                    "message": "asking",
-                },
-                root=root,
-            )
-            with patch(
-                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
-            ):
-                with patch(
-                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
-                    return_value={
-                        "root": str(root),
-                        "indexed_files": 1,
-                        "pending_files": 0,
-                        "stale_files": 0,
-                    },
-                ):
-                    with patch(
-                        "oracle.server.aspis_mcp.oracle_allowed_file_ids",
-                        return_value={"oracle/server/aspis_mcp.py"},
-                    ):
-                        with patch(
-                            "oracle.server.aspis_mcp.app_vault_account_secret",
-                            side_effect=fake_secret,
-                        ):
-                            with patch.dict("os.environ", {"ASPIS_MCP_DENSE_ASK": "1"}):
-                                result = handle_tool_call(
-                                    "oracle_ask",
-                                    {
-                                        "query": "how do agents use oracle",
-                                        "limit": 3,
-                                        "agent_id": "oracle-agent",
-                                        "role": "orchestrator",
-                                    },
-                                    root=root,
-                                )
-
-        llm_config = result["llm_config"]
-        self.assertEqual(llm_config["provider"], "scaleway")
-        self.assertEqual(llm_config["model"], "voxtral-small-24b-2507")
-        self.assertEqual(llm_config["api_key"], "scaleway-test-token")
-        # The LLM-to-LLM fallback was removed: no fallback_* keys in the config.
-        self.assertNotIn("fallback_provider", llm_config)
-        self.assertNotIn("fallback_api_key", llm_config)
-        self.assertEqual(result["allowed_file_ids"], ["oracle/server/aspis_mcp.py"])
-
     def test_oracle_paths_are_rooted_at_management_root(self):
         # Resolve the literal so the expectation matches mcp_oracle_paths()'s
         # resolved output on every OS: on Windows "C:/tmp/..." is already
@@ -3214,63 +3186,44 @@ root_path: "{escaped_work_root}"
         self.assertEqual(paths["chunks"], root / "oracle-data" / "chunks.lancedb")
 
     def test_oracle_index_status_root_is_basename_not_absolute_path(self):
-        # PRIVACY (FIX 1b): the readiness status fed back to agents must never
-        # carry an absolute filesystem path (which leaks the OS username and
-        # machine layout). Only a basename (or None) is allowed.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects_dir = prepare_management_root(root)
-            (root / "live.py").write_text("print('x')\n", encoding="utf-8")
-            manifest = {
-                "version": 2,
-                "roots": {
-                    str(root.resolve()): {
-                        "files": {
-                            "live.py": {},
-                            "oracle/server/aspis_mcp.py": {},
-                        }
-                    }
-                },
-            }
-            (root / "oracle-data").mkdir(parents=True, exist_ok=True)
-            (root / "oracle-data" / "chunk-index-manifest.json").write_text(
-                json.dumps(manifest), encoding="utf-8"
-            )
-            paths = mcp_oracle_paths(projects_dir)
-            SQLiteStore(paths["sqlite"]).replace_chunks_for_files(
-                ["live.py"],
-                [
-                    {
-                        "id": "live.py#chunk-0000",
-                        "file_id": "live.py",
-                        "chunk_index": 0,
-                        "start_char": 0,
-                        "end_char": 5,
-                        "text": "print",
-                        "file_sorgente": "live.py",
-                        "ultima_modifica": "2026-05-29T00:00:00Z",
-                        "embedding_dims": 1024,
-                    }
-                ],
-            )
+        # M3-P12c: the local readiness gate is gone — readiness is owned by
+        # the resident HTTP server. The privacy contract that survives is
+        # that the `index_status` forwarded to an agent never carries an
+        # absolute filesystem path (which would leak the OS username +
+        # machine layout). The HTTP placeholder (`source: resident-server`,
+        # `root: None`) is the only `index_status` the dispatch ever emits
+        # on the success path; we pin its shape here.
+        from oracle.server.aspis_mcp import _http_readiness_placeholder
 
-            status = ensure_oracle_index_ready(projects_dir, {})
-
-            blob = json.dumps(status)
-            self.assertNotIn("C:\\", blob)
-            self.assertNotIn("/Users/", blob)
-            self.assertNotIn("/home/", blob)
-            self.assertNotIn(str(root), blob)
-            self.assertEqual(status["root"], root.name)
+        status = _http_readiness_placeholder()
+        blob = json.dumps(status)
+        self.assertNotIn("C:\\", blob)
+        self.assertNotIn("/Users/", blob)
+        self.assertNotIn("/home/", blob)
+        # The root is None — privacy contract: never an absolute path.
+        self.assertIsNone(status["root"])
+        self.assertEqual(status["source"], "resident-server")
 
     def test_oracle_ask_response_carries_no_absolute_path(self):
-        # PRIVACY (FIX 1b): the oracle_ask MCP tool result returned to an agent
-        # must not contain any absolute path substring even though the local
-        # index_status is computed from an absolute root.
-        class FakeEngine:
-            def ask(self, query, limit=5, llm_config=None, allowed_file_ids=None):
-                return {"query": query, "answer": "ok", "chunks": []}
-
+        # M3-P12c PRIVACY (FIX 1b): the oracle_ask MCP tool result returned
+        # to an agent must not contain any absolute path substring. The
+        # dispatch is HTTP-only now; the resident server returns the answer
+        # envelope and the MCP side stamps the `_http_readiness_placeholder`
+        # onto the result. We mock `import_httpx` to feed a deterministic
+        # response and assert the serialized result is path-free.
+        recorder = _Recorder(
+            {
+                "answer": "ok",
+                "citations": [],
+                "not_found": False,
+                "suggested_path": None,
+                "results": [],
+                "answer_source": "http",
+                "fallback_reason": None,
+                "llm_provider": "scaleway",
+                "llm_model": "voxtral-small-24b-2507",
+            }
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
@@ -3284,46 +3237,42 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            status = {
-                "root": str(root),
-                "indexed_files": 1,
-                "pending_files": 0,
-                "stale_files": 0,
-            }
-            with patch(
-                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
+            with patch.dict(
+                os.environ,
+                {
+                    "ASPIS_ORACLE_HTTP_BASE": "http://127.0.0.1:8765",
+                    "ASPIS_ORACLE_AUTH_TOKEN": "env-token",
+                },
             ):
-                with patch(
-                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
-                    return_value=status,
-                ):
+                with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
                     with patch(
                         "oracle.server.aspis_mcp.oracle_allowed_file_ids",
                         return_value={"oracle/server/aspis_mcp.py"},
                     ):
-                        with patch.dict("os.environ", {"ASPIS_MCP_DENSE_ASK": "1"}):
-                            result = handle_tool_call(
-                                "oracle_ask",
-                                {
-                                    "query": "how do agents use oracle",
-                                    "limit": 3,
-                                    "agent_id": "oracle-agent",
-                                    "role": "orchestrator",
-                                },
-                                root=root,
-                            )
-
+                        result = handle_tool_call(
+                            "oracle_ask",
+                        {
+                            "query": "how do agents use oracle",
+                            "limit": 3,
+                            "agent_id": "oracle-agent",
+                            "role": "orchestrator",
+                        },
+                        root=root,
+                    )
         blob = json.dumps(result)
         self.assertNotIn("C:\\", blob)
         self.assertNotIn("/Users/", blob)
         self.assertNotIn("/home/", blob)
         self.assertNotIn(str(root), blob)
+        # The HTTP-path index_status is path-free (root: None).
+        self.assertIsNone(result["index_status"]["indexedFiles"])
 
     def test_oracle_context_response_carries_no_absolute_path(self):
-        class FakeEngine:
-            def context(self, query, limit=8, allowed_file_ids=None):
-                return []
-
+        # M3-P12c PRIVACY: same as test_oracle_ask_response_carries_no_absolute_path
+        # but for the /context path. The MCP response must never embed an
+        # absolute path; the resident server returns the chunks, the MCP
+        # stamps the HTTP-placeholder index_status (root: None).
+        recorder = _Recorder({"query": "q", "chunks": [{"chunk_id": "c1"}]})
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
@@ -3337,40 +3286,34 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            status = {
-                "root": str(root),
-                "indexed_files": 1,
-                "pending_files": 0,
-                "stale_files": 0,
-            }
-            with patch(
-                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
+            with patch.dict(
+                os.environ,
+                {
+                    "ASPIS_ORACLE_HTTP_BASE": "http://127.0.0.1:8765",
+                    "ASPIS_ORACLE_AUTH_TOKEN": "env-token",
+                },
             ):
-                with patch(
-                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
-                    return_value=status,
-                ):
+                with patch("oracle.server.aspis_mcp.import_httpx", return_value=SimpleNamespace(Client=recorder.client)):
                     with patch(
                         "oracle.server.aspis_mcp.oracle_allowed_file_ids",
                         return_value={"oracle/server/aspis_mcp.py"},
                     ):
-                        with patch.dict("os.environ", {"ASPIS_MCP_DENSE_CONTEXT": "1"}):
-                            result = handle_tool_call(
-                                "oracle_context",
-                                {
-                                    "query": "how do agents use oracle",
-                                    "limit": 3,
-                                    "agent_id": "oracle-agent",
-                                    "role": "orchestrator",
-                                },
-                                root=root,
-                            )
-
+                        result = handle_tool_call(
+                            "oracle_context",
+                        {
+                            "query": "how do agents use oracle",
+                            "limit": 3,
+                            "agent_id": "oracle-agent",
+                            "role": "orchestrator",
+                        },
+                        root=root,
+                    )
         blob = json.dumps(result)
         self.assertNotIn("C:\\", blob)
         self.assertNotIn("/Users/", blob)
         self.assertNotIn("/home/", blob)
         self.assertNotIn(str(root), blob)
+        self.assertIsNone(result["indexStatus"]["indexedFiles"])
 
     def test_validate_project_work_root_errors_are_path_free(self):
         # PRIVACY (FIX 1a): the McpError raised for a too-broad / unsafe work

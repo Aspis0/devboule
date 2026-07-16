@@ -40,7 +40,12 @@ use crate::store::sqlite::SqliteStore;
 
 const MAX_BOUNDED_LIMIT: usize = 100;
 const MAX_BOUNDED_ALLOWED_IDS: usize = 10_000;
-const MAX_EMBED_TEXTS: usize = 64;
+const MAX_BOUNDED_EMBED_TEXTS: usize = 64;
+// M3-P12c: cap on bounded filter lists (symbols/imports). Kept small since
+// the Rust engine applies these as per-chunk membership checks; a huge list
+// is almost certainly a client bug, so surface it as a 400 rather than
+// silently truncating.
+const MAX_BOUNDED_FILTER_ENTRIES: usize = 64;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AppState
@@ -244,6 +249,20 @@ struct BoundedPayload {
     limit: Option<i64>,
     #[serde(default)]
     allowed_file_ids: Option<Vec<String>>,
+    // M3-P12c: bounded filters forwarded to the engine. serde default None
+    // keeps old clients working; absent filters are silently ignored.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    symbols: Option<Vec<String>>,
+    #[serde(default)]
+    imports: Option<Vec<String>>,
+    #[serde(default)]
+    module: Option<String>,
+    #[serde(default)]
+    group_by_file: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -654,7 +673,7 @@ async fn context_get_handler(
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let limit = limit.clamp(1, MAX_BOUNDED_LIMIT);
-    run_context(&state, &q, limit, None, false).await
+    run_context(&state, &q, limit, None, false, None, None, None, None, None).await
 }
 
 async fn context_post_handler(
@@ -670,7 +689,7 @@ async fn context_post_handler(
         .max(1)
         .min(MAX_BOUNDED_LIMIT as i64) as usize;
     let prefer_lexical = state.job_manager.indexing_in_progress();
-    run_context(&state, &q, limit, None, prefer_lexical).await
+    run_context(&state, &q, limit, None, prefer_lexical, None, None, None, None, None).await
 }
 
 async fn run_context(
@@ -679,6 +698,11 @@ async fn run_context(
     limit: usize,
     allowed: Option<HashSet<String>>,
     prefer_lexical: bool,
+    kind: Option<&str>,
+    language: Option<&str>,
+    symbols: Option<&[String]>,
+    imports: Option<&[String]>,
+    module: Option<&str>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let engine = state.engine().map_err(internal_error)?;
     let pool = Arc::clone(&state.embedder_pool);
@@ -695,11 +719,11 @@ async fn run_context(
                 &embedder,
                 allowed.as_ref(),
                 prefer_lexical,
-                None,
-                None,
-                None,
-                None,
-                None,
+                kind,
+                language,
+                symbols,
+                imports,
+                module,
             )
             .await
     }
@@ -726,9 +750,21 @@ async fn context_bounded_handler(
     Json(payload): Json<BoundedPayload>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_auth(&headers, &state).map_err(auth_error)?;
-    let (q, limit, allowed) = parse_bounded_payload(payload, 8)?;
+    let (q, limit, allowed, filters) = parse_bounded_payload(payload, 8)?;
     let prefer_lexical = state.job_manager.indexing_in_progress();
-    run_context(&state, &q, limit, Some(allowed), prefer_lexical).await
+    run_context(
+        &state,
+        &q,
+        limit,
+        Some(allowed),
+        prefer_lexical,
+        filters.kind.as_deref(),
+        filters.language.as_deref(),
+        filters.symbols.as_deref(),
+        filters.imports.as_deref(),
+        filters.module.as_deref(),
+    )
+    .await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -741,7 +777,7 @@ async fn ask_bounded_handler(
     Json(payload): Json<BoundedPayload>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_auth(&headers, &state).map_err(auth_error)?;
-    let (q, limit, allowed) = parse_bounded_payload(payload, 5)?;
+    let (q, limit, allowed, filters) = parse_bounded_payload(payload, 5)?;
     let prefer_lexical = state.job_manager.indexing_in_progress();
 
     let engine = state.engine().map_err(internal_error)?;
@@ -761,12 +797,12 @@ async fn ask_bounded_handler(
                 Some(&answerer),
                 Some(&allowed),
                 prefer_lexical,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
+                filters.kind.as_deref(),
+                filters.language.as_deref(),
+                filters.symbols.as_deref(),
+                filters.imports.as_deref(),
+                filters.module.as_deref(),
+                filters.group_by_file,
             )
             .await
     }
@@ -807,7 +843,7 @@ async fn embed_bounded_handler(
         )
             .into_response());
     }
-    if texts.len() > MAX_EMBED_TEXTS {
+    if texts.len() > MAX_BOUNDED_EMBED_TEXTS {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"detail": "too many texts (max 64)"})),
@@ -1335,12 +1371,18 @@ async fn index_watch_stop_handler(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Bounded payload parser — port of parse_bounded_payload
+// M3-P12c: also parses the bounded filters (kind/language/symbols/imports/
+// module/group_by_file) and forwards them to the engine. Empty strings in
+// symbols/imports are trimmed to None (mirrors allowed_file_ids trimming).
+// symbols/imports exceeding MAX_BOUNDED_FILTER_ENTRIES return a 400 so a
+// client misconfiguration surfaces cleanly rather than silently truncating.
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn parse_bounded_payload(
     payload: BoundedPayload,
     default_limit: usize,
-) -> Result<(String, usize, HashSet<String>), Response> {
+) -> Result<(String, usize, HashSet<String>, FilterOptions), Response> {
+    use FilterOptions;
     let q = payload.query.or(payload.q).unwrap_or_default();
 
     let limit = match payload.limit {
@@ -1375,7 +1417,72 @@ fn parse_bounded_payload(
         }
     };
 
-    Ok((q, limit, allowed))
+    let filters = FilterOptions {
+        kind: payload.kind.filter(|s| !s.trim().is_empty()),
+        language: payload.language.filter(|s| !s.trim().is_empty()),
+        module: payload.module.filter(|s| !s.trim().is_empty()),
+        symbols: match payload.symbols {
+            None => None,
+            Some(raw) => {
+                if raw.len() > MAX_BOUNDED_FILTER_ENTRIES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"detail": format!(
+                            "symbols exceeds the maximum of {} entries.",
+                            MAX_BOUNDED_FILTER_ENTRIES
+                        )})),
+                    )
+                        .into_response());
+                }
+                let filtered: Vec<String> = raw
+                    .into_iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(filtered)
+                }
+            }
+        },
+        imports: match payload.imports {
+            None => None,
+            Some(raw) => {
+                if raw.len() > MAX_BOUNDED_FILTER_ENTRIES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"detail": format!(
+                            "imports exceeds the maximum of {} entries.",
+                            MAX_BOUNDED_FILTER_ENTRIES
+                        )})),
+                    )
+                        .into_response());
+                }
+                let filtered: Vec<String> = raw
+                    .into_iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(filtered)
+                }
+            }
+        },
+        group_by_file: payload.group_by_file.unwrap_or(false),
+    };
+
+    Ok((q, limit, allowed, filters))
+}
+
+#[derive(Debug, Default)]
+struct FilterOptions {
+    kind: Option<String>,
+    language: Option<String>,
+    symbols: Option<Vec<String>>,
+    imports: Option<Vec<String>>,
+    module: Option<String>,
+    group_by_file: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
