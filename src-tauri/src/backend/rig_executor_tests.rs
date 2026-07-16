@@ -525,3 +525,391 @@ fn test_cloud_directive_fails_loud_through_executor_plan() {
         outcome.error
     );
 }
+
+// ── B5: agentic full chain vs mock LLM ────────────────────────────────
+
+/// End-to-end agentic loop against a one-thread in-process mock OpenAI server.
+///
+/// The mock queues two scripted responses:
+///   POST 1 → tool_calls: one `edit_file` call replacing the planted `a + b + 1` bug
+///            line in `src/lib.rs` with `a + b` (arguments per the tool spec: path,
+///            oldString, newString — camelCase keys).
+///   POST 2 → plain content: "Fixed the off-by-one; done."
+///
+/// Each request body is recorded (Mutex<Vec<String>>) for assertions: exactly 2 POSTs,
+/// POST 2 must carry the `role:"tool"` message whose content reflects the edit success.
+///
+/// run_agentic_coder signature (agentic_runner.rs:147):
+///   fn run_agentic_coder(
+///       base_url: String, model: String, params: SamplingParams,
+///       enable_thinking: bool, system: &str, task: &str, root: PathBuf,
+///       write_allowlist: Vec<String>,
+///       net: crate::backend::sandbox::NetPolicy,
+///       working_set: Vec<PathBuf>,
+///       max_rounds: u32,
+///       cancel: &std::sync::atomic::AtomicBool,
+///   ) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String>
+///
+/// NetPolicy (sandbox/mod.rs:12): None / Loopback / Enabled.
+///   `Loopback` is the variant used by the one-shot mini calling a local oMLX server
+///   on 127.0.0.1 (sandbox/seatbelt.rs:94).
+/// SamplingParams (agentic_transport.rs:28): tuned() gives temp=0.6, top_p=0.95,
+///   top_k=20, thinking_budget=2000, max_tokens=detected_max_tokens().
+/// LoopOutcome variants (agentic_loop.rs:53): Done { output, rounds } | Aborted { reason, rounds }.
+/// HttpAgentLlm::next_turn POSTs to `{base_url}/chat/completions` (agentic_transport.rs:212).
+/// build_chat_request / parse_llm_turn (agentic_transport.rs:73/112) — assistant turns
+///   with tool calls carry `content: null` + `tool_calls` array; tool results carry
+///   `role:"tool"` + `tool_call_id`.
+/// run_agent_loop (agentic_loop.rs:79): a tool error is fed back as `ERROR: {e}` and
+///   the loop CONTINUES (tool_error_is_fed_back_not_fatal test in agentic_loop.rs).
+/// coordinator().try_acquire_decode (oracle_coordinator.rs:48) is test-safe:
+///   OnceLock-backed, cap=2 (DEFAULT_MAX_CONCURRENT_DECODES), no Tauri state.
+///
+/// Mock hardening (review round): the server reads each request by accumulating
+/// until the header terminator, then draining EXACTLY Content-Length body bytes
+/// (never the "short read = done" heuristic — not TCP semantics), logs the FULL
+/// body only, serves up to 6 connections, and answers HTTP 500 "mock exhausted"
+/// once the scripted queue is empty so an unexpected extra turn FAILS FAST
+/// instead of hanging the 600s reqwest timeout.
+fn spawn_mock_openai(
+    scripted: Vec<serde_json::Value>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port();
+    // The transport appends /chat/completions (agentic_transport.rs:212).
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let requests_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = requests_log.clone();
+    let mut queue: VecDeque<serde_json::Value> = scripted.into();
+
+    std::thread::spawn(move || {
+        // Serve strictly more connections than any sane test needs (max_rounds=4
+        // → at most 5 POSTs) so a runaway loop meets a fast 500, never a hang.
+        for _ in 0..6 {
+            let mut conn = match listener.accept() {
+                Ok((c, _)) => c,
+                Err(_) => break,
+            };
+            // Accumulate until the end of headers, then drain exactly
+            // Content-Length body bytes.
+            let mut acc: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            let headers_end = loop {
+                match conn.read(&mut buf) {
+                    Ok(0) => break None,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(pos + 4);
+                        }
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(headers_end) = headers_end else { continue };
+            let headers = String::from_utf8_lossy(&acc[..headers_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while acc.len() < headers_end + content_length {
+                match conn.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            // Log the COMPLETE body (pure JSON) — never a headers-only snapshot.
+            let body = String::from_utf8_lossy(&acc[headers_end..]).to_string();
+            log_clone.lock().unwrap().push(body);
+
+            let response = match queue.pop_front() {
+                Some(v) => {
+                    let payload = v.to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                }
+                None => {
+                    let payload = "mock exhausted";
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                }
+            };
+            let _ = conn.write_all(response.as_bytes());
+            let _ = conn.flush();
+        }
+    });
+
+    (base_url, requests_log)
+}
+
+/// Extract the content of the LAST `role:"tool"` message from a logged POST body.
+/// Parsing the JSON (instead of substring-matching the whole body) keeps the
+/// assertions honest: the system prompt rides along in EVERY request, so words
+/// like "scope" match vacuously on the raw body (review finding).
+fn last_tool_message(post_body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(post_body).ok()?;
+    v.get("messages")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(|s| s.to_string())
+}
+
+#[test]
+#[ignore = "rig: agentic worker against an in-test mock OpenAI server; cargo test rig_tests -- --ignored"]
+fn test_agentic_full_chain_vs_mock_llm() {
+    use crate::backend::agentic_loop::LoopOutcome;
+    use crate::backend::agentic_transport::SamplingParams;
+    use crate::backend::sandbox::NetPolicy;
+
+    // ── Mock server ──────────────────────────────────────────────────────
+    // POST 1: one edit_file call on src/lib.rs replacing "    a + b + 1" with "    a + b".
+    // NOTE: `arguments` MUST be a JSON string (OpenAI spec; parse_llm_turn reads .as_str()).
+    let edit_args: String = serde_json::to_string(&serde_json::json!({
+        "path": "src/lib.rs",
+        "oldString": "    a + b + 1",
+        "newString": "    a + b"
+    }))
+    .unwrap();
+    let (base_url, requests_log) = spawn_mock_openai(vec![
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "edit_file", "arguments": edit_args }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        // POST 2: plain content (done).
+        serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "Fixed the off-by-one; done." },
+                "finish_reason": "stop"
+            }]
+        }),
+    ]);
+
+    // ── Temp project with planted bug ────────────────────────────────────
+    let project = temp_project("b5-agentic");
+    let src = project.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        &src.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 1\n}\n",
+    )
+    .unwrap();
+
+    // ── Call run_agentic_coder ───────────────────────────────────────────
+    let outcome = crate::backend::agentic_runner::run_agentic_coder(
+        base_url,
+        "rig-model".to_string(),
+        SamplingParams::tuned(),
+        false,
+        crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT,
+        "Fix the off-by-one bug in add() so add(2,3) == 5",
+        project.clone(),
+        vec!["src/lib.rs".to_string()],
+        NetPolicy::Loopback,
+        vec![],
+        4,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+
+    // ── Assert outcome ───────────────────────────────────────────────────
+    match outcome {
+        Ok((LoopOutcome::Done { output, .. }, touched, net_blocked, out_of_scope)) => {
+            assert!(!output.is_empty(), "done output must be non-empty; got {output:?}");
+            // `touched` only records on a SUCCESSFUL edit (record_touched fires after
+            // the write in agentic_tools.rs edit_file) — combined with the on-disk
+            // content check below this proves the edit came from the tool execution.
+            assert!(
+                touched.contains(&"src/lib.rs".to_string()),
+                "src/lib.rs must be in files_touched; got {touched:?}"
+            );
+            assert!(!net_blocked, "net must not be blocked (Loopback policy)");
+            assert!(out_of_scope.is_none(), "no out-of-scope write expected; got {out_of_scope:?}");
+        }
+        Ok((other, touched, net_blocked, out_of_scope)) => {
+            panic!("expected LoopOutcome::Done, got {other:?}; touched={touched:?}; net_blocked={net_blocked}; out_of_scope={out_of_scope:?}");
+        }
+        Err(e) => {
+            panic!("run_agentic_coder returned Err: {e}");
+        }
+    }
+
+    // ── Assert on-disk edit ──────────────────────────────────────────────
+    let lib = std::fs::read_to_string(project.join("src/lib.rs")).expect("read src/lib.rs");
+    assert!(lib.contains("    a + b\n"), "bug line must be replaced; got:\n{lib}");
+    assert!(
+        !lib.contains("a + b + 1"),
+        "old bug line must be gone; got:\n{lib}"
+    );
+
+    // ── Assert request log ───────────────────────────────────────────────
+    let log = requests_log.lock().unwrap();
+    assert_eq!(log.len(), 2, "exactly 2 POSTs expected; got {}", log.len());
+    // POST 2 must carry the tool result message; parse the JSON (never substring
+    // the raw body — the system prompt rides along in every request).
+    let tool_msg = last_tool_message(&log[1])
+        .unwrap_or_else(|| panic!("POST 2 must carry a role:\"tool\" message; body:\n{}", log[1]));
+    assert!(
+        tool_msg.contains("edited"),
+        "tool result must reflect edit success (edit_file returns 'edited <path>'); got: {tool_msg}"
+    );
+
+    // Cleanup.
+    std::fs::remove_dir_all(&project).ok();
+}
+
+// ── B6: agentic allowlist blocks out-of-scope write ─────────────────────
+
+/// The mock scripts ONE edit_file on `README.md` (NOT allowlisted — only `src/lib.rs` is)
+/// then a done message. Per `run_agent_loop`: a tool error is fed back to the model
+/// (as `ERROR: {e}`) and the loop CONTINUES — it does NOT abort (see
+/// `tool_error_is_fed_back_not_fatal` in agentic_loop.rs). So the final outcome is
+/// `LoopOutcome::Done` (the model recovers and returns a message), but the file on
+/// disk must be UNCHANGED.
+#[test]
+#[ignore = "rig: agentic worker against an in-test mock OpenAI server; cargo test rig_tests -- --ignored"]
+fn test_agentic_allowlist_blocks_out_of_scope_write() {
+    use crate::backend::agentic_loop::LoopOutcome;
+    use crate::backend::agentic_transport::SamplingParams;
+    use crate::backend::sandbox::NetPolicy;
+
+    // POST 1: edit_file on README.md (NOT allowlisted).
+    // NOTE: `arguments` MUST be a JSON string (OpenAI spec; parse_llm_turn reads .as_str()).
+    let edit_args: String = serde_json::to_string(&serde_json::json!({
+        "path": "README.md",
+        "oldString": "# Test",
+        "newString": "# Updated"
+    }))
+    .unwrap();
+    let (base_url, requests_log) = spawn_mock_openai(vec![
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "edit_file", "arguments": edit_args }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        // POST 2: plain content (model recovers after the error is fed back).
+        serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "Done anyway." },
+                "finish_reason": "stop"
+            }]
+        }),
+    ]);
+
+    // ── Temp project ─────────────────────────────────────────────────────
+    let project = temp_project("b6-allowlist");
+    let src = project.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        &src.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("README.md"),
+        "# Test Project\n\nThis is a test project.\n",
+    )
+    .unwrap();
+
+    // ── Call run_agentic_coder (allowlist = only src/lib.rs) ─────────────
+    let outcome = crate::backend::agentic_runner::run_agentic_coder(
+        base_url,
+        "rig-model".to_string(),
+        SamplingParams::tuned(),
+        false,
+        crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT,
+        "Fix the off-by-one bug in add() so add(2,3) == 5",
+        project.clone(),
+        vec!["src/lib.rs".to_string()],
+        NetPolicy::Loopback,
+        vec![],
+        4,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+
+    // ── Outcome: Done (loop continues after a tool error; agentic_loop.rs) ─
+    match outcome {
+        Ok((LoopOutcome::Done { .. }, touched, _, out_of_scope)) => {
+            assert!(
+                !touched.contains(&"README.md".to_string()),
+                "README.md must NOT be recorded as touched; got {touched:?}"
+            );
+            // The relative-path allowlist rejection bails via write_allowed BEFORE the
+            // *_abs branches — the abs-path out_of_scope_write signal must stay unset
+            // (it is only set in write_file_abs/edit_file_abs, agentic_tools.rs).
+            assert!(
+                out_of_scope.is_none(),
+                "relative-path allowlist rejection must not set the abs-path out_of_scope signal; got {out_of_scope:?}"
+            );
+        }
+        Ok((other, touched, net_blocked, out_of_scope)) => {
+            panic!("expected LoopOutcome::Done, got {other:?}; touched={touched:?}; net_blocked={net_blocked}; out_of_scope={out_of_scope:?}");
+        }
+        Err(e) => {
+            panic!("run_agentic_coder returned Err: {e}");
+        }
+    }
+
+    // ── README.md must be UNCHANGED ──────────────────────────────────────
+    let readme = std::fs::read_to_string(project.join("README.md")).expect("read README.md");
+    assert!(
+        readme.contains("This is a test project."),
+        "README.md must be unchanged (out-of-scope write blocked); got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("# Updated"),
+        "README.md must NOT contain the rejected edit; got:\n{readme}"
+    );
+
+    // ── POST 2 must carry the rejection error fed back to the model ──────
+    // Parse the JSON and inspect the tool message CONTENT — substring checks on
+    // the raw body are vacuous ("scope" appears in the system prompt of every
+    // request; review finding).
+    let log = requests_log.lock().unwrap();
+    assert_eq!(log.len(), 2, "exactly 2 POSTs expected; got {}", log.len());
+    let tool_msg = last_tool_message(&log[1])
+        .unwrap_or_else(|| panic!("POST 2 must carry a role:\"tool\" message; body:\n{}", log[1]));
+    assert!(
+        tool_msg.contains("ERROR:") && tool_msg.contains("outside this task's write scope"),
+        "tool result must carry the allowlist rejection (run_agent_loop feeds back \
+         'ERROR: <path> is outside this task's write scope'); got: {tool_msg}"
+    );
+
+    // Cleanup.
+    std::fs::remove_dir_all(&project).ok();
+}

@@ -61,6 +61,11 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   round 1; coder path still lacks it).
 - **Bridge file for pi coder console** — `mini_activity_snapshot` hydrates
   from bridge files, but pi coders never write one → console lost on restart.
+- **Bridge file for DIRECTIVE minis too** (found in P5a recon 2026-07-15): the
+  directive executor's activity lives only in the in-memory MiniActivityStore
+  (Tauri events); only the ORCHESTRATOR writes `.devboule-activity/<id>.jsonl`
+  (projects.rs:~1974). Mini console is lost on restart — same fix class as the
+  pi-coder ticket above (one write-through in the executor's update path).
 - **node_modules in the packaged bundle** (Phase 5 question): debug `_up_`
   resource copy has no node_modules; packaged builds can't spawn the sidecar.
 - **Sandbox projects_dir = tree-wide cross-project write** — scoping requires
