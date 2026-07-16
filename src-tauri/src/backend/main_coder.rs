@@ -119,6 +119,7 @@ pub(crate) fn append_main_coder_directive(
     let directive = MiniCoderDirective {
         id: id.clone(),
         parent_agent_id: "app-user".into(),
+        stuck_report: None,
         status: MiniCoderStatus::Pending,
         task,
         files,

@@ -28,6 +28,7 @@ fn write_directive(id: &str, files: &[&str]) -> MiniCoderDirective {
     MiniCoderDirective {
         id: id.into(),
         parent_agent_id: "coder-1".into(),
+        stuck_report: None,
         status: MiniCoderStatus::Pending,
         task: "test task".into(),
         files: files.iter().map(|s| s.to_string()).collect(),
@@ -912,4 +913,188 @@ fn test_agentic_allowlist_blocks_out_of_scope_write() {
 
     // Cleanup.
     std::fs::remove_dir_all(&project).ok();
+}
+
+// ── B7: stuck report persists on the directive row ─────────────────────────
+
+/// v6 Phase 5 durability cell: drive a directive to a terminal `Failed` through
+/// the pure pieces that `finalize_finished_mini` chains (the finalize site, site
+/// 4 of the `mini://stuck` emit) and assert the `.aspis-agents.json` directive row
+/// now carries `stuckReport` with `taskId` == the directive id and `reason` ==
+/// "failed".
+///
+/// This test exercises the FINALIZE site — `finalize_finished_mini` is the path
+/// that runs for a mini that wrote a result file and was then finalized by the
+/// executor. The other 3 sites (timeout reap, stuck-launching reap, parent-gone
+/// reap) are bypass paths that DO NOT go through `finalize_finished_mini`.
+///
+/// Run with: cargo test -p aspis-management rig_executor -- --ignored
+#[test]
+#[ignore = "rig layer B: run with --ignored"]
+fn test_stuck_report_persists_on_directive_row() {
+    // 1) Temp projects dir (hermetic, cwd-independent).
+    let projects_dir = temp_project("b7-stuck");
+    let scratch = projects_dir.join(".aspis-mini");
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    // 2) Seed an empty agents state file so the path-based reader resolves the
+    //    directive queue (a missing file would yield `default_agent_live_state()`
+    //    whose `mini_coder_directives` is empty — finalize would then not find
+    //    the directive and the persist step would be a no-op).
+    let agents_state = crate::backend::model::AgentLiveState {
+        version: 2,
+        updated_at: "2026-07-15T00:00:00Z".into(),
+        sessions: Vec::new(),
+        claims: Vec::new(),
+        events: Vec::new(),
+        rules: Vec::new(),
+        state_path: String::new(),
+        mcp_command: String::new(),
+        mcp_client_config: String::new(),
+        mini_coder_directives: Vec::new(),
+        visual_check_directives: Vec::new(),
+        design_request_directives: Vec::new(),
+        git_push_requests: Vec::new(),
+        plan_approval_requests: Vec::new(),
+        consent_requests: Vec::new(),
+    };
+    let state_path = projects_dir.join(".aspis-agents.json");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&agents_state).unwrap()).unwrap();
+
+    // 3) Build a Running directive with scratch/result set (the finalize path
+    //    reads the result file under scratch_path).
+    let directive_id = "d-stuck-7";
+    let directive = mini_coder::MiniCoderDirective {
+        id: directive_id.into(),
+        parent_agent_id: "coder-1".into(),
+        status: MiniCoderStatus::Running,
+        task: "test task".into(),
+        files: vec!["src/lib.rs".into()],
+        backend: None,
+        write: false,
+        write_mode: mini_coder::WriteMode::EmitEdits,
+        tier: Default::default(),
+        project_id: None,
+        allow_oracle: false,
+        kill_requested: false,
+        steer_queue: Vec::new(),
+        result_path: "d-stuck-7.json".into(),
+        agent_id: Some("mini-test-agent".into()),
+        created_at: "2026-07-15T00:00:00Z".into(),
+        claimed_at: Some("2026-07-15T00:00:01Z".into()),
+        scratch_path: Some(scratch.to_string_lossy().to_string()),
+        started_at: Some("2026-07-15T00:00:02Z".into()),
+        result: None,
+        stuck_report: None,
+        attempt: 0,
+        parent_directive_id: None,
+        pigeon_ticket: None,
+        collected: None,
+    };
+
+    // 4) Call `finalize_outcome` (the pure outcome computation `finalize_finished_mini`
+    //    runs — scratch is set, but the result file is absent, so it returns
+    //    `MiniCoderOutcome::failed("result file missing")`). This is the same
+    //    outcome that the real finalize path stamps on the directive.
+    let outcome = super::finalize_outcome(&directive);
+    assert_eq!(
+        outcome.status,
+        MiniCoderStatus::Failed,
+        "no result file -> Failed; got {:?}",
+        outcome.status
+    );
+
+    // 5) Stamp the directive row with the outcome (the `mutate_agent_live_state`
+    //    that `finalize_finished_mini` runs). Path-based: no AppHandle needed.
+    crate::backend::agents::mutate_agent_live_state_at_path(&projects_dir, |state| {
+        if let Some(d) = state
+            .mini_coder_directives
+            .iter_mut()
+            .find(|d| d.id == directive_id)
+        {
+            d.status = outcome.status;
+            d.result = Some(outcome.clone());
+        } else {
+            // The directive wasn't in the seeded state; push it so finalize's
+            // mutate can stamp it (mirrors the real executor which already has
+            // the directive in its snapshot).
+            let mut d = directive.clone();
+            d.status = outcome.status;
+            d.result = Some(outcome.clone());
+            state.mini_coder_directives.push(d);
+        }
+    })
+    .unwrap();
+
+    // 6) Build the StuckReport the finalize site would emit (same fields as
+    //    `finalize_finished_mini`'s emit block) and persist it on the directive
+    //    row — exactly what `persist_and_emit_stuck` does (minus the live emit,
+    //    which is the fire-and-forget part we can't exercise without a real
+    //    AppHandle).
+    let reason = "failed"; // outcome.status == Failed
+    let raw = outcome.error.as_deref().unwrap_or("");
+    let report = crate::backend::stuck_report::StuckReport::new(
+        directive_id,
+        "coder-1",
+        reason,
+        directive.attempt.saturating_add(1),
+        raw,
+        outcome.files_touched.clone(),
+        None, // no project in this hermetic dir
+    );
+    // Attach through the SAME production function persist_and_emit_stuck uses
+    // (find predicate + clone + assignment) — not a hand-rolled re-implementation
+    // (review: tautology finding). Only the app.emit half stays untested here
+    // (needs an AppHandle).
+    crate::backend::agents::mutate_agent_live_state_at_path(&projects_dir, |state| {
+        assert!(
+            super::attach_stuck_report(state, &report),
+            "attach_stuck_report must find the seeded directive row"
+        );
+    })
+    .unwrap();
+
+    // 7) Read the persisted state and assert the directive row carries stuckReport.
+    let content = std::fs::read_to_string(&state_path)
+        .unwrap_or_else(|e| panic!("state file gone: {e}"));
+    let state: crate::backend::model::AgentLiveState =
+        serde_json::from_str(&content).unwrap_or_else(|e| panic!("invalid state JSON: {e}"));
+
+    let row = state
+        .mini_coder_directives
+        .iter()
+        .find(|d| d.id == directive_id)
+        .unwrap_or_else(|| panic!("directive {} not in persisted state", directive_id));
+
+    // Terminal state must be stamped.
+    assert_eq!(
+        row.result.as_ref().map(|r| r.status),
+        Some(MiniCoderStatus::Failed),
+        "finalize must stamp Failed; got {:?}",
+        row.result
+    );
+
+    // stuckReport must be present with taskId == directive id and reason == "failed".
+    let report = row
+        .stuck_report
+        .as_ref()
+        .unwrap_or_else(|| panic!("stuck_report must be persisted on directive {}", directive_id));
+    assert_eq!(
+        report.task_id, directive_id,
+        "stuckReport.taskId must equal the directive id; got {}",
+        report.task_id
+    );
+    assert_eq!(
+        report.reason, "failed",
+        "stuckReport.reason must be 'failed'; got {}",
+        report.reason
+    );
+    assert_eq!(
+        report.agent_id, "coder-1",
+        "stuckReport.agentId must be the parent_agent_id; got {}",
+        report.agent_id
+    );
+
+    // Cleanup.
+    std::fs::remove_dir_all(&projects_dir).ok();
 }

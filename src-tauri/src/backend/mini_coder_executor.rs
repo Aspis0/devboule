@@ -523,6 +523,37 @@ fn sweep_orphaned_launching(app: &AppHandle) -> Result<(), String> {
     })
 }
 
+/// PURE attach: set the report on its directive row (found by id ==
+/// report.task_id). Returns whether a row was found. Extracted so the rig cell
+/// exercises the SAME find-predicate/clone/assignment production uses instead
+/// of re-implementing the mutation (review: tautology finding).
+pub(crate) fn attach_stuck_report(
+    state: &mut crate::backend::model::AgentLiveState,
+    report: &crate::backend::stuck_report::StuckReport,
+) -> bool {
+    match state
+        .mini_coder_directives
+        .iter_mut()
+        .find(|d| d.id == report.task_id)
+    {
+        Some(d) => {
+            d.stuck_report = Some(report.clone());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Persist the stuck report on its directive row (durable fleet state), then
+/// emit the live event. The row is found by id == report.task_id; a missing row
+/// (already evicted) just skips persistence — the emit still fires.
+fn persist_and_emit_stuck(app: &AppHandle, report: crate::backend::stuck_report::StuckReport) {
+    let _ = agents::mutate_agent_live_state(app, |state| {
+        attach_stuck_report(state, &report);
+    });
+    let _ = app.emit("mini://stuck", report);
+}
+
 /// P6 (crash recovery) + BLOCKER 1: stamp every `Failed` directive that its retry
 /// chain can no longer reach via normal finalize propagation, then propagate that terminal
 /// up the chain so the Python poll on the ROOT id unblocks. Two cases (pure
@@ -842,7 +873,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     Vec::new(),
                     directive_project(&snapshot, directive),
                 );
-                let _ = app.emit("mini://stuck", report);
+                persist_and_emit_stuck(app, report);
             }
             // Slice 3 (seam C, bypass path): this terminal reap does NOT go through
             // `finalize_finished_mini`, so close the Pigeon ticket here too — both to unblock
@@ -897,7 +928,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     Vec::new(),
                     directive_project(&snapshot, directive),
                 );
-                let _ = app.emit("mini://stuck", report);
+                persist_and_emit_stuck(app, report);
             }
             // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap too.
             pigeon_egress_terminal_by_id(app, stuck_id);
@@ -975,7 +1006,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                     Vec::new(),
                     directive_project(&snapshot, directive),
                 );
-                let _ = app.emit("mini://stuck", report);
+                persist_and_emit_stuck(app, report);
             }
             // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap.
             pigeon_egress_terminal_by_id(app, &id);
@@ -2196,7 +2227,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             outcome.files_touched.clone(),
             snapshot.as_ref().and_then(|s| directive_project(s, directive)),
         );
-        let _ = app.emit("mini://stuck", report);
+        persist_and_emit_stuck(app, report);
     }
     // Clean up result file
     if let Some(scratch) = directive

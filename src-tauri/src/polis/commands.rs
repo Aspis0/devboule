@@ -3187,6 +3187,7 @@ mod tests {
         let directives = vec![MiniCoderDirective {
             id: "d-1".to_string(),
             parent_agent_id: "ag-1".to_string(),
+            stuck_report: None,
             status: MiniCoderStatus::Pending,
             task: "Fix a single, precisely-scoped issue detected by deterministic analysis.\nFile: src/bad.rs".to_string(),
             files: vec!["src/bad.rs".to_string()],

@@ -2,12 +2,12 @@
 //! loop). Gives the human an actionable record instead of a bare block string. Pure data
 //! + formatting — no I/O, no deps beyond serde. See v6 Phase 5.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Max chars of the mini's last output to keep in the report (keeps events/state small).
 const MAX_OUTPUT_EXCERPT: usize = 800;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StuckReport {
     pub task_id: String,
@@ -114,5 +114,82 @@ mod tests {
         let summary = report.human_summary();
         assert!(summary.len() >= 12, "summary must be at least 12 chars, got: {}", summary);
         assert!(!summary.contains("touched:"));
+    }
+
+    #[test]
+    fn json_round_trip_preserves_camel_case_keys() {
+        // Build a report with every field set, serialize to camelCase JSON, then
+        // deserialize back and assert equality (the PartialEq derive we added).
+        let report = StuckReport::new(
+            "task-7",
+            "agent-x",
+            "timeout",
+            3,
+            "some output excerpt",
+            vec!["a.rs".into(), "b.rs".into()],
+            Some("proj-1".into()),
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        // camelCase keys must appear (rename_all = "camelCase").
+        assert!(json.contains("\"taskId\""), "json: {json}");
+        assert!(json.contains("\"agentId\""), "json: {json}");
+        assert!(json.contains("\"reason\""), "json: {json}");
+        assert!(json.contains("\"attempts\""), "json: {json}");
+        assert!(json.contains("\"lastOutput\""), "json: {json}");
+        assert!(json.contains("\"filesTouched\""), "json: {json}");
+        assert!(json.contains("\"projectId\""), "json: {json}");
+        // snake_case must NOT leak.
+        assert!(!json.contains("task_id"), "snake leaked: {json}");
+        assert!(!json.contains("agent_id"), "snake leaked: {json}");
+        // Round-trip must reconstruct the exact struct (PartialEq).
+        let back: StuckReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, back, "round-trip must be byte-identical via PartialEq");
+        // And the values must match individually (sanity).
+        assert_eq!(back.task_id, "task-7");
+        assert_eq!(back.agent_id, "agent-x");
+        assert_eq!(back.reason, "timeout");
+        assert_eq!(back.attempts, 3);
+        assert_eq!(back.last_output, "some output excerpt");
+        assert_eq!(back.files_touched, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(back.project_id, Some("proj-1".into()));
+    }
+
+    #[test]
+    fn json_omits_stuck_report_when_none() {
+        // A directive whose stuck_report is None must NOT serialize the key
+        // (skip_serializing_if = "Option::is_none"), preserving wire compat.
+        use crate::backend::mini_coder::MiniCoderDirective;
+        let d = MiniCoderDirective {
+            id: "d-1".into(),
+            parent_agent_id: "coder-1".into(),
+            status: crate::backend::mini_coder::MiniCoderStatus::Pending,
+            task: "t".into(),
+            files: vec!["src/a.rs".into()],
+            backend: None,
+            write: false,
+            write_mode: crate::backend::mini_coder::WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: None,
+            allow_oracle: false,
+            kill_requested: false,
+            steer_queue: Vec::new(),
+            result_path: "mini/d-1.json".into(),
+            agent_id: None,
+            created_at: "2026-07-15T00:00:00Z".into(),
+            claimed_at: None,
+            scratch_path: None,
+            started_at: None,
+            result: None,
+            stuck_report: None,
+            attempt: 0,
+            parent_directive_id: None,
+            pigeon_ticket: None,
+            collected: None,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("stuckReport"),
+            "None stuck_report must be omitted from JSON: {json}"
+        );
     }
 }

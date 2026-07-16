@@ -96,9 +96,14 @@ Durable channels — POLL THESE:
 
 Event-only BLIND SPOTS (fire-and-forget, need small write-through product fixes
 to become testable — ticket candidates):
-`mini://stuck`, `sandbox://consent-request` (cloud-duplex branch),
-`agent-terminal://<id>` ring buffer, `censor://scan-started`,
-`censor://mini-findings` (partial), `design-stream:<id>` deltas.
+`mini://stuck` (P5d-1: persisted as `stuckReport` on the directive row),
+`sandbox://consent-request` (cloud-duplex branch), `censor://scan-started`
+(P5d-2), `censor://mini-findings` (partial; P5d-2 persists the summary on the
+directive row), `design-stream:<id>` deltas.
+CORRECTION (P5d recon 2026-07-16): `agent-terminal://<id>` is NOT a blind spot —
+`agent_pty_snapshot` (agent_pty.rs:369) reads the live ring on demand. The ring
+is memory-only BY DESIGN (explicit privacy invariant in the module header: never
+persisted, dies with the session) — do not "fix" it with a disk write-through.
 
 Injection trick: the activity tail parses `.devboule-activity/<id>.jsonl` every
 300ms — a test can APPEND bridge events itself to simulate an orchestrator

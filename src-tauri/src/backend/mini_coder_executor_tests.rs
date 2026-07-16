@@ -12,6 +12,7 @@ fn directive(id: &str, parent: &str) -> MiniCoderDirective {
     MiniCoderDirective {
         id: id.into(),
         parent_agent_id: parent.into(),
+        stuck_report: None,
         status: MiniCoderStatus::Pending,
         task: "docstring foo()".into(),
         files: vec!["src/a.rs".into()],
@@ -1929,6 +1930,7 @@ fn p4_directive(allow_oracle: bool) -> MiniCoderDirective {
     MiniCoderDirective {
         id: "d1".into(),
         parent_agent_id: "coder-1".into(),
+        stuck_report: None,
         status: MiniCoderStatus::Running,
         task: "add a docstring to foo()".into(),
         files: vec!["src/a.rs".into(), "src/b.rs".into()],
@@ -4405,6 +4407,7 @@ fn app_authored_directive_carries_its_own_project_and_never_loses_a_parent() {
         MiniCoderDirective {
             id: id.into(),
             parent_agent_id: String::new(),
+            stuck_report: None,
             status: crate::backend::mini_coder::MiniCoderStatus::Pending,
             task: "t".into(),
             files: vec!["src/a.rs".into()],

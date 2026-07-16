@@ -566,6 +566,12 @@ pub struct MiniCoderDirective {
     /// state. None while pending/launching/running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<MiniCoderOutcome>,
+    /// v6 Phase 5: structured stuck report emitted on a terminal failure/timeout
+    /// (the mini exhausted its budget). Durable fleet-state mirror of the fire-and-
+    /// forget `mini://stuck` event — survives app restarts where the live event
+    /// would be lost to a missing listener. None until a stuck report is emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_report: Option<crate::backend::stuck_report::StuckReport>,
     /// P6 retry lineage. Retry attempt number: the ROOT directive (the one the
     /// coder's `spawn_mini_coder` originally appended and whose id the blocking poll
     /// watches) is attempt 0; each Censor-driven retry increments it. NO-CHURN: a
@@ -1952,6 +1958,7 @@ mod tests {
             scratch_path: None,
             started_at: None,
             result: None,
+            stuck_report: None,
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
@@ -1984,6 +1991,7 @@ mod tests {
             scratch_path: Some("/proj/.aspis-mini".into()),
             started_at: Some("2026-06-06T00:00:01Z".into()),
             result: None,
+            stuck_report: None,
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
