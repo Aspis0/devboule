@@ -1912,6 +1912,7 @@ fn backend(
         command: command.map(|s| s.to_string()),
         base_url: None,
         max_concurrent: None,
+        fallbacks: None,
     }
 }
 
@@ -1924,6 +1925,7 @@ fn omlx_backend(model: &str, base_url: &str) -> MiniCoderBackend {
         command: None,
         base_url: Some(base_url.to_string()),
         max_concurrent: None,
+        fallbacks: None,
     }
 }
 

@@ -220,6 +220,12 @@ pub struct LocalCoderBackend {
     /// lives ONLY in the OS vault and is read at launch into `DEVBOULE_CLOUD_API_KEY` (env).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Ordered fallback chain (primary + fallbacks → Vec<SidecarEnvVars> resolved by
+    /// `resolve_coder_chain_for_sidecar`). Emitted to the sidecar as `DEVBOULE_PI_MODEL_CHAIN`.
+    /// Ignored by the sidecar until B2.2 consumes it. `None` (the common case) keeps
+    /// today's single-model behavior.
+    #[serde(default)]
+    pub fallbacks: Option<Vec<super::mini_coder::FallbackModel>>,
 }
 
 /// Validate + normalize a local-coder backend config. Applies the SAME per-field rules as
@@ -236,6 +242,9 @@ pub fn validate_local_coder_backend(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+
+    // Validate + normalize the fallback chain (same rules as the mini-coder).
+    let validated_fallbacks = super::mini_coder::validate_fallbacks(&backend.fallbacks)?;
 
     match backend.kind {
         LocalCoderBackendKind::Ollama => {
@@ -273,6 +282,7 @@ pub fn validate_local_coder_backend(
                 kind: LocalCoderBackendKind::Ollama,
                 model: Some(model),
                 base_url,
+                fallbacks: validated_fallbacks,
             })
         }
         LocalCoderBackendKind::Omlx => {
@@ -309,6 +319,7 @@ pub fn validate_local_coder_backend(
                 kind: LocalCoderBackendKind::Omlx,
                 model: Some(model),
                 base_url: Some(normalized_base),
+                fallbacks: validated_fallbacks,
             })
         }
         LocalCoderBackendKind::Cloud => {
@@ -347,6 +358,7 @@ pub fn validate_local_coder_backend(
                 kind: LocalCoderBackendKind::Cloud,
                 model: Some(model),
                 base_url: Some(normalized_base),
+                fallbacks: validated_fallbacks,
             })
         }
     }
@@ -577,6 +589,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             base_url: Some("https://api.example.com/v1".into()),
             model: Some("big".into()),
+            fallbacks: None,
         };
         assert!(preflight_local_orchestrator_backend(&backend).is_ok());
     }
@@ -643,6 +656,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: None,
+            fallbacks: None,
         };
         let json = serde_json::to_string(&ollama).unwrap();
         assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
@@ -660,6 +674,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: Some("http://localhost:11500/v1".into()),
+            fallbacks: None,
         };
         let json = serde_json::to_string(&ollama).unwrap();
         assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
@@ -677,6 +692,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("qwen2.5-coder".into()),
             base_url: Some("http://localhost:8000/v1".into()),
+            fallbacks: None,
         };
         let json = serde_json::to_string(&omlx).unwrap();
         assert!(json.contains("\"kind\":\"omlx\""), "json: {json}");
@@ -757,6 +773,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: None,
             base_url: None,
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&no_model).is_err());
 
@@ -765,6 +782,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("  qwen2.5-coder  ".into()),
             base_url: None,
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder")); // trimmed
@@ -779,6 +797,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: Some("   ".into()),
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.base_url, None);
@@ -792,6 +811,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: Some("  http://localhost:11500/v1/  ".into()),
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.base_url.as_deref(), Some("http://localhost:11500/v1"));
@@ -811,6 +831,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Ollama,
                 model: Some("qwen2.5-coder".into()),
                 base_url: Some(bad.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -826,6 +847,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Ollama,
                 model: Some(bad.into()),
                 base_url: None,
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -841,6 +863,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some(long_model),
             base_url: None,
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&b).is_err());
     }
@@ -851,6 +874,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: None,
             base_url: Some("http://localhost:8000/v1".into()),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&no_model).is_err());
 
@@ -858,6 +882,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("qwen2.5-coder".into()),
             base_url: None,
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&no_base).is_err());
     }
@@ -868,6 +893,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("  qwen2.5-coder  ".into()),
             base_url: Some("  http://127.0.0.1:8000/v1  ".into()),
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder"));
@@ -888,6 +914,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Omlx,
                 model: Some("qwen2.5-coder".into()),
                 base_url: Some(bad.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -902,6 +929,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("m".into()),
             base_url: Some("http://localhost:99999/v1".into()),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&bad_port).is_err());
 
@@ -909,6 +937,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("m".into()),
             base_url: Some("http://localhost:8000/v1/".into()),
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&trailing).unwrap();
         assert_eq!(n.base_url.as_deref(), Some("http://localhost:8000/v1"));
@@ -921,6 +950,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("m".into()),
             base_url: Some(long),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&overlong).is_err());
     }
@@ -935,6 +965,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("openrouter/auto".into()),
             base_url: Some("https://openrouter.ai/api/v1".into()),
+            fallbacks: None,
         };
         let json = serde_json::to_string(&cloud).unwrap();
         assert!(json.contains("\"kind\":\"cloud\""), "json: {json}");
@@ -955,6 +986,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: None,
             base_url: Some("https://openrouter.ai/api/v1".into()),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&no_model).is_err());
 
@@ -962,6 +994,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("openrouter/auto".into()),
             base_url: None,
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&no_base).is_err());
     }
@@ -972,6 +1005,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("  openrouter/auto  ".into()),
             base_url: Some("  https://openrouter.ai/api/v1/  ".into()),
+            fallbacks: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("openrouter/auto"));
@@ -995,6 +1029,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Cloud,
                 model: Some("m".into()),
                 base_url: Some(bad.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -1010,6 +1045,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("m".into()),
             base_url: Some(long),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&overlong).is_err());
     }
@@ -1029,6 +1065,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Cloud,
                 model: Some("m".into()),
                 base_url: Some(bad.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -1041,6 +1078,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Cloud,
                 model: Some("m".into()),
                 base_url: Some(ok.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_ok(),
@@ -1062,6 +1100,7 @@ mod tests {
                 kind: LocalCoderBackendKind::Cloud,
                 model: Some("m".into()),
                 base_url: Some(bad.into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -1072,6 +1111,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("m".into()),
             base_url: Some("https://api.openai.com/v1".into()),
+            fallbacks: None,
         };
         assert!(validate_local_coder_backend(&ok).is_ok());
     }
@@ -1085,6 +1125,7 @@ mod tests {
                 kind,
                 model: Some("m".into()),
                 base_url: Some("https://openrouter.ai/api/v1".into()),
+                fallbacks: None,
             };
             assert!(
                 validate_local_coder_backend(&b).is_err(),
@@ -1099,6 +1140,7 @@ mod tests {
             kind: LocalCoderBackendKind::Cloud,
             model: Some("openrouter/auto".into()),
             base_url: Some("https://openrouter.ai/api/v1".into()),
+            fallbacks: None,
         };
         let (base, model) = resolve_cloud_env(&cloud);
         assert_eq!(base, "https://openrouter.ai/api/v1");
@@ -1113,6 +1155,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("m".into()),
             base_url: Some("http://localhost:8000/v1".into()),
+            fallbacks: None,
         };
         assert_eq!(resolve_cloud_env(&omlx), (String::new(), String::new()));
     }
@@ -1125,6 +1168,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: None,
+            fallbacks: None,
         };
         let (base, model) = resolve_omlx_env(&b);
         assert_eq!(base, OLLAMA_OPENAI_BASE_URL);
@@ -1139,6 +1183,7 @@ mod tests {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
             base_url: Some("http://localhost:11500/v1".into()),
+            fallbacks: None,
         };
         let (base, model) = resolve_omlx_env(&b);
         assert_eq!(base, "http://localhost:11500/v1");
@@ -1152,6 +1197,7 @@ mod tests {
             kind: LocalCoderBackendKind::Omlx,
             model: Some("mlx-qwen".into()),
             base_url: Some("http://localhost:8000/v1".into()),
+            fallbacks: None,
         };
         let (base, model) = resolve_omlx_env(&b);
         assert_eq!(base, "http://localhost:8000/v1");

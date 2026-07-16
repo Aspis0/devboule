@@ -1418,12 +1418,31 @@ pub struct MiniCoderBackend {
     /// config that never set it (older/UI-omitted) round-trips without gaining a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u8>,
+    /// Ordered fallback chain (primary + fallbacks → Vec<SidecarEnvVars> resolved by
+    /// `resolve_coder_chain_for_sidecar`). Emitted to the sidecar as `DEVBOULE_PI_MODEL_CHAIN`.
+    /// Ignored by the sidecar until B2.2 consumes it. `None` (the common case) keeps
+    /// today's single-model behavior.
+    #[serde(default)]
+    pub fallbacks: Option<Vec<FallbackModel>>,
 }
 
 /// P6: default concurrency when `MiniCoderBackend.max_concurrent` is unset. Two minis is
 /// a conservative parallelism bump over the original one-at-a-time without overwhelming a
 /// local backend or the single executor loop.
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
+
+/// One entry in a role's ordered fallback chain. When the primary model
+/// fails (auth/rate-limit/timeout/exhausted retries), the sidecar advances to
+/// the next FallbackModel in order. `provider`/`base_url` default to the
+/// primary backend's when None (a same-provider model swap, the common case).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FallbackModel {
+    pub model: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default, rename = "baseUrl", alias = "base_url")]
+    pub base_url: Option<String>,
+}
 
 /// P6: clamp a configured `max_concurrent` into the valid `1..=4` band, preserving `None`
 /// as `None` (so the default applies at read and no value is injected — no-churn). A
@@ -1640,6 +1659,9 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
         .unwrap_or("")
         .to_string();
 
+    // Fallback-chain validation: reject empty-model entries and chains > 8.
+    let fallbacks = validate_fallbacks(&backend.fallbacks)?;
+
     match backend.kind {
         MiniCoderBackendKind::Ollama => {
             if model.is_empty() {
@@ -1661,6 +1683,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: None,
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::Api => {
@@ -1691,6 +1714,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: Some(command),
                 base_url: None,
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::Codex => {
@@ -1713,6 +1737,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: None,
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::Openai => {
@@ -1735,6 +1760,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: None,
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::AppleFm => {
@@ -1759,6 +1785,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: None,
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::Omlx => {
@@ -1793,6 +1820,7 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: Some(normalized_base),
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
         MiniCoderBackendKind::Cloud => {
@@ -1845,9 +1873,31 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
                 command: None,
                 base_url: Some(normalized_base),
                 max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+                fallbacks,
             })
         }
     }
+}
+
+/// Validate an optional fallback chain: reject empty/whitespace-only `model`
+/// entries and chains longer than 8. Returns the chain unchanged on success.
+pub fn validate_fallbacks(
+    fallbacks: &Option<Vec<FallbackModel>>,
+) -> Result<Option<Vec<FallbackModel>>, String> {
+    let Some(chain) = fallbacks else {
+        return Ok(None);
+    };
+    if chain.len() > 8 {
+        return Err("fallback chain too long (max 8)".to_string());
+    }
+    for (i, fb) in chain.iter().enumerate() {
+        if fb.model.trim().is_empty() {
+            return Err(format!(
+                "fallback model must not be empty (entry index {i})"
+            ));
+        }
+    }
+    Ok(Some(chain.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2983,6 +3033,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: Some(3),
+            fallbacks: None,
         };
         let json = serde_json::to_string(&b).unwrap();
         assert!(json.contains("\"maxConcurrent\":3"), "json: {json}");
@@ -3003,6 +3054,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         assert_eq!(effective_max_concurrent(&base), DEFAULT_MAX_CONCURRENT);
         assert_eq!(effective_max_concurrent(&base), 2);
@@ -3024,6 +3076,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: Some(0),
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&bad_low).unwrap();
         assert_eq!(n.max_concurrent, Some(1));
@@ -3454,6 +3507,7 @@ mod tests {
             command: Some("dropped".into()),
             base_url: Some("dropped".into()),
             max_concurrent: Some(0),
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&no_model).unwrap();
         assert_eq!(n.model, None);
@@ -3467,6 +3521,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: Some(9),
+            fallbacks: None,
         };
         assert!(validate_mini_coder_backend(&bad).is_err());
         assert_eq!(
@@ -3483,6 +3538,7 @@ mod tests {
             command: Some("dropped".into()),
             base_url: Some("dropped".into()),
             max_concurrent: None,
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&with_model).unwrap();
         assert_eq!(n.model.as_deref(), Some("gpt-5"));
@@ -3499,6 +3555,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let json = serde_json::to_string(&ollama).unwrap();
         assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
@@ -3514,6 +3571,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let cj = serde_json::to_string(&codex_bare).unwrap();
         assert_eq!(cj, r#"{"kind":"codex"}"#);
@@ -3527,6 +3585,7 @@ mod tests {
             command: Some("ignored".into()),
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         assert!(validate_mini_coder_backend(&bad).is_err());
 
@@ -3536,6 +3595,7 @@ mod tests {
             command: Some("dropped".into()),
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder")); // trimmed
@@ -3550,6 +3610,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         assert!(validate_mini_coder_backend(&no_cmd).is_err());
 
@@ -3559,6 +3620,7 @@ mod tests {
             command: Some("mycli chat\nrm -rf /".into()),
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         assert!(
             validate_mini_coder_backend(&ctrl).is_err(),
@@ -3571,6 +3633,7 @@ mod tests {
             command: Some("  mycli chat --json  ".into()),
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&ok).unwrap();
         assert_eq!(n.command.as_deref(), Some("mycli chat --json"));
@@ -3594,6 +3657,7 @@ mod tests {
                 command: Some((*bad).into()),
                 base_url: None,
                 max_concurrent: None,
+                fallbacks: None,
             };
             assert!(
                 validate_mini_coder_backend(&b).is_err(),
@@ -3610,6 +3674,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&bare).unwrap();
         assert_eq!(n.model, None);
@@ -3621,6 +3686,7 @@ mod tests {
             command: Some("dropped".into()),
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         };
         let n = validate_mini_coder_backend(&with_model).unwrap();
         assert_eq!(n.model.as_deref(), Some("gpt-5-codex"));
@@ -3636,6 +3702,7 @@ mod tests {
                 command: None,
                 base_url: None,
                 max_concurrent: None,
+                fallbacks: None,
             };
             assert!(
                 validate_mini_coder_backend(&b).is_err(),
@@ -3653,6 +3720,7 @@ mod tests {
             command: Some("dropped".into()), // omlx ignores command
             base_url: base_url.map(|s| s.to_string()),
             max_concurrent: None,
+            fallbacks: None,
         }
     }
 
@@ -3897,6 +3965,7 @@ mod tests {
             command: Some("dropped".into()), // cloud ignores command
             base_url: base_url.map(|s| s.to_string()),
             max_concurrent: None,
+            fallbacks: None,
         }
     }
 
@@ -4202,5 +4271,101 @@ mod tests {
             "censorSummary must be present when Some: {json}"
         );
         assert!(json.contains("\"total\":3"), "json: {json}");
+    }
+
+    // ---- B2.1: FallbackModel + fallback-chain validation + backward-compat ----
+
+    #[test]
+    fn fallback_model_deserializes_model_only() {
+        let raw = r#"{"model":"x"}"#;
+        let fb: super::FallbackModel = serde_json::from_str(raw).unwrap();
+        assert_eq!(fb.model, "x");
+        assert_eq!(fb.provider, None);
+        assert_eq!(fb.base_url, None);
+    }
+
+    #[test]
+    fn fallback_model_deserializes_camelCase_baseUrl_and_provider() {
+        let raw = r#"{"model":"x","provider":"openrouter","baseUrl":"http://h"}"#;
+        let fb: super::FallbackModel = serde_json::from_str(raw).unwrap();
+        assert_eq!(fb.model, "x");
+        assert_eq!(fb.provider, Some("openrouter".into()));
+        assert_eq!(fb.base_url, Some("http://h".into()));
+    }
+
+    #[test]
+    fn fallback_model_deserializes_snake_case_base_url_alias() {
+        let raw = r#"{"model":"x","provider":"p","base_url":"http://h"}"#;
+        let fb: super::FallbackModel = serde_json::from_str(raw).unwrap();
+        assert_eq!(fb.provider, Some("p".into()));
+        assert_eq!(fb.base_url, Some("http://h".into()));
+    }
+
+    #[test]
+    fn mini_coder_backend_without_fallbacks_key_deserializes_none() {
+        // Backward-compat proof: a JSON object without a `fallbacks` key must
+        // deserialize with `fallbacks == None` (no-churn for existing configs).
+        let raw = r#"{"kind":"ollama","model":"qwen2.5-coder"}"#;
+        let b: MiniCoderBackend = serde_json::from_str(raw).unwrap();
+        assert_eq!(b.fallbacks, None);
+    }
+
+    #[test]
+    fn mini_coder_backend_with_fallbacks_key_deserializes_chain() {
+        let raw = r#"{"kind":"ollama","model":"qwen2.5","fallbacks":[{"model":"alt"},{"model":"alt2","provider":"x","baseUrl":"http://h"}]}"#;
+        let b: MiniCoderBackend = serde_json::from_str(raw).unwrap();
+        let fb = b.fallbacks.expect("fallbacks must be Some");
+        assert_eq!(fb.len(), 2);
+        assert_eq!(fb[0].model, "alt");
+        assert_eq!(fb[0].provider, None);
+        assert_eq!(fb[1].provider, Some("x".into()));
+        assert_eq!(fb[1].base_url, Some("http://h".into()));
+    }
+
+    #[test]
+    fn validate_fallbacks_rejects_empty_model() {
+        let bad = Some(vec![super::FallbackModel {
+            model: "".into(),
+            provider: None,
+            base_url: None,
+        }]);
+        assert!(validate_fallbacks(&bad).is_err());
+
+        let bad_ws = Some(vec![super::FallbackModel {
+            model: "   ".into(),
+            provider: None,
+            base_url: None,
+        }]);
+        assert!(validate_fallbacks(&bad_ws).is_err());
+    }
+
+    #[test]
+    fn validate_fallbacks_rejects_chain_longer_than_eight() {
+        let chain: Vec<super::FallbackModel> = (0..9)
+            .map(|i| super::FallbackModel {
+                model: format!("m{i}"),
+                provider: None,
+                base_url: None,
+            })
+            .collect();
+        assert!(validate_fallbacks(&Some(chain)).is_err());
+    }
+
+    #[test]
+    fn validate_fallbacks_accepts_empty_chain_and_none() {
+        assert!(validate_fallbacks(&None).is_ok());
+        assert!(validate_fallbacks(&Some(vec![])).is_ok());
+    }
+
+    #[test]
+    fn validate_fallbacks_accepts_eight_entries() {
+        let chain: Vec<super::FallbackModel> = (0..8)
+            .map(|i| super::FallbackModel {
+                model: format!("m{i}"),
+                provider: None,
+                base_url: None,
+            })
+            .collect();
+        assert!(validate_fallbacks(&Some(chain)).is_ok());
     }
 }

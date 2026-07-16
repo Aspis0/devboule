@@ -6862,6 +6862,7 @@ mod tests {
             command: None,
             base_url: None,
             max_concurrent: None,
+            fallbacks: None,
         }
     }
 
@@ -7941,6 +7942,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             kind: super::super::local_coder::LocalCoderBackendKind::Omlx,
             base_url: Some("http://127.0.0.1:8000/v1".into()),
             model: Some("qwen".into()),
+            fallbacks: None,
         });
         let (omlx_base_url, _omlx_model) = match &local_backend {
             Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
@@ -7965,6 +7967,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             kind: super::super::local_coder::LocalCoderBackendKind::Cloud,
             base_url: Some("https://api.example.com/v1".into()),
             model: Some("big-model".into()),
+            fallbacks: None,
         });
         let (omlx_base_url, _omlx_model) = match &local_backend {
             Some(backend) => super::super::local_coder::resolve_omlx_env(backend),

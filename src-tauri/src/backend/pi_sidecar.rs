@@ -628,6 +628,20 @@ pub(crate) struct SidecarEnvVars {
     pub(crate) vault_key_warning: Option<String>,
 }
 
+// impl Clone for SidecarEnvVars: required by resolve_coder_chain_for_sidecar
+// which clones candidate 0 while building the ordered fallback chain.
+impl Clone for SidecarEnvVars {
+    fn clone(&self) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            api_key_env: self.api_key_env.clone(),
+            base_url: self.base_url.clone(),
+            vault_key_warning: self.vault_key_warning.clone(),
+        }
+    }
+}
+
 /// Web-search provider → env var name mapping. The 7 vault keys that the
 /// web-search settings card manages. A present key → set the env var on the
 /// sidecar; absent key → env NOT set (extension falls back to zero-config).
@@ -896,6 +910,121 @@ pub(crate) fn resolve_coder_env_for_sidecar(
             }
         }
     }
+}
+
+/// Return the ordered fallback chain configured for a pi role, mirroring the
+/// per-role dispatch in `resolve_coder_env_for_sidecar`. Empty when the role has
+/// no per-role backend (orchestrator/None -> localCoderBackend) or no fallbacks.
+///
+/// SIDE-CAR CAPABILITY GATE: only return the per-role backend's fallbacks when
+/// its `kind` is sidecar-capable (Cloud/Ollama/Omlx). For non-sidecar kinds
+/// (Api/Codex/Openai/AppleFm) the primary resolves from `localCoderBackend` in
+/// `resolve_coder_env_for_sidecar`, so the fallback chain MUST do the same —
+/// otherwise fallbacks attach from a DIFFERENT config row than the primary.
+pub(crate) fn role_fallbacks(app: &AppHandle, role: Option<&str>) -> Vec<super::mini_coder::FallbackModel> {
+    let mini_if_capable = |b: Option<super::mini_coder::MiniCoderBackend>| -> Vec<super::mini_coder::FallbackModel> {
+        match b {
+            Some(be) if matches!(
+                be.kind,
+                super::mini_coder::MiniCoderBackendKind::Cloud
+                    | super::mini_coder::MiniCoderBackendKind::Ollama
+                    | super::mini_coder::MiniCoderBackendKind::Omlx
+            ) => be.fallbacks.unwrap_or_default(),
+            _ => super::projects::read_local_coder_backend(app)
+                .and_then(|lb| lb.fallbacks)
+                .unwrap_or_default(),
+        }
+    };
+    match role {
+        None | Some("orchestrator") => super::projects::read_local_coder_backend(app)
+            .and_then(|b| b.fallbacks)
+            .unwrap_or_default(),
+        Some("coder") | Some("main-coder") => {
+            mini_if_capable(super::roles_config::read_main_coder_backend_no_fallback(app))
+        }
+        Some("mini") | Some("mini-coder") => {
+            mini_if_capable(super::projects::read_mini_coder_backend(app))
+        }
+        Some("verifier") => {
+            mini_if_capable(super::roles_config::read_verifier_backend(app))
+        }
+        Some(_) => super::projects::read_local_coder_backend(app)
+            .and_then(|b| b.fallbacks)
+            .unwrap_or_default(),
+    }
+}
+
+/// Resolve the full ordered model chain for a pi role: candidate 0 is the
+/// PRIMARY (identical to `resolve_coder_env_for_sidecar`), candidates 1..N are
+/// the configured fallbacks. Each fallback inherits the primary's provider,
+/// api_key_env, and base_url unless it overrides them. Consecutive duplicates
+/// (same provider+model) are collapsed; the chain is capped at 9 total
+/// (primary + up to 8 validated fallbacks).
+///
+/// The heavy lifting is delegated to `expand_chain` so the pure logic is
+/// unit-testable without an AppHandle.
+pub(crate) fn resolve_coder_chain_for_sidecar(
+    app: &AppHandle,
+    role: Option<&str>,
+) -> Vec<SidecarEnvVars> {
+    let primary = resolve_coder_env_for_sidecar(app, role);
+    let fallbacks = role_fallbacks(app, role);
+    expand_chain(primary, fallbacks)
+}
+
+/// Pure fallback-expansion loop (no AppHandle). Takes the resolved primary
+/// `SidecarEnvVars` and an ordered list of `FallbackModel` entries; returns the
+/// deduped, capped candidate chain. Used by `resolve_coder_chain_for_sidecar`
+/// AND unit-tested directly.
+///
+/// CAP: primary + up to 8 validated fallbacks = 9 total (validate_fallbacks
+/// rejects chains > 8, so expand_chain caps at 9 entries).
+pub(crate) fn expand_chain(
+    primary: SidecarEnvVars,
+    fallbacks: Vec<super::mini_coder::FallbackModel>,
+) -> Vec<SidecarEnvVars> {
+    let mut chain: Vec<SidecarEnvVars> = Vec::with_capacity(1 + fallbacks.len());
+    chain.push(primary.clone());
+    for fb in fallbacks {
+        let model = fb.model.trim().to_string();
+        if model.is_empty() {
+            continue;
+        }
+        let provider = fb
+            .provider
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| primary.provider.clone());
+        let base_url = fb
+            .base_url
+            .filter(|b| !b.trim().is_empty())
+            .or_else(|| primary.base_url.clone());
+        // same-key assumption: fallbacks reuse the primary's api key env (all
+        // cloud fallbacks share OPENROUTER_API_KEY; local reuse the placeholder).
+        // B2.2 TODO: cross-provider fallbacks (fb.provider != primary.provider) reuse
+        // the primary's api key env, which is WRONG for a different provider. B2.1 only
+        // ships same-provider chains (all cloud fallbacks share OPENROUTER_API_KEY);
+        // B2.2 must add a per-fallback key reference or constrain to same-provider.
+        let cand = SidecarEnvVars {
+            provider,
+            model,
+            api_key_env: primary.api_key_env.clone(),
+            base_url,
+            vault_key_warning: None,
+        };
+        // collapse consecutive duplicate (provider, model)
+        if chain
+            .last()
+            .map(|c| c.provider == cand.provider && c.model == cand.model)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        chain.push(cand);
+        if chain.len() >= 9 {
+            break;
+        }
+    }
+    chain
 }
 
 /// PURE helper: map a `MiniCoderBackend` + an OPTIONAL cloud-API-key (read
@@ -1209,7 +1338,12 @@ fn spawn_pi_session_inner(
         .ok_or_else(|| "Cannot resolve pi-sidecar directory".to_string())?
         .to_path_buf();
 
-    let mut env_vars = resolve_coder_env_for_sidecar(app, role);
+    // B2.1: resolve the full ordered fallback chain (candidate 0 == primary).
+    // `env_vars` stays candidate 0 for all existing env-var lines below (full
+    // backward compatibility). The tail (candidates 1..N) is emitted as the
+    // `DEVBOULE_PI_MODEL_CHAIN` env var (JSON); the sidecar ignores it until B2.2.
+    let chain = resolve_coder_chain_for_sidecar(app, role);
+    let mut env_vars = chain.first().cloned().unwrap_or_else(|| resolve_coder_env_for_sidecar(app, role));
 
     // --- macOS Seatbelt sandbox (decision #11) -------------------------------
     // Confine pi's edit/write/bash tools to the project directory. Default ON for
@@ -1286,6 +1420,29 @@ fn spawn_pi_session_inner(
 
     cmd.env("DEVBOULE_PI_PROVIDER", &env_vars.provider);
     cmd.env("DEVBOULE_PI_MODEL", &env_vars.model);
+
+    // B2.1: full fallback chain (candidate 0 == env_vars). Emit candidates 0..N
+    // as JSON for the sidecar (sidecar ignores it until B2.2). Keys are NEVER
+    // included — only provider/model/baseUrl. Candidate 0 stays in
+    // DEVBOULE_PI_MODEL/PROVIDER above for full backward compatibility.
+    // Guard: only emit when fallbacks are present (chain.len() > 1).
+    if chain.len() > 1 {
+        let chain_out: Vec<serde_json::Value> = chain
+            .iter()
+            .map(|c| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("provider".into(), serde_json::Value::String(c.provider.clone()));
+                obj.insert("model".into(), serde_json::Value::String(c.model.clone()));
+                if let Some(ref base_url) = c.base_url {
+                    obj.insert("baseUrl".into(), serde_json::Value::String(base_url.clone()));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        if let Ok(json) = serde_json::to_string(&chain_out) {
+            cmd.env("DEVBOULE_PI_MODEL_CHAIN", json);
+        }
+    }
 
     // #2: always set DEVBOULE_SESSION_ID, even on the legacy `spike_pi_prompt`
     // path (role == None). The session id is generated before spawn, so the
@@ -4394,6 +4551,7 @@ mod tests {
             command: None,
             base_url: base_url.map(|s| s.to_string()),
             max_concurrent: None,
+            fallbacks: None,
         }
     }
 
@@ -7166,6 +7324,119 @@ mod tests {
                 .expect("parses as thinking");
         assert_eq!(thinking_text, "live fragment");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- B2.1: expand_chain pure-logic unit tests ----
+#[cfg(test)]
+mod fallback_chain_tests {
+    use super::{expand_chain, SidecarEnvVars};
+    use crate::backend::mini_coder::FallbackModel;
+
+    fn primary() -> SidecarEnvVars {
+        SidecarEnvVars {
+            provider: "openrouter".into(),
+            model: "gpt-4o".into(),
+            api_key_env: Some(("OPENROUTER_API_KEY".into(), "sk-abc".into())),
+            base_url: None,
+            vault_key_warning: None,
+        }
+    }
+
+    #[test]
+    fn no_fallbacks_yields_single_primary() {
+        let chain = expand_chain(primary(), vec![]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "openrouter");
+        assert_eq!(chain[0].model, "gpt-4o");
+    }
+
+    #[test]
+    fn fallbacks_inherit_primary_provider_and_api_key_env() {
+        let fb = FallbackModel {
+            model: "alt".into(),
+            provider: None,
+            base_url: None,
+        };
+        let chain = expand_chain(primary(), vec![fb]);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].provider, "openrouter"); // inherited
+        assert_eq!(chain[1].api_key_env, Some(("OPENROUTER_API_KEY".into(), "sk-abc".into()))); // inherited
+    }
+
+    #[test]
+    fn fallback_override_provider_keeps_own() {
+        let fb = FallbackModel {
+            model: "alt".into(),
+            provider: Some("anthropic".into()),
+            base_url: None,
+        };
+        let chain = expand_chain(primary(), vec![fb]);
+        assert_eq!(chain[1].provider, "anthropic"); // own
+    }
+
+    #[test]
+    fn consecutive_duplicate_collapsed() {
+        // A fallback that matches the primary (provider+model) is dropped.
+        let fb = FallbackModel {
+            model: "gpt-4o".into(), // same as primary
+            provider: Some("openrouter".into()),
+            base_url: None,
+        };
+        let chain = expand_chain(primary(), vec![fb]);
+        assert_eq!(chain.len(), 1); // only primary
+    }
+
+    #[test]
+    fn non_consecutive_duplicate_kept() {
+        // Primary: openrouter/gpt-4o. Fallback 1: anthropic/claude. Fallback 2: openrouter/gpt-4o.
+        // Fallback 2 differs from fallback 1 (provider+model), so it's kept.
+        let chain = expand_chain(
+            primary(),
+            vec![
+                FallbackModel { model: "claude".into(), provider: Some("anthropic".into()), base_url: None },
+                FallbackModel { model: "gpt-4o".into(), provider: Some("openrouter".into()), base_url: None },
+            ],
+        );
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[2].provider, "openrouter");
+        assert_eq!(chain[2].model, "gpt-4o");
+    }
+
+    #[test]
+    fn chain_capped_at_nine_total() {
+        let fallbacks: Vec<FallbackModel> = (0..20)
+            .map(|i| FallbackModel {
+                model: format!("m{i}"),
+                provider: None,
+                base_url: None,
+            })
+            .collect();
+        let chain = expand_chain(primary(), fallbacks);
+        // primary + 8 fallbacks = 9 total (capped)
+        assert_eq!(chain.len(), 9);
+    }
+
+    #[test]
+    fn empty_model_fallback_skipped() {
+        let fb = FallbackModel {
+            model: "".into(),
+            provider: None,
+            base_url: None,
+        };
+        let chain = expand_chain(primary(), vec![fb]);
+        assert_eq!(chain.len(), 1); // empty model skipped
+    }
+
+    #[test]
+    fn whitespace_model_fallback_skipped() {
+        let fb = FallbackModel {
+            model: "   ".into(),
+            provider: None,
+            base_url: None,
+        };
+        let chain = expand_chain(primary(), vec![fb]);
+        assert_eq!(chain.len(), 1); // whitespace model skipped
     }
 }
 
