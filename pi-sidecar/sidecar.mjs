@@ -334,6 +334,30 @@ function buildCustomModelsJson() {
 	return modelsJsonPath;
 }
 
+/**
+ * Resolve a model from the registry, tolerant of provider-name skew.
+ * Devboule passes provider="openrouter" but a user's models.json may key the
+ * same models under a different provider (e.g. "openrouter-curated"). Try the
+ * exact (provider, id) match first; if that misses, fall back to matching by
+ * model id alone across all available models (reusing that entry's real
+ * provider/baseUrl/apiKey/metadata). Returns the Model or undefined.
+ */
+export function resolveModelWithFallback(modelRegistry, provider, modelId) {
+	const exact = modelRegistry.find(provider, modelId);
+	if (exact) return exact;
+	const all = typeof modelRegistry.getAvailable === "function" ? modelRegistry.getAvailable() : [];
+	const byId = all.find((m) => m && m.id === modelId);
+	if (byId) {
+		console.error(
+			`[pi-sidecar] model provider skew: no "${provider}/${modelId}"; ` +
+			`resolved by id to provider "${byId.provider}" (model "${modelId}").`
+		);
+		return byId;
+	}
+	console.error(`[pi-sidecar] model "${provider}/${modelId}" not found in registry (exact or by-id).`);
+	return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // pi SDK bootstrap
 // ---------------------------------------------------------------------------
@@ -373,7 +397,7 @@ async function main() {
 
 	let resolvedModel;
 	try {
-		resolvedModel = modelRegistry.find(provider, modelId);
+		resolvedModel = resolveModelWithFallback(modelRegistry, provider, modelId);
 	} catch (err) {
 		console.error(
 			`[pi-sidecar] Could not resolve model ${provider}/${modelId}: ${err instanceof Error ? err.message : String(err)}`,
