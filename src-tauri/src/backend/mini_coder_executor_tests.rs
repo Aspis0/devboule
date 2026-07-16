@@ -4552,3 +4552,34 @@ fn backend_supports_directive_dispatch_cloud_is_rejected() {
     assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Api).is_ok());
     assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::AppleFm).is_ok());
 }
+
+// ASYNC STEERING (a): pure unit tests for the NoOp routing decision.
+// `mark_steer_requested` is the pure helper that drives `SteerOutcome`; the `NoOp`
+// arm of `mini_coder_steer` then falls back to the pi route when a live pi session
+// exists, otherwise returns `{"status":"noop"}`. In these tests there is no AppHandle
+// and no PiSidecarState, so `pi_session_exists` would be false — the NoOp arm MUST
+// return `noop` (never `steered_pi`).
+#[test]
+fn steer_noop_outcome_maps_to_status_noop_when_no_pi_session() {
+    // A non-mini id (no directive row) -> NoOp -> `{"status":"noop"}`.
+    let mut state = empty_state();
+    let outcome = super::mark_steer_requested(&mut state, "non-mini-agent", "go");
+    assert_eq!(outcome, super::SteerOutcome::NoOp);
+
+    // A terminal directive -> NoOp -> `{"status":"noop"}`.
+    let mut term = directive("d1", "coder-1");
+    term.status = MiniCoderStatus::Done;
+    state.mini_coder_directives.push(term);
+    let outcome = super::mark_steer_requested(&mut state, "d1", "go");
+    assert_eq!(outcome, super::SteerOutcome::NoOp);
+
+    // A blank (after sanitize) message -> NoOp -> `{"status":"noop"}`.
+    let mut state = empty_state();
+    let outcome = super::mark_steer_requested(&mut state, "d1", "   ");
+    assert_eq!(outcome, super::SteerOutcome::NoOp);
+
+    // (A literal-JSON "status mapping" assertion lived here — reviewed as a
+    // tautology and removed: it asserted a locally-built literal, not the
+    // command's output. The pi-fallback + stop-sentinel routing needs an
+    // AppHandle and is covered by the live steer path, not unit tests.)
+}

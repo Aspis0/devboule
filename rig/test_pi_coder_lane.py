@@ -386,6 +386,15 @@ def test_steer_pi_coder_id_pins_not_found():
     steer_mini_coder with a bogus directive_id. Assert status == "not_found".
 
     P5c gap #2 -- routing fix pending owner design decision.
+
+    NOTE (T2): the UI's `mini_coder_steer` Tauri command now has a pi-fallback
+    arm (mini_coder_executor.rs:3955) that delivers via pi_sidecar when no
+    directive row matched, so a pi coder/mini row IS steerable from the app UI
+    (returns {"status":"steered_pi"}). The MCP surface (`steer_mini_coder` /
+    `dispatch_steer_mini_coder`) intentionally stays `not_found` for unknown ids
+    — this test keeps passing because the MCP tool never touches the pi route;
+    only the UI command falls back there. The gap pin is on the MCP surface, not
+    the UI route.
     """
     BOGUS_DIRECTIVE_ID = "pi-mini-coder-rigpin"
     STEER_MESSAGE = "fix the off-by-one bug"

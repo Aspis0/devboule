@@ -3952,7 +3952,51 @@ pub fn mini_coder_steer(
         SteerOutcome::QueueFull { queued } => {
             serde_json::json!({ "status": "queue_full", "queued": queued })
         }
-        SteerOutcome::NoOp => serde_json::json!({ "status": "noop" }),
+        SteerOutcome::NoOp => {
+            // PI-SESSION FALLBACK: when no directive row matched (NoOp), the agent may still
+            // be a live pi-sidecar session (a coder/mini whose steering is via the sidecar,
+            // not the directive queue). Delegate to the pi route — mirroring orchestrator_steer
+            // (projects.rs:4107) — so a pi coder/mini row is steerable from the UI. The MCP
+            // surface (`steer_mini_coder`) intentionally stays not_found for unknown ids: the
+            // rig pin test (`test_steer_pi_coder_id_pins_not_found`) keeps passing because the
+            // MCP tool never touches the pi route; only the UI's `mini_coder_steer` command
+            // falls back here. A send error propagates as Err (fail loud); the user-echo
+            // injection is best-effort so a queue-full sidecar never blocks the steer.
+            if crate::backend::pi_sidecar::pi_session_exists(&app, &agent_id) {
+                // STOP sentinel FIRST (review HIGH): "stop" on a directive row sets
+                // kill_requested; on a pi session it must STOP THE SESSION — without
+                // this guard the literal word "stop" was chatted at the model and the
+                // session kept running.
+                if mini_coder::is_steer_stop(&trimmed) {
+                    let existed =
+                        crate::backend::pi_sidecar::stop_pi_session(&app, &agent_id)?;
+                    return Ok(if existed {
+                        serde_json::json!({ "status": "stopped" })
+                    } else {
+                        serde_json::json!({ "status": "noop" })
+                    });
+                }
+                // User echo: inject BEFORE delivery so the sidecar's reader thread fires the
+                // echo queue-refill before the prompt (the echo appears before any assistant
+                // output). Best-effort: a missing/missing queue is non-fatal — the steer
+                // still reaches the sidecar via send_prompt_to_session. `msg_id` is None
+                // (the UI does not carry a steer msg id — the user-echo is the steer itself).
+                let _ = crate::backend::pi_sidecar::inject_console_entry(
+                    &app,
+                    &agent_id,
+                    crate::backend::mini_activity::ConsoleEntry::Chat {
+                        role: "user".to_string(),
+                        text: trimmed.clone(),
+                        time: crate::backend::mini_activity::console_now_str(),
+                        msg_id: None,
+                    },
+                );
+                crate::backend::pi_sidecar::send_prompt_to_session(&app, &agent_id, &trimmed)?;
+                serde_json::json!({ "status": "steered_pi" })
+            } else {
+                serde_json::json!({ "status": "noop" })
+            }
+        }
     };
     Ok(result)
 }
