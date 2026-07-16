@@ -122,7 +122,11 @@ export type ConsentBridgeStatus =
   | "pending_approval"
   | "allowed"
   | "denied"
-  | "timeout";
+  | "timeout"
+  // A newer ask for the same (project, kind, path) replaced this row
+  // (append_superseding, consent_bridge.rs) — terminal, never rendered as
+  // pending. Present on the wire since the executor write-through landed.
+  | "superseded";
 
 /**
  * One Claude consent request in the `.aspis-agents.json` `consentRequests` queue. Written by

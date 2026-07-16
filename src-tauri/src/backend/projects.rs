@@ -1491,6 +1491,8 @@ fn spawn_pi_coder_session(
     prompt: &str,
     role: &str,
     agent_id: &str,
+    initial_goal: Option<&str>,
+    initial_goal_msg_id: Option<&str>,
 ) -> Result<ProjectAgentLaunchResult, String> {
     // Map the launch role to the sidecar's agent-role namespace. The launch role
     // is "coder" (the Main coder) or "mini"; the sidecar expects "main-coder" /
@@ -1503,6 +1505,28 @@ fn spawn_pi_coder_session(
     };
     let info =
         crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id), Some(agent_id), Some(root_path))?;
+    // T5 (Fix C parity with the orchestrator path, :1420-1445): inject the
+    // Rust-authored user chat echo INTO THE QUEUE BEFORE delivering the prompt —
+    // the queue is drained by the reader thread on the first event AFTER the
+    // sidecar receives the prompt, so the echo lands before any assistant
+    // output. The SDK's own user message_start echoes the WHOLE persona prompt
+    // (ignored by the EventMapper on purpose); this is the only place that
+    // knows the user-visible task text + msgId.
+    if let Some(goal) = initial_goal {
+        let trimmed = goal.trim();
+        if !trimmed.is_empty() {
+            let _ = crate::backend::pi_sidecar::inject_console_entry(
+                app,
+                &info.session_id,
+                crate::backend::mini_activity::ConsoleEntry::Chat {
+                    role: "user".to_string(),
+                    text: trimmed.to_string(),
+                    time: crate::backend::mini_activity::console_now_str(),
+                    msg_id: initial_goal_msg_id.map(|s| s.to_string()),
+                },
+            );
+        }
+    }
     // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
     // this the agent sits idle forever while the UI reports `launched: true`.
     // Only send when there is actual text; fail loudly on delivery error rather
@@ -1815,15 +1839,31 @@ fn prepare_or_launch_project_agent(
                     input.initial_goal_msg_id.as_deref(),
                 )
             }
-            _ => spawn_pi_coder_session(
-                &app,
-                &project.metadata.id,
-                &client,
-                &root_path,
-                &prompt,
-                &role,
-                &agent_id,
-            ),
+            _ => {
+                // T5 (round-1 parity for the coder path): the typed goal/task must
+                // reach the pi coder too — via the CODER-flavored addendum (the
+                // orchestrator's goal_addendum is plan-first/Kairion-worded and
+                // would tell a coder to stop and plan instead of coding).
+                let mut pi_prompt = prompt;
+                if let Some(block) =
+                    crate::backend::agent_prompt::coder_goal_addendum(
+                        input.initial_goal.as_deref(),
+                    )
+                {
+                    pi_prompt.push_str(&block);
+                }
+                spawn_pi_coder_session(
+                    &app,
+                    &project.metadata.id,
+                    &client,
+                    &root_path,
+                    &pi_prompt,
+                    &role,
+                    &agent_id,
+                    input.initial_goal.as_deref(),
+                    input.initial_goal_msg_id.as_deref(),
+                )
+            }
         };
     }
     let projects_path = ensure_projects_dir(&app)?;
@@ -2802,6 +2842,35 @@ pub fn grant_net_consent(
             // No-op: next run will fail again; the user may invoke this command again.
         }
     }
+    // Resolve the matching non-terminal consent_requests row(s) for this (project, Net)
+    // to the granted terminal status so the durable queue reflects reality (inventory
+    // §3: a pending request is still meaningful after restart, so its grant must be
+    // recorded). claim_terminal only transitions a still-pending request; a grant with
+    // no pending row is a no-op on the queue (still Ok).
+    {
+        use crate::backend::consent_bridge::{claim_terminal, ConsentBridgeStatus};
+        // The durable row records the ANSWER, not the live grant: AllowOnce maps
+        // to Allowed even though the one-shot is consumed on the next spawn —
+        // the queue is an audit trail of what the user decided, never a mirror
+        // of current broker state (review: pinned by design, not a bug).
+        let target_status = match decision {
+            crate::backend::broker::ConsentDecision::AllowRemember
+            | crate::backend::broker::ConsentDecision::AllowOnce => {
+                ConsentBridgeStatus::Allowed
+            }
+            crate::backend::broker::ConsentDecision::Deny => ConsentBridgeStatus::Denied,
+        };
+        let _ = super::agents::mutate_agent_live_state(&app, |live| {
+            for req in live.consent_requests.iter_mut() {
+                if req.project_id == project_id
+                    && req.kind == crate::backend::broker::ConsentKind::Net
+                    && req.path.is_none()
+                {
+                    let _ = claim_terminal(req, target_status);
+                }
+            }
+        });
+    }
     // TODO(slice0): trigger retry on grant — reuse build_retry_directive path so the
     // directive is re-spawned immediately without waiting for the next executor pass.
     Ok(())
@@ -3073,6 +3142,33 @@ pub fn grant_folder_consent(
         crate::backend::broker::ConsentDecision::Deny => {
             // No-op: next run will fail again; the user may invoke this command again.
         }
+    }
+    // Resolve the matching non-terminal consent_requests row(s) for this (project, FolderWrite)
+    // to the granted terminal status so the durable queue reflects reality (inventory
+    // §3: a pending request is still meaningful after restart, so its grant must be
+    // recorded). claim_terminal only transitions a still-pending request; a grant with
+    // no pending row is a no-op on the queue (still Ok). The `folder` is already
+    // canonicalized by `normalize_working_set_folder` (see the AllowOnce branch above),
+    // so `path` matches verbatim.
+    {
+        use crate::backend::consent_bridge::{claim_terminal, ConsentBridgeStatus};
+        let target_status = match decision {
+            crate::backend::broker::ConsentDecision::AllowRemember
+            | crate::backend::broker::ConsentDecision::AllowOnce => {
+                ConsentBridgeStatus::Allowed
+            }
+            crate::backend::broker::ConsentDecision::Deny => ConsentBridgeStatus::Denied,
+        };
+        let _ = super::agents::mutate_agent_live_state(&app, |live| {
+            for req in live.consent_requests.iter_mut() {
+                if req.project_id == project_id
+                    && req.kind == crate::backend::broker::ConsentKind::FolderWrite
+                    && req.path.as_deref() == Some(folder.as_str())
+                {
+                    let _ = claim_terminal(req, target_status);
+                }
+            }
+        });
     }
     Ok(())
 }
@@ -8764,6 +8860,25 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(goal_addendum(Some("   ")).is_none());
     }
 
+    /// T5: the CODER-flavored addendum carries the task without the
+    /// orchestrator's plan-first/Kairion protocol (which would tell a coder to
+    /// stop and plan instead of coding).
+    #[test]
+    fn coder_goal_addendum_is_task_worded_without_plan_protocol() {
+        let block = crate::backend::agent_prompt::coder_goal_addendum(Some(
+            "Fix the login race",
+        ))
+        .expect("non-blank goal ⇒ Some");
+        assert!(block.contains("Fix the login race"));
+        assert!(block.contains("# Your task for this project"));
+        assert!(!block.contains("plan_submit"), "no plan-first protocol");
+        assert!(!block.contains("KAIRION_QUESTION"), "no Kairion protocol");
+        assert!(crate::backend::agent_prompt::coder_goal_addendum(None).is_none());
+        assert!(
+            crate::backend::agent_prompt::coder_goal_addendum(Some("  ")).is_none()
+        );
+    }
+
     #[test]
     fn launch_scripts_keep_special_char_prompt_off_the_cli_argv() {
         // A realistic agent prompt: contains `<`, `>`, spaces and newlines, which
@@ -11381,5 +11496,156 @@ mod fence_stale_orchestrator_tests {
              line comment — the fence is dead code and the bug would regress: {}",
             full_line
         );
+    }
+}
+
+#[cfg(test)]
+mod grant_consent_persist_tests {
+    use super::*;
+    use crate::backend::consent_bridge::{claim_terminal, ConsentBridgeStatus};
+    use crate::backend::broker::{ConsentDecision, ConsentKind};
+
+    /// Build a ConsentBridgeRequest with the given id/status/project/kind/path.
+    fn consent_req(
+        id: &str,
+        status: ConsentBridgeStatus,
+        project_id: &str,
+        kind: ConsentKind,
+        path: Option<&str>,
+    ) -> crate::backend::consent_bridge::ConsentBridgeRequest {
+        crate::backend::consent_bridge::ConsentBridgeRequest {
+            id: id.into(),
+            agent_id: "claude-1".into(),
+            project_id: project_id.into(),
+            kind,
+            detail: "test".into(),
+            path: path.map(|s| s.into()),
+            status,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// Inline of grant_net_consent's resolve block (the piece under test):
+    /// transitions matching non-terminal (project, Net, no-path) rows to the
+    /// granted terminal status. claim_terminal only transitions a still-pending
+    /// request, so a grant with no matching pending row is a no-op (still Ok).
+    fn resolve_net_grant(
+        requests: &mut Vec<crate::backend::consent_bridge::ConsentBridgeRequest>,
+        project_id: &str,
+        decision: ConsentDecision,
+    ) {
+        let target_status = match decision {
+            ConsentDecision::AllowRemember | ConsentDecision::AllowOnce => {
+                ConsentBridgeStatus::Allowed
+            }
+            ConsentDecision::Deny => ConsentBridgeStatus::Denied,
+        };
+        for req in requests.iter_mut() {
+            if req.project_id == project_id
+                && req.kind == ConsentKind::Net
+                && req.path.is_none()
+            {
+                let _ = claim_terminal(req, target_status);
+            }
+        }
+    }
+
+    /// Inline of grant_folder_consent's resolve block:
+    /// transitions matching non-terminal (project, FolderWrite, path=folder) rows.
+    fn resolve_folder_grant(
+        requests: &mut Vec<crate::backend::consent_bridge::ConsentBridgeRequest>,
+        project_id: &str,
+        folder: &str,
+        decision: ConsentDecision,
+    ) {
+        let target_status = match decision {
+            ConsentDecision::AllowRemember | ConsentDecision::AllowOnce => {
+                ConsentBridgeStatus::Allowed
+            }
+            ConsentDecision::Deny => ConsentBridgeStatus::Denied,
+        };
+        for req in requests.iter_mut() {
+            if req.project_id == project_id
+                && req.kind == ConsentKind::FolderWrite
+                && req.path.as_deref() == Some(folder)
+            {
+                let _ = claim_terminal(req, target_status);
+            }
+        }
+    }
+
+    #[test]
+    fn net_grant_flips_pending_to_allowed() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::Net, None),
+            consent_req("b", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::Net, None),
+        ];
+        resolve_net_grant(&mut q, "proj", ConsentDecision::AllowOnce);
+        assert_eq!(q[0].status, ConsentBridgeStatus::Allowed);
+        assert_eq!(q[1].status, ConsentBridgeStatus::Allowed);
+    }
+
+    #[test]
+    fn net_grant_deny_flips_pending_to_denied() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::Net, None),
+        ];
+        resolve_net_grant(&mut q, "proj", ConsentDecision::Deny);
+        assert_eq!(q[0].status, ConsentBridgeStatus::Denied);
+    }
+
+    #[test]
+    fn net_grant_no_pending_row_is_noop() {
+        // A grant with no matching pending row must not panic / error — just no-op.
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::Net, None),
+        ];
+        resolve_net_grant(&mut q, "other-project", ConsentDecision::AllowOnce);
+        assert_eq!(q[0].status, ConsentBridgeStatus::PendingApproval, "unmatched project untouched");
+    }
+
+    #[test]
+    fn net_grant_does_not_touch_terminal_rows() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::Allowed, "proj", ConsentKind::Net, None),
+        ];
+        resolve_net_grant(&mut q, "proj", ConsentDecision::Deny);
+        assert_eq!(q[0].status, ConsentBridgeStatus::Allowed, "terminal verdict preserved");
+    }
+
+    #[test]
+    fn net_grant_does_not_touch_different_kind() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::FolderWrite, Some("/x")),
+        ];
+        resolve_net_grant(&mut q, "proj", ConsentDecision::AllowOnce);
+        assert_eq!(q[0].status, ConsentBridgeStatus::PendingApproval, "different kind untouched");
+    }
+
+    #[test]
+    fn folder_grant_flips_matching_pending() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::FolderWrite, Some("/a/b/c")),
+        ];
+        resolve_folder_grant(&mut q, "proj", "/a/b/c", ConsentDecision::AllowRemember);
+        assert_eq!(q[0].status, ConsentBridgeStatus::Allowed);
+    }
+
+    #[test]
+    fn folder_grant_no_match_noop() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::PendingApproval, "proj", ConsentKind::FolderWrite, Some("/x/y/z")),
+        ];
+        resolve_folder_grant(&mut q, "proj", "/a/b/c", ConsentDecision::AllowOnce);
+        assert_eq!(q[0].status, ConsentBridgeStatus::PendingApproval, "unmatched path untouched");
+    }
+
+    #[test]
+    fn folder_grant_does_not_touch_terminal() {
+        let mut q = vec![
+            consent_req("a", ConsentBridgeStatus::Denied, "proj", ConsentKind::FolderWrite, Some("/a/b/c")),
+        ];
+        resolve_folder_grant(&mut q, "proj", "/a/b/c", ConsentDecision::AllowOnce);
+        assert_eq!(q[0].status, ConsentBridgeStatus::Denied, "terminal verdict preserved");
     }
 }

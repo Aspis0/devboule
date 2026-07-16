@@ -287,6 +287,11 @@ export function SpawnPanel({
 		// PTY opt-out: only threaded for claude (duplex default for in-app launches).
 		// Undefined for every other client so the launch is byte-identical.
 		terminalPty: client === "claude" && terminalPty ? true : undefined,
+		// T5 — the selected task's human-readable title rides along so the pi
+		// coder/mini launch can echo it as the console's first user bubble and
+		// append it to the prompt (the composed prompt otherwise carries only the
+		// task UUID). Undefined when no task is picked.
+		taskTitle: selectedTask?.title?.trim() ? selectedTask.title : undefined,
 	};
 
 	const roleSummary = ROLE_OPTIONS.find((r) => r.id === role)?.summary ?? "";

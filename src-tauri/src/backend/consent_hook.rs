@@ -249,6 +249,12 @@ fn decide() -> Result<bool, String> {
             Ok(Some(ConsentBridgeStatus::PendingApproval)) => {
                 consecutive_errors = 0; /* healthy read — keep polling */
             }
+            Ok(Some(ConsentBridgeStatus::Superseded)) => {
+                // A newer ask for the same (project,kind,path) superseded this one.
+                // The user may still answer this stale ask — keep polling (same as
+                // PendingApproval) so a late answer still resolves the hook.
+                consecutive_errors = 0;
+            }
             Ok(None) => {
                 // Vanished (evicted / hand-edited away) with no verdict → fail-closed.
                 return Err("Consent request vanished before a decision.".into());

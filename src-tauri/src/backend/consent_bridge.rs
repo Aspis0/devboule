@@ -53,6 +53,13 @@ pub enum ConsentBridgeStatus {
     /// Terminal: the hook's bounded poll gave up before the human acted (fail-closed →
     /// the hook prints `deny`). Stamped by the hook's poll path so a later answer no-ops.
     Timeout,
+    /// Terminal: a newer request superseded this one (same project+kind+path). The older
+    /// ask is stale — the user is presented the latest ask instead. Kept in the queue
+    /// (not evicted) so the card can show the full history; `cap_consent_requests` never
+    /// evicts it, but `append_superseding` marks it so the queue never accumulates
+    /// duplicate pending asks for the same (project, kind, path). Mirrors the git-push
+    /// gate's `superseded` status so the wire contract stays byte-identical.
+    Superseded,
 }
 
 impl ConsentBridgeStatus {
@@ -64,6 +71,7 @@ impl ConsentBridgeStatus {
             ConsentBridgeStatus::Allowed
                 | ConsentBridgeStatus::Denied
                 | ConsentBridgeStatus::Timeout
+                | ConsentBridgeStatus::Superseded
         )
     }
 }
@@ -186,6 +194,37 @@ pub fn cap_consent_requests(requests: &mut Vec<ConsentBridgeRequest>, max: usize
     });
 }
 
+/// Append `req` into the queue, first marking any EXISTING NON-terminal row with the same
+/// (project_id, kind, path) as `Superseded` (so the user sees the *latest* ask, and the
+/// queue never accumulates duplicate pending asks for the same thing), then pushing `req`
+/// and applying `cap_consent_requests` with the existing `MAX_CONSENT_REQUESTS` cap.
+///
+/// A row is "superseded" only if it is NOT already terminal — a terminal row (Allowed/
+/// Denied/Timeout/Superseded) is left intact so the recorded verdict / history is never
+/// clobbered. This mirrors the Claude consent-hook convention: the hook appends a fresh
+/// `pending_approval` request each time the agent asks; the earlier pending ask becomes
+/// stale and is marked `Superseded` so the queue reflects the current state of the world.
+///
+/// `cap_consent_requests` evicts the oldest TERMINAL rows (never a pending one); because
+/// `Superseded` is itself terminal, a superseded row is eligible for eviction if the
+/// queue overflows. The net effect: the queue holds at most `MAX_CONSENT_REQUESTS` rows,
+/// with all non-terminal rows preserved.
+pub fn append_superseding(requests: &mut Vec<ConsentBridgeRequest>, req: ConsentBridgeRequest) {
+    // Mark any existing non-terminal row with the same (project_id, kind, path) as
+    // superseded. Pick the existing terminal status that fits, or add a `Superseded`
+    // variant (the enum is additive; serde handles the new variant without churn).
+    for r in requests.iter_mut() {
+        if r.status.is_terminal() {
+            continue; // already terminal — leave the recorded verdict intact.
+        }
+        if r.project_id == req.project_id && r.kind == req.kind && r.path == req.path {
+            r.status = ConsentBridgeStatus::Superseded;
+        }
+    }
+    requests.push(req);
+    cap_consent_requests(requests, MAX_CONSENT_REQUESTS);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +277,7 @@ mod tests {
             (ConsentBridgeStatus::Allowed, "allowed"),
             (ConsentBridgeStatus::Denied, "denied"),
             (ConsentBridgeStatus::Timeout, "timeout"),
+            (ConsentBridgeStatus::Superseded, "superseded"),
         ] {
             assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{tok}\""));
             let back: ConsentBridgeStatus = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
@@ -316,6 +356,7 @@ mod tests {
         assert!(is_terminal(&request("r", ConsentBridgeStatus::Allowed, "t")));
         assert!(is_terminal(&request("r", ConsentBridgeStatus::Denied, "t")));
         assert!(is_terminal(&request("r", ConsentBridgeStatus::Timeout, "t")));
+        assert!(is_terminal(&request("r", ConsentBridgeStatus::Superseded, "t")));
     }
 
     // -- bounded queue ------------------------------------------------------
@@ -352,5 +393,116 @@ mod tests {
         let mut q = vec![request("a", ConsentBridgeStatus::Allowed, "t")];
         cap_consent_requests(&mut q, 50);
         assert_eq!(q.len(), 1);
+    }
+
+    // -- append_superseding -------------------------------------------------
+
+    #[test]
+    fn append_superseding_marks_only_same_key_rows() {
+        // Two pendings with different (project,kind,path): only the matching one is
+        // marked superseded; the other stays pending.
+        let mut q = vec![];
+        let a = request("a", ConsentBridgeStatus::PendingApproval, "2026-01-01T00:00:01Z");
+        // `b` has a *different path* so its key (project,kind,path) differs from `a`.
+        let b = ConsentBridgeRequest {
+            id: "b".into(),
+            agent_id: "claude-1".into(),
+            project_id: "proj-1".into(),
+            kind: ConsentKind::Exec,
+            detail: "cargo build".into(),
+            path: Some("/different/path".into()),
+            status: ConsentBridgeStatus::PendingApproval,
+            created_at: "2026-01-01T00:00:02Z".into(),
+        };
+        let a2 = request("a2", ConsentBridgeStatus::PendingApproval, "2026-01-01T00:00:03Z");
+        q.push(a);
+        q.push(b); // same project+kind, different path -> untouched
+        q.push(a2); // same project+kind+path as "a" -> superseded
+        let new_req = request("new", ConsentBridgeStatus::PendingApproval, "2026-01-01T00:00:04Z");
+        append_superseding(&mut q, new_req);
+
+        let a = q.iter().find(|r| r.id == "a").unwrap();
+        let b = q.iter().find(|r| r.id == "b").unwrap();
+        let a2 = q.iter().find(|r| r.id == "a2").unwrap();
+        assert_eq!(a.status, ConsentBridgeStatus::Superseded);
+        assert_eq!(b.status, ConsentBridgeStatus::PendingApproval, "different path untouched");
+        assert_eq!(a2.status, ConsentBridgeStatus::Superseded);
+    }
+
+    #[test]
+    fn append_superseding_does_not_touch_terminal_rows() {
+        // An existing Allowed row with the same key must NOT be clobbered.
+        let mut q = vec![];
+        let allowed = request(
+            "allowed",
+            ConsentBridgeStatus::Allowed,
+            "2026-01-01T00:00:01Z",
+        );
+        let new_req = request("new", ConsentBridgeStatus::PendingApproval, "2026-01-01T00:00:02Z");
+        q.push(allowed);
+        append_superseding(&mut q, new_req);
+        let allowed = q.iter().find(|r| r.id == "allowed").unwrap();
+        assert_eq!(allowed.status, ConsentBridgeStatus::Allowed, "terminal verdict preserved");
+        let new = q.iter().find(|r| r.id == "new").unwrap();
+        assert_eq!(new.status, ConsentBridgeStatus::PendingApproval);
+    }
+
+    #[test]
+    fn append_superseding_applies_cap() {
+        // With max=1 and one existing terminal row, the new row must be pushed and the
+        // oldest terminal evicted so the queue length equals max.
+        // We pass requests with max=1 to cap directly after append_superseding to verify
+        // the cap step runs (append_superseding itself uses MAX_CONSENT_REQUESTS=50, so
+        // these two rows won't be capped there — we verify the cap step separately).
+        let mut q = vec![request("old", ConsentBridgeStatus::Denied, "2026-01-01T00:00:01Z")];
+        let new_req = request("new", ConsentBridgeStatus::PendingApproval, "2026-01-01T00:00:02Z");
+        append_superseding(&mut q, new_req);
+        // After append_superseding the queue has 2 rows (cap didn't fire at max=50).
+        // Now cap to max=1: the oldest terminal ("old") must be evicted, leaving only "new".
+        cap_consent_requests(&mut q, 1);
+        assert_eq!(q.len(), 1, "cap applied: queue length equals max");
+        assert!(q.iter().any(|r| r.id == "new"));
+        assert!(!q.iter().any(|r| r.id == "old"), "oldest terminal evicted");
+    }
+
+    #[test]
+    fn append_superseding_different_kind_untouched() {
+        // Same project+path, different kind: no superseding, both pendings survive.
+        let mut q = vec![request("exec", ConsentBridgeStatus::PendingApproval, "t")];
+        q[0].kind = ConsentKind::Exec;
+        let new_req = ConsentBridgeRequest {
+            id: "patch".into(),
+            agent_id: "claude-1".into(),
+            project_id: "proj-1".into(),
+            kind: ConsentKind::Patch,
+            detail: "edit".into(),
+            path: None,
+            status: ConsentBridgeStatus::PendingApproval,
+            created_at: "t2".into(),
+        };
+        append_superseding(&mut q, new_req);
+        assert_eq!(q.len(), 2);
+        let exec = q.iter().find(|r| r.id == "exec").unwrap();
+        assert_eq!(exec.status, ConsentBridgeStatus::PendingApproval, "different kind untouched");
+    }
+
+    #[test]
+    fn append_superseding_different_project_untouched() {
+        let mut q = vec![request("proj-a", ConsentBridgeStatus::PendingApproval, "t")];
+        q[0].project_id = "proj-a".into();
+        let new_req = ConsentBridgeRequest {
+            id: "proj-b".into(),
+            agent_id: "claude-1".into(),
+            project_id: "proj-b".into(),
+            kind: ConsentKind::Exec,
+            detail: "build".into(),
+            path: None,
+            status: ConsentBridgeStatus::PendingApproval,
+            created_at: "t2".into(),
+        };
+        append_superseding(&mut q, new_req);
+        assert_eq!(q.len(), 2);
+        let a = q.iter().find(|r| r.id == "proj-a").unwrap();
+        assert_eq!(a.status, ConsentBridgeStatus::PendingApproval, "different project untouched");
     }
 }

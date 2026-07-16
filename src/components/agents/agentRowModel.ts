@@ -332,6 +332,11 @@ export interface SpawnSelection {
 	// client "claude" + host "app"; for every other combination the field is ignored
 	// (duplex never applies). Absent/undefined = duplex is the default (product decision).
 	terminalPty?: boolean;
+	// T5 — the selected task's human-readable title. For non-orchestrator roles it
+	// threads into the launch as initialGoal: the pi coder/mini path echoes it as
+	// the console's first user bubble and appends it to the prompt (which otherwise
+	// carries only the task UUID). Absent when no task is selected.
+	taskTitle?: string;
 	// 3b — "Plan first" bias for the LOCAL orchestrator (client === "orchestrator")
 	// ONLY. When true the launch sets DEVBOULE_PLAN_FIRST=1 so the orchestrator's
 	// system prompt gains a plan-before-acting directive. Meaningless for
@@ -492,6 +497,16 @@ export function buildLaunchInput(
 			host === "app" &&
 			selection.terminalPty !== true
 				? true
+				: undefined,
+		// T5 — the task title becomes the launch's initialGoal for NON-orchestrator
+		// roles (the orchestrator's goal comes from the Planner composer, never from
+		// here): the pi coder/mini spawn echoes it as the first user bubble and
+		// appends the coder-flavored task block to the prompt.
+		initialGoal:
+			selection.client !== "orchestrator" &&
+			selection.taskTitle &&
+			selection.taskTitle.trim().length > 0
+				? selection.taskTitle.trim()
 				: undefined,
 	};
 }

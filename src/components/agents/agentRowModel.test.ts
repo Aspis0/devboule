@@ -308,6 +308,27 @@ describe("buildLaunchInput", () => {
     expect(input.host).toBe("app");
   });
 
+  it("T5: the selected task title rides as initialGoal for non-orchestrator roles", () => {
+    const input = buildLaunchInput(
+      { ...sel, taskTitle: "Fix the login race" },
+      "app",
+    );
+    expect(input.initialGoal).toBe("Fix the login race");
+    // No task selected → absent.
+    expect(buildLaunchInput(sel, "app").initialGoal).toBeUndefined();
+    // Blank title → absent.
+    expect(
+      buildLaunchInput({ ...sel, taskTitle: "   " }, "app").initialGoal,
+    ).toBeUndefined();
+    // The orchestrator's goal comes from the Planner composer, never from here.
+    expect(
+      buildLaunchInput(
+        { ...sel, client: "orchestrator", taskTitle: "X" },
+        "app",
+      ).initialGoal,
+    ).toBeUndefined();
+  });
+
   it("throws for host=copy (not a launch path)", () => {
     expect(() => buildLaunchInput(sel, "copy")).toThrow();
   });

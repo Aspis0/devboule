@@ -2105,6 +2105,44 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             // sandbox_mode is Some because project_id is Some.
             let mode = sandbox_mode.unwrap_or(crate::backend::broker::SandboxMode::Ask);
             if mode.prompts_for_net() {
+                // Persist the consent request so it survives an app restart (the "activates
+                // on reset" contract means a pending request is still meaningful after
+                // restart — without this, a user who wanted to grant on a prior run would
+                // never learn of it). Mirrors the Claude consent-hook convention: mint an
+                // id like the hook does (getrandom hex, fallback pid+timestamp), stamp
+                // `pending_approval`, then append_superseding so duplicate pending asks for
+                // the same (project,kind,path) don't accumulate.
+                {
+                    use crate::backend::consent_bridge::{append_superseding, ConsentBridgeRequest, ConsentBridgeStatus};
+                    let request_id = {
+                        let mut bytes = [0u8; 16];
+                        if getrandom::fill(&mut bytes).is_ok() {
+                            hex::encode(bytes)
+                        } else {
+                            format!(
+                                "{}-{}",
+                                std::process::id(),
+                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                            )
+                        }
+                    };
+                    let row = ConsentBridgeRequest {
+                        id: request_id,
+                        agent_id: agent_id.clone(),
+                        project_id: pid.to_string(),
+                        kind: crate::backend::broker::ConsentKind::Net,
+                        detail: "A sandboxed command needed network access, which is disabled for \
+                                 this project. Grant to retry."
+                            .to_string(),
+                        path: None,
+                        status: ConsentBridgeStatus::PendingApproval,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::backend::agents::mutate_agent_live_state(
+                        &app,
+                        |st| append_superseding(&mut st.consent_requests, row),
+                    );
+                }
                 let req = crate::backend::broker::ConsentRequest {
                     kind: crate::backend::broker::ConsentKind::Net,
                     project_id: pid.to_string(),
@@ -2174,6 +2212,45 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             // sandbox_mode is Some because project_id is Some.
             let mode = sandbox_mode.unwrap_or(crate::backend::broker::SandboxMode::Ask);
             if mode.prompts_for_folder_write() {
+                // Persist the consent request so it survives an app restart (the "activates
+                // on reset" contract means a pending request is still meaningful after
+                // restart). Mirrors the Claude consent-hook convention: mint an id like the
+                // hook does, stamp `pending_approval`, then append_superseding so duplicate
+                // pending asks for the same (project,kind,path) don't accumulate.
+                {
+                    use crate::backend::consent_bridge::{append_superseding, ConsentBridgeRequest, ConsentBridgeStatus};
+                    let request_id = {
+                        let mut bytes = [0u8; 16];
+                        if getrandom::fill(&mut bytes).is_ok() {
+                            hex::encode(bytes)
+                        } else {
+                            format!(
+                                "{}-{}",
+                                std::process::id(),
+                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                            )
+                        }
+                    };
+                    let row = ConsentBridgeRequest {
+                        id: request_id,
+                        agent_id: agent_id.clone(),
+                        project_id: pid.to_string(),
+                        kind: crate::backend::broker::ConsentKind::FolderWrite,
+                        detail: format!(
+                            "A sandboxed command attempted to write outside the project to \
+                             \"{folder}\". Grant to allow writes there and retry."
+                        ),
+                        // BLOCKER 1 fix: `path` carries the raw canonical folder so the
+                        // frontend passes it (not the prose `detail`) to grant_folder_consent.
+                        path: Some(folder.to_string()),
+                        status: ConsentBridgeStatus::PendingApproval,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::backend::agents::mutate_agent_live_state(
+                        &app,
+                        |st| append_superseding(&mut st.consent_requests, row),
+                    );
+                }
                 let req = crate::backend::broker::ConsentRequest {
                     kind: crate::backend::broker::ConsentKind::FolderWrite,
                     project_id: pid.to_string(),

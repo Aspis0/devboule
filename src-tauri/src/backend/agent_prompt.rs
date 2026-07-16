@@ -49,6 +49,18 @@ pub(crate) fn goal_addendum(initial_goal: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Coder-flavored goal addendum: the typed goal/task appended to a pi CODER or
+/// MINI launch prompt. Deliberately NOT [`goal_addendum`]: that block is
+/// orchestrator-worded (plan-first, plan_submit, Kairion doubt protocol) and
+/// would tell a coder to stop and plan instead of coding. `None` when
+/// absent/blank. Pure → testable.
+pub(crate) fn coder_goal_addendum(initial_goal: Option<&str>) -> Option<String> {
+    let goal = initial_goal.map(str::trim).filter(|g| !g.is_empty())?;
+    Some(format!(
+        "\n\n# Your task for this project\n\n{goal}\n"
+    ))
+}
+
 /// B2 F1: build the goal section appended to a CLOUD orchestrator's stdin prompt.
 /// Returns `None` (no change) for the local orchestrator client (it reads the goal
 /// from DEVBOULE_GOAL env, ignoring this prompt) or when no goal was typed. Gating on
