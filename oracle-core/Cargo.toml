@@ -11,6 +11,10 @@ name = "oracle_core"
 name = "oracle-cli"
 path = "src/bin/oracle-cli.rs"
 
+[[bin]]
+name = "oracle-mcp"
+path = "src/bin/oracle_mcp.rs"
+
 [dependencies]
 fastembed = { version = "5", features = ["qwen3"] }
 candle-core = "0.10.2"
@@ -38,6 +42,8 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 http-body-util = "0.1"
+# M4: pi-oracle MCP rail port. rmcp = official Rust MCP SDK; stdio server + macros.
+rmcp = { version = "0.7", features = ["server", "transport-io", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Metal/CoreML are macOS-only — other targets must never see them.

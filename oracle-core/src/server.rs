@@ -82,17 +82,57 @@ impl AppState {
     /// Fallible: a corrupt/locked/unreadable metadata.sqlite must surface as a
     /// clean 500, never panic the handler task.
     fn engine(&self) -> Result<QueryEngine> {
-        let sqlite = SqliteStore::new(&self.sqlite_path)?;
-        let vectors = LanceStore::new(&self.vectors_path);
-        let chunk_vectors = LanceStore::new(&self.chunk_vectors_path);
-        let file_vectors = LanceStore::new(&self.file_vectors_path);
-        Ok(QueryEngine::new(
-            sqlite,
-            vectors,
-            Some(chunk_vectors),
-            Some(file_vectors),
-        ))
+        build_query_engine_from_stores(
+            &self.sqlite_path,
+            &self.vectors_path,
+            &self.chunk_vectors_path,
+            &self.file_vectors_path,
+        )
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public engine/embedder factories (M4)
+//
+// Shared by BOTH the HTTP server (`AppState::engine`) and the standalone
+// `oracle-mcp` rmcp stdio binary so the per-call store wiring cannot drift.
+// `build_query_engine` is byte-identical to the previous private
+// `AppState::engine()` recipe.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a `QueryEngine` directly from the four store paths (no OracleDataPaths).
+///
+/// Stores are cheap to construct and not `Clone`, so callers build one per
+/// query. Fallible: a corrupt/locked/unreadable `metadata.sqlite` surfaces a
+/// clean error rather than panicking.
+pub fn build_query_engine_from_stores(
+    metadata: &Path,
+    vectors: &Path,
+    chunks: &Path,
+    file_vectors: &Path,
+) -> anyhow::Result<QueryEngine> {
+    let sqlite = SqliteStore::new(metadata)?;
+    Ok(QueryEngine::new(
+        sqlite,
+        LanceStore::new(vectors),
+        Some(LanceStore::new(chunks)),
+        Some(LanceStore::new(file_vectors)),
+    ))
+}
+
+/// Build a `QueryEngine` for the given store paths.
+///
+/// Mirrors the recipe that used to live in `AppState::engine()`. Stores are
+/// cheap to construct and not `Clone`, so callers build one per query.
+/// Fallible: a corrupt/locked/unreadable `metadata.sqlite` surfaces a clean
+/// error rather than panicking. Delegates to `build_query_engine_from_stores`.
+pub fn build_query_engine(paths: &OracleDataPaths) -> Result<QueryEngine> {
+    build_query_engine_from_stores(
+        &paths.metadata,
+        &paths.vectors,
+        &paths.chunks,
+        &paths.file_vectors,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -315,7 +355,7 @@ struct SimilarQuery {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Wraps `Arc<EmbedderPool>` to implement `QueryEmbedder` (not `TextEmbedder`).
-struct PoolQueryEmbedder {
+pub struct PoolQueryEmbedder {
     pool: Arc<EmbedderPool>,
     use_hash: bool,
 }
@@ -341,6 +381,16 @@ impl QueryEmbedder for PoolQueryEmbedder {
             .next()
             .ok_or_else(|| anyhow::anyhow!("empty embedding result"))
     }
+}
+
+/// Construct a `PoolQueryEmbedder` over the given pool.
+///
+/// `use_hash = true` forces the deterministic `hash_embed` query path (used by
+/// tests / environments without the ONNX model). When `false`, the pool's
+/// real embedding backend is used unless `ORACLE_QUERY_EMBEDDER=hash` is set in
+/// the environment. Shared by the HTTP server and the `oracle-mcp` binary.
+pub fn pool_query_embedder(pool: Arc<EmbedderPool>, use_hash: bool) -> PoolQueryEmbedder {
+    PoolQueryEmbedder { pool, use_hash }
 }
 
 /// Wrapper to adapt `Arc<EmbedderPool>` to `TextEmbedder` (for jobs module).
@@ -625,10 +675,7 @@ async fn run_ask(
     let pool = Arc::clone(&state.embedder_pool);
     let q = q.to_string();
     let result = {
-        let embedder = PoolQueryEmbedder {
-            pool,
-            use_hash: state.query_embedder_hash,
-        };
+        let embedder = pool_query_embedder(pool, state.query_embedder_hash);
         let answerer = LlmAnswerer::from_env();
         engine
             .ask(
@@ -708,10 +755,7 @@ async fn run_context(
     let pool = Arc::clone(&state.embedder_pool);
     let q2 = q.to_string();
     let result = {
-        let embedder = PoolQueryEmbedder {
-            pool,
-            use_hash: state.query_embedder_hash,
-        };
+        let embedder = pool_query_embedder(pool, state.query_embedder_hash);
         engine
             .context(
                 &q2,
@@ -784,10 +828,7 @@ async fn ask_bounded_handler(
     let pool = Arc::clone(&state.embedder_pool);
     let q = q.to_string();
     let result = {
-        let embedder = PoolQueryEmbedder {
-            pool,
-            use_hash: state.query_embedder_hash,
-        };
+        let embedder = pool_query_embedder(pool, state.query_embedder_hash);
         let answerer = LlmAnswerer::from_env();
         engine
             .ask(
