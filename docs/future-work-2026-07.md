@@ -51,6 +51,26 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   agent prompt/help so models don't retry).
 - `censor_findings` requires `root_path` frontmatter + ASPIS_WORKSPACE_ROOT
   approval — confusing failure mode when missing; better error message.
+- **Deterministic censor gate on the session diff (salvage pi-lens diagnostics,
+  NO autofix)** — owner design ticket 2026-07-16. Background: `npm:pi-lens` was
+  the deterministic-censor-before-LLM experiment, but its autofix ran
+  `cargo clippy --fix`/`cargo fix --allow-dirty --allow-staged` TREE-WIDE as a
+  side effect of any agent .rs edit — invisible, unscoped, attributed to the
+  coder models (the "mimo/kat cargo incidents" were pi-lens), and it would
+  bypass the agentic executor's write_allowlist entirely. Owner removed the
+  package 2026-07-16. What to build instead, inside Devboule's censor rail:
+  * **Detection, report-only**: run the deterministic checks (clippy WITHOUT
+    --fix, typos, ast-grep/opengrep patterns) on the DIFF of the coder's
+    session — only files the coder touched — and feed findings back into the
+    fix-pass loop exactly like tool `ERROR:` feedback. Attach on the (now
+    fixed, 8aa592a/c6aa4e4) `devboule_censor_review` channel for pi sessions
+    and on the emit-edits result for directive minis.
+  * **Autofix never in the live tree**: at most rustfmt on the edited files at
+    an explicit turn boundary; anything clippy-fix-shaped runs in an isolated
+    worktree and comes back as a PATCH PROPOSAL the loop can accept — never
+    --allow-dirty on the shared tree.
+  * Related: [censor-gate-expansion-and-skills] linter list; the 3-tier local
+    review design (censor-and-projects-ia-redesign).
 
 ## 3. Orchestrator / pi-sidecar (from the 6 fix rounds, still open)
 
