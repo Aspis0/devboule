@@ -3420,6 +3420,7 @@ export function ProjectsView() {
 						onUnarchive={() => void updateProjectStatus("active")}
 						launchMessage={launchMessage}
 						rules={agentState?.rules ?? []}
+						miniCoderDirectives={agentState?.miniCoderDirectives ?? []}
 						customClients={config.customAgentClients ?? []}
 						localCoderModel={config.localCoderBackend?.model ?? null}
 						onBack={exitWorkMode}

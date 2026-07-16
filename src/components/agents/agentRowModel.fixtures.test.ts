@@ -13,6 +13,7 @@ import type {
   AgentClaim,
   AgentEvent,
   AgentLiveState,
+  MiniCoderDirective,
 } from "../../types/backend";
 import fixture from "../../../rig/fixtures/agents-state.json";
 
@@ -95,19 +96,56 @@ describe("agentRowModel against agents-state fixture", () => {
     expect(data.subagents).toEqual([]);
   });
 
-  // ---- stuckReport gap ----
+  // ---- stuckReport / censorSummary surface through drawerData ----
 
-  it.todo(
-    "drawerData does NOT surface stuckReport from miniCoderDirectives — the model " +
-    "does not read directives. stuckReport is surfaced via a SEPARATE " +
-    "useMiniStuckReports hook + mini://stuck event channel. The drawer has no " +
-    "visibility into directive-level stuck reports.",
-  );
+  it("drawerData surfaces stuckReport for the parent agent of a failed directive", () => {
+    const directives = state.miniCoderDirectives as MiniCoderDirective[];
+    const data = drawerData(coder, claims, events, NOW, 12, directives);
+    expect(data.stuckReports).toHaveLength(1);
+    const sr = data.stuckReports[0];
+    expect(sr.taskId).toBe("d-failed");
+    expect(sr.reason).toBe("failed");
+    expect(sr.attempts).toBe(3);
+    expect(sr.filesTouchedCount).toBe(1);
+  });
 
-  it("miniCoderDirectives are present in the fixture but the model does not consume them", () => {
-    const directives = state.miniCoderDirectives;
-    expect(directives).toBeDefined();
-    expect(Array.isArray(directives)).toBe(true);
-    expect(directives!.length).toBe(3);
+  it("drawerData surfaces censorSummary for the parent agent of a done directive", () => {
+    const directives = state.miniCoderDirectives as MiniCoderDirective[];
+    const data = drawerData(coder, claims, events, NOW, 12, directives);
+    expect(data.censorSummaries).toHaveLength(1);
+    const cs = data.censorSummaries[0];
+    expect(cs.taskId).toBe("d-censored");
+    expect(cs.total).toBe(2);
+    expect(cs.files).toEqual(["src/auth.rs", "src/db.rs"]);
+  });
+
+  it("drawerData returns empty stuck/censor arrays for an agent with no directives", () => {
+    // orch-1 has no directives in the fixture (no directive has parentAgentId === "orch-1")
+    const data = drawerData(orch, claims, events, NOW, 12, state.miniCoderDirectives as MiniCoderDirective[]);
+    expect(data.stuckReports).toHaveLength(0);
+    expect(data.censorSummaries).toHaveLength(0);
+  });
+
+  it("drawerData returns empty stuck/censor arrays when directives is null/undefined", () => {
+    const data = drawerData(coder, claims, events, NOW, 12, null);
+    expect(data.stuckReports).toHaveLength(0);
+    expect(data.censorSummaries).toHaveLength(0);
+  });
+
+  it("drawerData surfaces a directive's reports for the MINI row itself (agentId tie)", () => {
+    // NOT fixture-driven (the fixture's failed directive never launched a PTY so
+    // it has no agentId): a synthetic directive pins the selector's second tie —
+    // opening the MINI's own drawer (directive.agentId === session.agentId) must
+    // show its report, not only the parent coder's drawer (parentAgentId tie).
+    const mini = sessions.find((s) => s.agentId === "mini-1")!;
+    const failedDirective = (
+      (state.miniCoderDirectives ?? []) as MiniCoderDirective[]
+    ).find((d) => d.id === "d-failed")!;
+    const withAgentId: MiniCoderDirective = {
+      ...failedDirective,
+      agentId: "mini-1",
+    };
+    const data = drawerData(mini, claims, events, NOW, 12, [withAgentId]);
+    expect(data.stuckReports.map((r) => r.taskId)).toContain("d-failed");
   });
 });

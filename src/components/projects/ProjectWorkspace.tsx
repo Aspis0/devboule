@@ -49,6 +49,7 @@ import type {
   AgentSession,
   CensorFinding,
   CensorStatus,
+  MiniCoderDirective,
   ProjectDetail,
   SandboxMode,
 } from "../../types/backend";
@@ -198,6 +199,9 @@ export interface ProjectWorkspaceProps {
   /** Called after a successful working-set add or remove so the parent can patch
    *  the in-memory project metadata immediately (avoids a ~10s wait for the poll). */
   onWorkingSetChange?: (next: string[]) => void;
+  /** Mini-coder directive queue from the live state (containing stuckReport /
+   *  censorSummary). Threaded to AgentDetailDrawer for durable per-agent display. */
+  miniCoderDirectives?: MiniCoderDirective[] | null;
   /**
    * Called after a successful `grant_folder_consent` with decision=allowRemember so
    * the parent can reload the project detail and surface the backend-canonicalized
@@ -240,6 +244,7 @@ export function ProjectWorkspace({
   onSandboxModeChange,
   onWorkingSetChange,
   onReloadProject,
+  miniCoderDirectives,
 }: ProjectWorkspaceProps) {
   const now = useNow();
   // Phase B twinning: the selection lives in the shared store so the bottom DAG board
@@ -1338,6 +1343,7 @@ export function ProjectWorkspace({
                   claims={claims}
                   events={events}
                   now={now}
+                  directives={miniCoderDirectives}
                 />
               )}
 

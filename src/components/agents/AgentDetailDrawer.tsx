@@ -4,11 +4,12 @@
 // so the page stops being a flat dump of every claim/event. Pure derivation lives
 // in agentRowModel.drawerData; this is the thin JSX shell.
 
-import { Activity, GitPullRequest, Users } from "lucide-react";
+import { Activity, GitPullRequest, ShieldAlert, TriangleAlert, Users } from "lucide-react";
 import type {
   AgentClaim,
   AgentEvent,
   AgentSession,
+  MiniCoderDirective,
 } from "../../types/backend";
 import { drawerData, formatStamp, subagentChipLabel } from "./agentRowModel";
 
@@ -47,13 +48,15 @@ export function AgentDetailDrawer({
   claims,
   events,
   now,
+  directives,
 }: {
   session: AgentSession;
   claims: AgentClaim[];
   events: AgentEvent[];
   now: number;
+  directives?: MiniCoderDirective[] | null;
 }) {
-  const data = drawerData(session, claims, events, now);
+  const data = drawerData(session, claims, events, now, 12, directives);
   const openClaims = [...data.activeClaims, ...data.waitingClaims];
 
   return (
@@ -153,6 +156,60 @@ export function AgentDetailDrawer({
           </ul>
         )}
       </div>
+
+      {/* Mini-coder directive reports (stuck + censor). Only renders when at
+          least one report exists — zero visual change otherwise. */}
+      {data.stuckReports.length > 0 || data.censorSummaries.length > 0 ? (
+        <div className="md:col-span-3 border-t border-cream-200 pt-3">
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <ShieldAlert className="h-3.5 w-3.5 text-coral-dark" />
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+              Mini reports
+            </p>
+          </div>
+          <ul className="space-y-1">
+            {data.stuckReports.map((sr, i) => (
+              <li
+                key={`stuck-${sr.taskId}-${i}`}
+                className="rounded-md bg-coral/5 px-2 py-1 text-[10px]"
+              >
+                <div className="flex items-center gap-1.5">
+                  <TriangleAlert className="h-3 w-3 shrink-0 text-coral-dark" />
+                  <span className="text-cream-700">
+                    <span className="font-semibold">
+                      mini {sr.taskId}
+                    </span>{" "}
+                    stuck after {sr.attempts} attempt
+                    {sr.attempts !== 1 ? "s" : ""}{" "}
+                    ({sr.reason})
+                  </span>
+                </div>
+                <p className="mt-0.5 pl-[18px] text-cream-400">
+                  {sr.filesTouchedCount} file
+                  {sr.filesTouchedCount !== 1 ? "s" : ""} touched
+                </p>
+              </li>
+            ))}
+            {data.censorSummaries.map((cs, i) => (
+              <li
+                key={`censor-${cs.taskId}-${i}`}
+                className="rounded-md bg-cream-50 px-2 py-1 text-[10px]"
+              >
+                <div className="flex items-center gap-1.5">
+                  <ShieldAlert className="h-3 w-3 shrink-0 text-sage-dark" />
+                  <span className="text-cream-700">
+                    <span className="font-semibold">
+                      censor
+                    </span>
+                    : {cs.total} finding{cs.total !== 1 ? "s" : ""} on{" "}
+                    {cs.files.length} file{cs.files.length !== 1 ? "s" : ""}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -15,6 +15,7 @@ import type {
 	AgentRole,
 	AgentSession,
 	AgentSubagent,
+	MiniCoderDirective,
 	ProjectTask,
 } from "../../types/backend";
 import type { SpawnRole } from "./roleDisplay";
@@ -211,6 +212,23 @@ export function capHistory(
 
 // --- AgentDetailDrawer model -------------------------------------------------
 
+/** One stuck report row surfaced in the drawer, derived from a directive's
+ *  stuckReport field. Never shows lastOutput raw (too big). */
+export interface DrawerStuckReport {
+	taskId: string;
+	reason: string;
+	attempts: number;
+	filesTouchedCount: number;
+}
+
+/** One censor summary row surfaced in the drawer, derived from a directive's
+ *  censorSummary field. */
+export interface DrawerCensorSummary {
+	taskId: string;
+	total: number;
+	files: string[];
+}
+
 export interface DrawerData {
 	// This agent's claims, split for display. Working = currently held; open =
 	// claimed/awaiting; history = closed/expired. All newest-updated first.
@@ -221,6 +239,10 @@ export interface DrawerData {
 	events: AgentEvent[];
 	// Subagent breakdown rows (copied through; the drawer renders the raw entries).
 	subagents: AgentSubagent[];
+	// Stuck reports from this agent's mini-coder directives that failed terminally.
+	stuckReports: DrawerStuckReport[];
+	// Censor summaries from this agent's mini-coder directives that completed.
+	censorSummaries: DrawerCensorSummary[];
 }
 
 // Filter the GLOBAL claim/event arrays down to one agent and shape them for the
@@ -232,11 +254,42 @@ export function drawerData(
 	events: AgentEvent[],
 	now: number = Date.now(),
 	eventLimit = 12,
+	directives?: MiniCoderDirective[] | null,
 ): DrawerData {
 	const agentId = session.agentId;
 	const mine = claims
 		.filter((claim) => claim.agentId === agentId)
 		.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+
+	// Derive stuck reports and censor summaries from mini-coder directives tied
+	// to this drawer's agent: as the SPAWNER (parentAgentId — a coder's drawer
+	// shows its delegated minis' reports) or as the MINI ITSELF (directive
+	// agentId — opening a mini row shows its own report). Keep both arrays
+	// pure — never mutate the input.
+	const agentDirectives =
+		directives?.filter(
+			(d) => d.parentAgentId === agentId || d.agentId === agentId,
+		) ?? [];
+	const stuckReports: DrawerStuckReport[] = [];
+	const censorSummaries: DrawerCensorSummary[] = [];
+	for (const d of agentDirectives) {
+		if (d.stuckReport) {
+			stuckReports.push({
+				taskId: d.stuckReport.taskId,
+				reason: d.stuckReport.reason,
+				attempts: d.stuckReport.attempts,
+				filesTouchedCount: d.stuckReport.filesTouched?.length ?? 0,
+			});
+		}
+		if (d.censorSummary) {
+			censorSummaries.push({
+				taskId: d.id,
+				total: d.censorSummary.total,
+				files: d.censorSummary.files,
+			});
+		}
+	}
+
 	return {
 		activeClaims: mine.filter((claim) => isWorkingClaim(claim, now)),
 		waitingClaims: mine.filter(
@@ -248,6 +301,10 @@ export function drawerData(
 			.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""))
 			.slice(0, eventLimit),
 		subagents: session.subagents ?? [],
+		// Bounded like `events` — a long-lived fleet state can accumulate many
+		// directives; the drawer shows the most recent few, not an unbounded list.
+		stuckReports: stuckReports.slice(0, eventLimit),
+		censorSummaries: censorSummaries.slice(0, eventLimit),
 	};
 }
 

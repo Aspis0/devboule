@@ -1375,9 +1375,57 @@ export interface AgentLiveState {
 	// Plan approval requests currently pending human review. Optional: absent in
 	// older snapshots or backends that do not yet populate this field.
 	planApprovalRequests?: PlanApprovalRequest[];
-	// Mini-coder directive queue entries. Typed as unknown[] until a concrete
-	// MiniCoderDirective type is needed; callers must narrow before use.
-	miniCoderDirectives?: unknown[];
+	// Mini-coder directive queue entries from .aspis-agents.json.
+	miniCoderDirectives?: MiniCoderDirective[];
+}
+
+// ---- Mini-coder directive shapes (camelCase wire from .aspis-agents.json) -------
+
+/** Terminal stuck report written when a mini-coder directive times out or fails
+ *  terminally. Mirrors the Rust `StuckReport` serde shape. */
+export interface StuckReport {
+	taskId: string;
+	agentId: string;
+	reason: string;
+	attempts: number;
+	lastOutput: string;
+	filesTouched: string[];
+	projectId?: string;
+}
+
+/** Censor phase-a summary for a completed mini-coder directive, recording how
+ *  many findings the coarse pass flagged on which files. */
+export interface MiniCensorSummary {
+	total: number;
+	files: string[];
+}
+
+/** Result block for a completed/failed mini-coder directive. */
+export interface MiniCoderResult {
+	status: string;
+	filesTouched?: string[];
+	error?: string;
+}
+
+/** One entry in the mini-coder directive queue, persisted in .aspis-agents.json.
+ *  Mirrors the Rust `MiniCoderDirective` serde shape (camelCase wire). */
+export interface MiniCoderDirective {
+	id: string;
+	parentAgentId: string;
+	status: string;
+	task: string;
+	files: string[];
+	projectId?: string;
+	resultPath: string;
+	agentId?: string;
+	createdAt: string;
+	claimedAt?: string;
+	startedAt?: string;
+	attempt?: number;
+	write?: boolean;
+	result?: MiniCoderResult;
+	stuckReport?: StuckReport;
+	censorSummary?: MiniCensorSummary;
 }
 
 // MC-P6: per-agent token / cost window (best-effort, Claude-Code-coupled). Mirror
