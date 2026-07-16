@@ -746,3 +746,474 @@ async fn test_ask_bounded_group_by_file_accepted() {
     assert!(body["answer"].is_string());
     assert!(body["citations"].is_array());
 }
+
+// ── BoundedEndpointTests port (M3-P13a) ────────────────────────────────────
+// Pin the live-Rust behavior of /context-bounded and /ask-bounded that used
+// to live in oracle/tests/test_thin_client.py::BoundedEndpointTests. The
+// Python server died with the runtime, so these contracts were orphaned
+// until now. The harness TestWorld already seeds multiple files
+// (docs/architecture.md, src/main.rs, src/api.rs, data/config.json) so the
+// scope-narrowing tests can prove the corpus actually narrows.
+
+/// NON-empty `allowed_file_ids` on /context-bounded restricts the returned
+/// chunks to the allowed file. Both the dense (vector) and lexical paths
+/// in `engine::context` filter by `chunk.file_id` ∈ allowed.
+#[tokio::test]
+async fn test_context_bounded_constrains_to_allowed_ids() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 10,
+        "allowed_file_ids": ["src/main.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let chunks = body["chunks"].as_array().unwrap();
+    assert!(
+        !chunks.is_empty(),
+        "scoped query should still return the in-scope chunk(s), got empty"
+    );
+    for c in chunks {
+        assert_eq!(
+            c["file_source"], "src/main.rs",
+            "scope leakage: out-of-scope chunk leaked through: {c}"
+        );
+    }
+}
+
+/// /ask-bounded narrows the synthesized result rows to the allowed file.
+/// The engine filters node cards at engine.rs `ask()` (line ~619) by both
+/// `card.id` and `card.file_sorgente` against the allowed set. The harness
+/// has cards for `docs/architecture.md` and `src/main.rs` — the
+/// architecture card must NOT survive the `["src/main.rs"]` scope.
+#[tokio::test]
+async fn test_ask_bounded_constrains_to_allowed_ids() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": ["src/main.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ask-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert!(
+        !results.is_empty(),
+        "scoped ask should return the in-scope node card"
+    );
+    for r in results {
+        let id = r["id"].as_str().unwrap_or("");
+        assert!(
+            id == "src/main.rs",
+            "scope leakage: out-of-scope result id leaked through: {id} ({r})"
+        );
+    }
+    // Citations produced by the extractive fallback (no LLM configured)
+    // come from the in-scope chunks only.
+    let citations = body["citations"].as_array().unwrap();
+    assert!(
+        !citations.is_empty(),
+        "in-scope ask should produce citations from the allowed chunk"
+    );
+    for c in citations {
+        assert_eq!(c["file_source"], "src/main.rs");
+    }
+}
+
+/// Empty `allowed_file_ids` on /ask-bounded is the "grounded empty" path.
+/// The engine's `context()` returns no chunks (the filter
+/// `allowed_file_ids.is_none_or(|ids| ids.contains(&chunk.file_id))` is
+/// false for every chunk when the set is empty), then
+/// `answer_from_context` short-circuits at
+/// `if context.is_empty() { return Ok(not_found_answer(...)); }` — the LLM
+/// is never invoked. The response envelope has the canonical
+/// not_found shape: `not_found: true`, `answer_source: "not_found"`,
+/// `citations: []`, `results: []`, and the `answer` text is the not_found
+/// phrase.
+#[tokio::test]
+async fn test_ask_bounded_empty_scope_grounded_empty_no_answerer() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": []
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ask-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    // Grounded-empty envelope shape (no LLM was invoked).
+    assert_eq!(body["results"].as_array().unwrap().len(), 0);
+    assert_eq!(body["citations"].as_array().unwrap().len(), 0);
+    assert_eq!(body["not_found"], true);
+    assert_eq!(body["answer_source"], "not_found");
+    // The answer string is the canonical not_found phrase, NOT a synthesized
+    // "I don't know" from an LLM — the canonical NOT_FOUND_PHRASE constant.
+    let answer = body["answer"].as_str().unwrap_or("");
+    assert!(
+        answer.starts_with("not found in corpus"),
+        "expected not_found answer phrase, got: {answer}"
+    );
+}
+
+/// Negative limit is REJECTED, not silently clamped.
+/// DIVERGENCE FROM PYTHON: the Python BoundedEndpointTests asserted
+/// `clamped to 1 → 200`. The Rust `parse_bounded_payload` guards `v < 1`
+/// with an explicit 422 (treating a non-positive limit as a noisy bad
+/// client request rather than silently coercing it to a different
+/// default). This test pins the Rust 422 behavior.
+#[tokio::test]
+async fn test_context_bounded_negative_limit_returns_422() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": -5,
+        "allowed_file_ids": ["src/main.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// A huge limit is silently clamped to MAX_BOUNDED_LIMIT (100) — same as
+/// the Python contract. The response is 200 and the chunk count is
+/// bounded by the cap. (Harness has 5 chunks; the clamp is a no-op here
+/// but the contract is "never a 500, never a raw pass-through".)
+#[tokio::test]
+async fn test_context_bounded_huge_limit_clamped() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 100_000,
+        // A real scope: an empty scope is fail-closed (returns no chunks), so
+        // it could never distinguish "clamped and served" from "rejected".
+        "allowed_file_ids": ["docs/architecture.md", "src/main.rs", "src/api.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let chunks = body["chunks"].as_array().unwrap();
+    assert!(
+        !chunks.is_empty(),
+        "huge limit (clamped) should still return chunks from the corpus"
+    );
+    assert!(
+        chunks.len() <= 100,
+        "huge limit must be clamped to MAX_BOUNDED_LIMIT (100), got {}",
+        chunks.len()
+    );
+}
+
+/// A non-integer limit fails serde deserialization of
+/// `BoundedPayload.limit` (`Option<i64>`). Axum's JsonRejection surfaces
+/// a serde Data error as 422 UNPROCESSABLE_ENTITY — same status as the
+/// Python contract.
+#[tokio::test]
+async fn test_context_bounded_non_integer_limit_returns_422() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": "abc",
+        "allowed_file_ids": ["src/main.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// `allowed_file_ids` exceeding MAX_BOUNDED_ALLOWED_IDS (10_000) is
+/// rejected with 422 + a `detail` message that mentions the cap. Mirrors
+/// the Python `test_oversized_id_list_returns_422`.
+#[tokio::test]
+async fn test_context_bounded_oversized_id_list_returns_422() {
+    let world = TestWorld::new("op", "ag").await;
+    let ids: Vec<String> = (0..10_001).map(|i| format!("f{i}.py")).collect();
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": ids
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let detail = body["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("10000") && detail.contains("allowed_file_ids"),
+        "detail should mention the 10000 cap and the field name, got: {detail}"
+    );
+}
+
+/// `allowed_file_ids` of the WRONG JSON type (string, object, number)
+/// fails serde deserialization of `Option<Vec<String>>` → 422. Mirrors
+/// the Python `test_wrong_type_ids_returns_422` which looped over the
+/// same bad types.
+#[tokio::test]
+async fn test_context_bounded_wrong_type_ids_returns_422() {
+    let world = TestWorld::new("op", "ag").await;
+    for bad in [
+        serde_json::json!("alpha.py"),
+        serde_json::json!(5),
+        serde_json::json!({"a": 1}),
+    ] {
+        let body = serde_json::json!({
+            "query": "Scaleway GPU",
+            "limit": 5,
+            "allowed_file_ids": bad.clone()
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/context-bounded")
+            .header("x-oracle-auth-token", "ag")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = world.router().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong-type allowed_file_ids ({bad}) should be 422, got {}",
+            resp.status()
+        );
+    }
+}
+
+/// `allowed_file_ids: null` is equivalent to "field absent" — the
+/// `Option<Vec<String>>` deserializes JSON `null` to `None`,
+/// `parse_bounded_payload` returns an empty `HashSet`, and `context()`
+/// returns no chunks. Mirrors the Python `test_null_ids_is_empty_scope`.
+#[tokio::test]
+async fn test_context_bounded_null_ids_is_empty_scope() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": null
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert_eq!(body["chunks"].as_array().unwrap().len(), 0);
+}
+
+/// `allowed_file_ids` absent (key not in JSON) is equivalent to `null` —
+/// `#[serde(default)]` on the field makes it `None` → empty scope. Mirrors
+/// the Python `test_absent_ids_is_empty_scope`.
+#[tokio::test]
+async fn test_context_bounded_absent_ids_is_empty_scope() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/context-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert_eq!(body["chunks"].as_array().unwrap().len(), 0);
+}
+
+/// POST /context (operator-only) returns the FULL CORPUS — same envelope
+/// shape and same set of `file_source` values as GET /context. This is
+/// the privacy invariant: POST /context never serves the
+/// bounded/empty-scope semantics of /context-bounded. Mirrors the Python
+/// `test_post_context_returns_full_corpus_chunks_like_get`.
+#[tokio::test]
+async fn test_post_context_matches_get_context_corpus() {
+    let world = TestWorld::new("op", "ag").await;
+    let q = "Scaleway";
+
+    // POST /context.
+    let post_body = serde_json::json!({"q": q, "limit": 10});
+    let post_req = Request::builder()
+        .method("POST")
+        .uri("/context")
+        .header("x-oracle-auth-token", "op")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&post_body).unwrap()))
+        .unwrap();
+    let post_resp = world.router().oneshot(post_req).await.unwrap();
+    assert_eq!(post_resp.status(), StatusCode::OK);
+    let post_body: serde_json::Value = axum::body::to_bytes(post_resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let post_sources: std::collections::BTreeSet<String> = post_body["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["file_source"].as_str().unwrap_or("").to_string())
+        .collect();
+
+    // GET /context.
+    let get_uri = format!("/context?q={q}&limit=10");
+    let get_req = Request::builder()
+        .method("GET")
+        .uri(&get_uri)
+        .header("x-oracle-auth-token", "op")
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = world.router().oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_body: serde_json::Value = axum::body::to_bytes(get_resp.into_body(), 1024 * 1024)
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    let get_sources: std::collections::BTreeSet<String> = get_body["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["file_source"].as_str().unwrap_or("").to_string())
+        .collect();
+
+    assert_eq!(
+        post_sources, get_sources,
+        "POST/GET /context must serve the same corpus"
+    );
+    assert!(
+        post_sources.len() >= 2,
+        "POST /context must return a multi-file corpus, got {post_sources:?}"
+    );
+    // Both responses share the same envelope keys (run_context is the
+    // single producer for both verbs).
+    let post_keys: std::collections::BTreeSet<String> = post_body
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let get_keys: std::collections::BTreeSet<String> = get_body
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        post_keys, get_keys,
+        "envelope keys must match between POST and GET /context"
+    );
+}
+
+/// Agent token explicitly authorizes /ask-bounded. The whole point of the
+/// two-tier auth: agents get the bounded envelope, never the unscoped
+/// corpus. This test pins 200 specifically for /ask-bounded — the
+/// existing `test_auth_agent_token_on_bounded_route_accepted` only
+/// asserts `!= 401`, which would let a non-200 success leak through.
+#[tokio::test]
+async fn test_agent_token_allows_ask_bounded() {
+    let world = TestWorld::new("op", "ag").await;
+    let body = serde_json::json!({
+        "query": "Scaleway GPU",
+        "limit": 5,
+        "allowed_file_ids": ["src/main.rs"]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ask-bounded")
+        .header("x-oracle-auth-token", "ag")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Agent token MUST be rejected on /index/run — indexing is a write
+/// surface (it embeds an entire tree into the live vector store) and
+/// only the operator token may invoke it. The Rust `require_operator`
+/// returns 401 UNAUTHORIZED on token mismatch (NOT 403, same as the
+/// Python contract). Mirrors the Python
+/// `test_agent_token_rejected_on_index_run`.
+#[tokio::test]
+async fn test_agent_token_rejected_on_index_run() {
+    let world = TestWorld::new("op", "ag").await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/index/run?background=true")
+        .header("x-oracle-auth-token", "ag")
+        .body(Body::empty())
+        .unwrap();
+    let resp = world.router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
