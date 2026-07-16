@@ -51,6 +51,17 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   agent prompt/help so models don't retry).
 - `censor_findings` requires `root_path` frontmatter + ASPIS_WORKSPACE_ROOT
   approval — confusing failure mode when missing; better error message.
+- **P5d write-throughs DONE 2026-07-16**: `mini://stuck` → durable
+  `stuckReport` on the directive row (`c69ce27`); `censor://scan-started` →
+  CensorScanRegistry + `censor_scan_state` command, `censor://mini-findings`
+  summary → `censorSummary` on the directive row (`88db1ae`);
+  `agent-terminal://<id>` was NOT a blind spot (agent_pty_snapshot exists;
+  ring memory-only by privacy design — inventory corrected). Still event-only:
+  `sandbox://consent-request`, `design-stream:<id>` deltas.
+- **UI gap (P5e finding, pinned by it.todo)**: drawerData/AgentsView has no
+  visibility into the new directive-level `stuckReport`/`censorSummary` —
+  surfaced only via the live `mini://stuck` event hook; a durable-state read
+  in the drawer would make them visible after restart.
 - **Deterministic censor gate on the session diff (salvage pi-lens diagnostics,
   NO autofix)** — owner design ticket 2026-07-16. Background: `npm:pi-lens` was
   the deterministic-censor-before-LLM experiment, but its autofix ran
@@ -79,8 +90,9 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   (design decision: route by session kind).
 - **User-echo + goal delivery for coder/mini spawns** (orchestrator got it in
   round 1; coder path still lacks it).
-- **Bridge file for pi coder console** — `mini_activity_snapshot` hydrates
-  from bridge files, but pi coders never write one → console lost on restart.
+- ~~**Bridge file for pi coder console**~~ **DONE 2026-07-16 (`e1cd083`, P5c)**:
+  EventMapper write-through to `.devboule-activity/<id>.jsonl` + hydrate at
+  construction; plans/chat/thinking/websearch/milestones replay after restart.
 - **Bridge file for DIRECTIVE minis too** (found in P5a recon 2026-07-15): the
   directive executor's activity lives only in the in-memory MiniActivityStore
   (Tauri events); only the ORCHESTRATOR writes `.devboule-activity/<id>.jsonl`

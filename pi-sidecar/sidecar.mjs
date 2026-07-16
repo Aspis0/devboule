@@ -483,6 +483,8 @@ async function main() {
 	// 500ms-delay gap where a stdin close would cleanup(0) and silently drop
 	// the devboule_censor_review event (review MAJOR on c6aa4e4).
 	let censorPending = false;
+	// Monotonic token for scheduled censor reviews — see handleCensorAgentEnd.
+	let censorRunSeq = 0;
 
 	// ---- subscribe helpers (close over main() locals) ----------------------
 
@@ -599,9 +601,15 @@ async function main() {
 				// stdin-close exit paths see it before the timer fires. The .catch
 				// keeps a review failure from escalating to the global
 				// unhandledRejection handler (which would cleanup(1) the sidecar).
+				// censorRunSeq: each scheduled review gets its own token so a
+				// review's finally only clears state that still belongs to IT —
+				// two overlapping schedules must not let the second's finally
+				// wipe censorPending while the first is mid-flight (max-recall).
 				censorPending = true;
+				censorRunSeq += 1;
+				const myRun = censorRunSeq;
 				setTimeout(() => {
-					triggerCensorReview().catch((e) => {
+					triggerCensorReview(myRun).catch((e) => {
 						console.error("[pi-sidecar] censor: review trigger failed:", e);
 					});
 				}, 0);
@@ -614,7 +622,7 @@ async function main() {
 	// ReferenceError ("editedRsFiles is not defined") on the first .rs edit,
 	// killing the sidecar at agent_end (rig product bug #8 — the censor
 	// review channel was dead in production).
-	async function triggerCensorReview() {
+	async function triggerCensorReview(myRun) {
 		try {
 			const files = [...editedRsFiles.entries()];
 			editedRsFiles.clear();
@@ -652,13 +660,18 @@ async function main() {
 			});
 		} finally {
 			isReviewTurn = false;
-			censorPending = false;
-			// If stdin closed while this review was in flight, the stdin-end
-			// handler deferred its exit to us — finish it now that the event is
-			// out (mirrors handleStdinCloseAtAgentEnd's drained-queue condition).
-			if (stdinClosed && !promptInFlight && promptQueue.length === 0) {
-				clearTimeout(stdinGraceTimer);
-				setImmediate(() => cleanup(0));
+			// Only clear the pending flag if no NEWER review has been scheduled
+			// since this one (token check) — a stale finally must never wipe the
+			// state a mid-flight successor depends on.
+			if (myRun === censorRunSeq) {
+				censorPending = false;
+				// If stdin closed while this review was in flight, the stdin-end
+				// handler deferred its exit to us — finish it now that the event is
+				// out (mirrors handleStdinCloseAtAgentEnd's drained-queue condition).
+				if (stdinClosed && !promptInFlight && promptQueue.length === 0) {
+					clearTimeout(stdinGraceTimer);
+					setImmediate(() => cleanup(0));
+				}
 			}
 		}
 	}
@@ -853,8 +866,21 @@ async function main() {
 				// Fix 1: don't lose queued prompts silently on quit.
 				if (promptQueue.length > 0) {
 					emit({ type: "queue_dropped", count: promptQueue.length });
+					promptQueue.length = 0;
 				}
-				cleanup(0);
+				// Same censorPending discipline as the stdin-end handler
+				// (max-recall: quit used to cleanup(0) unconditionally, dropping
+				// a scheduled devboule_censor_review — the exact bug class the
+				// stdin path fixed). A pending review is short-lived (500ms
+				// settle + one emit): flag stdinClosed so triggerCensorReview's
+				// finally performs the exit, with a short grace as upper bound.
+				if (censorPending) {
+					stdinClosed = true;
+					clearTimeout(stdinGraceTimer);
+					stdinGraceTimer = setTimeout(() => cleanup(0), 10_000);
+				} else {
+					cleanup(0);
+				}
 				break;
 			}
 

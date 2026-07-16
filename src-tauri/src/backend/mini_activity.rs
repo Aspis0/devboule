@@ -2130,17 +2130,43 @@ pub(crate) fn bridge_line_for_entry(entry: &ConsoleEntry) -> Option<String> {
             affects,
             ..
         } => {
+            // Write-time caps mirroring parse_question_line's read-side limits
+            // (every sibling arm caps at write; without these a pathological
+            // question wrote unbounded bytes that the 8KiB line guard then
+            // silently dropped whole on replay — max-recall finding).
+            let cap = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
+            let options_w: Vec<QOption> = options
+                .iter()
+                .take(12)
+                .map(|o| QOption {
+                    id: cap(&o.id, MILESTONE_TEXT_CAP),
+                    label: cap(&o.label, MILESTONE_TEXT_CAP),
+                })
+                .collect();
+            let candidates_w: Vec<Cand> = candidates
+                .iter()
+                .take(12)
+                .map(|c| Cand {
+                    label: cap(&c.label, MILESTONE_TEXT_CAP),
+                    pull: c.pull,
+                })
+                .collect();
+            let affects_w: Vec<String> = affects
+                .iter()
+                .take(40)
+                .map(|a| cap(a, MILESTONE_TEXT_CAP))
+                .collect();
             let mut line = serde_json::json!({
                 "kind": "question",
-                "id": id,
-                "text": text,
-                "options": options,
+                "id": cap(id, MILESTONE_TEXT_CAP),
+                "text": cap(text, CHAT_TEXT_CAP),
+                "options": options_w,
                 "unrest": unrest,
-                "candidates": candidates,
-                "lean": lean,
+                "candidates": candidates_w,
+                "lean": lean.as_deref().map(|l| cap(l, MILESTONE_TEXT_CAP)),
                 "directionConfidence": direction_confidence,
                 "status": status,
-                "affects": affects
+                "affects": affects_w
             });
             // Skip null lean in the wire (the parser tolerates missing keys).
             if lean.is_none() {

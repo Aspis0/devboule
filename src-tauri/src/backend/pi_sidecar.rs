@@ -1564,27 +1564,56 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
     // "stopped a session" from "no such session". The wiring in
     // stop_agent_process_only relies on the Ok(false) branch to fall through to
     // the ledger/external routes when this id is not a live pi session.
-    let (reader_handle, existed) = if let Some(mut slot) = guard.remove(session_id) {
-        match slot.inner.take() {
-            Some(mut session) => {
-                // Bump THIS session's generation so the reader detects staleness.
-                session.generation.fetch_add(1, Ordering::SeqCst);
-                // Kill the child process (now behind a Mutex, #1).
-                if let Ok(mut c) = session.child.lock() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-                (session.reader_handle.take(), true)
-            }
-            None => (None, false),
-        }
+    let (session_taken, existed) = if let Some(mut slot) = guard.remove(session_id) {
+        let taken = slot.inner.take();
+        let existed = taken.is_some();
+        (taken, existed)
     } else {
         (None, false)
     };
-    // #1: release the state lock BEFORE joining the reader thread.
+    // #1: release the state lock BEFORE the graceful-stop wait and the reader
+    // join — the grace window must never stall other sessions' map access.
     drop(guard);
-    if let Some(handle) = reader_handle {
-        let _ = handle.join();
+    if let Some(mut session) = session_taken {
+        // Bump THIS session's generation so the reader detects staleness.
+        session.generation.fetch_add(1, Ordering::SeqCst);
+        // GRACEFUL FIRST (max-recall BLOCKER): a hard kill() was the ONLY stop
+        // path, so the sidecar's own drain logic (pending censor review →
+        // devboule_censor_review emit, queue_dropped notice) never got to run —
+        // the whole stdin-close/censorPending machinery was dead in production.
+        // Send the `quit` command and give the sidecar a short bounded window
+        // to exit on its own; only then fall back to kill(). Best-effort at
+        // every step — a wedged child still dies within the grace bound.
+        {
+            use std::io::Write;
+            if let Ok(mut sin) = session.stdin.lock() {
+                let _ = writeln!(sin, "{}", r#"{"type":"quit"}"#);
+                let _ = sin.flush();
+            }
+        }
+        const STOP_GRACE_MS: u64 = 2_000;
+        let deadline = Instant::now() + std::time::Duration::from_millis(STOP_GRACE_MS);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if let Ok(mut c) = session.child.lock() {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    exited = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !exited {
+            if let Ok(mut c) = session.child.lock() {
+                let _ = c.kill();
+            }
+        }
+        if let Ok(mut c) = session.child.lock() {
+            let _ = c.wait();
+        }
+        if let Some(handle) = session.reader_handle.take() {
+            let _ = handle.join();
+        }
     }
     // Persist: mark this session stopped and rewrite the sessions file.
     {

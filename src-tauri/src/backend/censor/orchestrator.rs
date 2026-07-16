@@ -640,9 +640,15 @@ fn run_fine_batch_inner(
     // Only the LIVE watcher lights the "linters running…" indicator. The verdict gate and the async
     // Censor review reuse this pass too, but they must NOT flicker the indicator (findings-updated
     // still fires below so their findings surface).
-    if emit_scan {
-        let _guard = emit_scan_started(app, project_id, "fine", files.len(), running);
-    }
+    // The ScanGuard MUST live until this function returns (its Drop clears the
+    // CensorScanRegistry entry) — binding it inside the `if` dropped it at the
+    // closing brace, so censor_scan_state never observed a running fine pass
+    // (max-recall BLOCKER).
+    let _scan_guard = if emit_scan {
+        emit_scan_started(app, project_id, "fine", files.len(), running)
+    } else {
+        None
+    };
     let changed = fine_batch_collect(root, files, gemma);
     // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
     // and write a steer file so the main coder sees them next turn.

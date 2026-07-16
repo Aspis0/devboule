@@ -184,10 +184,11 @@ export interface ThinkingEntry {
  *  words (`assistant`) or a steer echoed back (`user`). Mirrors the backend `Chat` entry.
  *
  *  role "plan": a structured plan payload emitted by the orchestrator's `plan` tool
- *  (see `devboule_plan` wire contract). `text` is the pretty-printed JSON of the
- *  payload `{title, steps:[{text,status}], notes?}` — consumed by the Plan stage via
+ *  (see `devboule_plan` wire contract). `text` is the COMPACT JSON of the payload
+ *  `{title, steps:[{text,status}], notes?}` (compact so it fits the bridge-file
+ *  caps; JSON.parse is whitespace-agnostic) — consumed by the Plan stage via
  *  `latestPlan` / `planCardsFromPiPlan`, NEVER rendered as a chat bubble. Mirrors the
- *  backend `ConsoleEntry::Chat { role: "plan", text: <PRETTY-PRINTED JSON>, ... }`. */
+ *  backend `ConsoleEntry::Chat { role: "plan", text: <compact JSON>, ... }`. */
 export interface ChatEntry {
 	type: "chat";
 	role: "assistant" | "user" | "plan";
