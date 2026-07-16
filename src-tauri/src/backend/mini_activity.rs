@@ -1249,7 +1249,7 @@ fn node_from_wire(node: &str) -> Option<NodeStyle> {
 
 /// Parse ONE file line into a `(text, node)` milestone, or `None` to SKIP it (blank,
 /// oversized, non-JSON, or not a `kind == "milestone"` event). Pure + directly testable.
-fn parse_milestone_line(line: &str) -> Option<(String, Option<NodeStyle>)> {
+pub(crate) fn parse_milestone_line(line: &str) -> Option<(String, Option<NodeStyle>)> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1281,7 +1281,7 @@ struct WsEvent {
 /// Parse ONE file line into a `(query, pages)` websearch event, or `None` to SKIP
 /// (blank, oversized, non-JSON, or not `kind == "websearch"`). Pure + total. Re-caps
 /// the untrusted query/title/summary lengths and the page count on the read side.
-fn parse_websearch_line(line: &str) -> Option<(String, Vec<PageEntry>)> {
+pub(crate) fn parse_websearch_line(line: &str) -> Option<(String, Vec<PageEntry>)> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1328,9 +1328,12 @@ pub(crate) struct ParsedChatLine {
 
 /// Parse ONE file line into a chat turn, or `None` to SKIP (blank, oversized,
 /// non-JSON, not `kind == "chat"`, or an unknown role). Pure + total. Role is
-/// normalized to "assistant"/"user" (anything else is dropped); text re-capped;
-/// the untrusted `msgId` is trimmed, capped, and blank ⇒ absent.
-fn parse_chat_line(line: &str) -> Option<ParsedChatLine> {
+/// normalized to "assistant"/"user"/"plan" (anything else is dropped); text
+/// re-capped; the untrusted `msgId` is trimmed, capped, and blank ⇒ absent.
+/// "plan" is the pi plan-tool payload the EventMapper pushes as a Chat entry —
+/// without it here, persisted plans were silently dropped on hydration and the
+/// planner lost the pi plan on every restart (bridge-review BLOCKER).
+pub(crate) fn parse_chat_line(line: &str) -> Option<ParsedChatLine> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1342,9 +1345,22 @@ fn parse_chat_line(line: &str) -> Option<ParsedChatLine> {
     let role = match event.role.as_str() {
         "assistant" => "assistant",
         "user" => "user",
+        "plan" => "plan",
         _ => return None,
     };
-    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    // "plan" text is a JSON document the planner re-parses — truncating it
+    // mid-JSON would replay a MALFORMED newest plan (latestPlan → null, worse
+    // than absent). The writer refuses to persist a plan over PLAN_TEXT_CAP,
+    // so accept up to the cap untruncated and DROP anything larger (only a
+    // hand-crafted file can produce that).
+    let text: String = if role == "plan" {
+        if event.text.chars().count() > PLAN_TEXT_CAP {
+            return None;
+        }
+        event.text
+    } else {
+        event.text.chars().take(CHAT_TEXT_CAP).collect()
+    };
     if text.trim().is_empty() {
         return None;
     }
@@ -1457,7 +1473,7 @@ fn clamp01(v: f32) -> f32 {
 /// non-JSON, not `kind == "question"`, or an empty question text). Pure + total, with the same
 /// caps/guards as [`parse_chat_delta_line`]: re-caps every untrusted string + count, clamps the
 /// floats, and normalizes the status. Mirrors the frozen QUESTION wire shape.
-fn parse_question_line(line: &str) -> Option<ParsedQuestionLine> {
+pub(crate) fn parse_question_line(line: &str) -> Option<ParsedQuestionLine> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1527,7 +1543,7 @@ fn parse_question_line(line: &str) -> Option<ParsedQuestionLine> {
 
 /// Parse ONE file line into a banner text, or `None` to SKIP (blank, oversized,
 /// non-JSON, not `kind == "banner"`, or empty/whitespace-only text). Pure + total.
-fn parse_banner_line(line: &str) -> Option<String> {
+pub(crate) fn parse_banner_line(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1545,7 +1561,7 @@ fn parse_banner_line(line: &str) -> Option<String> {
 
 /// Parse ONE file line into a thinking text, or `None` to SKIP (blank, oversized,
 /// non-JSON, not `kind == "thinking"`, or empty/whitespace-only text). Pure + total.
-fn parse_thinking_line(line: &str) -> Option<String> {
+pub(crate) fn parse_thinking_line(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1564,6 +1580,16 @@ fn parse_thinking_line(line: &str) -> Option<String> {
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
 /// because the file is untrusted input the host reads back.
 const MILESTONE_TEXT_CAP: usize = 200;
+
+/// Max CHARS of a persisted `role:"plan"` chat text (a compact-JSON plan
+/// document). Sized so the worst case survives the read side: even with every
+/// char escaping to two bytes, 3500 chars + the JSON envelope stays under
+/// `MAX_LINE_BYTES` (8 KiB) — an oversized line would be silently skipped on
+/// replay. The writer (`bridge_line_for_entry`) SKIPS persisting a plan larger
+/// than this (an in-memory plan stays visible for the live session; only
+/// restart loses it) — never truncates, because a truncated plan is malformed
+/// JSON and nulls the planner's fallback.
+const PLAN_TEXT_CAP: usize = 3500;
 
 /// Host-side cap for a `chat` turn's text (chars) — matches the writer's larger chat cap.
 /// A chat reply is prose, not a basename+verb label, so 200 would truncate it mid-sentence.
@@ -1967,7 +1993,7 @@ fn read_new_chunk(path: &Path, offset: u64) -> Option<(Vec<u8>, u64, bool)> {
 /// in-memory render cache from the last window of the durable file. ~200 chat turns fit
 /// comfortably; anything older stays on disk for `read_activity_chat` (the full-history
 /// escape hatch). Bounded so a months-old project file can never stall a project open.
-const HYDRATE_WINDOW_BYTES: u64 = 256 * 1024;
+pub(crate) const HYDRATE_WINDOW_BYTES: u64 = 256 * 1024;
 
 /// D2: whether a stored console has NO renderable content — used to decide that a disk
 /// hydration is warranted (store miss, CAP eviction, app restart). Resting flags don't
@@ -1997,7 +2023,7 @@ fn is_console_blank(activity: &ConsoleActivity) -> bool {
 ///   replay stays the plain resting state.
 ///
 /// Blocking I/O — call on a blocking thread from async contexts.
-fn hydrate_from_bridge_file(
+pub(crate) fn hydrate_from_bridge_file(
     path: &Path,
     window: u64,
     mark_running: bool,
@@ -2044,6 +2070,95 @@ fn hydrate_from_bridge_file(
         activity.running = Some(mark_running);
     }
     Some((activity, start + consumed as u64))
+}
+
+/// Serialize ONE `ConsoleEntry` into a single JSONL line (no trailing newline) in the
+/// exact wire shape the corresponding bridge-file parser reads back. Returns `None` for
+/// any variant that has no read-side parser (e.g. `Spawn`, which carries a nested
+/// `MiniRun` the parsers do not know).
+///
+/// Mapped variants and their wire shapes (match the parsers 1:1):
+/// - `Coder` → `{"kind":"milestone","text":...,"node":...}` (node via serde)
+/// - `WebSearch` → `{"kind":"websearch","query":...,"pages":[PageEntry...]}`
+/// - `Chat` → `{"kind":"chat","role":...,"text":...,"msgId":...}` (msgId only when present)
+/// - `Question` → `{"kind":"question","id":...,"text":...,"options":...,...}`
+/// - `Banner` → `{"kind":"banner","text":...}`
+/// - `Thinking` → `{"kind":"thinking","text":...}`
+///
+/// All other variants (`Spawn`, etc.) return `None`. Uses `serde_json` construction
+/// exclusively (never `format!`), so embedded quotes/newlines are always safe.
+pub(crate) fn bridge_line_for_entry(entry: &ConsoleEntry) -> Option<String> {
+    match entry {
+        ConsoleEntry::Coder { node, text, .. } => {
+            // Cap at write to what the read side replays anyway
+            // (MILESTONE_TEXT_CAP): tool-progress rows can carry multi-KB raw
+            // tool args — persisting them whole was disk bloat AND put payloads
+            // on disk that were never persisted before this bridge existed
+            // (review MAJOR). NOTE: `node: None` round-trips as
+            // `Some(Hollow)` — the wire has no "absent" value; cosmetic only.
+            let capped: String = text.chars().take(MILESTONE_TEXT_CAP).collect();
+            let node_val = node.as_ref().map(|n| serde_json::to_value(n).unwrap_or_default()).unwrap_or(serde_json::Value::String(String::new()));
+            let line = serde_json::json!({"kind": "milestone", "text": capped, "node": node_val});
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        ConsoleEntry::WebSearch { query, pages, .. } => {
+            let line = serde_json::json!({"kind": "websearch", "query": query, "pages": pages});
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        ConsoleEntry::Chat { role, text, msg_id, .. } => {
+            // A plan document too large to survive the read side is SKIPPED,
+            // not truncated (see PLAN_TEXT_CAP): truncated JSON replays as a
+            // malformed newest plan and nulls the planner's fallback.
+            if role == "plan" && text.chars().count() > PLAN_TEXT_CAP {
+                return None;
+            }
+            let mut line = serde_json::json!({"kind": "chat", "role": role, "text": text});
+            if let Some(ref mid) = msg_id {
+                line["msgId"] = serde_json::Value::String(mid.clone());
+            }
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        ConsoleEntry::Question {
+            id,
+            text,
+            options,
+            unrest,
+            candidates,
+            lean,
+            direction_confidence,
+            status,
+            affects,
+            ..
+        } => {
+            let mut line = serde_json::json!({
+                "kind": "question",
+                "id": id,
+                "text": text,
+                "options": options,
+                "unrest": unrest,
+                "candidates": candidates,
+                "lean": lean,
+                "directionConfidence": direction_confidence,
+                "status": status,
+                "affects": affects
+            });
+            // Skip null lean in the wire (the parser tolerates missing keys).
+            if lean.is_none() {
+                line.as_object_mut().and_then(|m| m.remove("lean"));
+            }
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        ConsoleEntry::Banner { text, .. } => {
+            let line = serde_json::json!({"kind": "banner", "text": text});
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        ConsoleEntry::Thinking { text, .. } => {
+            let line = serde_json::json!({"kind": "thinking", "text": text});
+            Some(serde_json::to_string(&line).unwrap_or_default())
+        }
+        // Spawn and any future variant without a read-side parser → no bridge line.
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -3699,5 +3814,241 @@ not json\n";
         );
         // The critical assertion: empty must be None so the frontend does not hide these rows.
         assert_eq!(activity.empty, None, "hydrate clears empty when entries exist");
+    }
+
+    // ---- bridge_line_for_entry round-trip tests ---------------------------------
+
+    #[test]
+    fn bridge_line_for_entry_chat_round_trips() {
+        let entry = ConsoleEntry::Chat {
+            role: "assistant".to_string(),
+            text: "hello world".to_string(),
+            time: "12:00:00".to_string(),
+            msg_id: None,
+        };
+        let line = bridge_line_for_entry(&entry).expect("chat maps");
+        let parsed = parse_chat_line(&line).expect("parsed chat");
+        assert_eq!(parsed.role, "assistant");
+        assert_eq!(parsed.text, "hello world");
+        assert!(parsed.msg_id.is_none());
+    }
+
+    #[test]
+    fn bridge_line_for_entry_chat_with_msgid_round_trips() {
+        let entry = ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "what is pi?".to_string(),
+            time: "12:00:01".to_string(),
+            msg_id: Some("abc-123".to_string()),
+        };
+        let line = bridge_line_for_entry(&entry).expect("chat with msgId maps");
+        let parsed = parse_chat_line(&line).expect("parsed chat with msgId");
+        assert_eq!(parsed.role, "user");
+        assert_eq!(parsed.text, "what is pi?");
+        assert_eq!(parsed.msg_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn bridge_line_for_entry_banner_round_trips() {
+        let entry = ConsoleEntry::Banner {
+            text: "Compaction completed".to_string(),
+            time: "12:00:02".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("banner maps");
+        let text = parse_banner_line(&line).expect("parsed banner");
+        assert_eq!(text, "Compaction completed");
+    }
+
+    #[test]
+    fn bridge_line_for_entry_thinking_round_trips() {
+        let entry = ConsoleEntry::Thinking {
+            text: "Let me analyze this...".to_string(),
+            time: "12:00:03".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("thinking maps");
+        let text = parse_thinking_line(&line).expect("parsed thinking");
+        assert_eq!(text, "Let me analyze this...");
+    }
+
+    #[test]
+    fn bridge_line_for_entry_websearch_round_trips() {
+        let entry = ConsoleEntry::WebSearch {
+            query: "rust serde".to_string(),
+            pages: vec![
+                PageEntry {
+                    url: "https://docs.rs/serde".to_string(),
+                    title: "Serde Docs".to_string(),
+                    summary: "Official documentation".to_string(),
+                },
+            ],
+            time: "12:00:04".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("websearch maps");
+        let (query, pages) = parse_websearch_line(&line).expect("parsed websearch");
+        assert_eq!(query, "rust serde");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].url, "https://docs.rs/serde");
+        assert_eq!(pages[0].title, "Serde Docs");
+        assert_eq!(pages[0].summary, "Official documentation");
+    }
+
+    #[test]
+    fn bridge_line_for_entry_milestone_round_trips() {
+        let entry = ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: "Planning: 3 files".to_string(),
+            time: "12:00:05".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("coder maps");
+        let (text, node) = parse_milestone_line(&line).expect("parsed milestone");
+        assert_eq!(text, "Planning: 3 files");
+        assert!(matches!(node, Some(NodeStyle::Dot)));
+    }
+
+    #[test]
+    fn bridge_line_for_entry_milestone_hollow_node_round_trips() {
+        let entry = ConsoleEntry::Coder {
+            node: Some(NodeStyle::Hollow),
+            text: "Starting...".to_string(),
+            time: "12:00:06".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("coder hollow maps");
+        let (text, node) = parse_milestone_line(&line).expect("parsed milestone hollow");
+        assert_eq!(text, "Starting...");
+        assert!(matches!(node, Some(NodeStyle::Hollow)));
+    }
+
+    #[test]
+    fn bridge_line_for_entry_question_round_trips() {
+        let entry = ConsoleEntry::Question {
+            id: "q1".to_string(),
+            text: "Which approach?".to_string(),
+            options: vec![
+                QOption { id: "a".to_string(), label: "Option A".to_string() },
+                QOption { id: "b".to_string(), label: "Option B".to_string() },
+            ],
+            unrest: 0.5,
+            candidates: vec![
+                Cand { label: "Option A".to_string(), pull: 0.7 },
+            ],
+            lean: Some("a".to_string()),
+            direction_confidence: 0.8,
+            status: "open".to_string(),
+            affects: vec!["file.rs".to_string()],
+            time: "12:00:07".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("question maps");
+        let parsed = parse_question_line(&line).expect("parsed question");
+        assert_eq!(parsed.id, "q1");
+        assert_eq!(parsed.text, "Which approach?");
+        assert_eq!(parsed.options.len(), 2);
+        assert!((parsed.unrest - 0.5).abs() < 0.001);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.lean.as_deref(), Some("a"));
+        assert!((parsed.direction_confidence - 0.8).abs() < 0.001);
+        assert_eq!(parsed.status, "open");
+        assert_eq!(parsed.affects, vec!["file.rs"]);
+    }
+
+    #[test]
+    fn bridge_line_for_entry_spawn_returns_none() {
+        // Spawn carries a nested MiniRun that has no read-side parser.
+        let entry = ConsoleEntry::Spawn {
+            node: Some(NodeStyle::Dot),
+            text: "mini run".to_string(),
+            time: "12:00:08".to_string(),
+            mini: MiniRun {
+                model: "test".to_string(),
+                scope: vec![],
+                rounds: vec![],
+                working: None,
+                banner: None,
+            },
+        };
+        assert!(bridge_line_for_entry(&entry).is_none(), "Spawn returns None");
+    }
+
+    #[test]
+    fn bridge_line_for_entry_plan_chat_round_trips() {
+        // The pi plan payload rides a Chat entry with role "plan" (compact
+        // JSON). Review BLOCKER: parse_chat_line used to reject the role, so
+        // persisted plans were silently dropped on hydration.
+        let plan_json = r#"{"title":"T","steps":[{"text":"a","status":"pending"}]}"#;
+        let entry = ConsoleEntry::Chat {
+            role: "plan".to_string(),
+            text: plan_json.to_string(),
+            time: "12:00:00".to_string(),
+            msg_id: None,
+        };
+        let line = bridge_line_for_entry(&entry).expect("plan chat persists");
+        let parsed = parse_chat_line(&line).expect("plan chat replays");
+        assert_eq!(parsed.role, "plan");
+        assert_eq!(parsed.text, plan_json, "plan JSON must survive UNTRUNCATED");
+    }
+
+    #[test]
+    fn bridge_line_for_entry_oversized_plan_is_skipped_not_truncated() {
+        // A truncated plan is malformed JSON → latestPlan replays null. The
+        // writer must SKIP an oversized plan entirely.
+        let big = format!(r#"{{"title":"{}"}}"#, "x".repeat(PLAN_TEXT_CAP + 100));
+        let entry = ConsoleEntry::Chat {
+            role: "plan".to_string(),
+            text: big.clone(),
+            time: "12:00:00".to_string(),
+            msg_id: None,
+        };
+        assert!(
+            bridge_line_for_entry(&entry).is_none(),
+            "oversized plan must not be persisted"
+        );
+        // And a hand-crafted oversized plan LINE is dropped whole on read,
+        // never truncated.
+        let line = serde_json::to_string(
+            &json!({"kind": "chat", "role": "plan", "text": big}),
+        )
+        .unwrap();
+        assert!(parse_chat_line(&line).is_none(), "oversized plan line dropped");
+        // Regular chat keeps the old truncate-to-cap behavior.
+        let long_chat = serde_json::to_string(
+            &json!({"kind": "chat", "role": "assistant", "text": "y".repeat(CHAT_TEXT_CAP + 50)}),
+        )
+        .unwrap();
+        let parsed = parse_chat_line(&long_chat).expect("assistant chat replays");
+        assert_eq!(parsed.text.chars().count(), CHAT_TEXT_CAP);
+    }
+
+    #[test]
+    fn bridge_line_for_entry_milestone_caps_text_on_write() {
+        // Tool-progress rows can carry multi-KB raw args; the write side caps
+        // at MILESTONE_TEXT_CAP (what the read side would replay anyway) so
+        // payloads never land whole on disk (review MAJOR).
+        let entry = ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: "a".repeat(MILESTONE_TEXT_CAP + 500),
+            time: "12:00:00".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("milestone persists");
+        assert!(
+            line.len() < MILESTONE_TEXT_CAP + 100,
+            "persisted line must be capped, got {} bytes",
+            line.len()
+        );
+        let (text, _) = parse_milestone_line(&line).expect("milestone replays");
+        assert_eq!(text.chars().count(), MILESTONE_TEXT_CAP);
+    }
+
+    #[test]
+    fn bridge_line_for_entry_milestone_none_node_replays_hollow() {
+        // Pinned lossy round-trip: the wire has no "absent node" value, so
+        // node: None replays as Some(Hollow). Cosmetic only — documented in
+        // bridge_line_for_entry.
+        let entry = ConsoleEntry::Coder {
+            node: None,
+            text: "  args: {}".to_string(),
+            time: "12:00:00".to_string(),
+        };
+        let line = bridge_line_for_entry(&entry).expect("milestone persists");
+        let (_, node) = parse_milestone_line(&line).expect("milestone replays");
+        assert_eq!(node, Some(NodeStyle::Hollow));
     }
 }

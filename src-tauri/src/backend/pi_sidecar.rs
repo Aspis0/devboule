@@ -1438,6 +1438,13 @@ fn spawn_pi_session_inner(
         }
     }
 
+    // Console durability: resolve the bridge-file path for write-through
+    // persistence so the console survives app restart. `None` when the
+    // agent id is unsanitizable or the holding dir cannot be created —
+    // observability never blocks a launch.
+    let bridge_path: Option<PathBuf> =
+        super::mini_activity::activity_file_path(&projects_dir, session_id);
+
     let app_clone = app.clone();
     let sid = session_id.to_string();
     let gen_clone = generation.clone();
@@ -1456,6 +1463,7 @@ fn spawn_pi_session_inner(
             &sid,
             pigeon_enabled,
             injections_clone,
+            bridge_path,
         );
     });
 
@@ -2059,6 +2067,11 @@ struct EventMapper {
     /// `handle_event` call so entries pushed by steer/spawn/censor-note land
     /// in the mapper's timeline before any assistant output of that turn.
     injections: ConsoleInjections,
+    /// Durable bridge-file path for write-through persistence. When `Some`, every
+    /// new console entry is appended as a JSONL line (best-effort, silent on I/O
+    /// error) so the console survives app restart. `None` for unit tests and the
+    /// legacy path that has no project directory.
+    bridge_path: Option<std::path::PathBuf>,
 }
 
 /// Cap a string at `cap` CHARS (not bytes) appending `…` when truncated. UTF-8
@@ -2176,7 +2189,15 @@ fn banner_text_for_event(event: &PiEvent) -> Option<String> {
 
 impl EventMapper {
     fn new(agent_id: &str, injections: ConsoleInjections) -> Self {
-        Self {
+        Self::with_bridge(agent_id, injections, None)
+    }
+
+    fn with_bridge(
+        agent_id: &str,
+        injections: ConsoleInjections,
+        bridge_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let mut mapper = Self {
             agent_id: agent_id.to_string(),
             running: false,
             entries: Vec::new(),
@@ -2190,7 +2211,49 @@ impl EventMapper {
             current_role: None,
             live_thinking_idx: None,
             injections,
+            bridge_path,
+        };
+        // Seed entries from a pre-existing bridge file so the console survives
+        // app restart. Hydration writes directly to `self.entries` — NOT through
+        // `push_entry` — so it does not duplicate lines in the file.
+        if let Some(ref p) = mapper.bridge_path {
+            if p.exists() {
+                if let Some((activity, _)) =
+                    super::mini_activity::hydrate_from_bridge_file(
+                        p,
+                        super::mini_activity::HYDRATE_WINDOW_BYTES,
+                        false,
+                    )
+                {
+                    if let Some(entries) = activity.entries {
+                        mapper.entries = entries;
+                        // evicted_count stays 0: we re-read the tail, so no
+                        // entries have been front-evicted by this mapper yet.
+                    }
+                    mapper.running = activity.running.unwrap_or(false);
+                }
+            }
         }
+        mapper
+    }
+
+    /// Write a single JSONL line to the bridge file (best-effort, silent on any
+    /// I/O error). Observability must never break a session.
+    fn persist_bridge_line(&self, entry: &super::mini_activity::ConsoleEntry) {
+        let Some(ref path) = self.bridge_path else {
+            return;
+        };
+        let Some(line) = super::mini_activity::bridge_line_for_entry(entry) else {
+            return;
+        };
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{line}")
+            });
     }
 
     /// Push a console entry, enforcing the [`MAX_CONSOLE_ENTRIES`] sliding window.
@@ -2206,6 +2269,20 @@ impl EventMapper {
     /// is removed/cleared entirely. This is the only place entries are
     /// added/removed, so the hazard is fully contained.
     fn push_entry(&mut self, entry: ConsoleEntry) {
+        // Bridge write-through: persist every entry that has a read-side parser
+        // (skipping Thinking — see below). Must happen BEFORE `entry` is moved
+        // into `self.entries`. Any I/O error is silently ignored so observability
+        // never breaks a session.
+        //
+        // IMPORTANT: Thinking entries are deliberately NOT persisted here.
+        // `upsert_live_thinking` pushes a Thinking entry via `push_entry` BEFORE
+        // the content is complete; subsequent thinking deltas mutate that entry
+        // IN PLACE (via `self.entries[idx] = ...`). Persisting at push time would
+        // write a stale fragment to the bridge file. Instead, the FINAL Thinking
+        // entry is persisted at the flush/finalize site in `flush_thinking_block`.
+        if !matches!(entry, super::mini_activity::ConsoleEntry::Thinking { .. }) {
+            self.persist_bridge_line(&entry);
+        }
         self.entries.push(entry);
         if self.entries.len() > MAX_CONSOLE_ENTRIES {
             self.entries.remove(0);
@@ -2359,6 +2436,10 @@ impl EventMapper {
                         text,
                         time: Self::now_str(),
                     };
+                    // Persist the FINAL Thinking entry to the bridge file.
+                    // `push_entry` deliberately skips Thinking (live entries are
+                    // mutated in place); we persist ONLY here at finalization.
+                    self.persist_bridge_line(&self.entries[idx]);
                 } else {
                     // Empty thinking (delta never carried text): the row already
                     // shows the streamed (empty) Thinking entry, so just finalize
@@ -2375,6 +2456,11 @@ impl EventMapper {
                         text,
                         time: Self::now_str(),
                     });
+                    // `push_entry` skips Thinking persistence (live-entry hazard);
+                    // this is the final state — persist it now.
+                    if let Some(last) = self.entries.last() {
+                        self.persist_bridge_line(last);
+                    }
                 } else {
                     self.accumulated_thinking.clear();
                 }
@@ -2388,6 +2474,11 @@ impl EventMapper {
                 text,
                 time: Self::now_str(),
             });
+            // `push_entry` skips Thinking persistence (live-entry hazard);
+            // this is the final state — persist it now.
+            if let Some(last) = self.entries.last() {
+                self.persist_bridge_line(last);
+            }
         }
     }
 
@@ -2847,9 +2938,13 @@ impl EventMapper {
     /// plan entry type yet, so per the Task-2 fallback we emit a `ConsoleEntry::Chat`
     /// with `role == "plan"`; PlannerPlanMode can later parse the formatted plan text.
     fn handle_devboule_plan(&mut self, plan: &serde_json::Value) {
+        // COMPACT serialization on purpose: this text is parsed back as JSON by
+        // the planner (latestPlan) and by the bridge-file replay — never shown
+        // raw (role "plan" is filtered from chat bubbles). Pretty-printing only
+        // inflated it past the bridge caps (truncated JSON = planner sees null).
         let text = match plan {
             serde_json::Value::Null => "(empty plan)".to_string(),
-            _ => serde_json::to_string_pretty(plan).unwrap_or_default(),
+            _ => serde_json::to_string(plan).unwrap_or_default(),
         };
         self.push_entry(ConsoleEntry::Chat {
             role: "plan".to_string(),
@@ -3602,10 +3697,11 @@ fn read_sidecar_events(
     agent_id: &str,
     pigeon_enabled: bool,
     injections: ConsoleInjections,
+    bridge_path: Option<PathBuf>,
 ) {
     let gen = generation.load(Ordering::SeqCst);
     let reader = BufReader::new(stdout);
-    let mut mapper = EventMapper::new(agent_id, injections);
+    let mut mapper = EventMapper::with_bridge(agent_id, injections, bridge_path);
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -3651,6 +3747,13 @@ fn read_sidecar_events(
         // (`try_wait` returned `Ok(None)`) — otherwise classified as `Clean`
         // and the session leaks in the map forever.
         let child_alive = try_wait.map(|s| s.is_none()).unwrap_or(false);
+        // A death mid-stream (crash/timeout/kill) means text_end/thinking_end
+        // never arrived — flush the accumulators into real entries so the
+        // partial reply reaches BOTH the final snapshot and the bridge file
+        // (review MAJOR: the durable console otherwise truncates the last
+        // turn). No-ops when the accumulators are empty (clean end-of-turn).
+        mapper.flush_thinking_block();
+        mapper.flush_text_block();
         // last-second injections (steer echo / censor note racing session death) must land in the final snapshot.
         mapper.drain_injections();
         match classify_sidecar_termination(exit_status, timed_out.load(Ordering::SeqCst)) {
@@ -6608,6 +6711,221 @@ mod tests {
         let mut env_with_warning = env;
         env_with_warning.vault_key_warning = Some("test warning".to_string());
         assert_eq!(env_with_warning.vault_key_warning.as_deref(), Some("test warning"));
+    }
+
+    // -- bridge write-through durability tests ---------------------------------
+
+    /// A temp dir + unique subdir for tests that need a real filesystem path.
+    /// Uses std::env::temp_dir() (no tempfile crate dependency). `label` MUST be
+    /// unique per test: cargo runs tests as parallel threads of ONE process, so a
+    /// pid-only dir would be shared — colliding on the file and letting one
+    /// test's remove_dir_all delete another's live file.
+    fn temp_bridge_dir(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "pi-bridge-test-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("test-agent.jsonl");
+        (path, dir)
+    }
+
+    #[test]
+    fn bridge_write_through_persists_chat_and_banner() {
+        let (path, dir) = temp_bridge_dir("chat_banner");
+        let mut mapper = EventMapper::with_bridge(
+            "pi-bridge-1",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        // Push a chat entry via the same internal path existing tests use.
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "assistant".to_string(),
+            text: "hello".to_string(),
+            time: "00:00:00".to_string(),
+            msg_id: None,
+        });
+        // Push a banner.
+        mapper.push_entry(ConsoleEntry::Banner {
+            text: "done".to_string(),
+            time: "00:00:01".to_string(),
+        });
+        // Read the file and verify the lines parse.
+        let contents = std::fs::read_to_string(&path).expect("read bridge file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "two lines: chat + banner");
+        let chat = crate::backend::mini_activity::parse_chat_line(lines[0]).expect("chat parses");
+        assert_eq!(chat.role, "assistant");
+        assert_eq!(chat.text, "hello");
+        let banner = crate::backend::mini_activity::parse_banner_line(lines[1]).expect("banner parses");
+        assert_eq!(banner, "done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_hydration_on_second_mapper() {
+        let (path, dir) = temp_bridge_dir("hydrate");
+        // First mapper writes two entries.
+        let mut m1 = EventMapper::with_bridge(
+            "pi-bridge-2",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        m1.push_entry(ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "first".to_string(),
+            time: "00:00:00".to_string(),
+            msg_id: None,
+        });
+        m1.push_entry(ConsoleEntry::Banner {
+            text: "banner1".to_string(),
+            time: "00:00:01".to_string(),
+        });
+        drop(m1);
+        // Second mapper with the same path: must hydrate existing entries
+        // WITHOUT duplicating them in the file.
+        let m2 = EventMapper::with_bridge(
+            "pi-bridge-2",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        assert_eq!(m2.entries.len(), 2, "hydrated both entries");
+        match &m2.entries[0] {
+            ConsoleEntry::Chat { role, text, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(text, "first");
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+        match &m2.entries[1] {
+            ConsoleEntry::Banner { text, .. } => {
+                assert_eq!(text, "banner1");
+            }
+            other => panic!("expected Banner, got {other:?}"),
+        }
+        // File must still have exactly 2 lines (no duplication).
+        let contents = std::fs::read_to_string(&path).expect("read bridge file");
+        assert_eq!(contents.lines().count(), 2, "file not duplicated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_append_after_hydration_does_not_duplicate() {
+        let (path, dir) = temp_bridge_dir("no_dup");
+        // First mapper writes one entry.
+        let mut m1 = EventMapper::with_bridge(
+            "pi-bridge-3",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        m1.push_entry(ConsoleEntry::Chat {
+            role: "assistant".to_string(),
+            text: "old".to_string(),
+            time: "00:00:00".to_string(),
+            msg_id: None,
+        });
+        drop(m1);
+        // Second mapper hydrates, then pushes a NEW entry — file must have
+        // exactly 2 lines (old + new), not 3 (old duplicated).
+        let mut m2 = EventMapper::with_bridge(
+            "pi-bridge-3",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        assert_eq!(m2.entries.len(), 1, "hydrated one");
+        m2.push_entry(ConsoleEntry::Banner {
+            text: "new".to_string(),
+            time: "00:00:01".to_string(),
+        });
+        let contents = std::fs::read_to_string(&path).expect("read bridge file");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "old + new, no duplication");
+        assert!(lines[0].contains("old"), "first line is old chat");
+        assert!(lines[1].contains("new"), "second line is new banner");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_mapper_new_writes_no_file() {
+        let (path, dir) = temp_bridge_dir("new_none");
+        // `new` (no bridge) must NOT create/write the path.
+        let mut mapper = EventMapper::new(
+            "pi-bridge-4",
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "assistant".to_string(),
+            text: "ephemeral".to_string(),
+            time: "00:00:00".to_string(),
+            msg_id: None,
+        });
+        assert!(!path.exists(), "no file when bridge_path is None");
+        assert_eq!(mapper.entries.len(), 1, "entry still in memory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_entry_returns_none_leaves_file_untouched() {
+        let (path, dir) = temp_bridge_dir("spawn_none");
+        // Pre-populate with one chat line.
+        let mut mapper = EventMapper::with_bridge(
+            "pi-bridge-5",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "only".to_string(),
+            time: "00:00:00".to_string(),
+            msg_id: None,
+        });
+        // Push a Spawn entry — bridge_line_for_entry returns None, so file
+        // must still contain exactly the one chat line.
+        mapper.push_entry(ConsoleEntry::Spawn {
+            node: Some(crate::backend::mini_activity::NodeStyle::Dot),
+            text: "mini run".to_string(),
+            time: "00:00:01".to_string(),
+            mini: crate::backend::mini_activity::MiniRun {
+                model: "test".to_string(),
+                scope: vec![],
+                rounds: vec![],
+                working: None,
+                banner: None,
+            },
+        });
+        let contents = std::fs::read_to_string(&path).expect("read bridge file");
+        assert_eq!(contents.lines().count(), 1, "still one line (Spawn => None)");
+        assert!(contents.contains("only"), "only the chat line persisted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_thinking_finalized_on_flush_not_on_live_push() {
+        let (path, dir) = temp_bridge_dir("thinking");
+        let mut mapper = EventMapper::with_bridge(
+            "pi-think-bridge",
+            Arc::new(Mutex::new(Vec::new())),
+            Some(path.clone()),
+        );
+        // Simulate a live thinking delta (which calls upsert_live_thinking →
+        // push_entry of a Thinking entry). The file must be EMPTY because
+        // push_entry skips Thinking persistence.
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("live fragment".to_string()),
+            content_index: Some(0),
+        });
+        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
+            "live thinking push must NOT persist");
+        // Now flush — the FINAL thinking entry must be persisted.
+        mapper.flush_thinking_block();
+        let contents = std::fs::read_to_string(&path).expect("read bridge file");
+        assert!(!contents.is_empty(), "flush must persist the thinking entry");
+        let thinking_text =
+            crate::backend::mini_activity::parse_thinking_line(contents.lines().next().unwrap())
+                .expect("parses as thinking");
+        assert_eq!(thinking_text, "live fragment");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
