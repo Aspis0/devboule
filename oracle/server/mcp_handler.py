@@ -1,6 +1,26 @@
 import sys
 
-from oracle.server.routes import make_engine
+from oracle.config import (
+    CHUNK_DB_PATH,
+    FILE_VECTORS_DB_PATH,
+    LANCE_DB_PATH,
+    SQLITE_PATH,
+)
+from oracle.server.query_engine import QueryEngine
+from oracle.store.lance_store import LanceStore
+from oracle.store.sqlite_store import SQLiteStore
+
+
+def make_engine() -> QueryEngine:
+    """In-process engine over the ORACLE_DIR stores. Inlined verbatim from the
+    deleted `oracle.server.routes` (M3-P13a): this module is the last consumer —
+    the pi-session oracle MCP rail — and lives only until the Rust port (M4)."""
+    return QueryEngine(
+        SQLiteStore(SQLITE_PATH),
+        LanceStore(LANCE_DB_PATH),
+        LanceStore(CHUNK_DB_PATH),
+        file_vectors=LanceStore(FILE_VECTORS_DB_PATH),
+    )
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
