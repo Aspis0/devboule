@@ -594,6 +594,49 @@ async function main() {
 		}
 	}
 
+	// MUST live inside main(): it closes over editedRsFiles / isReviewTurn,
+	// which are main() locals. As a top-level function it threw a fatal
+	// ReferenceError ("editedRsFiles is not defined") on the first .rs edit,
+	// killing the sidecar at agent_end (rig product bug #8 — the censor
+	// review channel was dead in production).
+	async function triggerCensorReview() {
+		const files = [...editedRsFiles.entries()];
+		editedRsFiles.clear();
+
+		if (files.length === 0) return;
+
+		isReviewTurn = true;
+
+		// Small delay to let the agent settle.
+		if (CENSOR_REVIEW_DELAY_MS > 0) {
+			await new Promise((r) => setTimeout(r, CENSOR_REVIEW_DELAY_MS));
+		}
+
+		const reviewPrompt = composeCensorReviewPrompt(files);
+		const filePaths = files.map(([fp]) => fp);
+		const diffs = files
+			.filter(([, info]) => info.patch)
+			.map(([fp, info]) => `--- ${fp}\n${info.patch}`);
+
+		// #8: do NOT call `session.prompt()` from inside the subscribe callback —
+		// the pi SDK may not support reentrant prompts and it deadlocks/panics.
+		// Instead, surface the review request as an OUTGOING JSONL line that Rust
+		// renders in the console. Actual review execution is deferred to Phase 5.
+		// TODO(Phase 5): drive the Censor review from Rust (it owns the prompt).
+		console.error(
+			"[pi-sidecar] censor: emitting review trigger for",
+			files.length,
+			"file(s)",
+		);
+		emit({
+			type: "devboule_censor_review",
+			prompt: reviewPrompt,
+			files: filePaths,
+			diffs,
+		});
+		isReviewTurn = false;
+	}
+
 	function handleStdinCloseAtAgentEnd(event) {
 		if (stdinClosed && event.type === "agent_end" && !isReviewTurn) {
 			clearTimeout(stdinGraceTimer);
@@ -855,44 +898,6 @@ export function enqueuePrompt(queue, cmd, max) {
 		return { accepted: false, queue };
 	}
 	return { accepted: true, queue: [...queue, cmd] };
-}
-
-async function triggerCensorReview() {
-	const files = [...editedRsFiles.entries()];
-	editedRsFiles.clear();
-
-	if (files.length === 0) return;
-
-	isReviewTurn = true;
-
-	// Small delay to let the agent settle.
-	if (CENSOR_REVIEW_DELAY_MS > 0) {
-		await new Promise((r) => setTimeout(r, CENSOR_REVIEW_DELAY_MS));
-	}
-
-	const reviewPrompt = composeCensorReviewPrompt(files);
-	const filePaths = files.map(([fp]) => fp);
-	const diffs = files
-		.filter(([, info]) => info.patch)
-		.map(([fp, info]) => `--- ${fp}\n${info.patch}`);
-
-	// #8: do NOT call `session.prompt()` from inside the subscribe callback —
-	// the pi SDK may not support reentrant prompts and it deadlocks/panics.
-	// Instead, surface the review request as an OUTGOING JSONL line that Rust
-	// renders in the console. Actual review execution is deferred to Phase 5.
-	// TODO(Phase 5): drive the Censor review from Rust (it owns the prompt).
-	console.error(
-		"[pi-sidecar] censor: emitting review trigger for",
-		files.length,
-		"file(s)",
-	);
-	emit({
-		type: "devboule_censor_review",
-		prompt: reviewPrompt,
-		files: filePaths,
-		diffs,
-	});
-	isReviewTurn = false;
 }
 
 // ---------------------------------------------------------------------------
