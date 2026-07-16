@@ -140,9 +140,12 @@ export function PlannerChat({
 				overflow: "hidden",
 				display: "flex",
 				flexDirection: "column",
-				minHeight: 420,
-				maxHeight: "clamp(460px, 62vh, 1200px)",
-				flex: 1,
+				// DEFINITE height, not maxHeight+flex:1 — WKWebView resolves that combo
+				// against the content size in an indefinite-height flex column, so the
+				// card grew with the conversation and the inner thread never scrolled
+				// (live e2e finding 2026-07-16).
+				height: "clamp(460px, 62vh, 900px)",
+				flex: "none",
 			}}
 		>
 			{/* HEADER */}

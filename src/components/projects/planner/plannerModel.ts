@@ -201,8 +201,22 @@ export function chatMessagesWithMilestones(
           ? { role: e.role, text: e.text, msgId: e.msgId }
           : { role: e.role, text: e.text },
       );
-    } else if (e.type === "coder" || e.type === "spawn")
-      out.push({ role: "milestone", text: e.text });
+    } else if (e.type === "coder" || e.type === "spawn") {
+      const text = e.text;
+      // Tool-call `args: {...}` lines are noise at chat altitude: fold them into
+      // the preceding "Calling `x`" milestone as a short preview instead of their
+      // own 10px row — a long tool loop otherwise floods the chat with an
+      // unreadable wall of arg dumps (live e2e finding 2026-07-16). The row's
+      // tooltip (title={msg.text}) still carries the merged text in full.
+      const prev = out[out.length - 1];
+      if (/^args:\s*/.test(text.trim()) && prev?.role === "milestone") {
+        const args = text.trim().replace(/^args:\s*/, "");
+        const preview = args.length > 80 ? `${args.slice(0, 77)}…` : args;
+        prev.text = `${prev.text} · ${preview}`;
+        continue;
+      }
+      out.push({ role: "milestone", text });
+    }
   }
   return out;
 }
