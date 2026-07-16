@@ -41,9 +41,10 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   project tasks exist yet; raw JSON never reaches chat bubbles (planner +
   AgentConsole filters); drawer auto-expands on first plan. Live e2e with
   a real model still owed.
-- **`project_claim_task` returns the full `public_agents_state`** — same
-  oversized-ack class as the round-5 register bug (110KB into the model
-  context). Give it a compact ack like register/heartbeat (aspis_mcp.py).
+- ~~**`project_claim_task` returns the full `public_agents_state`**~~ **DONE
+  2026-07-15** (`6299019`, rig P5b): compact_session_ack + claim key
+  {projectId,taskId,status,leaseUntil}; ack<4096B guarded in the rig; zero
+  breaking consumers; 5 old-contract unit tests adapted.
 - **Project status `draft` rejected** by project_get/oracle_context — decide
   whether draft should be readable (guards at aspis_mcp.py:8253/2935).
 - `agent_heartbeat` does not echo sessionToken (by design — document it in the
