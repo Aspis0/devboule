@@ -6899,6 +6899,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- Task 5: Fixture regeneration ------------------------------------------
+
+    /// Regenerates `rig/fixtures/console-activity.json` — a real `ConsoleActivity`
+    /// snapshot built by driving the `EventMapper` through the same internal paths
+    /// the production `handle_event` uses, but WITHOUT an `AppHandle` (so it is
+    /// unit-testable / hermetic). Feed it a REPRESENTATIVE sequence of `PiEvent`
+    /// shapes copied from a real rig run (the censor-scenario stream from
+    /// `test_pi_coder_lane.py::test_censor_review_trigger_on_rs_write` plus one
+    /// thinking block and one websearch banner). The test WRITES the fixture file
+    /// (that's its job — it's `#[ignore]`, run manually to regen).
+    ///
+    /// Determinism: every `time` field comes from `now_str` (a wall-clock stamp);
+    /// after building the snapshot we normalize ALL `time` fields to `""` so the
+    /// dumped JSON is diff-stable across regenerations. Mutating the entries in
+    /// place via `ConsoleActivity::normalize_times` does not alter the wire shape
+    /// (just the values), so vitest consumers that assert on entry kinds/text
+    /// remain valid.
+    ///
+    /// Run with:
+    /// ```sh
+    /// cargo test --manifest-path src-tauri/Cargo.toml regen_console_activity_fixture -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "P5e fixture regen: writes rig/fixtures/console-activity.json"]
+    fn regen_console_activity_fixture() {
+        // Build without a bridge (no persistent file) — entries live only in the mapper.
+        let mut mapper = EventMapper::new("pi-regen", Arc::new(Mutex::new(Vec::new())));
+
+        // ---- Turn 1: user echo + assistant text ----
+        // message_start with the user's steer. apply_devboule_role reads the
+        // orchestrator role; handle_devboule_custom_message returns false (plain
+        // user message, not a devboule.websearch/plan). We push a Chat user entry
+        // explicitly for the echoed steer.
+        let line = r#"{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"write a hello function"}]},"_devboule":{"agentRole":"orchestrator","projectId":"my-proj","sessionId":"pi-regen"}}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        mapper.apply_devboule_role(&event);
+        mapper.handle_devboule_custom_message(event.message.as_ref().unwrap());
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "write a hello function".to_string(),
+            time: String::new(),
+            msg_id: None,
+        });
+
+        // assistant text deltas (the sidecar emits these as message_update events
+        // carrying an `assistant_message_event` with `type: text_*`).
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "text_start".into(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "text_delta".into(),
+            delta: Some("I'll write a hello function".into()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "text_end".into(),
+            delta: None,
+            content_index: Some(0),
+        });
+        // Flush the accumulated text into a Chat entry.
+        mapper.flush_text_block();
+
+        // ---- Tool call: write ----
+        // tool_execution_start (the mapper pushes a Coder {node: Dot} + "  args:" row).
+        let tool_start = r#"{"type":"tool_execution_start","toolName":"write","toolCallId":"call-write-1","args":{"path":"src/hello.rs","content":"pub fn hello() -> &'static str { \"hello\" }"}}"#;
+        let event: PiEvent = serde_json::from_str(tool_start).unwrap();
+        // `handle_event` needs an AppHandle; drive the same internal steps directly.
+        mapper.flush_text_block();
+        mapper.flush_thinking_block();
+        let args_str = event.args.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default()).unwrap_or_default();
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: format!("🔧 Calling `write`"),
+            time: String::new(),
+        });
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: None,
+            text: format!("  args: {args_str}"),
+            time: String::new(),
+        });
+        if let Some(ref id) = event.tool_call_id {
+            let args_idx = mapper.entries.len() - 1;
+            mapper.active_tool_progress.insert(id.clone(), (args_idx, format!("  args: {args_str}")));
+        }
+
+        // tool_execution_end (✅ + result summary).
+        let tool_end = r#"{"type":"tool_execution_end","toolCallId":"call-write-1","result":{"content":[{"type":"text","text":"wrote src/hello.rs"}]},"isError":false}"#;
+        let event: PiEvent = serde_json::from_str(tool_end).unwrap();
+        mapper.flush_text_block();
+        mapper.flush_thinking_block();
+        let result_summary = event.result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|t| cap_chars(t, 200))
+            .unwrap_or_else(|| "(no result)".into());
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Sage),
+            text: format!("✅ `write` → {result_summary}"),
+            time: String::new(),
+        });
+        if let Some(ref id) = event.tool_call_id {
+            mapper.restore_tool_progress(id);
+        }
+
+        // ---- devboule_censor_review (Sage Coder row) ----
+        let censor = r#"{"type":"devboule_censor_review","prompt":"Review src/hello.rs","files":["src/hello.rs"],"_devboule":{"agentRole":"orchestrator","projectId":"my-proj","sessionId":"pi-regen"}}"#;
+        let event: PiEvent = serde_json::from_str(censor).unwrap();
+        mapper.flush_text_block();
+        mapper.flush_thinking_block();
+        // Use the production censor_review_dispatch to compute the banner text
+        // (the same pure fn handle_event calls). Event has a project_id so no
+        // "no project id" skip-banner is emitted.
+        let d = censor_review_dispatch(&event, "pi-regen");
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Sage),
+            text: d.banner,
+            time: String::new(),
+        });
+
+        // ---- Thinking block (one thinking_start + delta + thinking_end) ----
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".into(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".into(),
+            delta: Some("I need to create a hello function".into()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".into(),
+            delta: None,
+            content_index: Some(0),
+        });
+
+        // ---- Websearch entry (first-class event, pushed via handle_devboule_websearch) ----
+        let websearch_results = serde_json::json!([
+            {"url": "https://docs.rust-lang.org/std/primitive.fn.html", "title": "Rust fn docs", "summary": "Function type signatures"},
+            {"url": "https://example.com/hello-world", "title": "Hello World in Rust", "summary": "A basic hello program"}
+        ]);
+        mapper.handle_devboule_websearch("rust hello function", &websearch_results);
+
+        // ---- Banner (error event) ----
+        mapper.flush_text_block();
+        mapper.flush_thinking_block();
+        let error_event = r#"{"type":"error","context":"sidecar","message":"network timeout"}"#;
+        let event: PiEvent = serde_json::from_str(error_event).unwrap();
+        mapper.flush_text_block();
+        mapper.flush_thinking_block();
+        if let Some(text) = banner_text_for_event(&event) {
+            mapper.push_entry(ConsoleEntry::Banner {
+                text,
+                time: String::new(),
+            });
+        }
+
+        // ---- agent_end (running=false) ----
+        mapper.running = false;
+
+        // ---- Build + normalize times + dump ----
+        let mut snapshot = mapper.build_snapshot();
+        normalize_console_activity_times(&mut snapshot);
+
+        // CARGO_MANIFEST_DIR = <repo>/src-tauri; one level up is the repo root.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixtures_dir = manifest_dir
+            .parent()
+            .expect("CARGO_MANIFEST_DIR must have a parent (repo root)")
+            .join("rig")
+            .join("fixtures");
+        std::fs::create_dir_all(&fixtures_dir).expect("create fixtures dir");
+        let path = fixtures_dir.join("console-activity.json");
+        let json = serde_json::to_string_pretty(&snapshot)
+            .expect("snapshot must serialize")
+            + "\n";
+        std::fs::write(&path, json)
+            .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+    }
+
+    /// Recursively zero out every `time` field on a `ConsoleActivity` so the
+    /// dumped fixture is diff-stable across regenerations (wall-clock stamps
+    /// would otherwise change every run).
+    fn normalize_console_activity_times(activity: &mut ConsoleActivity) {
+        if let Some(ref mut entries) = activity.entries {
+            for entry in entries.iter_mut() {
+                match entry {
+                    ConsoleEntry::Coder { time, .. } | ConsoleEntry::Spawn { time, .. }
+                    | ConsoleEntry::WebSearch { time, .. }
+                    | ConsoleEntry::Banner { time, .. }
+                    | ConsoleEntry::Thinking { time, .. }
+                    | ConsoleEntry::Chat { time, .. }
+                    | ConsoleEntry::Question { time, .. } => {
+                        *time = String::new();
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bridge_thinking_finalized_on_flush_not_on_live_push() {
         let (path, dir) = temp_bridge_dir("thinking");

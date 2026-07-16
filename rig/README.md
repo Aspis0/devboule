@@ -225,3 +225,27 @@ def test_tool_call_flow(self):
 - Mock server: `HTTPServer.shutdown()` + thread join in `MockLLMServer.__exit__`
 - Sidecar: `SIGTERM` → 2s grace → `SIGKILL` + thread joins in `SidecarSession.close()`
 - **No child processes, no temp files, no real-state pollution survive a test run.**
+
+## Fixtures
+
+Versioned backend snapshots committed under `rig/fixtures/`. The rig proves what
+the backend EMITS; vitest proves what the UI models CONSUME. The seam between
+them = these recorded fixtures. Fixtures are committed — vitest runs WITHOUT the
+rig. Regen only when the wire shape changes intentionally.
+
+| Fixture | Description | Regen test |
+|---------|-------------|------------|
+| `console-activity.json` | `ConsoleActivity` snapshot covering chat (user + assistant), thinking, coder/tool rows, websearch, and banner entries. | `regen_console_activity_fixture` (Rust, `#[ignore]`) |
+| `agents-state.json` | Fleet state (`AgentLiveState`) with orchestrator/coder/mini sessions, two `MiniCoderDirective` rows (one running, one failed with `stuckReport`), and a directive with `censorSummary`. | `regen_agents_state_fixture` (Rust, `#[ignore]`) |
+| `project-tasks.json` | Kanban tasks array (from `project_get`) with `dependsOn` edges, normalized timestamps. | `test_task_deps_roundtrip_for_arrows` (Python, `RIG_FIXTURES=1` opt-in) |
+
+### Regen Commands
+
+```bash
+# Rust fixtures (run by the orchestrator — do NOT run during this task):
+cargo test --manifest-path src-tauri/Cargo.toml regen_console_activity_fixture -- --ignored
+cargo test --manifest-path src-tauri/Cargo.toml regen_agents_state_fixture -- --ignored
+
+# Python fixture (run manually with RIG=1 RIG_FIXTURES=1):
+RIG=1 RIG_FIXTURES=1 oracle-data/venv/bin/python -m pytest rig/test_task_lifecycle.py::test_task_deps_roundtrip_for_arrows -v --timeout=120
+```

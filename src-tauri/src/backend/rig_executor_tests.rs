@@ -1100,3 +1100,285 @@ fn test_stuck_report_persists_on_directive_row() {
     // Cleanup.
     std::fs::remove_dir_all(&projects_dir).ok();
 }
+
+// ── P5e-A fixture regen: agents-state.json ─────────────────────────────────
+
+/// Write `rig/fixtures/agents-state.json` — a real fleet state snapshot with
+/// sessions + directives. The test seeds a representative state (orchestrator
+/// session, coder session, mini session, two MiniCoderDirectives — one running,
+/// one failed with stuck_report — plus a directive with censor_summary),
+/// reads back the persisted `.aspis-agents.json`, normalizes all timestamp-ish
+/// fields to fixed literals, then pretty-writes the fixture.
+///
+/// Run with:
+/// ```sh
+/// cargo test --manifest-path src-tauri/Cargo.toml regen_agents_state_fixture -- --ignored
+/// ```
+#[test]
+#[ignore = "P5e fixture regen: writes rig/fixtures/agents-state.json"]
+fn regen_agents_state_fixture() {
+    // 1) Temp projects dir (hermetic, cwd-independent).
+    let projects_dir = temp_project("p5e-agents");
+
+    // 2) Seed the agent live state.
+    crate::backend::agents::mutate_agent_live_state_at_path(&projects_dir, |state| {
+        // ── Sessions ──
+        state.sessions = vec![
+            // Orchestrator (active)
+            crate::backend::model::AgentSession {
+                agent_id: "orch-1".into(),
+                role: "orchestrator".into(),
+                model: Some("claude-sonnet-4-20250514".into()),
+                status: "active".into(),
+                message: Some("Planning the work…".into()),
+                client: Some("claude".into()),
+                current_project_id: Some("my-proj".into()),
+                current_task_id: Some("T1".into()),
+                current_file_path: None,
+                first_seen_at: Some("2026-07-16T00:00:00Z".into()),
+                last_seen_at: Some("2026-07-16T00:10:00Z".into()),
+                launch_token_hash: Some("hash-orch-1".into()),
+                launch_token_issued_at: Some("2026-07-16T00:00:00Z".into()),
+                session_token_hash: Some("sess-hash-orch-1".into()),
+                session_token_issued_at: Some("2026-07-16T00:00:01Z".into()),
+                subagents: vec![],
+                needs_user: None,
+                host: Some("app".into()),
+                parent_agent_id: None,
+                pending_question: None,
+                user_reply: None,
+            },
+            // Main coder (active, working on a task)
+            crate::backend::model::AgentSession {
+                agent_id: "coder-1".into(),
+                role: "coder".into(),
+                model: Some("claude-sonnet-4-20250514".into()),
+                status: "active".into(),
+                message: Some("Implementing the scaffold…".into()),
+                client: Some("claude".into()),
+                current_project_id: Some("my-proj".into()),
+                current_task_id: Some("T2".into()),
+                current_file_path: Some("src/lib.rs".into()),
+                first_seen_at: Some("2026-07-16T00:01:00Z".into()),
+                last_seen_at: Some("2026-07-16T00:11:00Z".into()),
+                launch_token_hash: Some("hash-coder-1".into()),
+                launch_token_issued_at: Some("2026-07-16T00:01:00Z".into()),
+                session_token_hash: Some("sess-hash-coder-1".into()),
+                session_token_issued_at: Some("2026-07-16T00:01:01Z".into()),
+                subagents: vec![],
+                needs_user: None,
+                host: Some("app".into()),
+                parent_agent_id: None,
+                pending_question: None,
+                user_reply: None,
+            },
+            // Mini coder (running, nested under coder-1)
+            crate::backend::model::AgentSession {
+                agent_id: "mini-1".into(),
+                role: "mini-coder".into(),
+                model: Some("gemini-2.5-flash".into()),
+                status: "active".into(),
+                message: Some("Running mini…".into()),
+                client: Some("claude".into()),
+                current_project_id: Some("my-proj".into()),
+                current_task_id: Some("mini-task-1".into()),
+                current_file_path: Some("src/hello.rs".into()),
+                first_seen_at: Some("2026-07-16T00:02:00Z".into()),
+                last_seen_at: Some("2026-07-16T00:12:00Z".into()),
+                launch_token_hash: Some("hash-mini-1".into()),
+                launch_token_issued_at: Some("2026-07-16T00:02:00Z".into()),
+                session_token_hash: Some("sess-hash-mini-1".into()),
+                session_token_issued_at: Some("2026-07-16T00:02:01Z".into()),
+                subagents: vec![],
+                needs_user: None,
+                host: Some("app".into()),
+                parent_agent_id: Some("coder-1".into()),
+                pending_question: None,
+                user_reply: None,
+            },
+        ];
+
+        // ── Mini-coder directives ──
+        let running_directive = mini_coder::MiniCoderDirective {
+            id: "d-running".into(),
+            parent_agent_id: "coder-1".into(),
+            stuck_report: None,
+            censor_summary: None,
+            status: MiniCoderStatus::Running,
+            task: "Write hello function".into(),
+            files: vec!["src/hello.rs".into()],
+            backend: None,
+            write: false,
+            write_mode: mini_coder::WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: Some("my-proj".into()),
+            allow_oracle: false,
+            kill_requested: false,
+            steer_queue: vec![],
+            result_path: "d-running.json".into(),
+            agent_id: Some("mini-1".into()),
+            created_at: "2026-07-16T00:00:00Z".into(),
+            claimed_at: Some("2026-07-16T00:00:01Z".into()),
+            scratch_path: None,
+            started_at: Some("2026-07-16T00:02:00Z".into()),
+            result: None,
+            attempt: 0,
+            parent_directive_id: None,
+            pigeon_ticket: None,
+            collected: None,
+        };
+
+        let mut failed_directive = mini_coder::MiniCoderDirective {
+            id: "d-failed".into(),
+            parent_agent_id: "coder-1".into(),
+            stuck_report: None,
+            censor_summary: None,
+            status: MiniCoderStatus::Failed,
+            task: "Add tests for hello".into(),
+            files: vec!["tests/hello_test.rs".into()],
+            backend: None,
+            write: false,
+            write_mode: mini_coder::WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: Some("my-proj".into()),
+            allow_oracle: false,
+            kill_requested: false,
+            steer_queue: vec![],
+            result_path: "d-failed.json".into(),
+            agent_id: None,
+            created_at: "2026-07-16T00:00:00Z".into(),
+            claimed_at: None,
+            scratch_path: None,
+            started_at: None,
+            result: Some(mini_coder::MiniCoderOutcome {
+                status: MiniCoderStatus::Failed,
+                output: None,
+                files_touched: vec!["tests/hello_test.rs".into()],
+                edits: vec![],
+                question: None,
+                partial: None,
+                error: Some("timeout after 3 attempts".into()),
+                net_blocked: false,
+                folder_write_blocked: None,
+                censor_findings: None,
+            }),
+            attempt: 3,
+            parent_directive_id: None,
+            pigeon_ticket: None,
+            collected: None,
+        };
+
+        // Attach a stuck_report to the failed directive via the production fn.
+        let report = crate::backend::stuck_report::StuckReport::new(
+            "d-failed",
+            "coder-1",
+            "failed",
+            3,
+            "error: compilation failed\n  --> tests/hello_test.rs:2:1",
+            vec!["tests/hello_test.rs".into()],
+            Some("my-proj".into()),
+        );
+        // Use the same production attach fn as persist_and_emit_stuck.
+        super::attach_stuck_report(state, &report);
+        failed_directive.stuck_report = Some(report);
+
+        // Directive with censor_summary (phase-a findings).
+        let censor_directive = mini_coder::MiniCoderDirective {
+            id: "d-censored".into(),
+            parent_agent_id: "coder-1".into(),
+            stuck_report: None,
+            censor_summary: Some(mini_coder::CensorMiniSummary {
+                total: 2,
+                files: vec!["src/auth.rs".into(), "src/db.rs".into()],
+            }),
+            status: MiniCoderStatus::Done,
+            task: "Refactor auth module".into(),
+            files: vec!["src/auth.rs".into(), "src/db.rs".into()],
+            backend: None,
+            write: true,
+            write_mode: mini_coder::WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: Some("my-proj".into()),
+            allow_oracle: false,
+            kill_requested: false,
+            steer_queue: vec![],
+            result_path: "d-censored.json".into(),
+            agent_id: None,
+            created_at: "2026-07-16T00:00:00Z".into(),
+            claimed_at: None,
+            scratch_path: None,
+            started_at: None,
+            result: Some(mini_coder::MiniCoderOutcome {
+                status: MiniCoderStatus::Done,
+                output: None,
+                files_touched: vec!["src/auth.rs".into(), "src/db.rs".into()],
+                edits: vec![],
+                question: None,
+                partial: None,
+                error: None,
+                net_blocked: false,
+                folder_write_blocked: None,
+                censor_findings: None,
+            }),
+            attempt: 0,
+            parent_directive_id: None,
+            pigeon_ticket: None,
+            collected: None,
+        };
+
+        state.mini_coder_directives = vec![running_directive, failed_directive, censor_directive];
+    })
+    .unwrap();
+
+    // 3) Read the persisted state file.
+    let state_path = projects_dir.join(".aspis-agents.json");
+    let content = std::fs::read_to_string(&state_path)
+        .unwrap_or_else(|e| panic!("state file missing: {e}"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).expect("invalid state JSON");
+
+    // 4) Normalize all timestamp-ish fields to fixed literals so the fixture
+    //    is diff-stable across regenerations.
+    normalize_agents_state_timestamps(&mut value);
+
+    // 5) Pretty-write to rig/fixtures/agents-state.json.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_dir = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR must have a parent (repo root)")
+        .join("rig")
+        .join("fixtures");
+    std::fs::create_dir_all(&fixtures_dir).expect("create fixtures dir");
+    let path = fixtures_dir.join("agents-state.json");
+    let json = serde_json::to_string_pretty(&value).expect("value must serialize")
+        + "\n";
+    std::fs::write(&path, json)
+        .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+
+    // Cleanup.
+    std::fs::remove_dir_all(&projects_dir).ok();
+}
+
+/// Recursively replace every timestamp-ish string value (matching an RFC3339
+/// pattern like `2026-07-16T…`) with the fixed literal `"2026-07-16T00:00:00Z"`
+/// so the dumped fixture is diff-stable across regenerations.
+fn normalize_agents_state_timestamps(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.starts_with("202") && s.contains('T') && s.ends_with('Z') {
+                *s = "2026-07-16T00:00:00Z".to_string();
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                normalize_agents_state_timestamps(v);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                normalize_agents_state_timestamps(v);
+            }
+        }
+        _ => {}
+    }
+}

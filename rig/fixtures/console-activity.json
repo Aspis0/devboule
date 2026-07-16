@@ -1,0 +1,69 @@
+{
+  "running": false,
+  "runCount": 0,
+  "entries": [
+    {
+      "type": "chat",
+      "role": "user",
+      "text": "write a hello function",
+      "time": ""
+    },
+    {
+      "type": "chat",
+      "role": "assistant",
+      "text": "I'll write a hello function",
+      "time": ""
+    },
+    {
+      "type": "coder",
+      "node": "dot",
+      "text": "🔧 Calling `write`",
+      "time": ""
+    },
+    {
+      "type": "coder",
+      "text": "  args: {\"path\":\"src/hello.rs\",\"content\":\"pub fn hello() -> &'static str { \\\"hello\\\" }\"}",
+      "time": ""
+    },
+    {
+      "type": "coder",
+      "node": "sage",
+      "text": "✅ `write` → wrote src/hello.rs",
+      "time": ""
+    },
+    {
+      "type": "coder",
+      "node": "sage",
+      "text": "⚑ Censor review started for: src/hello.rs",
+      "time": ""
+    },
+    {
+      "type": "thinking",
+      "text": "I need to create a hello function",
+      "time": ""
+    },
+    {
+      "type": "webSearch",
+      "query": "rust hello function",
+      "pages": [
+        {
+          "url": "https://docs.rust-lang.org/std/primitive.fn.html",
+          "title": "Rust fn docs",
+          "summary": "Function type signatures"
+        },
+        {
+          "url": "https://example.com/hello-world",
+          "title": "Hello World in Rust",
+          "summary": "A basic hello program"
+        }
+      ],
+      "time": ""
+    },
+    {
+      "type": "banner",
+      "text": "Sidecar error [sidecar]: network timeout",
+      "time": ""
+    }
+  ],
+  "entriesBase": 0
+}

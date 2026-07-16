@@ -1,0 +1,63 @@
+[
+  {
+    "assignee": null,
+    "due": null,
+    "id": "T1",
+    "linkedResources": [],
+    "priority": "high",
+    "status": "todo",
+    "title": "Implement feature X",
+    "updatedAt": "2026-07-16T00:00:00Z"
+  },
+  {
+    "acceptance": "builds",
+    "assignee": null,
+    "due": null,
+    "id": "T2",
+    "linkedResources": [],
+    "planId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "priority": "medium",
+    "scope": [
+      "src/a.ts"
+    ],
+    "status": "todo",
+    "title": "Scaffold module",
+    "updatedAt": "2026-07-16T00:00:00Z"
+  },
+  {
+    "acceptance": "tests pass",
+    "assignee": null,
+    "dependsOn": [
+      "T2"
+    ],
+    "due": null,
+    "id": "T3",
+    "linkedResources": [],
+    "planId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "priority": "medium",
+    "scope": [
+      "src/b.ts"
+    ],
+    "status": "todo",
+    "title": "Wire it up",
+    "updatedAt": "2026-07-16T00:00:00Z"
+  },
+  {
+    "acceptance": "docs built",
+    "assignee": null,
+    "dependsOn": [
+      "T3"
+    ],
+    "due": null,
+    "id": "T4",
+    "linkedResources": [],
+    "planId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "priority": "medium",
+    "scope": [
+      "docs/api.md"
+    ],
+    "status": "todo",
+    "title": "Add docs",
+    "updatedAt": "2026-07-16T00:00:00Z"
+  }
+]

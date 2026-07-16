@@ -444,6 +444,19 @@ def test_task_deps_roundtrip_for_arrows():
             assert "Wire it up" in titles2
             assert "Add docs" in titles2
 
+            # ---- P5e-A fixture dump: project-tasks.json ----
+            if os.environ.get("RIG_FIXTURES") == "1":
+                fixtures = Path(__file__).parent / "fixtures"
+                fixtures.mkdir(exist_ok=True)
+                # Use the first project_get tasks (carries the dependsOn edges).
+                tasks_payload = list(tasks)  # shallow copy for safe mutation
+                for t in tasks_payload:
+                    for key in ("createdAt", "updatedAt", "claimedAt", "completedAt"):
+                        if key in t:
+                            t[key] = "2026-07-16T00:00:00Z"
+                (fixtures / "project-tasks.json").write_text(
+                    json.dumps(tasks_payload, indent=2, sort_keys=True) + "\n")
+
 
 @pytest.mark.rig
 def test_double_claim_rejected():
