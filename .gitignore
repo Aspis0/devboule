@@ -62,6 +62,9 @@ polis-dev-city.json
 aspis.html
 tsconfig.tsbuildinfo
 
+# Devboule pi sidecar runtime state (session persistence — not source)
+src-tauri/.devboule/
+
 # Pi agent sessions
 # Pi agent sessions / config (ignore contents, keep project agents tracked)
 .pi/*
