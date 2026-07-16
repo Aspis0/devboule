@@ -117,6 +117,9 @@ export interface MiniCoderBackend {
 	// Maximum number of concurrent mini-coder slots (1–4, default 2 when absent).
 	// Mirrors Rust MiniCoderBackend.max_concurrent: Option<u8>.
 	maxConcurrent?: number;
+	// Ordered fallback chain: if the primary model fails (rate-limit / provider error),
+	// the coder tries these models in order. Mirrors the Rust FallbackModel.
+	fallbacks?: FallbackModel[];
 }
 
 // The single, global LLM provider the generative-design module generates node markup
@@ -157,6 +160,16 @@ export interface DesignLlmBackend {
 // (low/medium/high); any other value is rejected by `validateDesignEffort`.
 export type DesignEffort = "low" | "medium" | "high";
 
+// One entry in a role's ordered fallback chain. If the primary model fails
+// (rate-limit / provider error), the coder advances to the next FallbackModel.
+// `provider`/`baseUrl` default to the primary backend's when omitted (a
+// same-provider model swap, the common case). Mirrors the Rust FallbackModel.
+export interface FallbackModel {
+	model: string;
+	provider?: string;
+	baseUrl?: string;
+}
+
 // The single, global backend the LOCAL MAIN coder (the Devboule orchestrator binary,
 // client === "orchestrator") runs on. A SEPARATE, INDEPENDENT value from MiniCoderBackend:
 // the orchestrator (local MAIN coder) and the mini (the delegated worker a coder spawns)
@@ -181,6 +194,9 @@ export interface LocalCoderBackend {
 	// "ollama" (resolves Ollama's loopback OpenAI endpoint when absent). Stored normalized (no
 	// trailing slash). The CLOUD API KEY is NEVER stored here — it lives only in the OS vault.
 	baseUrl?: string;
+	// Ordered fallback chain: if the primary model fails, the coder tries these models in order.
+	// Mirrors the Rust FallbackModel.
+	fallbacks?: FallbackModel[];
 }
 
 // One provider detected on this machine by the Rust `detect_providers` command

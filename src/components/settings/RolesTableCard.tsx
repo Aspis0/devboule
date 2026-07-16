@@ -44,6 +44,7 @@ import type { AuxCredentialStatus } from "../../types/backend";
 import type {
 	DetectedProvider,
 	EffectiveRolesConfig,
+	FallbackModel,
 	LocalCoderBackend,
 	LocalCoderBackendKind,
 	MiniCoderBackend,
@@ -84,6 +85,11 @@ interface BackendDraft {
 	// set command REPLACES the whole miniCoderBackend, so omitting it would silently reset it
 	// to the default (the bug the review caught). Only the Mini row surfaces an editor for it.
 	maxConcurrent: number;
+	// Ordered fallback chain carried in the draft so a save PRESERVES it — the backend set
+	// command REPLACES the whole backend, so omitting it would silently wipe it. Mirrors the
+	// Rust MiniCoderBackend.fallbacks. Uses DraftFallback (transient _key) while editing; _key
+	// is stripped before the save payload reaches Rust.
+	fallbacks: DraftFallback[];
 }
 
 const EMPTY_DRAFT: BackendDraft = {
@@ -92,6 +98,7 @@ const EMPTY_DRAFT: BackendDraft = {
 	command: "",
 	baseUrl: "",
 	maxConcurrent: 2,
+	fallbacks: [],
 };
 
 // Local = on-device (the prompt never leaves the machine). Cloud = external (a
@@ -166,6 +173,8 @@ function draftFromBackend(
 		command: backend.command ?? "",
 		baseUrl: backend.baseUrl ?? "",
 		maxConcurrent: backend.maxConcurrent ?? 2,
+		// Attach a transient _key per entry so ↑/↓ reorders keep React input focus stable.
+		fallbacks: (backend.fallbacks ?? []).map((f) => ({ ...f, _key: crypto.randomUUID() })),
 	};
 }
 
@@ -176,12 +185,18 @@ interface LocalBackendRowDraft {
 	kind: LocalCoderBackendKind;
 	model: string;
 	baseUrl: string;
+	// Ordered fallback chain carried in the draft so a save PRESERVES it — the backend set
+	// command REPLACES the whole backend, so omitting it would silently wipe it. Mirrors the
+	// Rust LocalCoderBackend.fallbacks. Uses DraftFallback (transient _key) while editing; _key
+	// is stripped before the save payload reaches Rust.
+	fallbacks: DraftFallback[];
 }
 
 const EMPTY_LOCAL_DRAFT: LocalBackendRowDraft = {
 	kind: "ollama",
 	model: "",
 	baseUrl: "",
+	fallbacks: [],
 };
 
 function localDraftFromBackend(
@@ -192,6 +207,8 @@ function localDraftFromBackend(
 		kind: backend.kind,
 		model: backend.model ?? "",
 		baseUrl: backend.baseUrl ?? "",
+		// Attach a transient _key per entry so ↑/↓ reorders keep React input focus stable.
+		fallbacks: (backend.fallbacks ?? []).map((f) => ({ ...f, _key: crypto.randomUUID() })),
 	};
 }
 
@@ -274,6 +291,93 @@ const ROLES: RoleMeta[] = [
 			"Review-only. Sets a task to review, never to done. No file writes.",
 	},
 ];
+
+// Draft-local fallback shape: a FallbackModel plus a transient `_key` used only while
+// the user is editing the chain (gives React a stable key across ↑/↓ reorders so the
+// input focus/caret stays on the right row). `_key` is STRIPPED before save so the
+// Rust payload never carries it. Mirrors the Rust FallbackModel.
+type DraftFallback = FallbackModel & { _key?: string };
+
+// One entry in a role's ordered fallback chain editor. If the primary model fails
+// (rate-limit / provider error), the coder advances to the next FallbackModel in order.
+// Mirrors the Rust FallbackModel and round-trips through the save payload.
+function FallbackChainEditor(props: {
+	fallbacks: DraftFallback[];
+	onChange: (next: DraftFallback[]) => void;
+	disabled?: boolean;
+}) {
+	const { fallbacks, onChange, disabled } = props;
+	const update = (i: number, patch: Partial<FallbackModel>) =>
+		onChange(fallbacks.map((f, idx) => (idx === i ? { ...f, ...patch } : f)));
+	const remove = (i: number) => onChange(fallbacks.filter((_, idx) => idx !== i));
+	const move = (i: number, dir: -1 | 1) => {
+		const j = i + dir;
+		if (j < 0 || j >= fallbacks.length) return;
+		const next = [...fallbacks];
+		[next[i], next[j]] = [next[j], next[i]];
+		onChange(next);
+	};
+	const add = () => onChange([...fallbacks, { model: "", _key: crypto.randomUUID() }]);
+	return (
+		<div className="mt-2">
+			<div className="text-xs font-medium opacity-70 text-cream-400">
+				Fallback models (tried in order if the primary fails)
+			</div>
+			{fallbacks.length === 0 && (
+				<div className="text-xs opacity-50 text-cream-400 mt-1">
+					No fallbacks. The role uses only its primary model.
+				</div>
+			)}
+			{fallbacks.map((f, i) => (
+				<div key={f._key ?? i} className="flex items-center gap-1 mt-1">
+					<span className="text-xs opacity-50 w-4 text-cream-400">{i + 1}.</span>
+					<input
+						className="flex-1 text-xs px-1 py-0.5 rounded border border-cream-200 bg-white text-cream-700 outline-none focus:border-teal/30"
+						placeholder="model id (e.g. kwaipilot/kat-coder-air-v2.5)"
+						value={f.model}
+						disabled={disabled}
+						onChange={(e) => update(i, { model: e.target.value })}
+					/>
+					<button
+						type="button"
+						className="text-xs px-1 opacity-60 hover:opacity-100 text-cream-700"
+						disabled={disabled || i === 0}
+						onClick={() => move(i, -1)}
+						title="Move up"
+					>
+						↑
+					</button>
+					<button
+						type="button"
+						className="text-xs px-1 opacity-60 hover:opacity-100 text-cream-700"
+						disabled={disabled || i === fallbacks.length - 1}
+						onClick={() => move(i, 1)}
+						title="Move down"
+					>
+						↓
+					</button>
+					<button
+						type="button"
+						className="text-xs px-1 opacity-60 hover:opacity-100 text-coral-dark"
+						disabled={disabled}
+						onClick={() => remove(i)}
+						title="Remove"
+					>
+						✕
+					</button>
+				</div>
+			))}
+			<button
+				type="button"
+				className="text-xs mt-1 opacity-70 hover:opacity-100 underline text-cream-700"
+				disabled={disabled}
+				onClick={add}
+			>
+				+ Add fallback model
+			</button>
+		</div>
+	);
+}
 
 // A compact, controlled MiniCoderBackend field group (kind + the fields that kind
 // needs), reusing the shared validator so the inline errors match the Rust boundary.
@@ -490,6 +594,14 @@ function MiniBackendFields(props: {
 				</label>
 			) : null}
 
+			{/* Fallback chain: only meaningful for kinds that drive a real coder (cloud + local model kinds). */}
+			{(isCloudKind(draft.kind) || draft.kind === "ollama" || draft.kind === "omlx") && (
+				<FallbackChainEditor
+					fallbacks={draft.fallbacks}
+					onChange={(fb) => set({ fallbacks: fb })}
+				/>
+			)}
+
 			{firstError ? (
 				<p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
 					{firstError}
@@ -655,6 +767,12 @@ function LocalBackendFields(props: {
 					onRefreshKey={onRefreshCloudKey}
 				/>
 			) : null}
+
+			{/* Fallback chain: meaningful for all LocalCoderBackend kinds (ollama/omlx/cloud). */}
+			<FallbackChainEditor
+				fallbacks={draft.fallbacks}
+				onChange={(fb) => set({ fallbacks: fb })}
+			/>
 
 			{firstError ? (
 				<p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
@@ -1166,8 +1284,9 @@ export function RolesTableCard() {
 			}
 			// Merge maxConcurrent (not managed by validateMiniBackend) so a save never resets it.
 			const clamped = Math.max(1, Math.min(4, draft.maxConcurrent));
+			const fallbacks = draft.fallbacks.length ? draft.fallbacks.map(({ _key, ...f }) => f) : undefined;
 			await invokeBackendCommand(command, {
-				backend: { ...validation.value, maxConcurrent: clamped },
+				backend: { ...validation.value, maxConcurrent: clamped, fallbacks },
 			});
 		},
 		[],
@@ -1189,7 +1308,7 @@ export function RolesTableCard() {
 				throw new Error(firstError ?? "Invalid local coder backend.");
 			}
 			await invokeBackendCommand("set_local_coder_backend", {
-				backend: validation.value,
+				backend: { ...validation.value, fallbacks: draft.fallbacks.length ? draft.fallbacks.map(({ _key, ...f }) => f) : undefined },
 			});
 		},
 		[],
