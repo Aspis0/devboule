@@ -2186,6 +2186,15 @@ struct PiEvent {
     results: Option<serde_json::Value>,
     #[serde(default)]
     plan: Option<serde_json::Value>,
+    /// `devboule_model_switch` (B2.2): automatic coder-model fallback. `from`/`to`
+    /// are model ids; `resolved=true` means the switch happened, `false` means the
+    /// chain was exhausted or the next model could not be resolved.
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    resolved: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3031,6 +3040,25 @@ impl EventMapper {
                     .clone()
                     .unwrap_or(serde_json::Value::Null);
                 self.handle_devboule_plan(&plan);
+                self.emit_snapshot(app);
+            }
+            "devboule_model_switch" => {
+                // B2.2: coder model auto-fallback. Flush pending blocks, then show a
+                // banner so the user sees which model failed and what took over.
+                self.flush_text_block();
+                self.flush_thinking_block();
+                let from = event.from.as_deref().unwrap_or("?");
+                let to = event.to.as_deref().unwrap_or("?");
+                let reason = event.reason.as_deref().unwrap_or("provider error");
+                let text = if event.resolved.unwrap_or(false) {
+                    format!("Model fallback: {from} failed ({reason}) \u{2192} switched to {to}")
+                } else {
+                    format!("Model fallback exhausted: could not switch from {from} to {to} ({reason})")
+                };
+                self.push_entry(ConsoleEntry::Banner {
+                    text,
+                    time: Self::now_str(),
+                });
                 self.emit_snapshot(app);
             }
             "compaction_start" | "compaction_end" | "auto_retry_start"
@@ -4822,6 +4850,17 @@ mod tests {
         let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_plan event");
         assert_eq!(event.event_type, "devboule_plan");
         assert!(event.plan.is_some());
+    }
+
+    #[test]
+    fn parses_devboule_model_switch_event() {
+        let line = r#"{"type":"devboule_model_switch","from":"tencent/hy3","to":"kwaipilot/kat-coder-air-v2.5","reason":"rate limited","resolved":true}"#;
+        let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_model_switch event");
+        assert_eq!(event.event_type, "devboule_model_switch");
+        assert_eq!(event.from.as_deref(), Some("tencent/hy3"));
+        assert_eq!(event.to.as_deref(), Some("kwaipilot/kat-coder-air-v2.5"));
+        assert_eq!(event.reason.as_deref(), Some("rate limited"));
+        assert_eq!(event.resolved, Some(true));
     }
 
     #[test]
@@ -6727,6 +6766,9 @@ mod tests {
             query: None,
             results: None,
             plan: None,
+            from: None,
+            to: None,
+            resolved: None,
         }
     }
 

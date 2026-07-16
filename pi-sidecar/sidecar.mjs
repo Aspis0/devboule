@@ -53,6 +53,11 @@ let currentTurnFailed = false;
 // S2: capture the real error detail from auto_retry_end(finalError).
 let currentTurnError = null;
 
+// Model chain fallback state (B2.2). Declared at module scope so
+// handlePromptCommand and the subscribe callback all read/write the same bindings.
+let modelChain = [];
+let currentChainIndex = 0;
+
 // ---------------------------------------------------------------------------
 // JSONL helpers
 // ---------------------------------------------------------------------------
@@ -249,6 +254,7 @@ export async function handlePromptCommand(
 	session,
 	modelRegistry,
 	pigeonEnabled = false,
+	emitFn = emit,
 ) {
 	if (!pigeonEnabled) {
 		// Pigeon OFF (default): no classification, no model switch, no redirect —
@@ -256,15 +262,27 @@ export async function handlePromptCommand(
 		await session.prompt(cmd.message, {
 			streamingBehavior: cmd.streamingBehavior,
 		});
-		return;
+	} else {
+		const classification = await requestClassification(cmd.message);
+		// Pigeon ON: apply tier→model routing, then run the turn.
+		await applyPigeonRouting(session, modelRegistry, classification);
+		await session.prompt(cmd.message, {
+			streamingBehavior: cmd.streamingBehavior,
+		});
 	}
 
-	const classification = await requestClassification(cmd.message);
-	// Pigeon ON: apply tier→model routing, then run the turn.
-	await applyPigeonRouting(session, modelRegistry, classification);
-	await session.prompt(cmd.message, {
-		streamingBehavior: cmd.streamingBehavior,
-	});
+	// B2.2: automatic model fallback. If the turn failed because the provider
+	// exhausted retries, advance to the next chain model (setModel preserves the
+	// conversation) and re-run the SAME prompt. Loop until success or exhausted.
+	const chainState = { chain: modelChain, index: currentChainIndex };
+	const failState = {
+		isFailed: () => currentTurnFailed,
+		error: () => currentTurnError,
+		clear: () => { currentTurnFailed = false; currentTurnError = null; },
+	};
+	await runModelFallbackLoop(session, modelRegistry, chainState, emitFn, failState,
+		() => session.prompt(cmd.message, { streamingBehavior: cmd.streamingBehavior }));
+	currentChainIndex = chainState.index;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +376,79 @@ export function resolveModelWithFallback(modelRegistry, provider, modelId) {
 	return undefined;
 }
 
+/**
+ * Parse DEVBOULE_PI_MODEL_CHAIN (JSON array of {provider, model, baseUrl?}).
+ * Falls back to a single-entry chain built from the primary env when the var is
+ * absent or malformed, so the rest of the code can always treat it uniformly.
+ */
+export function parseModelChain(env) {
+	const primary = { provider: env.DEVBOULE_PI_PROVIDER || "openai", model: env.DEVBOULE_PI_MODEL || "gpt-4o" };
+	const raw = env.DEVBOULE_PI_MODEL_CHAIN;
+	if (!raw) return [primary];
+	try {
+		const arr = JSON.parse(raw);
+		if (!Array.isArray(arr) || arr.length === 0) return [primary];
+		const cleaned = arr
+			.filter((e) => e && typeof e.model === "string" && e.model.trim() !== "")
+			.map((e) => ({ provider: (e.provider || primary.provider), model: e.model, baseUrl: e.baseUrl }));
+		return cleaned.length > 0 ? cleaned : [primary];
+	} catch {
+		return [primary];
+	}
+}
+
+/**
+ * Run the model-fallback loop: while the turn is marked failed and the chain has
+ * more models, switch to the next model and re-run the prompt. `failState` injects
+ * the failure signal so this is testable without the module-global flags.
+ *   failState = { isFailed: () => bool, error: () => string|null, clear: () => void }
+ * `runPrompt` re-runs the same prompt (returns a Promise). Returns the number of
+ * loop iterations performed.
+ */
+export async function runModelFallbackLoop(session, modelRegistry, chainState, emitFn, failState, runPrompt) {
+	let hops = 0;
+	const maxHops = chainState.chain.length;
+	while (failState.isFailed() && hops < maxHops) {
+		hops += 1;
+		const reason = failState.error() || "provider error";
+		const switched = await switchToNextModel(session, modelRegistry, reason, chainState, emitFn);
+		if (!switched) break;
+		failState.clear();
+		await runPrompt();
+	}
+	return hops;
+}
+
+/**
+ * Advance to the next model in the chain and setModel to it. Returns true if a
+ * switch happened, false if the chain is exhausted or the next model can't be
+ * resolved. Emits a `devboule_model_switch` event for the UI banner.
+ * `emitFn` and `chainState` are injected for testability; production passes the
+ * module-level `emit` and a {chain, index} object.
+ */
+export async function switchToNextModel(session, modelRegistry, reason, chainState, emitFn) {
+	const { chain } = chainState;
+	if (chainState.index + 1 >= chain.length) return false;
+	const fromEntry = chain[chainState.index];
+	const nextEntry = chain[chainState.index + 1];
+	const model = resolveModelWithFallback(modelRegistry, nextEntry.provider, nextEntry.model);
+	if (!model) {
+		emitFn({ type: "devboule_model_switch", from: fromEntry.model, to: nextEntry.model, reason, resolved: false });
+		return false;
+	}
+	try {
+		await session.setModel(model);
+	} catch (err) {
+		// setModel rejected (bad auth / model rejected). Do NOT advance the index;
+		// report the switch as unresolved so the caller stops cleanly.
+		emitFn({ type: "devboule_model_switch", from: fromEntry.model, to: nextEntry.model, reason: String(reason || "provider error"), resolved: false });
+		return false;
+	}
+	chainState.index += 1;
+	emitFn({ type: "devboule_model_switch", from: fromEntry.model, to: nextEntry.model, reason: String(reason || "provider error"), resolved: true });
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // pi SDK bootstrap
 // ---------------------------------------------------------------------------
@@ -401,6 +492,15 @@ async function main() {
 	} catch (err) {
 		console.error(
 			`[pi-sidecar] Could not resolve model ${provider}/${modelId}: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+
+	// B2.2: parse the candidate model chain from the Rust-provided env var.
+	modelChain = parseModelChain(process.env);
+	currentChainIndex = 0;
+	if (modelChain.length > 1) {
+		console.error(
+			`[pi-sidecar] Model chain: ${modelChain.map((e) => `${e.provider}/${e.model}`).join(" -> ")}`,
 		);
 	}
 
@@ -724,14 +824,20 @@ async function main() {
 		// (before any await), so the flag is set in the same tick the event is
 		// delivered, avoiding microtask interleaving with session.prompt().
 		if (promptInFlight) {
-			if (event.type === "auto_retry_end" && event.success === false) {
-				currentTurnFailed = true;
-				// S2: capture the real error detail from the event
-				currentTurnError = event.finalError || null;
-			}
-			// S1: defensive — the SDK never emits type:"error" through the
-			// session bus, but keep the branch in case that changes.
-			else if (event.type === "error") {
+			if (event.type === "auto_retry_end") {
+				if (event.success === false) {
+					currentTurnFailed = true;
+					// S2: capture the real error detail from the event
+					currentTurnError = event.finalError || null;
+				} else {
+					// retry RECOVERED — clear the failure so the fallback loop does not
+					// spuriously switch models on a turn that actually succeeded.
+					currentTurnFailed = false;
+					currentTurnError = null;
+				}
+			} else if (event.type === "error") {
+				// S1: defensive — the SDK never emits type:"error" through the
+				// session bus, but keep the branch in case that changes.
 				// defensive: SDK has no "error" event today
 				currentTurnFailed = true;
 			}
