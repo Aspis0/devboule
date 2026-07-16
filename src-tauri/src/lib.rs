@@ -10,6 +10,7 @@ use tauri::Manager;
 use backend::agent_pty::AgentPtySessions;
 use backend::broker::PermissionBrokerState;
 use backend::censor::commands::CensorState;
+use backend::censor::orchestrator::CensorScanRegistry;
 use backend::design_generate::DesignGenState;
 use backend::mini_coder_executor::MiniCoderState;
 use backend::state::BackendState;
@@ -370,6 +371,7 @@ pub fn run() {
         .manage(polis_state)
         .manage(agent_pty_sessions)
         .manage(censor_state)
+        .manage(CensorScanRegistry::default())
         .manage(mini_coder_state)
         .manage(PermissionBrokerState::new())
         .manage(backend::broker::CloudConsentState::new())
@@ -709,6 +711,7 @@ pub fn run() {
             backend::censor::commands::censor_get_findings,
             backend::censor::commands::censor_dispose_finding,
             backend::censor::commands::censor_count_open,
+            backend::censor::commands::censor_scan_state,
             backend::censor::commands::censor_status,
             backend::censor::commands::censor_set_coarse_policy,
             backend::censor::commands::censor_open_in_editor,

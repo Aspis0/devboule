@@ -554,6 +554,30 @@ fn persist_and_emit_stuck(app: &AppHandle, report: crate::backend::stuck_report:
     let _ = app.emit("mini://stuck", report);
 }
 
+/// PURE attach: set the censor summary on its directive row (found by id ==
+/// directive_id). Returns whether a row was found. Extracted so the phase-a
+/// emit site can exercise the SAME find-predicate/clone/assignment production
+/// and so the summary-attach logic is unit-testable on a built AgentsState.
+/// `files` are capped at [`CENSOR_MINI_SUMMARY_FILES_CAP`] to bound the
+/// persisted state file; `total` is the accurate count regardless of the cap.
+pub(crate) fn attach_censor_summary(
+    state: &mut crate::backend::model::AgentLiveState,
+    directive_id: &str,
+    summary: crate::backend::mini_coder::CensorMiniSummary,
+) -> bool {
+    match state
+        .mini_coder_directives
+        .iter_mut()
+        .find(|d| d.id == directive_id)
+    {
+        Some(d) => {
+            d.censor_summary = Some(summary);
+            true
+        }
+        None => false,
+    }
+}
+
 /// P6 (crash recovery) + BLOCKER 1: stamp every `Failed` directive that its retry
 /// chain can no longer reach via normal finalize propagation, then propagate that terminal
 /// up the chain so the Python poll on the ROOT id unblocks. Two cases (pure
@@ -1885,6 +1909,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             let app = app.clone();
             let root = root.clone();
             let agent_id = directive.id.clone();
+            let directive_id = directive.id.clone();
             let project_id_for_censor = project_id.clone().unwrap_or_default();
 
             // FINE cooldown: skip files censorated in the last FINE_COOLDOWN_S seconds.
@@ -1992,6 +2017,25 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 }
                 // Push to Activity Console (human-visible).
                 let total = findings.len();
+                // Durable fleet-state mirror: persist the summary on the directive row
+                // BEFORE emitting the fire-and-forget event, so a restart does not lose
+                // the linkage (the event listener may be absent on remount). The row is
+                // found by directive.id (the directive that owns this phase-a pass);
+                // a missing row (evicted) just skips persistence — the emit still fires.
+                // `files` is capped at CENSOR_MINI_SUMMARY_FILES_CAP to bound the
+                // persisted state file; `total` is the accurate count.
+                let summary_files: Vec<String> = files_to_censor
+                    .iter()
+                    .take(crate::backend::mini_coder::CENSOR_MINI_SUMMARY_FILES_CAP)
+                    .cloned()
+                    .collect();
+                let summary = crate::backend::mini_coder::CensorMiniSummary {
+                    total,
+                    files: summary_files,
+                };
+                let _ = agents::mutate_agent_live_state(&app, |state| {
+                    attach_censor_summary(state, &directive_id, summary);
+                });
                 let _ = app.emit(
                     "censor://mini-findings",
                     serde_json::json!({
@@ -3981,5 +4025,141 @@ mod denial_note_tests {
         );
         // Hint portion present (first 120 'h' chars).
         assert!(note.contains(&"h".repeat(120)));
+    }
+}
+
+// ---- attach_censor_summary pure helper tests ----
+#[cfg(test)]
+mod attach_censor_summary_tests {
+    use super::*;
+
+    fn sample_state() -> crate::backend::model::AgentLiveState {
+        crate::backend::model::AgentLiveState {
+            version: 6,
+            updated_at: String::new(),
+            sessions: Vec::new(),
+            claims: Vec::new(),
+            events: Vec::new(),
+            rules: Vec::new(),
+            state_path: String::new(),
+            mcp_command: String::new(),
+            mcp_client_config: String::new(),
+            mini_coder_directives: Vec::new(),
+            visual_check_directives: Vec::new(),
+            design_request_directives: Vec::new(),
+            git_push_requests: Vec::new(),
+            plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn attach_finds_existing_directive() {
+        let mut state = sample_state();
+        let directive = crate::backend::mini_coder::MiniCoderDirective {
+            id: "d-attach".into(),
+            parent_agent_id: "coder-1".into(),
+            task: "t".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            // All other fields are zero-sized defaults (empty strings, None, empty Vecs).
+            ..crate::backend::mini_coder::MiniCoderDirective {
+                id: String::new(),
+                parent_agent_id: String::new(),
+                ..crate::backend::mini_coder::MiniCoderDirective {
+                    id: String::new(),
+                    parent_agent_id: String::new(),
+                    status: crate::backend::mini_coder::MiniCoderStatus::Pending,
+                    task: String::new(),
+                    files: Vec::new(),
+                    write: false,
+                    write_mode: crate::backend::mini_coder::WriteMode::EmitEdits,
+                    tier: crate::backend::mini_coder::DirectiveTier::Mini,
+                    project_id: None,
+                    backend: None,
+                    allow_oracle: false,
+                    kill_requested: false,
+                    steer_queue: Vec::new(),
+                    result_path: String::new(),
+                    agent_id: None,
+                    created_at: String::new(),
+                    claimed_at: None,
+                    scratch_path: None,
+                    started_at: None,
+                    result: None,
+                    stuck_report: None,
+                    censor_summary: None,
+                    attempt: 0,
+                    parent_directive_id: None,
+                    pigeon_ticket: None,
+                    collected: None,
+                }
+            }
+        };
+        state.mini_coder_directives.push(directive);
+        let attached = attach_censor_summary(
+            &mut state,
+            "d-attach",
+            crate::backend::mini_coder::CensorMiniSummary {
+                total: 5,
+                files: vec!["src/a.rs".into()],
+            },
+        );
+        assert!(attached, "must find the directive row");
+        let d = state
+            .mini_coder_directives
+            .iter()
+            .find(|d| d.id == "d-attach")
+            .expect("directive present");
+        let s = d.censor_summary.as_ref().expect("summary attached");
+        assert_eq!(s.total, 5);
+        assert_eq!(s.files, vec!["src/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn attach_missing_directive_returns_false() {
+        let mut state = sample_state();
+        let attached = attach_censor_summary(
+            &mut state,
+            "nonexistent",
+            crate::backend::mini_coder::CensorMiniSummary {
+                total: 1,
+                files: vec![],
+            },
+        );
+        assert!(!attached, "must not find a missing directive");
+    }
+
+    #[test]
+    fn attach_overwrites_previous_summary() {
+        let mut state = sample_state();
+        let directive = crate::backend::mini_coder::MiniCoderDirective {
+            id: "d-overwrite".into(),
+            parent_agent_id: "coder-1".into(),
+            task: "t".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            censor_summary: Some(crate::backend::mini_coder::CensorMiniSummary {
+                total: 1,
+                files: vec!["old.rs".into()],
+            }),
+            ..Default::default()
+        };
+        state.mini_coder_directives.push(directive);
+        let attached = attach_censor_summary(
+            &mut state,
+            "d-overwrite",
+            crate::backend::mini_coder::CensorMiniSummary {
+                total: 9,
+                files: vec!["new.rs".into()],
+            },
+        );
+        assert!(attached);
+        let d = state
+            .mini_coder_directives
+            .iter()
+            .find(|d| d.id == "d-overwrite")
+            .expect("directive present");
+        let s = d.censor_summary.as_ref().expect("summary overwritten");
+        assert_eq!(s.total, 9, "total updated");
+        assert_eq!(s.files, vec!["new.rs".to_string()], "files updated");
     }
 }

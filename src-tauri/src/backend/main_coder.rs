@@ -120,6 +120,7 @@ pub(crate) fn append_main_coder_directive(
         id: id.clone(),
         parent_agent_id: "app-user".into(),
         stuck_report: None,
+        censor_summary: None,
         status: MiniCoderStatus::Pending,
         task,
         files,

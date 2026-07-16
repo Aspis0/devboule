@@ -51,6 +51,14 @@ use serde::{Deserialize, Serialize};
 /// Bounded so a long-lived `.aspis-agents.json` cannot grow without limit.
 pub const MAX_DIRECTIVES: usize = 50;
 
+/// Cap on the number of file paths stored in a [`CensorMiniSummary`] so the
+/// persisted agent-state file cannot bloat from a directive that censored a
+/// large batch. The summary is a durable mirror of a fire-and-forget event;
+/// it is informative, not exhaustive. When `files.len()` would exceed this cap
+/// the executor stores only the first `CAP` entries (the total field is still
+/// accurate).
+pub const CENSOR_MINI_SUMMARY_FILES_CAP: usize = 50;
+
 /// Default wall-clock cap (seconds) for a single running mini before the executor
 /// kills it and synthesizes `timeout`. Mirrors the plan's ~10-minute hard cap.
 /// Lives here so the pure `plan_tick` and the P2 executor agree on one constant.
@@ -120,6 +128,24 @@ pub(crate) const MAX_RESULT_BYTES: u64 = 1 << 20; // 1 MiB
 /// constant MUST be extended in lockstep with a verdict-thread allowance (and the math above
 /// re-checked); the test `budget_max_agentic_fix_rounds_fits_the_python_poll_budget` pins it.
 pub const MAX_AGENTIC_FIX_ROUNDS: u32 = 2;
+
+/// Durable fleet-state summary of a mini-coder's phase-a censor pass, persisted
+/// on its directive row (mirroring the fire-and-forget `censor://mini-findings`
+/// event so a restart does not lose the linkage). Stored on
+/// [`MiniCoderDirective::censor_summary`]. `files` is capped at
+/// [`CENSOR_MINI_SUMMARY_FILES_CAP`] by the executor; the `total` field is the
+/// accurate count regardless of the cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CensorMiniSummary {
+    /// Total number of open findings produced by the phase-a pass (accurate even
+    /// when `files` is capped).
+    pub total: usize,
+    /// Project-relative file paths that were censored in this pass (up to
+    /// [`CENSOR_MINI_SUMMARY_FILES_CAP`] entries). The set is order-stable
+    /// (first-seen order) and deduped by the caller.
+    pub files: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Status
@@ -457,7 +483,7 @@ pub fn is_auto_write_behavior(m: &MiniWriteBehavior) -> bool {
     matches!(m, MiniWriteBehavior::Auto)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniCoderDirective {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -566,12 +592,21 @@ pub struct MiniCoderDirective {
     /// state. None while pending/launching/running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<MiniCoderOutcome>,
-    /// v6 Phase 5: structured stuck report emitted on a terminal failure/timeout
+/// v6 Phase 5: structured stuck report emitted on a terminal failure/timeout
     /// (the mini exhausted its budget). Durable fleet-state mirror of the fire-and-
     /// forget `mini://stuck` event — survives app restarts where the live event
     /// would be lost to a missing listener. None until a stuck report is emitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_report: Option<crate::backend::stuck_report::StuckReport>,
+    /// Censor mini-findings summary: the total number of open findings produced by
+    /// the directive's phase-a censor pass, plus the project-relative file paths
+    /// that were censored. Durable fleet-state mirror of the fire-and-forget
+    /// `censor://mini-findings` event — survives app restarts where the live event
+    /// would be lost to a missing listener. None until a phase-a pass completes.
+    /// `files` is capped at [`CENSOR_MINI_SUMMARY_FILES_CAP`] entries to bound the
+    /// persisted state file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censor_summary: Option<CensorMiniSummary>,
     /// P6 retry lineage. Retry attempt number: the ROOT directive (the one the
     /// coder's `spawn_mini_coder` originally appended and whose id the blocking poll
     /// watches) is attempt 0; each Censor-driven retry increments it. NO-CHURN: a
@@ -1959,6 +1994,7 @@ mod tests {
             started_at: None,
             result: None,
             stuck_report: None,
+            censor_summary: None,
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
@@ -1992,6 +2028,7 @@ mod tests {
             started_at: Some("2026-06-06T00:00:01Z".into()),
             result: None,
             stuck_report: None,
+            censor_summary: None,
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
@@ -4124,5 +4161,46 @@ mod tests {
         );
         let back: MiniCoderOutcome = serde_json::from_str(&json).unwrap();
         assert!(back.net_blocked);
+    }
+
+    // ---- CensorMiniSummary: serde round-trip + directive without summary omits key ----
+
+    #[test]
+    fn censor_mini_summary_round_trips_camel_case() {
+        let summary = CensorMiniSummary {
+            total: 7,
+            files: vec!["src/a.rs".into(), "src/b.ts".into()],
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total\":7"), "json: {json}");
+        assert!(json.contains("\"files\":[\"src/a.rs\",\"src/b.ts\"]"), "json: {json}");
+        let back: CensorMiniSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total, 7);
+        assert_eq!(back.files, vec!["src/a.rs".to_string(), "src/b.ts".to_string()]);
+    }
+
+    #[test]
+    fn directive_without_censor_summary_serializes_without_key() {
+        let d = directive("d-no-summary", MiniCoderStatus::Pending, "2026-01-01T00:00:00Z");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("censorSummary"),
+            "censorSummary must be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn directive_with_censor_summary_serializes_with_key() {
+        let mut d = directive("d-with-summary", MiniCoderStatus::Pending, "2026-01-01T00:00:00Z");
+        d.censor_summary = Some(CensorMiniSummary {
+            total: 3,
+            files: vec!["src/x.rs".into()],
+        });
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains("\"censorSummary\""),
+            "censorSummary must be present when Some: {json}"
+        );
+        assert!(json.contains("\"total\":3"), "json: {json}");
     }
 }

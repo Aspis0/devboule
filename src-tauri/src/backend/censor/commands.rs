@@ -17,7 +17,7 @@
 
 use super::gemma;
 use super::ledger;
-use super::orchestrator::{self, GemmaCtx};
+use super::orchestrator::{self, CensorScanRegistry, GemmaCtx, ScanStartedPayload};
 use super::schema::{CensorShard, Disposition, Finding, Severity};
 use crate::backend::state::BackendState;
 use std::path::{Path, PathBuf};
@@ -803,6 +803,51 @@ pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Fi
     }
     out.sort_by_key(|f| std::cmp::Reverse(f.severity.rank()));
     out
+}
+
+/// Read command: the in-memory running-scan state for `project_id`, if any.
+/// Mirrors the prologue of the sibling `censor_count_open` (ensure_unlocked +
+/// root confinement) so a poller can read scan progress via the same IPC path
+/// as the rest of Censor. Returns `Ok(None)` when no scan is currently running
+/// for the project, `Ok(Some(...))` when one is, `Err(...)` on auth/root errors.
+///
+/// `project_id` is required: the registry is keyed by project id, and the
+/// command is scoped to a trusted project root (same confinement as the other
+/// project-scoped censor commands).
+#[tauri::command]
+pub fn censor_scan_state(
+    project_id: String,
+    root: String,
+    app: AppHandle,
+    backend_state: State<'_, BackendState>,
+    reg: State<'_, CensorScanRegistry>,
+) -> Result<Option<ScanStartedCommandPayload>, String> {
+    backend_state.ensure_unlocked()?;
+    // Confine to THIS project's configured root (rejects arbitrary dirs).
+    let _path = validate_censor_root(&app, &backend_state, &root, Some(&project_id))?;
+    Ok(reg.get(project_id).map(ScanStartedCommandPayload::from))
+}
+
+/// Owned, deserializable mirror of [`ScanStartedPayload`] returned by the
+/// `censor_scan_state` command. The registry stores `&'static str` for `kind`
+/// (the original payload's wire shape), which does NOT implement Deserialize;
+/// the mirror uses `String` so the command return is a plain serde type.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStartedCommandPayload {
+    pub project_id: String,
+    pub kind: String,
+    pub file_count: usize,
+}
+
+impl From<ScanStartedPayload> for ScanStartedCommandPayload {
+    fn from(p: ScanStartedPayload) -> Self {
+        Self {
+            project_id: p.project_id,
+            kind: p.kind.to_string(),
+            file_count: p.file_count,
+        }
+    }
 }
 
 #[cfg(test)]

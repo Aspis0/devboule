@@ -30,10 +30,11 @@ use super::detect::{detect_project_kinds, FileLang, ProjectKind};
 use super::gemma::{self, GemmaClient};
 use super::ledger::read_supersede_write_shard;
 use super::runners::{self, applicable_runners, Granularity, RawFinding, RunTarget, RunnerId};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{AppHandle, Emitter};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::backend::censor::schema::{Disposition, Finding, FindingBatch};
 use crate::backend::training_export::{self, FindingLite};
@@ -80,6 +81,83 @@ pub const COARSE_DEBOUNCE_MS: u64 = 4000;
 pub struct FindingsUpdatedPayload {
     pub project_id: String,
     pub files: Vec<String>,
+}
+
+/// Live "is a censor pass running?" registry — write-through for the
+/// fire-and-forget `SCAN_STARTED_EVENT` so a poller (rig, remounted UI) can
+/// read scan progress on demand. In-memory only: a scan does not survive a
+/// restart, so persisted state would lie (a stale `Some` would report a
+/// scan that no longer exists).
+///
+/// Generation-aware: each [`set`] bumps a monotonic counter and stores
+/// `(generation, payload)`. Clearing uses the generation as a CAS token so a
+/// concurrent scan of the same project can NEVER be wiped by a stale scan's
+/// cleanup (ABA protection). The RAII [`ScanGuard`] owns cleanup — its [`Drop`]
+/// runs on normal return AND panic unwind, so a panic between `set` and the
+/// end of a pass can never leak a stale "running scan" entry.
+#[derive(Clone, Default)]
+pub struct CensorScanRegistry {
+    map: std::sync::Arc<std::sync::Mutex<HashMap<String, (u64, ScanStartedPayload)>>>,
+    counter: std::sync::Arc<AtomicU64>,
+}
+
+impl CensorScanRegistry {
+    /// Record that a scan for `project_id` started with the given payload.
+    /// Returns the generation token for this entry — the caller must pass it
+    /// to [`clear_if`] to release the entry, or construct a [`ScanGuard`] for
+    /// automatic RAII cleanup.
+    /// Best-effort: lock poisoning is recovered via `into_inner()`.
+    pub fn set(&self, project_id: impl Into<String>, payload: ScanStartedPayload) -> u64 {
+        // fetch_add returns the PREVIOUS value; +1 so generations start at 1
+        // and 0 can never match a stored entry.
+        let gen = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(project_id.into(), (gen, payload));
+        gen
+    }
+
+    /// Remove the entry for `project_id` ONLY if its stored generation
+    /// matches `gen` — a stale clear is a silent no-op (ABA protection).
+    pub fn clear_if(&self, project_id: impl Into<String>, gen: u64) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let key = project_id.into();
+        let should_remove = map.get(key.as_str()).map_or(false, |(g, _)| *g == gen);
+        if should_remove {
+            map.remove(key.as_str());
+        }
+    }
+
+    /// Clear the running-scan entry for `project_id` unconditionally. No-op
+    /// if absent. Retained for backward compatibility; scan paths should
+    /// prefer [`clear_if`] paired with the generation returned by [`set`].
+    pub fn clear(&self, project_id: impl Into<String>) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(project_id.into().as_str());
+    }
+
+    /// Read the running-scan entry for `project_id`, if any.
+    pub fn get(&self, project_id: impl Into<String>) -> Option<ScanStartedPayload> {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project_id.into().as_str()).map(|(_, p)| p.clone())
+    }
+}
+
+/// RAII guard that clears its registry entry on [`Drop`] — normal return AND
+/// panic unwind — but only if the entry still belongs to THIS scan (generation
+/// check → no ABA wipe of a newer concurrent scan).
+///
+/// Constructed by [`emit_scan_started`]; callers bind it with `let _guard = ...`
+/// for the duration of the pass (NOT `let _ =` which drops immediately).
+pub struct ScanGuard {
+    reg: CensorScanRegistry,
+    project_id: String,
+    gen: u64,
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.reg.clear_if(&self.project_id, self.gen);
+    }
 }
 
 /// Tauri event emitted when a Censor pass STARTS, before the slow runner work, so the UI can
@@ -563,7 +641,7 @@ fn run_fine_batch_inner(
     // Censor review reuse this pass too, but they must NOT flicker the indicator (findings-updated
     // still fires below so their findings surface).
     if emit_scan {
-        emit_scan_started(app, project_id, "fine", files.len(), running);
+        let _guard = emit_scan_started(app, project_id, "fine", files.len(), running);
     }
     let changed = fine_batch_collect(root, files, gemma);
     // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
@@ -751,7 +829,7 @@ pub fn run_coarse_pass(app: &AppHandle, project_id: &str, root: &Path, running: 
     if !running.load(Ordering::SeqCst) {
         return;
     }
-    emit_scan_started(app, project_id, "coarse", 0, running);
+    let _guard = emit_scan_started(app, project_id, "coarse", 0, running);
     let changed = coarse_pass_collect(root);
     // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
     // and write a steer file so the main coder sees them next turn.
@@ -927,7 +1005,9 @@ fn record_findings_for_batch(app: &AppHandle, root: &Path, changed: &[String]) {
 /// closes the window where a stop/replace lands during a slow pass: without this a
 /// torn-down or replaced project would still receive a stale `findings-updated`
 /// event (MAJOR — stale-emit-after-stop). An emit failure (window gone) logs and is
-/// ignored.
+/// ignored. The in-memory [`CensorScanRegistry`] entry for this project is cleared
+/// by the [`ScanGuard`] returned from [`emit_scan_started`] — this function no longer
+/// touches the registry.
 fn emit_if_running(app: &AppHandle, project_id: &str, files: Vec<String>, running: &AtomicBool) {
     if !running.load(Ordering::SeqCst) {
         return;
@@ -947,24 +1027,46 @@ fn emit_if_running(app: &AppHandle, project_id: &str, files: Vec<String>, runnin
 
 /// Emit [`SCAN_STARTED_EVENT`] iff the project is still running — mirrors `emit_if_running`'s
 /// stop-flag check so a torn-down/replaced project never receives a stale scan-started.
+/// ALSO writes the in-memory [`CensorScanRegistry`] so a poller can read the running scan
+/// on demand.
+///
+/// Returns an [`Option`]<[`ScanGuard`]> — `Some` when the app state exists and the registry
+/// was written (the guard clears the entry on drop, normal return AND panic unwind);
+/// `None` otherwise (absent app state: unit tests, teardown races). Callers MUST bind
+/// the guard with `let _guard = ...` (NOT `let _ = ...` which drops immediately) for
+/// the duration of the pass.
 fn emit_scan_started(
     app: &AppHandle,
     project_id: &str,
     kind: &'static str,
     file_count: usize,
     running: &AtomicBool,
-) {
+) -> Option<ScanGuard> {
     if !running.load(Ordering::SeqCst) {
-        return;
+        return None;
     }
     let payload = ScanStartedPayload {
         project_id: project_id.to_string(),
         kind,
         file_count,
     };
+    // Write-through: best-effort, skip silently when the registry is absent
+    // (unit tests, teardown races).
+    let guard = if let Some(reg) = app.try_state::<CensorScanRegistry>() {
+        let gen = reg.set(project_id, payload.clone());
+        // State<T> derefs to &T; CensorScanRegistry itself is Clone (shared Arc).
+        Some(ScanGuard {
+            reg: reg.inner().clone(),
+            project_id: project_id.to_string(),
+            gen,
+        })
+    } else {
+        None
+    };
     if let Err(e) = app.emit(SCAN_STARTED_EVENT, &payload) {
         eprintln!("censor orchestrator: emit {SCAN_STARTED_EVENT} failed: {e}");
     }
+    guard
 }
 
 /// Collect all Open findings for the given files by reading their Censor shards.
@@ -2269,5 +2371,227 @@ mod tests {
             !root.join(".aspis").join("steer_censor").exists(),
             "no steer file when findings empty"
         );
+    }
+
+    // ---- CensorScanRegistry: set/get/clear/clear_if + ABA + ScanGuard + poisoned-lock recovery ----
+
+    #[test]
+    fn scan_registry_set_get_returns_payload() {
+        let reg = CensorScanRegistry::default();
+        assert!(reg.get("proj-1").is_none(), "empty registry -> None");
+        let gen = reg.set(
+            "proj-1",
+            ScanStartedPayload {
+                project_id: "proj-1".into(),
+                kind: "fine",
+                file_count: 3,
+            },
+        );
+        assert!(gen > 0, "set returns a non-zero generation");
+        let got = reg.get("proj-1").expect("set -> Some");
+        assert_eq!(got.project_id, "proj-1");
+        assert_eq!(got.kind, "fine");
+        assert_eq!(got.file_count, 3);
+    }
+
+    #[test]
+    fn scan_registry_clear_removes_entry() {
+        let reg = CensorScanRegistry::default();
+        reg.set("proj-2", ScanStartedPayload {
+            project_id: "proj-2".into(),
+            kind: "coarse",
+            file_count: 0,
+        });
+        assert!(reg.get("proj-2").is_some(), "set -> Some");
+        reg.clear("proj-2");
+        assert!(reg.get("proj-2").is_none(), "clear -> None");
+    }
+
+    #[test]
+    fn scan_registry_clear_missing_is_noop() {
+        let reg = CensorScanRegistry::default();
+        // Must not panic on a missing key.
+        reg.clear("nonexistent");
+        assert!(reg.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn scan_registry_overwrite_replaces_kind() {
+        let reg = CensorScanRegistry::default();
+        let gen_a = reg.set("proj-3", ScanStartedPayload {
+            project_id: "proj-3".into(),
+            kind: "fine",
+            file_count: 5,
+        });
+        let gen_b = reg.set("proj-3", ScanStartedPayload {
+            project_id: "proj-3".into(),
+            kind: "coarse",
+            file_count: 0,
+        });
+        assert!(gen_b > gen_a, "generation is monotonic on overwrite");
+        let got = reg.get("proj-3").expect("overwritten -> Some");
+        assert_eq!(got.kind, "coarse", "kind updated on overwrite");
+        assert_eq!(got.file_count, 0, "file_count updated on overwrite");
+    }
+
+    #[test]
+    fn scan_registry_clear_if_matching_gen_removes() {
+        let reg = CensorScanRegistry::default();
+        let gen = reg.set("proj-a", ScanStartedPayload {
+            project_id: "proj-a".into(),
+            kind: "fine",
+            file_count: 1,
+        });
+        assert!(reg.get("proj-a").is_some());
+        reg.clear_if("proj-a", gen);
+        assert!(reg.get("proj-a").is_none(), "clear_if with matching gen removes entry");
+    }
+
+    #[test]
+    fn scan_registry_clear_if_stale_gen_noop_aba_pin() {
+        // ABA pin: scan A sets the entry, then scan B overwrites it (new gen).
+        // When scan A's cleanup fires with its STALE gen, B's entry MUST survive.
+        let reg = CensorScanRegistry::default();
+        let gen_a = reg.set("proj-aba", ScanStartedPayload {
+            project_id: "proj-aba".into(),
+            kind: "fine",
+            file_count: 1,
+        });
+        // Scan B overwrites — new generation.
+        let gen_b = reg.set("proj-aba", ScanStartedPayload {
+            project_id: "proj-aba".into(),
+            kind: "coarse",
+            file_count: 0,
+        });
+        assert_ne!(gen_a, gen_b, "generations must differ");
+        // Scan A's stale clear_if is a silent no-op.
+        reg.clear_if("proj-aba", gen_a);
+        let survived = reg.get("proj-aba").expect("B's entry must survive A's stale clear");
+        assert_eq!(survived.kind, "coarse", "B's payload intact");
+        assert_eq!(survived.file_count, 0);
+        // B's own matching clear_if still works.
+        reg.clear_if("proj-aba", gen_b);
+        assert!(reg.get("proj-aba").is_none(), "B clears its own entry");
+    }
+
+    #[test]
+    fn scan_guard_drop_clears() {
+        let reg = CensorScanRegistry::default();
+        let gen = reg.set("proj-g", ScanStartedPayload {
+            project_id: "proj-g".into(),
+            kind: "fine",
+            file_count: 2,
+        });
+        {
+            let _guard = ScanGuard {
+                reg: reg.clone(),
+                project_id: "proj-g".to_string(),
+                gen,
+            };
+            assert!(reg.get("proj-g").is_some(), "entry present while guard alive");
+        } // guard drops here
+        assert!(reg.get("proj-g").is_none(), "guard drop clears entry via clear_if");
+    }
+
+    #[test]
+    fn scan_guard_drop_after_newer_set_is_noop() {
+        // Scan A creates a guard. Scan B overwrites with a new generation.
+        // When A's guard drops, B's entry survives (ABA protection).
+        let reg = CensorScanRegistry::default();
+        let gen_a = reg.set("proj-aba2", ScanStartedPayload {
+            project_id: "proj-aba2".into(),
+            kind: "fine",
+            file_count: 1,
+        });
+        let guard = ScanGuard {
+            reg: reg.clone(),
+            project_id: "proj-aba2".to_string(),
+            gen: gen_a,
+        };
+        // Scan B overwrites while A's guard is still alive.
+        let _gen_b = reg.set("proj-aba2", ScanStartedPayload {
+            project_id: "proj-aba2".into(),
+            kind: "coarse",
+            file_count: 0,
+        });
+        drop(guard); // A's stale clear_if is a no-op.
+        let survived = reg.get("proj-aba2").expect("B's entry survives A's guard drop");
+        assert_eq!(survived.kind, "coarse");
+    }
+
+    #[test]
+    fn scan_registry_poisoned_lock_recovers() {
+        // Poison the inner mutex by having a spawned thread hold the lock and panic
+        // while holding it. The recovery path (`unwrap_or_else(|e| e.into_inner())`)
+        // is exercised by set/get/clear/clear_if — they must not panic and must leave
+        // the map in a usable state.
+        let reg = CensorScanRegistry::default();
+        let reg_map = std::sync::Arc::clone(&reg.map);
+        // Hold the lock in a child thread and panic while holding it -> poisoned Mutex.
+        let handle = std::thread::spawn(move || {
+            let _guard = reg_map.lock().unwrap();
+            panic!("poisoning the mutex");
+        });
+        let _ = handle.join(); // ignore JoinError
+        // The mutex is now poisoned. set/get/clear/clear_if must recover via into_inner().
+        let gen = reg.set("proj-4", ScanStartedPayload {
+            project_id: "proj-4".into(),
+            kind: "fine",
+            file_count: 1,
+        });
+        assert_eq!(reg.get("proj-4").unwrap().file_count, 1);
+        // clear_if with matching gen works post-poison.
+        reg.clear_if("proj-4", gen);
+        assert!(reg.get("proj-4").is_none());
+        // clear also works (unconditional).
+        reg.set("proj-4b", ScanStartedPayload {
+            project_id: "proj-4b".into(),
+            kind: "coarse",
+            file_count: 0,
+        });
+        reg.clear("proj-4b");
+        assert!(reg.get("proj-4b").is_none());
+    }
+
+    #[test]
+    fn scan_registry_guard_panic_clears() {
+        // A panic while a ScanGuard is alive must still clear the registry entry
+        // (Drop runs during unwind). Spawn a thread that creates a guard then panics;
+        // after join the entry must be gone.
+        let reg = CensorScanRegistry::default();
+        let gen = reg.set("proj-panic", ScanStartedPayload {
+            project_id: "proj-panic".into(),
+            kind: "fine",
+            file_count: 7,
+        });
+        let reg_for_thread = reg.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = ScanGuard {
+                reg: reg_for_thread,
+                project_id: "proj-panic".to_string(),
+                gen,
+            };
+            panic!("simulated pass panic — guard must still clear");
+        });
+        let _ = handle.join(); // panic caught by JoinHandle
+        assert!(
+            reg.get("proj-panic").is_none(),
+            "entry cleared by guard drop during panic unwind"
+        );
+    }
+
+    #[test]
+    fn scan_registry_get_missing_returns_none() {
+        let reg = CensorScanRegistry::default();
+        assert!(reg.get("absent").is_none());
+        assert!(reg.get("").is_none());
+    }
+
+    #[test]
+    fn scan_registry_clear_if_missing_key_is_noop() {
+        let reg = CensorScanRegistry::default();
+        // clear_if on a never-set key must not panic.
+        reg.clear_if("ghost", 99);
+        assert!(reg.get("ghost").is_none());
     }
 }

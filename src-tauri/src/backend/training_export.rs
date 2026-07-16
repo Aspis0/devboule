@@ -909,6 +909,7 @@ mod tests {
             id: id.to_string(),
             parent_agent_id: parent.to_string(),
             stuck_report: None,
+            censor_summary: None,
             status: MiniCoderStatus::Running,
             task: String::new(),
             files: vec![],

@@ -181,6 +181,7 @@ mod tests {
             started_at: None,
             result: None,
             stuck_report: None,
+            censor_summary: None,
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
