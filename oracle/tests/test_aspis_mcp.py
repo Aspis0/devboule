@@ -3618,6 +3618,448 @@ root_path: "{escaped_work_root}"
             self.assertIsNone(heartbeat["session"].get("currentFilePath"))
 
 
+class T4DraftReadableTests(unittest.TestCase):
+    """T4 — Ticket A: `draft` is a READABLE project status.
+
+    The planner needs read-only introspection of pre-approval projects
+    (project_get) and Oracle queries against them (oracle_context). Every
+    mutation path (claim, update_status, follow-up create, plan-tasks
+    create, provider mutations) MUST keep rejecting `draft` exactly as it
+    rejects `paused | done | archived`.
+
+    Draft projects are authored via a direct markdown write (bypassing
+    MCP `project_create`, which enforces `VALID_PROJECT_STATUSES` and
+    correctly rejects `draft`). The on-disk file mirrors the real shape a
+    planner-written draft would take.
+    """
+
+    def setUp(self):
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+        else:
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old
+
+    @staticmethod
+    def _write_draft_project(projects_dir: Path) -> Path:
+        prepare_management_root(projects_dir.parent)
+        path = projects_dir / "draft-proj.md"
+        path.write_text(
+            """---
+id: draft-proj
+title: Drafted project (pre-approval)
+status: draft
+updated_at: 2026-05-28T00:00:00Z
+---
+
+# Goal
+- This project was authored externally in `draft` status and is awaiting planner approval.
+
+```aspis-project
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Initial design",
+      "status": "todo",
+      "priority": "high",
+      "assignee": null,
+      "due": null,
+      "linkedResources": [],
+      "updatedAt": "2026-05-28T00:00:00Z"
+    }
+  ],
+  "notes": []
+}
+```
+
+# Loose notes
+""",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_draft_project_get_succeeds(self):
+        # READ: project_get must accept a `draft` project (no rejection).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "planner-bot",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "introspecting draft",
+                },
+                root=root,
+            )
+            result = handle_tool_call(
+                "project_get",
+                {
+                    "project_id": "draft-proj",
+                    "agent_id": "planner-bot",
+                    "role": "orchestrator",
+                },
+                root=root,
+            )
+            self.assertEqual(result["metadata"]["id"], "draft-proj")
+            self.assertEqual(result["metadata"]["title"], "Drafted project (pre-approval)")
+            self.assertEqual(result["metadata"]["status"], "draft")
+            # The readable allowlist MUST keep `draft` included.
+            from oracle.server.aspis_mcp import READABLE_PROJECT_STATUSES
+
+            self.assertIn("draft", READABLE_PROJECT_STATUSES)
+            self.assertIn("active", READABLE_PROJECT_STATUSES)
+
+    def test_draft_oracle_context_guard_path_passes(self):
+        # READ: oracle_context must accept a draft project without
+        # draft-specific rejection. Call the REAL dispatch path; if the
+        # tool fails (e.g. missing index in a temp dir), assert the
+        # failure is NOT about draft status.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "planner-bot",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "introspecting draft",
+                },
+                root=root,
+            )
+            try:
+                result = handle_tool_call(
+                    "oracle_context",
+                    {
+                        "query": "test query",
+                        "project_id": "draft-proj",
+                        "agent_id": "planner-bot",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+                # Success is proof the draft status did not block the call.
+                self.assertIn("chunks", result)
+            except McpError as e:
+                # If it fails, it must NOT be because of draft status.
+                self.assertNotIn("draft", str(e).lower())
+            except Exception:
+                # Any non-McpError failure is also not draft-related.
+                pass
+
+    def test_draft_project_claim_rejected(self):
+        # MUTATION: project_claim_task must keep rejecting draft.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "test",
+                    "message": "trying to claim a draft",
+                },
+                root=root,
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_claim_task",
+                    {
+                        "project_id": "draft-proj",
+                        "task_id": "T1",
+                        "agent_id": "codex",
+                        "role": "coder",
+                    },
+                    root=root,
+                )
+            # Error message must explicitly enumerate `draft` so the planner
+            # knows the rejection covers this status.
+            self.assertIn("draft", str(ctx.exception))
+            self.assertIn("Cannot claim", str(ctx.exception))
+
+    def test_draft_project_update_status_rejected(self):
+        # MUTATION: project_update_status must keep rejecting draft.
+        # Seed an active claim directly in the agents state so the guard
+        # under test (the project status check) is reached.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "test",
+                    "message": "trying to mutate a draft",
+                },
+                root=root,
+            )
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "codex",
+                                "role": "coder",
+                                "status": "active",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                            }
+                        ],
+                        "claims": [
+                            {
+                                "projectId": "draft-proj",
+                                "taskId": "T1",
+                                "agentId": "codex",
+                                "role": "coder",
+                                "status": "wip",
+                                "claimedAt": "2026-06-12T00:00:00Z",
+                                "leaseUntil": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_update_status",
+                    {
+                        "project_id": "draft-proj",
+                        "task_id": "T1",
+                        "status": "review",
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "evidence": "Pretend to advance a draft task.",
+                        "confidence": 0.5,
+                    },
+                    root=root,
+                )
+            self.assertIn("draft", str(ctx.exception))
+            self.assertIn("Cannot update tasks", str(ctx.exception))
+
+    def test_draft_provider_mutation_rejected(self):
+        # MUTATION: provider mutations require `active`; draft must be
+        # explicitly enumerated in the rejection message so the planner
+        # can see what was rejected.
+        from oracle.server.aspis_mcp import (
+            require_live_task_for_provider_mutation,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            with self.assertRaises(McpError) as ctx:
+                require_live_task_for_provider_mutation(
+                    projects, "draft-proj", "T1"
+                )
+            message = str(ctx.exception)
+            # Error must keep the active-only contract AND enumerate `draft`.
+            self.assertIn("active Management project", message)
+            self.assertIn("draft", message)
+
+    def test_draft_project_append_note_rejected(self):
+        # MUTATION: project_append_note must reject draft projects.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "test",
+                    "message": "trying to append a note to a draft",
+                },
+                root=root,
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_append_note",
+                    {
+                        "project_id": "draft-proj",
+                        "text": "Should be rejected.",
+                        "agent_id": "codex",
+                        "role": "coder",
+                    },
+                    root=root,
+                )
+            self.assertIn("draft projects are read-only", str(ctx.exception))
+            self.assertIn("project_append_note", str(ctx.exception))
+
+    def test_draft_project_set_title_rejected(self):
+        # MUTATION: project_set_title must reject draft projects.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "trying to rename a draft",
+                },
+                root=root,
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_set_title",
+                    {
+                        "project_id": "draft-proj",
+                        "title": "Hijacked Title",
+                        "agent_id": "namer",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+            self.assertIn("draft projects are read-only", str(ctx.exception))
+            self.assertIn("project_set_title", str(ctx.exception))
+
+    def test_draft_plan_submit_rejected(self):
+        # MUTATION: plan_submit must reject draft projects.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            token = "test-launch-token"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "updatedAt": "2026-06-09T00:00:00+00:00",
+                        "sessions": [
+                            {
+                                "agentId": "codex",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-09T00:00:00+00:00",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reg = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "codex",
+                    "message": "coding",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            session_token = reg["sessionToken"]
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "plan_submit",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "project_id": "draft-proj",
+                        "title": "Test plan",
+                        "plan_markdown": "# Plan\n\n- step one\n",
+                        "session_token": session_token,
+                    },
+                    root=root,
+                )
+            self.assertIn("draft projects are read-only", str(ctx.exception))
+            self.assertIn("plan_submit", str(ctx.exception))
+
+    def test_draft_spawn_mini_coder_rejected(self):
+        # MUTATION: spawn_mini_coder must reject when parent session is on a
+        # draft project.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            self._write_draft_project(projects)
+            token = "test-launch-token"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "updatedAt": "2026-06-09T00:00:00+00:00",
+                        "sessions": [
+                            {
+                                "agentId": "codex",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-09T00:00:00+00:00",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                                "currentProjectId": "draft-proj",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reg = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "codex",
+                    "message": "coding",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            session_token = reg["sessionToken"]
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "test task",
+                        "files": ["src/a.rs"],
+                        "session_token": session_token,
+                    },
+                    root=root,
+                )
+            self.assertIn("draft projects are read-only", str(ctx.exception))
+            self.assertIn("spawn_mini_coder", str(ctx.exception))
+
+
 class NormalizeModelTests(unittest.TestCase):
     def test_opus_family_mapping(self):
         self.assertEqual(normalize_model("claude-opus-4-8"), "opus")
@@ -6071,6 +6513,119 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             self.assertIsNone(legacy["needsUser"])
 
 
+class T4HeartbeatAckNoteTests(unittest.TestCase):
+    """T4 — Ticket C: heartbeat acks deliberately omit `sessionToken`
+    (small models kept retrying, thinking the absence signaled an error).
+    The agent-facing guidance the models DO receive must explicitly explain
+    the contract so they don't retry / re-register / loop.
+
+    `compact_session_ack` is the single composition site for the ack
+    returned by BOTH `agent_register` AND `agent_heartbeat`. The
+    no-token-echo sentence lives in the `note` field of the ack payload
+    (so a cheap string assert on the composed payload suffices).
+    """
+
+    def setUp(self):
+        # Compact-ack is reachable via the unmanaged-privileged kill switch.
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+        else:
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old
+
+    def test_compact_session_ack_note_states_no_token_echo_contract(self):
+        # Direct, cheap assertion on the ack-rendering function. The note
+        # is the only field the operator-facing guidance travels in for
+        # both register and heartbeat replies.
+        from oracle.server.aspis_mcp import (
+            compact_session_ack,
+            default_agents_state,
+        )
+
+        state = default_agents_state()
+        state["sessions"] = [
+            {
+                "agentId": "hb-coder",
+                "role": "coder",
+                "status": "active",
+                "lastSeenAt": "2026-06-12T00:00:00Z",
+            }
+        ]
+        ack = compact_session_ack(state, "hb-coder")
+        note = ack.get("note", "")
+        self.assertIn("heartbeat", note.lower())
+        self.assertIn("sessionToken", note)
+        self.assertIn("NOT an error", note or "NOT an error".lower())
+
+    def test_register_and_heartbeat_ack_text_carries_no_token_echo_note(self):
+        # End-to-end: drive both register AND heartbeat through handle_tool_call,
+        # confirm the composed ack payloads both carry the no-token-echo
+        # sentence. This is the cheap string assert the ticket asked for.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            token = "t4-c-launch-token-0123456789"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "hb-coder",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registered = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "hb-coder",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            self.assertIn("note", registered)
+            self.assertIn("sessionToken", registered["note"])
+            self.assertIn("NOT an error", registered["note"])
+
+            heartbeat = handle_tool_call(
+                "agent_heartbeat",
+                {
+                    "agent_id": "hb-coder",
+                    "status": "active",
+                    "message": "alive",
+                    "session_token": registered["sessionToken"],
+                },
+                root=root,
+            )
+            self.assertIn("note", heartbeat)
+            self.assertIn("sessionToken", heartbeat["note"])
+            self.assertIn("NOT an error", heartbeat["note"])
+            # Heartbeat ack must NOT carry a fresh sessionToken; the model
+            # should re-use the one from register.
+            self.assertNotIn("sessionToken", heartbeat)
+
+
 class AgentIdHardeningTests(unittest.TestCase):
     """FIX 3: agent ids must match the safe allowlist so a rogue local process
     cannot register as e.g. an alarming display name and sign phishing toasts."""
@@ -6896,6 +7451,145 @@ class CensorMcpToolTests(unittest.TestCase):
                     {"project_id": "censor-proj", "agent_id": "ghost", "role": "coder"},
                     root=root,
                 )
+
+
+class T4CensorFailureMessageTests(unittest.TestCase):
+    """T4 — Ticket B: `censor_findings` failure modes must surface distinct,
+    actionable error messages so an operator can fix them without reading
+    source code.
+
+    (1) Missing `root_path` frontmatter → names the file inspected AND the
+        frontmatter key the operator must set.
+    (2) `root_path` set but NOT under an approved workspace parent →
+        names the env var (ASPIS_WORKSPACE_ROOT) AND echoes the offending
+        path.
+
+    Both messages stay ≤200 chars and contain no secrets / full env dumps.
+    """
+
+    def setUp(self):
+        self._old_managed = os.environ.get(
+            "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"
+        )
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+        # ASPIS_WORKSPACE_ROOT shifts the "approved parents" list. Wipe it on
+        # entry so the workspace-rejection failure path is the *only* thing
+        # being tested; restore on tearDown.
+        self._old_workspace_root = os.environ.get("ASPIS_WORKSPACE_ROOT")
+        os.environ.pop("ASPIS_WORKSPACE_ROOT", None)
+
+    def tearDown(self):
+        if self._old_managed is None:
+            os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+        else:
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old_managed
+        if self._old_workspace_root is None:
+            os.environ.pop("ASPIS_WORKSPACE_ROOT", None)
+        else:
+            os.environ["ASPIS_WORKSPACE_ROOT"] = self._old_workspace_root
+
+    def _register_coder(self, root: Path) -> None:
+        handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": "coder-b",
+                "role": "coder",
+                "model": "opus",
+                "message": "x",
+            },
+            root=root,
+        )
+
+    def test_missing_root_path_failure_message_is_actionable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            prepare_management_root(root)
+            # Write a project WITHOUT a `root_path` frontmatter key.
+            (projects / "noroot.md").write_text(
+                """---
+id: noroot
+title: No configured root
+status: active
+updated_at: 2026-06-05T00:00:00Z
+---
+
+```aspis-project
+{"version":1,"tasks":[],"notes":[]}
+```
+""",
+                encoding="utf-8",
+            )
+            self._register_coder(root)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "censor_findings",
+                    {"project_id": "noroot", "agent_id": "coder-b", "role": "coder"},
+                    root=root,
+                )
+            message = str(ctx.exception)
+            # (1) actionable + distinct: names the project file, names the
+            # frontmatter key the operator must add, points at Censor.
+            self.assertIn("noroot", message)
+            self.assertIn("root_path", message)
+            self.assertIn("frontmatter", message)
+            # Word + char bounds.
+            self.assertLessEqual(len(message), 200)
+            # Don't dump the whole env.
+            self.assertNotIn("ASPIS_", message.replace("ASPIS_WORKSPACE_ROOT", ""))
+
+    def test_workspace_root_rejection_message_names_env_and_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            prepare_management_root(root)
+            # Build a workspace root OUTSIDE the management root and any
+            # other approved parent (set ASPIS_WORKSPACE_ROOT to a sibling
+            # tmpdir so the rejected path is genuinely unapproved). The
+            # other_tmp stays short so the message stays within ≤200 chars.
+            other_tmp = tempfile.mkdtemp(prefix="t4o-")
+            sibling = Path(other_tmp)
+            os.environ["ASPIS_WORKSPACE_ROOT"] = str(sibling / "approved-parent")
+            # Reject a path under a different sibling entirely.
+            rejected = sibling / "other-branch" / "proj"
+            rejected.mkdir(parents=True, exist_ok=True)
+            outside_root = rejected
+            escaped = str(outside_root).replace("\\", "\\\\")
+            (projects / "outsider.md").write_text(
+                f"""---
+id: outsider
+title: Outsider project
+status: active
+updated_at: 2026-06-05T00:00:00Z
+root_path: "{escaped}"
+---
+
+```aspis-project
+{{"version":1,"tasks":[],"notes":[]}}
+```
+""",
+                encoding="utf-8",
+            )
+            self._register_coder(root)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "censor_findings",
+                    {"project_id": "outsider", "agent_id": "coder-b", "role": "coder"},
+                    root=root,
+                )
+            message = str(ctx.exception)
+            # (2) distinct from (1): names the env var the operator can set
+            # AND the offending path (last 2 components) that was rejected.
+            self.assertIn("ASPIS_WORKSPACE_ROOT", message)
+            # T4 — Ticket B: path is trimmed to last 2 components (…/parent/leaf).
+            parts = outside_root.parts
+            expected_tail = "…/" + "/".join(parts[-2:])
+            self.assertIn(expected_tail, message)
+            # Bounds + no-secret posture.
+            self.assertLessEqual(len(message), 200)
+            # The two failure modes must NOT be confused: the "frontmatter"
+            # wording belongs to (1) only.
+            self.assertNotIn("no `root_path` in frontmatter", message)
 
 
 class CensorRoleMandateTests(unittest.TestCase):

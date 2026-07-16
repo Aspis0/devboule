@@ -84,6 +84,11 @@ AGENTS_STATE_FILE = ".aspis-agents.json"
 # schema), so older v1 files load without migration; see normalize_agents_state.
 AGENTS_STATE_VERSION = 2
 VALID_PROJECT_STATUSES = {"active", "paused", "done", "archived"}
+# T4 — Ticket A: `draft` is READABLE (pre-approval planner introspection via
+# project_get / oracle_context) but is NOT a mutatable status. Any guard that
+# ENUMERATES the blocked statuses must include "draft" explicitly so a draft
+# project cannot be claimed on, transitioned, or provider-mutated through.
+READABLE_PROJECT_STATUSES = VALID_PROJECT_STATUSES | {"draft"}
 VALID_TASK_STATUSES = {"todo", "wip", "review", "blocked", "done"}
 # Phase B role merge: spawn-time roles collapse to {coder, verifier}. The
 # coder PLANS and CODES (and may spawn subagents).
@@ -1270,10 +1275,19 @@ def normalize_task_status(value: str) -> str:
     return status
 
 
-def normalize_project_status(value: str) -> str:
+def normalize_readable_project_status(value: str) -> str:
+    """T4 — Ticket A: permissive variant for READ-side frontmatter parsing.
+
+    `parse_frontmatter` calls into the status normalizer for every `.aspis`
+    file read. To let draft projects stay readable (project_get,
+    oracle_context, agent_state) the read path must accept any value in
+    READABLE_PROJECT_STATUSES; `draft` can never be SET via MCP.
+    """
     status = str(value or "").strip().lower()
-    if status not in VALID_PROJECT_STATUSES:
-        raise McpError("Project status must be active, paused, done or archived.")
+    if status not in READABLE_PROJECT_STATUSES:
+        raise McpError(
+            "Project status must be active, paused, done, archived or draft."
+        )
     return status
 
 
@@ -1362,7 +1376,9 @@ def path_is_within(child: Path, parent: Path) -> bool:
 
 
 def validate_project_work_root(
-    candidate: Path, management_root: Path | None = None
+    candidate: Path,
+    management_root: Path | None = None,
+    project_id: str | None = None,
 ) -> Path:
     root = candidate.expanduser().resolve()
     home = Path.home().resolve()
@@ -1376,9 +1392,14 @@ def validate_project_work_root(
     if root in broad_roots:
         # PRIVACY: never echo the absolute path back to an agent (it leaks the OS
         # username + machine layout). Name only the basename + actionable phrase.
+        # T4 — Ticket B: keep the basename-only posture but include the
+        # workspace env var name and the project id (when known) so the
+        # operator knows WHICH project the rejection targets.
+        project_tag = f" for project '{project_id}'" if project_id else ""
         raise McpError(
-            f"Project working root '{root.name}' is too broad; "
-            "point it at a specific project folder under the Devboule workspace."
+            f"Project working root '{root.name}'{project_tag} is too broad; "
+            "point it at a specific project folder under the Devboule "
+            "workspace (set ASPIS_WORKSPACE_ROOT to widen the approved set)."
         )
     lower = str(root).lower()
     if lower.endswith("\\windows") or "\\windows\\system32" in lower:
@@ -1390,9 +1411,16 @@ def validate_project_work_root(
     # project markdown cannot index an arbitrary sensitive tree (e.g. ~/.ssh).
     parents = approved_work_root_parents(management_root)
     if not any(root == parent or path_is_within(root, parent) for parent in parents):
+        # T4 — Ticket B: name the env var (ASPIS_WORKSPACE_ROOT) the operator
+        # can set to APPROVE the offending path. Echo only the last 2 path
+        # components (…/parent/leaf) and hard-truncate to ≤200 chars.
+        parts = root.parts
+        display = "…/" + "/".join(parts[-2:]) if len(parts) > 2 else str(root)
+        if len(display) > 200:
+            display = display[:197] + "..."
         raise McpError(
-            "Project working root is outside the approved Devboule workspace roots. "
-            "Place it under the management root or the configured Devboule workspace."
+            f"rootPath '{display}' is outside approved Devboule workspaces; "
+            "set ASPIS_WORKSPACE_ROOT to its parent to approve."
         )
     return root
 
@@ -1769,7 +1797,7 @@ def parse_frontmatter(content: str, path: Path) -> tuple[dict[str, Any], int]:
         {
             "id": project_id,
             "title": clean_text(fields.get("title", project_id), "Project title", 500),
-            "status": normalize_project_status(fields.get("status", "active")),
+            "status": normalize_readable_project_status(fields.get("status", "active")),
             "updatedAt": fields.get("updated_at") or fields.get("updatedAt") or now(),
             "rootPath": fields.get("root_path")
             or fields.get("rootPath")
@@ -2143,7 +2171,16 @@ def compact_session_ack(
         "updatedAt": public.get("updatedAt"),
         "session": session,
         "fleet": {"sessions": len(sessions), "active": active},
-        "note": "Full fleet state available via agent_state.",
+        # T4 — Ticket C: heartbeat acks deliberately DO NOT echo sessionToken
+        # (small models kept retrying, thinking the missing token signaled an
+        # error). Stamp the no-echo contract onto EVERY ack so the operator-
+        # facing guidance tells the model the absence is expected. Keep the
+        # sentence in this single string so it remains easy to grep / update.
+        "note": (
+            "Full fleet state available via agent_state. "
+            "Heartbeat acks do not echo sessionToken -- keep using the token "
+            "from agent_register; a missing token in the ack is NOT an error."
+        ),
     }
     if session_token:
         ack["sessionToken"] = session_token
@@ -2932,8 +2969,15 @@ def require_live_task_for_provider_mutation(
     with file_lock(project_lock_path(projects_dir, project_id)):
         project = read_project_file(project_path(projects_dir, project_id))
         project_status = project["metadata"].get("status")
+        # T4 — Ticket A: `active` is the ONLY status eligible for a destructive
+        # provider mutation; draft/paused/done/archived are all rejected.
+        # Explicit check (not an enumerated set) so the error string names each
+        # non-active state clearly to a planner debugging the rejection.
         if project_status != "active":
-            raise McpError("Provider mutations require an active Management project.")
+            raise McpError(
+                "Provider mutations require an active Management project "
+                f"(status={project_status!r}; only 'active' is allowed)."
+            )
         task = next(
             (
                 item
@@ -5346,13 +5390,33 @@ def resolve_project_work_root(projects_dir: Path, project_id: str) -> Path:
     its Markdown `root_path`, reusing `load_project_locked` + the same
     `validate_project_work_root` allowlist every other root-resolving tool uses.
     A project without a configured root has no Censor ledger — that is an error,
-    not an empty list, because the caller asked about a specific project."""
+    not an empty list, because the caller asked about a specific project.
+
+    T4 — Ticket B: the two failure paths here produce DISTINCT, actionable
+    error messages (≤200 chars each):
+      (1) `root_path` missing in the project's `.aspis` frontmatter → name
+          the file inspected AND the frontmatter key the operator must set.
+      (2) `root_path` set but NOT under an approved workspace parent
+          (management_root / ASPIS_WORKSPACE_ROOT) → name the env var AND
+          echo the offending path so the operator can see what was rejected.
+    These used to be a single confusing "no configured working root" line.
+    """
     project = load_project_locked(projects_dir, project_id)
+    project_path = project.get("path") or project_path(projects_dir, project_id)
     root_path = str(project["metadata"].get("rootPath") or "").strip()
     if not root_path:
-        raise McpError("Project has no configured working root for Censor findings.")
+        # (1) missing frontmatter `root_path`. Name the file so the operator
+        # knows exactly where to add the key. No secrets, no env dump. The
+        # message is short by design (≤200 chars) so an agent reading the
+        # response gets a single-line reminder, not a paragraph.
+        raise McpError(
+            f"Project '{project_id}' has no `root_path` in its frontmatter "
+            f"(file: {project_path}); add `root_path` to enable Censor findings."
+        )
     management_root = management_root_from_projects_dir(projects_dir).resolve()
-    return validate_project_work_root(Path(root_path), management_root)
+    return validate_project_work_root(
+        Path(root_path), management_root, project_id=project_id
+    )
 
 
 # --- Phase 11.2: project_structure (shared, read-only STRUCTURE graph) ---------------
@@ -6407,6 +6471,29 @@ def dispatch_spawn_mini_coder(
         agent_id, role = require_agent_tool(projects_dir, args, "spawn_mini_coder")
         if "spawn_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
             raise McpError(f"{role} agents cannot use spawn_mini_coder.")
+
+    # T4 — draft guard: if the parent session is bound to a draft project,
+    # reject the spawn (draft projects are read-only). Skip when there is no
+    # project (a spawn can legitimately operate without one).
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        session = next(
+            (item for item in state["sessions"] if item.get("agentId") == agent_id),
+            None,
+        )
+        spawn_project_id = str((session or {}).get("currentProjectId") or "").strip()
+        if spawn_project_id and spawn_project_id != "default":
+            try:
+                spawn_project = load_project_locked(projects_dir, spawn_project_id)
+                if spawn_project["metadata"].get("status") == "draft":
+                    raise McpError(
+                        "spawn_mini_coder: draft projects are read-only "
+                        "— activate the project first."
+                    )
+            except McpError:
+                raise
+            except Exception:
+                pass  # project missing or unreadable — skip the guard
 
     # 2) Validate the task + files (the directive payload the executor + mini act on).
     task = clean_text(args.get("task"), "Mini-coder task", MINI_CODER_MAX_TASK_LEN)
@@ -7570,9 +7657,14 @@ def dispatch_plan_submit(
     #    is single-line cleaned + capped; the markdown is prose (newlines PRESERVED, so
     #    NOT run through clean_text which collapses whitespace) — non-empty + hard cap.
     project_id = normalize_project_id(args.get("project_id", ""))
-    load_project_locked(
+    project = load_project_locked(
         projects_dir, project_id
     )  # raises McpError("Project not found.")
+    # T4 — Ticket A: draft projects are read-only; reject plan_submit on draft.
+    if project["metadata"].get("status") == "draft":
+        raise McpError(
+            "plan_submit: draft projects are read-only — activate the project first."
+        )
     title = clean_text(args.get("title"), "Plan title", 200)
     plan_markdown = str(args.get("plan_markdown") or "")
     if not strip_invisible_and_bidi(plan_markdown).strip():
@@ -8250,9 +8342,18 @@ def handle_tool_call(
                 )
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
-                if project["metadata"].get("status") in {"paused", "archived", "done"}:
+                # T4 — Ticket A: `draft` joins `paused|archived|done` here.
+                # draft is readable (project_get / oracle_context) but NOT
+                # claimable: the planner must approve the project before any
+                # coder (or orchestrator) can pick up a task.
+                if project["metadata"].get("status") in {
+                    "draft",
+                    "paused",
+                    "archived",
+                    "done",
+                }:
                     raise McpError(
-                        "Cannot claim tasks on paused, done or archived projects."
+                        "Cannot claim tasks on draft, paused, done or archived projects."
                     )
                 task = next(
                     (
@@ -8386,9 +8487,17 @@ def handle_tool_call(
 
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
-                if project["metadata"].get("status") in {"paused", "archived"}:
+                # T4 — Ticket A: draft is readable but not status-mutable.
+                # Paused/archived already blocked task status writes; draft must
+                # also be rejected explicitly so a pre-approval project never
+                # silently advances through MCP calls.
+                if project["metadata"].get("status") in {
+                    "draft",
+                    "paused",
+                    "archived",
+                }:
                     raise McpError(
-                        "Cannot update tasks on paused or archived projects."
+                        "Cannot update tasks on draft, paused or archived projects."
                     )
                 task = next(
                     (
@@ -8475,6 +8584,12 @@ def handle_tool_call(
             state = read_agents_state(projects_dir)
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
+                # T4: draft projects are read-only — reject mutations.
+                if project["metadata"].get("status") == "draft":
+                    raise McpError(
+                        "project_append_note: draft projects are read-only "
+                        "— activate the project first."
+                    )
                 project["state"].setdefault("notes", []).append(
                     {
                         "id": note_id(),
@@ -8515,6 +8630,12 @@ def handle_tool_call(
             state = read_agents_state(projects_dir)
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
+                # T4: draft projects are read-only — reject mutations.
+                if project["metadata"].get("status") == "draft":
+                    raise McpError(
+                        "project_set_title: draft projects are read-only "
+                        "— activate the project first."
+                    )
                 project["metadata"]["title"] = title
                 project["metadata"]["updatedAt"] = now()
                 saved = write_project_file(project)
@@ -8557,9 +8678,18 @@ def handle_tool_call(
             state = read_agents_state(projects_dir)
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
-                if project["metadata"].get("status") in {"paused", "archived", "done"}:
+                # T4 — Ticket A: draft is readable but not task-writable.
+                # Adding `draft` here closes the only remaining mutation path
+                # on a draft project; without it a coder could append follow-ups
+                # before the planner approved the project.
+                if project["metadata"].get("status") in {
+                    "draft",
+                    "paused",
+                    "archived",
+                    "done",
+                }:
                     raise McpError(
-                        "Cannot create follow-up tasks on paused, done or archived projects."
+                        "Cannot create follow-up tasks on draft, paused, done or archived projects."
                     )
                 tasks = project["state"].setdefault("tasks", [])
                 task = {
@@ -8769,9 +8899,17 @@ def handle_tool_call(
                 )
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
-                if project["metadata"].get("status") in {"paused", "archived", "done"}:
+                # T4 — Ticket A: draft is readable but plan-task writes must
+                # be blocked pre-approval. Same set as the other write guards
+                # so every mutation path rejects draft uniformly.
+                if project["metadata"].get("status") in {
+                    "draft",
+                    "paused",
+                    "archived",
+                    "done",
+                }:
                     raise McpError(
-                        "Cannot create plan tasks on paused, done or archived projects."
+                        "Cannot create plan tasks on draft, paused, done or archived projects."
                     )
                 tasks = project["state"].setdefault("tasks", [])
                 # Allocate a FRESH T<n> per incoming task. next_task_id derives the

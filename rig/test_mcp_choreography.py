@@ -303,7 +303,9 @@ def test_claim_rejected_on_paused_project():
             session_token = reg_result["sessionToken"]
 
             # Try to claim a task on the paused project → must raise McpError
-            with pytest.raises(McpError, match="Cannot claim tasks on paused"):
+            # T4 widened the guard message to enumerate draft too ("Cannot claim
+            # tasks on draft, paused, done or archived projects").
+            with pytest.raises(McpError, match="Cannot claim tasks on .*paused"):
                 client.call_tool(
                     "project_claim_task",
                     {
