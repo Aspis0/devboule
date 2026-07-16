@@ -2378,6 +2378,11 @@ impl EventMapper {
 
     fn build_snapshot(&self) -> ConsoleActivity {
         ConsoleActivity {
+            // The pi mapper persists its own bridge lines (push_entry) — the
+            // store-side tail-diff counter is bookkeeping it never uses; stamp
+            // the mapper's own monotonic total so a wholesale store replace
+            // (emit_snapshot) never looks like a fresh append burst.
+            appended_total: self.evicted_count + self.entries.len() as u64,
             running: Some(self.running),
             run_count: if self.running { Some(1) } else { Some(0) },
             empty: if self.entries.is_empty() {

@@ -1817,14 +1817,27 @@ fn claim_and_launch(
             }
         }
 
-        store.update(app, &agent_id, |a| {
+        if let Some(store) = console_store(app) {
+            let projects_dir = super::projects::ensure_projects_dir(app).ok();
             if directive.attempt == 0 {
-                *a = super::mini_activity::build_initial(&model, &label, &scope, round_n);
-            } else {
-                super::mini_activity::resume_retry_round(a, &model, &label, &scope, round_n);
+                if let (Some(usd), Some(m)) = (est, backend.model.as_deref()) {
+                    let _ = super::cost::record_cost(app.clone(), m.to_string(), usd);
+                }
             }
-            a.task_cost_estimate_usd = est;
-        });
+
+            let f = |a: &mut super::mini_activity::ConsoleActivity| {
+                if directive.attempt == 0 {
+                    *a = super::mini_activity::build_initial(&model, &label, &scope, round_n);
+                } else {
+                    super::mini_activity::resume_retry_round(a, &model, &label, &scope, round_n);
+                }
+                a.task_cost_estimate_usd = est;
+            };
+            match projects_dir {
+                Some(ref pd) => store.update_bridged(app, &agent_id, pd, f),
+                None => store.update(app, &agent_id, f),
+            }
+        }
     }
 }
 
@@ -2113,14 +2126,18 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 let note = unattended_denial_note("net", "");
                 if let Some(store) = console_store(app) {
                     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                    store.update(app, &agent_id, |a| {
+                    let f = |a: &mut super::mini_activity::ConsoleActivity| {
                         super::mini_activity::push_coder_note(
                             a,
                             &note,
                             Some(super::mini_activity::NodeStyle::Terra),
                             &ts,
                         );
-                    });
+                    };
+                    match super::projects::ensure_projects_dir(app).ok() {
+                        Some(ref pd) => store.update_bridged(app, &agent_id, pd, f),
+                        None => store.update(app, &agent_id, f),
+                    }
                 }
             }
         } else {
@@ -2129,14 +2146,18 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             // the operator is not left with zero feedback.
             if let Some(store) = console_store(app) {
                 let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                store.update(app, &agent_id, |a| {
+                let f = |a: &mut super::mini_activity::ConsoleActivity| {
                     super::mini_activity::push_coder_note(
                         a,
                         "Network access denied — project context unavailable",
                         Some(super::mini_activity::NodeStyle::Terra),
                         &ts,
                     );
-                });
+                };
+                match super::projects::ensure_projects_dir(app).ok() {
+                    Some(ref pd) => store.update_bridged(app, &agent_id, pd, f),
+                    None => store.update(app, &agent_id, f),
+                }
             }
         }
     }
@@ -2174,28 +2195,36 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 let note = unattended_denial_note("folder", folder);
                 if let Some(store) = console_store(app) {
                     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                    store.update(app, &agent_id, |a| {
+                    let f = |a: &mut super::mini_activity::ConsoleActivity| {
                         super::mini_activity::push_coder_note(
                             a,
                             &note,
                             Some(super::mini_activity::NodeStyle::Terra),
                             &ts,
                         );
-                    });
+                    };
+                    match super::projects::ensure_projects_dir(app).ok() {
+                        Some(ref pd) => store.update_bridged(app, &agent_id, pd, f),
+                        None => store.update(app, &agent_id, f),
+                    }
                 }
             }
         } else {
             // FIX 3: project_id is None — best-effort denial note without project context.
             if let Some(store) = console_store(app) {
                 let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                store.update(app, &agent_id, |a| {
+                let f = |a: &mut super::mini_activity::ConsoleActivity| {
                     super::mini_activity::push_coder_note(
                         a,
                         "Out-of-scope write denied — project context unavailable",
                         Some(super::mini_activity::NodeStyle::Terra),
                         &ts,
                     );
-                });
+                };
+                match super::projects::ensure_projects_dir(app).ok() {
+                    Some(ref pd) => store.update_bridged(app, &agent_id, pd, f),
+                    None => store.update(app, &agent_id, f),
+                }
             }
         }
     }
@@ -2208,7 +2237,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         if let Some(store) = console_store(app) {
             let round = directive.attempt.saturating_add(1);
             let fc = outcome.files_touched.len();
-            store.update(app, agent_id, |a| {
+            let f = |a: &mut super::mini_activity::ConsoleActivity| {
                 for path in &outcome.files_touched {
                     super::mini_activity::push_write_action(a, path, vec![]);
                 }
@@ -2232,7 +2261,11 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                         )),
                     },
                 );
-            });
+            };
+            match super::projects::ensure_projects_dir(app).ok() {
+                Some(ref pd) => store.update_bridged(app, agent_id, pd, f),
+                None => store.update(app, agent_id, f),
+            }
         }
     }
     let _ = agents::mutate_agent_live_state(app, |state| {
@@ -3225,7 +3258,7 @@ pub(crate) fn unattended_denial_note(kind: &str, detail: &str) -> String {
 fn console_mark_stopped(app: &AppHandle, directive: &MiniCoderDirective) {
     if let Some(store) = console_store(app) {
         if let Some(agent_id) = directive.agent_id.as_deref() {
-            store.update(app, agent_id, |a| {
+            let f = |a: &mut super::mini_activity::ConsoleActivity| {
                 super::mini_activity::set_terminal(
                     a,
                     super::mini_activity::Banner {
@@ -3234,7 +3267,11 @@ fn console_mark_stopped(app: &AppHandle, directive: &MiniCoderDirective) {
                         sub: None,
                     },
                 );
-            });
+            };
+            match super::projects::ensure_projects_dir(app).ok() {
+                Some(ref pd) => store.update_bridged(app, agent_id, pd, f),
+                None => store.update(app, agent_id, f),
+            }
         }
     }
 }
