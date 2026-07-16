@@ -127,9 +127,18 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
 - Agentic stack ~2.7k (agentic_worker/runner/transport): structure + tests.
 - Double censor pipeline (fine batch vs pigeon review) unification.
 - Megafile splits: projects.rs (~11k), pi_sidecar.rs (~5k+), scanner.rs (~12k).
-- Oracle M3: delete the Python oracle server path (oracle-rs is live) —
-  PLAN.md exists; needs the owner's go. Windows DirectML untested;
+- ~~Oracle M3: delete the Python oracle server path (oracle-rs is live)~~ —
+  DONE 2026-07-16 (P12a-d + P13a-c: python runtime deleted, supervisor
+  rust-only, slim MCP venv + fat→slim migration, LLM env plumbed in-process;
+  see docs/oracle-m3-execution-plan-2026-07.md). Windows DirectML untested;
   candle-Metal exists but is not wired.
+- Oracle M4 (owner committed, next session): port the pi-oracle MCP rail to
+  Rust — `oracle/server/mcp_handler.py` + its retrieval core
+  (query_engine/answerer/stores, the surviving fat `.venv` surface) is the
+  LAST Python oracle path, kept alive per owner decision because the pi recon
+  rail and the figlyph rail run on it. Port target: an rmcp/Rust MCP server
+  over oracle-core with an arbitrary ORACLE_DIR, then delete the remaining
+  Python retrieval modules + the fat requirements.txt.
 
 ## 5. Platform / packaging
 

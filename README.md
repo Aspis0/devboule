@@ -939,28 +939,19 @@ Now there is **one resident Oracle server, supervised by the app**:
 - When you **unlock** the app, it starts one Oracle HTTP server (and keeps it
   from idling out) and a background supervisor restarts it within ~10s if it
   dies. When you **lock** the app, the server is torn down.
-- Agents are **thin clients**: when the app is open they ask that one shared
-  server over `http://127.0.0.1` (no per-agent model load). When the app is
-  closed they automatically fall back to running Oracle in-process, so they
-  **always work**, just slower.
+- Agents are **thin clients**: they ask that one shared server over
+  `http://127.0.0.1` (no per-agent model load). When the app is closed there is
+  **no fallback** (M3 deleted the in-process Python engine): agent oracle calls
+  fail with an actionable "open the Aspis Management app" error.
 - Agents discover the server through a small file the app writes,
   `projects/.oracle-server.json` (`baseUrl`, `authToken`, `indexRoot`). The file
   is written with owner-only permissions and **deleted when you lock**.
 
-> **Why you see TWO `python -m oracle.server.main` processes per server (NOT a bug).**
-> The auto-installed runtime uses a `pythoncore-3.14` venv, whose `venv\Scripts\python.exe`
-> is a thin **launcher stub**: when it runs a script or `-m module` (but not `-c`), it
-> **re-execs the real base interpreter as a child process** and waits on it. So ONE logical
-> Oracle server shows up in Task Manager as TWO processes: a tiny ~4 MB parent (the launcher
-> stub, 1 thread, holds the bound socket, no work) **and** the real child (~150 MB, dozens of
-> threads, the actual FastAPI/uvicorn server that listens on the loopback port). This is the
-> venv launcher's normal behavior — confirmed: a trivial `.py` run by the venv python spawns 1
-> child; run by the base interpreter it spawns 0. It is **not** a double-spawn, not uvicorn
-> workers/reload, and not `multiprocessing` (our code uses none). Do NOT "fix" it by killing the
-> idle parent (that orphans/cascades the real child) or by hunting a phantom double-spawn in the
-> supervisor. If `ps`/Task Manager shows MORE than one such pair, *that* is a real respawn issue
-> (historically: slow `/health` readiness probes timing out, or a `\\?\` verbatim-prefix root
-> mismatch making readiness fail — both fixed June 2026). Count *pairs*, not processes: one pair = healthy.
+> **Since M3 (July 2026) the Oracle server runs IN-PROCESS (Rust, `oracle-core`)** —
+> there is no Python server subprocess anymore. If you see any
+> `python -m oracle.server.main` process, it is a leftover from a pre-M3 build:
+> kill it. The only Python the app still launches from the (now slim) venv is
+> `oracle/server/aspis_mcp.py`, the project-management MCP server for agents.
 
 ### Two-tier token (security)
 
@@ -1069,10 +1060,13 @@ The intended behavior:
 MCP Oracle tools fail closed when a project root has stale/pending chunks. In
 that case, re-run indexing from the app or command line.
 
-Manual indexing example:
+Manual indexing (M3: the Python CLI is gone — index from the app's Oracle
+panel, or hit the resident server's operator endpoint):
 
 ```powershell
-python -m oracle.cli index-chunks --root "C:\Users\gualt\Desktop\Devboule" --progress
+# app open; operator token from projects/.oracle-server.json is NOT enough —
+# /index/run requires the operator token the app itself holds. Prefer the UI.
+curl -X POST "http://127.0.0.1:<port>/index/run?root=<project-root>&force=false"
 ```
 
 For the big Devboule folder, use the configured Devboule root instead.
