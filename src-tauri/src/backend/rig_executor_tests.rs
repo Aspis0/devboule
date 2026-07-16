@@ -1365,7 +1365,13 @@ fn regen_agents_state_fixture() {
 fn normalize_agents_state_timestamps(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
-            if s.starts_with("202") && s.contains('T') && s.ends_with('Z') {
+            // Cover BOTH ISO shapes the state writers produce: "...Z" and
+            // "...+00:00" (updatedAt uses the latter — leaving it unnormalized
+            // made the committed fixture drift on every regen run).
+            if s.starts_with("202")
+                && s.contains('T')
+                && (s.ends_with('Z') || s.contains("+00:00"))
+            {
                 *s = "2026-07-16T00:00:00Z".to_string();
             }
         }
