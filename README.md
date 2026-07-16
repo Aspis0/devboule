@@ -58,8 +58,11 @@ These are product rules, not suggestions.
 - Vite: frontend build.
 - Tailwind CSS: UI styling.
 - Lucide React: icons.
-- Python: Oracle service, indexing CLI, local MCP server.
-- LanceDB / local Oracle data: chunk/vector storage + a local embedder (GPU-aware).
+- Python: the `aspis_mcp` app-tools MCP server (project/cloud/Kanban tools) — slim
+  (httpx-only). Oracle retrieval + indexing are Rust now (`oracle-core`); the
+  pi-oracle rail is the native `oracle-mcp` binary (M4, July 2026).
+- LanceDB / local Oracle data: chunk/vector storage + a local embedder (GPU-aware),
+  driven by the Rust `oracle-core` crate.
 - PixiJS 8: the Polis isometric "city of the codebase" renderer.
 - Remote LLM providers only: allowlisted GDPR/ZDR-gated providers (no local chat
   model — the on-device Ollama/hardware-gated path was removed; answers are
@@ -759,7 +762,7 @@ python -m oracle.server.aspis_mcp --root "C:\Users\gualt\Desktop\Devboule" --pro
 Preflight:
 
 ```powershell
-python -m pip install -r oracle\requirements.txt
+python -m pip install -r oracle\requirements-mcp.txt
 python -m unittest oracle.tests.test_aspis_mcp
 ```
 

@@ -132,13 +132,18 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   rust-only, slim MCP venv + fat→slim migration, LLM env plumbed in-process;
   see docs/oracle-m3-execution-plan-2026-07.md). Windows DirectML untested;
   candle-Metal exists but is not wired.
-- Oracle M4 (owner committed, next session): port the pi-oracle MCP rail to
-  Rust — `oracle/server/mcp_handler.py` + its retrieval core
-  (query_engine/answerer/stores, the surviving fat `.venv` surface) is the
-  LAST Python oracle path, kept alive per owner decision because the pi recon
-  rail and the figlyph rail run on it. Port target: an rmcp/Rust MCP server
-  over oracle-core with an arbitrary ORACLE_DIR, then delete the remaining
-  Python retrieval modules + the fat requirements.txt.
+- ~~Oracle M4: port the pi-oracle MCP rail to Rust~~ — DONE 2026-07-16
+  (branch `oracle/m4-rail-port`; see docs/oracle-m4-execution-plan-2026-07.md).
+  New `oracle-mcp` rmcp/stdio binary over oracle-core (6 retrieval tools,
+  arbitrary ORACLE_DIR, retrieval-only/no-LLM); the Python retrieval surface
+  (mcp_handler/query_engine/answerer/stores + ingestion/evals/evalbench/training
+  + fat requirements.txt) is deleted; only aspis_mcp.py + ckg_store.py + the slim
+  requirements-mcp.txt remain. `.pi/mcp.json` + `~/.pi/agent/mcp.json` repointed
+  to the bin at `~/.local/bin/oracle-mcp` (ORACLE_MODEL_DIR = the shared
+  oracle-core qwen3-onnx dir). Live-proven: pi's oracle rail returns real chunks
+  from the indexed figlyph corpus. OPEN: owner live-e2e in the app; when the
+  branch merges to phase1/infra, rebuild the release bin from the merged tree and
+  (optionally) repoint the config at the main-repo target instead of ~/.local/bin.
 
 ## 5. Platform / packaging
 
