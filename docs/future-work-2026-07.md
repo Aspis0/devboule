@@ -45,23 +45,29 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
   2026-07-15** (`6299019`, rig P5b): compact_session_ack + claim key
   {projectId,taskId,status,leaseUntil}; ack<4096B guarded in the rig; zero
   breaking consumers; 5 old-contract unit tests adapted.
-- **Project status `draft` rejected** by project_get/oracle_context — decide
-  whether draft should be readable (guards at aspis_mcp.py:8253/2935).
-- `agent_heartbeat` does not echo sessionToken (by design — document it in the
-  agent prompt/help so models don't retry).
-- `censor_findings` requires `root_path` frontmatter + ASPIS_WORKSPACE_ROOT
-  approval — confusing failure mode when missing; better error message.
+- ~~**Project status `draft` rejected**~~ **DONE 2026-07-16 (`bdedd31`)**: draft
+  is READABLE (project_get/oracle_context) and read-only — every mutation
+  rejects it, including 4 previously-unguarded paths (append_note, set_title,
+  plan_submit, spawn_*) the review caught.
+- ~~`agent_heartbeat` does not echo sessionToken~~ **DONE 2026-07-16
+  (`bdedd31`)**: contract documented in the register/heartbeat ack note.
+- ~~`censor_findings` confusing failure mode~~ **DONE 2026-07-16 (`bdedd31`)**:
+  distinct actionable messages for missing root_path frontmatter vs workspace
+  approval (paths trimmed, capped).
 - **P5d write-throughs DONE 2026-07-16**: `mini://stuck` → durable
   `stuckReport` on the directive row (`c69ce27`); `censor://scan-started` →
   CensorScanRegistry + `censor_scan_state` command, `censor://mini-findings`
   summary → `censorSummary` on the directive row (`88db1ae`);
   `agent-terminal://<id>` was NOT a blind spot (agent_pty_snapshot exists;
-  ring memory-only by privacy design — inventory corrected). Still event-only:
-  `sandbox://consent-request`, `design-stream:<id>` deltas.
-- **UI gap (P5e finding, pinned by it.todo)**: drawerData/AgentsView has no
-  visibility into the new directive-level `stuckReport`/`censorSummary` —
-  surfaced only via the live `mini://stuck` event hook; a durable-state read
-  in the drawer would make them visible after restart.
+  ring memory-only by privacy design — inventory corrected). 2026-07-16
+  (`d2bfec5`): the executor's seatbelt `sandbox://consent-request` asks now
+  persist to consentRequests (append_superseding + grant resolution); the
+  cloud-duplex ask stays live-only by design. Still event-only:
+  `design-stream:<id>` deltas.
+- ~~**UI gap: drawer blind to durable stuckReport/censorSummary**~~ **DONE
+  2026-07-16 (`aa31ebd`)**: drawerData derives them from the directives (both
+  parentAgentId and mini agentId ties); AgentDetailDrawer renders a compact
+  "Mini reports" section.
 - **Deterministic censor gate on the session diff (salvage pi-lens diagnostics,
   NO autofix)** — owner design ticket 2026-07-16. Background: `npm:pi-lens` was
   the deterministic-censor-before-LLM experiment, but its autofix ran
@@ -82,22 +88,29 @@ workstreams. Grouped by area; within each area, roughly most-urgent first.
     --allow-dirty on the shared tree.
   * Related: [censor-gate-expansion-and-skills] linter list; the 3-tier local
     review design (censor-and-projects-ia-redesign).
+  * **STATUS 2026-07-16 (`17e0b17`): the detection half already EXISTED in the
+    censor rail** (27+ presence-detected runners, per-file shards, steer-file
+    feedback into the coder loop, no LLM required) and is now PROVEN by the
+    rig cell `rig_deterministic_gate_full_chain_no_llm` (plant → findings in
+    durable shard → fix → clearance). Remaining (deferred, needs owner
+    design): the optional worktree-isolated autofix PATCH-PROPOSAL flow.
 
 ## 3. Orchestrator / pi-sidecar (from the 6 fix rounds, still open)
 
-- **Pi coder/mini rows visible but NOT steerable from UI** — `mini_coder_steer`
-  targets the directive executor only; pi sidecar sessions need a steer route
-  (design decision: route by session kind).
-- **User-echo + goal delivery for coder/mini spawns** (orchestrator got it in
-  round 1; coder path still lacks it).
+- ~~**Pi coder/mini rows NOT steerable from UI**~~ **DONE 2026-07-16
+  (`30a4e43`)**: mini_coder_steer falls back to the pi route (echo + prompt,
+  "steered_pi"); the stop sentinel stops the session instead of being chatted
+  at the model. MCP surface intentionally unchanged (not_found).
+- ~~**User-echo + goal delivery for coder/mini spawns**~~ **DONE 2026-07-16
+  (`d2bfec5`)**: coder-flavored task addendum + Fix-C echo on
+  spawn_pi_coder_session; Spawn panel threads the selected task title as
+  initialGoal.
 - ~~**Bridge file for pi coder console**~~ **DONE 2026-07-16 (`e1cd083`, P5c)**:
   EventMapper write-through to `.devboule-activity/<id>.jsonl` + hydrate at
   construction; plans/chat/thinking/websearch/milestones replay after restart.
-- **Bridge file for DIRECTIVE minis too** (found in P5a recon 2026-07-15): the
-  directive executor's activity lives only in the in-memory MiniActivityStore
-  (Tauri events); only the ORCHESTRATOR writes `.devboule-activity/<id>.jsonl`
-  (projects.rs:~1974). Mini console is lost on restart — same fix class as the
-  pi-coder ticket above (one write-through in the executor's update path).
+- ~~**Bridge file for DIRECTIVE minis**~~ **DONE 2026-07-16 (`a5da1dd`)**:
+  MiniActivityStore::update_bridged (monotonic appended_total tail-diff) at
+  all 7 executor console sites; hydrate-on-miss replays after restart.
 - **node_modules in the packaged bundle** (Phase 5 question): debug `_up_`
   resource copy has no node_modules; packaged builds can't spawn the sidecar.
 - **Sandbox projects_dir = tree-wide cross-project write** — scoping requires
