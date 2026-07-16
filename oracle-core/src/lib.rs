@@ -27,4 +27,5 @@ pub enum BackendArg {
     Onnx,
 }
 pub mod answer;
+pub mod mcp;
 pub mod query;

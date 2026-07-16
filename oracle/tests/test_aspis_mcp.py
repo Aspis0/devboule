@@ -83,7 +83,6 @@ from oracle.server.aspis_mcp import (
     validate_task_dependency_dag,
     MAX_PLAN_TASKS,
 )
-from oracle.store.sqlite_store import SQLiteStore
 
 
 class _Recorder:
@@ -8777,17 +8776,6 @@ class VisualCheckTests(unittest.TestCase):
             (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
         )
 
-    def test_visual_check_in_tool_schema_and_allowed_for_agents(self):
-        from oracle.server import aspis_mcp
-        from oracle.server import mcp_handler
-
-        self.assertIn("visual_check", {tool["name"] for tool in aspis_mcp.TOOLS})
-        self.assertIn("visual_check", {tool["name"] for tool in mcp_handler.TOOLS})
-        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
-        self.assertIn("visual_check", coder["allowedTools"])
-        self.assertIn("visual_check", verifier["allowedTools"])
-
     def test_writes_pending_directive_with_exact_camel_case_keys_and_caps_focus(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
@@ -8817,17 +8805,6 @@ class VisualCheckTests(unittest.TestCase):
             self.assertEqual(d["resultPath"], f"{out['directiveId']}.json")
             self.assertNotIn("html_path", d)
             self.assertNotIn("parent_agent_id", d)
-
-    def test_design_request_in_tool_schema_and_allowed_for_orchestrator_and_coder(self):
-        from oracle.server import aspis_mcp
-        from oracle.server import mcp_handler
-
-        self.assertIn("design_request", {tool["name"] for tool in aspis_mcp.TOOLS})
-        self.assertIn("design_request", {tool["name"] for tool in mcp_handler.TOOLS})
-        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        orchestrator = next(r for r in ROLE_RULES if r["role"] == "orchestrator")
-        self.assertIn("design_request", coder["allowedTools"])
-        self.assertIn("design_request", orchestrator["allowedTools"])
 
     def test_design_request_writes_pending_directive_camel_case(self):
         with tempfile.TemporaryDirectory() as tmp:

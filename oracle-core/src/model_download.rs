@@ -61,16 +61,28 @@ pub fn model_dir(oracle_data_root: &Path) -> PathBuf {
     OrtEmbedder::default_model_dir(oracle_data_root)
 }
 
+/// True when every required bundle file exists (and is non-trivially sized)
+/// directly under `model_dir` (the resolved qwen3-onnx dir, NOT the data root).
+///
+/// This is the building block behind [`model_present`]; callers that have
+/// already resolved an explicit model directory (e.g. `ORACLE_MODEL_DIR`)
+/// should check *that* path rather than recomputing the default layout from a
+/// data root, which would inspect the wrong location.
+pub fn model_present_at(model_dir: &Path, int8: bool) -> bool {
+    bundle_files(int8).iter().all(|rel| {
+        let p = model_dir.join(rel);
+        std::fs::metadata(&p).map(|m| m.len() > 1024).unwrap_or(false)
+    })
+}
+
 /// True when every file of the requested bundle is present AND above a minimal
 /// plausible size. UI-status only — never use this to SKIP `ensure_qwen3_onnx`
 /// (that path does its own Content-Length verification); a planted 1-byte file
 /// must not read as "installed" enough to bypass the download.
+///
+/// Equivalent to `model_present_at(&model_dir(root), int8)`.
 pub fn model_present(oracle_data_root: &Path, int8: bool) -> bool {
-    let dir = model_dir(oracle_data_root);
-    bundle_files(int8).iter().all(|rel| {
-        let p = dir.join(rel);
-        std::fs::metadata(&p).map(|m| m.len() > 1024).unwrap_or(false)
-    })
+    model_present_at(&model_dir(oracle_data_root), int8)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client> {
