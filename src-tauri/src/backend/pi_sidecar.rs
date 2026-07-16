@@ -2121,7 +2121,11 @@ struct PiEvent {
     /// means `oracle_ask` will not work (surfaced as a banner in the console).
     #[serde(rename = "oracleMCP", default)]
     oracle_mcp: Option<bool>,
-    #[serde(default)]
+    // The sidecar emits this field camelCase (`assistantMessageEvent`); without
+    // the rename serde silently left it `None` on EVERY message_update, so no
+    // assistant text/thinking delta was ever ingested — the chat showed tool
+    // milestones but never an assistant bubble (live e2e finding #6, 2026-07-16).
+    #[serde(rename = "assistantMessageEvent", default)]
     assistant_message_event: Option<AssistantMessageEvent>,
     #[serde(rename = "toolCallId", default)]
     tool_call_id: Option<String>,
@@ -7116,6 +7120,48 @@ mod tests {
         assert!(!path.exists(), "no file when bridge_path is None");
         assert_eq!(mapper.entries.len(), 1, "entry still in memory");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding #6 regression (2026-07-16): `assistantMessageEvent` is emitted
+    /// camelCase by the sidecar. Without the serde rename, the field silently
+    /// deserialized to `None` on every `message_update`, so no assistant
+    /// text/thinking delta was ever ingested — tool milestones appeared but the
+    /// assistant bubble never did. This test goes THROUGH `PiEvent`
+    /// deserialization (the older mapper tests constructed
+    /// `AssistantMessageEvent` directly and could never catch it) using a raw
+    /// line captured from a live sidecar run.
+    #[test]
+    fn message_update_deserializes_camelcase_assistant_event_into_chat() {
+        // Verbatim shape from a live capture (trimmed `partial` — the mapper
+        // only reads type/delta/contentIndex).
+        let lines = [
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1},"_devboule":{"agentRole":"orchestrator","projectId":"p","sessionId":"s"}}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"The folder contains a README."},"_devboule":{"agentRole":"orchestrator","projectId":"p","sessionId":"s"}}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1},"_devboule":{"agentRole":"orchestrator","projectId":"p","sessionId":"s"}}"#,
+        ];
+        let mut mapper = EventMapper::new("pi-f6", Arc::new(Mutex::new(Vec::new())));
+        for line in lines {
+            let event: PiEvent = serde_json::from_str(line).unwrap();
+            assert_eq!(event.event_type, "message_update");
+            let delta = event
+                .assistant_message_event
+                .as_ref()
+                .expect("assistantMessageEvent must deserialize (finding #6)");
+            mapper.apply_message_delta(delta);
+        }
+        // agent_end flushes the accumulated text into the assistant Chat entry.
+        mapper.flush_text_block();
+        let chat = mapper.entries.iter().find_map(|e| match e {
+            ConsoleEntry::Chat { role, text, .. } if role == "assistant" => {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            chat.as_deref(),
+            Some("The folder contains a README."),
+            "assistant text must reach the chat as one bubble"
+        );
     }
 
     #[test]
