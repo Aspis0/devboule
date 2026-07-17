@@ -58,14 +58,14 @@ AGENT_ROLE = "main-coder"
 
 
 def _ensure_project_pi_mcp_config(project_root: Path) -> None:
-    """Write <project_root>/.pi/mcp.json with an aspis-management entry so the
+    """Write <project_root>/.pi/mcp.json with an devboule entry so the
     sidecar's isAspisMcpConfigured() returns True (required for the ready
     event to carry oracleMCP:true, matching the round-5 ciao choreography)."""
     pi_dir = project_root / ".pi"
     pi_dir.mkdir(parents=True, exist_ok=True)
     mcp_cfg = {
         "mcpServers": {
-            "aspis-management": {
+            "devboule": {
                 "command": sys.executable,
                 "args": [
                     "-m",
@@ -126,7 +126,7 @@ def test_cloud_api_shaped_cell():
                 ready = session.wait_ready(timeout=30.0)
                 assert ready.data.get("type") == "ready"
                 assert ready.data.get("oracleMCP") is True, (
-                    "expected oracleMCP:true (aspis-management MCP configured)"
+                    "expected oracleMCP:true (devboule MCP configured)"
                 )
 
                 session.send_prompt("ciao")

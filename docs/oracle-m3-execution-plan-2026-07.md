@@ -51,7 +51,7 @@ during recon and the phase breakdown actually executed. Owner has been live on
   answerer/query_engine/LanceStore/SQLiteStore; remove `make_mcp_engine`,
   `_MCP_ENGINE_CACHE`, `ensure_oracle_index_ready`, `mcp_oracle_context/ask`
   fallback bodies; `dispatch_oracle_context/ask` raise a clean actionable
-  McpError ("Oracle server unreachable — open the Aspis Management app") when
+  McpError ("Oracle server unreachable — open the Devboule app") when
   HTTP fails or no target resolves. Keep CkgStore tools untouched. Write
   `oracle/requirements-mcp.txt` (httpx only). Adapt python tests.
 - **P12d — default flip + python engine retired (Rust+TS, small).** Default

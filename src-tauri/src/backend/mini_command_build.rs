@@ -911,7 +911,7 @@ pub(crate) fn build_mini_command_impl(
         Ok(match backend.kind {
             MiniCoderBackendKind::Codex => {
                 // P3: with the read-only oracle grant the mini's codex gets the SAME
-                // aspis-management server as full coders via the shared token builder
+                // devboule server as full coders via the shared token builder
                 // (no drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no
                 // `-c` flags ⇒ byte-identical to the MINOR 9 status quo.
                 let mut args: Vec<String> = vec!["exec".to_string()];
@@ -1016,7 +1016,7 @@ pub(crate) fn build_mini_command_impl(
                 // The `openai` CLI binary is installed by the user. Like codex, the agent
                 // writes its own result file, so we do NOT wrap stdout to the result target.
                 // With the read-only oracle grant the mini's openai gets the SAME
-                // aspis-management server as full coders via the shared token builder (no
+                // devboule server as full coders via the shared token builder (no
                 // drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no `-c` flags
                 // ⇒ plain invocation.
                 let mut args: Vec<String> =

@@ -1,4 +1,4 @@
-# Full lint sweep — Aspis-management Rust app (PLAN, do NOT execute yet)
+# Full lint sweep — Devboule Rust app (PLAN, do NOT execute yet)
 
 **Created:** 2026-06-28 · **Status:** PLANNED, not started (deferred — token budget). Resume later.
 **Branch when planned:** `censor-verifier-flow` (clean, 0 dirty). **Do the work on a dedicated branch.**
@@ -20,7 +20,7 @@ First full run ever: `cargo clippy --all-targets --all-features` on `src-tauri/`
 - Reproduce: `cd src-tauri && cargo clippy --all-targets --all-features 2>&1 | tee /tmp/clippy.log`
 - (Prior memory: `clippy --lib` was 233 = 47 dead-code + ~30 real + ~139 cosmetic doc-fmt.)
 - **Out of scope of THIS run, still TODO:** the `devboule-coder` crate (separate Cargo.toml,
-  not yet linted) + `Aspis-management-design/` copy (probably skip — scratch/design variant).
+  not yet linted) + `Devboule-design/` copy (probably skip — scratch/design variant).
 
 Lint flavor seen (mostly idiomatic, few potentially-real):
 - **Cosmetic/idiom (bulk, low risk):** `needless_return`, `unnecessary_to_owned`,

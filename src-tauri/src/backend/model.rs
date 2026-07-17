@@ -644,7 +644,7 @@ pub struct ProjectAgentLaunchInput {
     pub client: String,
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
-    /// Where the agent terminal runs: "app" (hosted inside Aspis Management via a
+    /// Where the agent terminal runs: "app" (hosted inside Devboule via a
     /// PTY) or "external" (a detached OS console window). Optional and lenient:
     /// `None`/unknown values normalize to "external" so existing callers (and the
     /// current TS invoke, which sends no `host`) keep the legacy external behavior
@@ -1187,7 +1187,7 @@ pub struct AgentSession {
         skip_serializing_if = "Option::is_none"
     )]
     pub needs_user: Option<AgentNeedsUser>,
-    // Terminal host for this agent: "app" (PTY hosted inside Aspis Management),
+    // Terminal host for this agent: "app" (PTY hosted inside Devboule),
     // "external" (detached OS console), or None when the session was not launched
     // by the app. For a LIVE agent this is a READ-TIME stamp set in
     // `get_agent_live_state` from the Rust-owned ledger (authoritative). For a

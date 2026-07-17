@@ -269,7 +269,7 @@ follow-up questions interactively.\n\n",
             ) =>
         {
             prompt.push_str(&format!(
-                "CONTEXT TOOL (read-only): you have exactly ONE MCP tool: `oracle_context` on the `aspis-management` server.\n\
+                "CONTEXT TOOL (read-only): you have exactly ONE MCP tool: `oracle_context` on the `devboule` server.\n\
 FIRST call `agent_register` with {{\"agent_id\": \"{id}\", \"role\": \"mini\", \"model\": \"<your model name>\", \"message\": \"mini reading context\", \"launch_token\": \"{token}\"}}; it returns a `session_token`.\n\
 THEN, when the front-loaded files are NOT enough, call `oracle_context` with {{\"query\": \"<what you need>\", \"agent_id\": \"{id}\", \"role\": \"mini\", \"session_token\": \"<from agent_register>\"}}.\n\
 You have NO other tools: no mutation tools, no browsing, no other MCP servers; the FILE SCOPE above still bounds every change you report.\n\n",

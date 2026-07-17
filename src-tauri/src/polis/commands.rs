@@ -186,7 +186,7 @@ impl PolisState {
 /// MCP agent live state.
 ///
 /// `project_path` is OPTIONAL: when empty/None the scan targets THIS repo (the
-/// Aspis Management root), resolved the same way the projects/workspace code
+/// Devboule root), resolved the same way the projects/workspace code
 /// resolves it (`backend::agents::management_root_for_mcp`). So the frontend can
 /// call this with no path and get a real map of this codebase (src/,
 /// src-tauri/src/, oracle/ — node_modules/target excluded by the scanner).
@@ -212,7 +212,7 @@ pub fn generate_city_state(
     let live =
         crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
 
-    // DEFAULT MAP TARGET: empty/None -> the Aspis Management root (this repo),
+    // DEFAULT MAP TARGET: empty/None -> the Devboule root (this repo),
     // resolved the same way projects/workspace do
     // (`backend::agents::management_root_for_mcp`).
     let path = resolve_scan_path(project_path, &app, &live);
@@ -383,7 +383,7 @@ fn clear_city_agents(city: &mut CityState) {
 }
 
 /// Resolve the scan TARGET path the same way `generate_city_state` does: an
-/// empty/None `project_path` maps THIS repo (the Aspis Management root); a
+/// empty/None `project_path` maps THIS repo (the Devboule root); a
 /// non-empty path is used verbatim. Shared by the scan command and the live
 /// watcher so both target the same directory.
 fn resolve_scan_path(
@@ -2105,10 +2105,10 @@ pub(crate) fn launch_editor(editor: &str, abs_path: &Path) -> Result<(), String>
             // Reveal-in-folder. `/select,<path>` selects the file in Explorer.
             //
             // FIX 5 (Windows, spaced paths): Rust's normal `arg` quotes the WHOLE
-            // argument (`"/select,C:\...\Aspis Management\x.ts"`), which explorer.exe
+            // argument (`"/select,C:\...\Devboule\x.ts"`), which explorer.exe
             // mis-parses — it does NOT use the standard CommandLineToArgvW rules and
             // ends up navigating to the wrong place for a path containing spaces
-            // (this machine's root is "Aspis Management"). The documented-correct
+            // (this machine's root is "Devboule"). The documented-correct
             // invocation quotes ONLY the path: `/select,"<path>"`. We build that exact
             // command-line fragment with `raw_arg` so libstd does not re-quote it.
             let mut cmd = Command::new("explorer");
@@ -2820,21 +2820,21 @@ mod tests {
         #[cfg(windows)]
         {
             let p = projects_dir_from_state_path(
-                r"C:\Users\gualt\Desktop\Aspis Management\projects\.aspis-agents.json",
+                r"C:\Users\gualt\Desktop\Devboule\projects\.aspis-agents.json",
             );
             assert_eq!(
                 p,
-                PathBuf::from(r"C:\Users\gualt\Desktop\Aspis Management\projects")
+                PathBuf::from(r"C:\Users\gualt\Desktop\Devboule\projects")
             );
         }
         #[cfg(not(windows))]
         {
             let p = projects_dir_from_state_path(
-                "/Users/gualt/Desktop/Aspis Management/projects/.aspis-agents.json",
+                "/Users/gualt/Desktop/Devboule/projects/.aspis-agents.json",
             );
             assert_eq!(
                 p,
-                PathBuf::from("/Users/gualt/Desktop/Aspis Management/projects")
+                PathBuf::from("/Users/gualt/Desktop/Devboule/projects")
             );
         }
         // Empty / rootless input stays empty (caller falls back to "projects").

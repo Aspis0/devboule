@@ -1,5 +1,5 @@
 // CliAgentsCard — registers the Oracle MCP in the local `claude`/`codex` user
-// config. Oracle-specific (registers the `aspis-management` Oracle MCP server),
+// config. Oracle-specific (registers the `devboule` Oracle MCP server),
 // not a general CLI-agents feature. Moved here from SettingsView's Account tab
 // so all Oracle surfaces live on the Oracle page.
 import { useCallback, useEffect, useRef, useState } from "react";

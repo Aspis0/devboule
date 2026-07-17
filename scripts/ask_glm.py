@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin OpenRouter caller — delegate coding/critique to GLM-5.2 (and friends).
 
-Aspis-management copy of review-experts/src/ask_glm.py, with the effort choices
+Devboule copy of review-experts/src/ask_glm.py, with the effort choices
 extended to include `minimal` and `xhigh` (xhigh = the real max on OpenRouter for
 z-ai/glm-5.2; measured ~+84% reasoning tokens vs high). NOTE: at xhigh, reasoning
 consumes a large share of the completion budget — pass a generous --max-tokens

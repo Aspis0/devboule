@@ -1044,7 +1044,7 @@ fn mcp_client_config_hint_for_paths(
     }
     serde_json::to_string_pretty(&json!({
         "mcpServers": {
-            "aspis-management": {
+            "devboule": {
                 "command": "python",
                 "args": [
                     "-m",
@@ -1063,7 +1063,7 @@ fn mcp_client_config_hint_for_paths(
 }
 
 pub fn management_root_for_mcp(app: &tauri::AppHandle, projects_dir: &Path) -> PathBuf {
-    if let Ok(value) = std::env::var("ASPIS_MANAGEMENT_ROOT") {
+    if let Ok(value) = std::env::var("DEVBOULE_ROOT") {
         if let Some(path) = normalize_management_root_candidate(&PathBuf::from(value.trim())) {
             return path;
         }
@@ -2081,7 +2081,7 @@ mod tests {
     #[test]
     fn management_root_requires_mcp_entrypoint() {
         let root =
-            std::env::temp_dir().join(format!("aspis-management-root-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("devboule-root-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("oracle").join("server")).unwrap();
         fs::write(root.join("config.json"), "{}").unwrap();
@@ -2107,7 +2107,7 @@ mod tests {
     #[test]
     fn management_root_accepts_split_layout_config_under_src_tauri() {
         let root = std::env::temp_dir().join(format!(
-            "aspis-management-split-root-test-{}",
+            "devboule-split-root-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -2141,7 +2141,7 @@ mod tests {
     #[test]
     fn management_root_accepts_self_contained_src_tauri_dir() {
         let parent = std::env::temp_dir().join(format!(
-            "aspis-management-selfcontained-test-{}",
+            "devboule-selfcontained-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&parent);
@@ -2163,7 +2163,7 @@ mod tests {
     #[test]
     fn manual_mcp_hints_enable_cloudflare_profile_mode() {
         let root = std::env::temp_dir().join(format!(
-            "aspis-management-mcp-hint-test-{}",
+            "devboule-mcp-hint-test-{}",
             std::process::id()
         ));
         let projects = root.join("projects");

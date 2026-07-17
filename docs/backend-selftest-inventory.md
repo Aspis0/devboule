@@ -68,7 +68,7 @@ each with `_devboule{agentRole,projectId,sessionId}` → `{"type":"response",
 "command":"prompt","success":bool,"error"?}` per turn. Internal events:
 `devboule_censor_review`, `compaction_*`, `auto_retry_*`, `error`, `queue_dropped`.
 
-MCP prerequisites: `<project_root>/.pi/mcp.json` with `aspis-management` entry
+MCP prerequisites: `<project_root>/.pi/mcp.json` with `devboule` entry
 (Rust merge-writes it at spawn via `ensure_project_pi_mcp_config`), sibling
 `node_modules` next to sidecar.mjs (resolver requirement), `PI_CODING_AGENT_DIR`
 with `settings.json`.

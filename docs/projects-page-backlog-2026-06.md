@@ -174,7 +174,7 @@ with / shown on the project (it lingers as a project session). Relates to B10 (a
 ### B13 — "Changes" view shows the whole working-tree diff, not the project's changes
 **What:** the Changes section on the single-project page is genuinely nice, BUT it shows ALL
 git changes in the working tree — e.g. unrelated edits to the SAME repo (the owner saw OUR edits
-to `ProjectsView.tsx` while the project's working tree was the Aspis-management repo). It
+to `ProjectsView.tsx` while the project's working tree was the Devboule repo). It
 should show only the changes THAT PROJECT's agents made, not the whole tree's diff.
 **Where:** the changes/diff backend (`changes.rs`?) + the Changes view — scope to the
 project's agent activity (e.g. a baseline ref captured when the agent starts, or the agent's

@@ -52,7 +52,7 @@
 //! languages can still over-connect on shared short names, mitigated as described above.
 //!
 //! PRODUCTION CALLER (Phase 11.2): the builder is no longer "dark". The headless CLI
-//! bridge [`run_structure_cli`] (invoked as `aspis-management structure --root <path>`,
+//! bridge [`run_structure_cli`] (invoked as `devboule structure --root <path>`,
 //! detected in `main` before the GUI builder runs) calls [`build_structure_graph`] and
 //! prints the [`StructureGraph`] as JSON to stdout, so the shared, read-only
 //! `project_structure` MCP tool can reuse THIS builder (zero tree-sitter duplication) by
@@ -356,7 +356,7 @@ pub fn build_structure_graph(project_root: &Path) -> Result<StructureGraph, Stri
     })
 }
 
-/// The argv token that selects the headless STRUCTURE bridge: `aspis-management
+/// The argv token that selects the headless STRUCTURE bridge: `devboule
 /// structure --root <path>`. Detected in `main` BEFORE the Tauri GUI builder runs, so the
 /// process behaves as a one-shot CLI (no window) when invoked this way. Kept here next to
 /// the builder so the bridge and the graph never drift.
@@ -1280,16 +1280,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ---- CLI bridge (`aspis-management structure --root <path>`) ----------------------
+    // ---- CLI bridge (`devboule structure --root <path>`) ----------------------
 
     #[test]
     fn cli_non_structure_argv_returns_none() {
         // A normal app launch (no `structure` subcommand) must NOT trigger the bridge,
         // so `main` proceeds to the GUI. Both an empty argv tail and an unrelated first
         // arg yield None.
-        assert_eq!(run_structure_cli(["aspis-management"]), None);
+        assert_eq!(run_structure_cli(["devboule"]), None);
         assert_eq!(
-            run_structure_cli(["aspis-management", "--some-tauri-flag"]),
+            run_structure_cli(["devboule", "--some-tauri-flag"]),
             None
         );
     }
@@ -1323,7 +1323,7 @@ mod tests {
         // The dispatcher recognizes the subcommand + --root and reports success.
         let root_s = dir.to_string_lossy().into_owned();
         let code = run_structure_cli([
-            "aspis-management".to_string(),
+            "devboule".to_string(),
             STRUCTURE_SUBCOMMAND.to_string(),
             "--root".to_string(),
             root_s,
@@ -1340,7 +1340,7 @@ mod tests {
         let dir = unique_temp_root("cli-bad");
         let missing = dir.join("does-not-exist");
         let code = run_structure_cli([
-            "aspis-management".to_string(),
+            "devboule".to_string(),
             STRUCTURE_SUBCOMMAND.to_string(),
             "--root".to_string(),
             missing.to_string_lossy().into_owned(),
@@ -1357,18 +1357,18 @@ mod tests {
         // extra token: each is a usage error → Some(2), never None (which would fall
         // through to the GUI) and never 0.
         assert_eq!(
-            run_structure_cli(["aspis-management", STRUCTURE_SUBCOMMAND]),
+            run_structure_cli(["devboule", STRUCTURE_SUBCOMMAND]),
             Some(2),
             "missing --root is a usage error"
         );
         assert_eq!(
-            run_structure_cli(["aspis-management", STRUCTURE_SUBCOMMAND, "--root"]),
+            run_structure_cli(["devboule", STRUCTURE_SUBCOMMAND, "--root"]),
             Some(2),
             "--root with no value is a usage error"
         );
         assert_eq!(
             run_structure_cli([
-                "aspis-management",
+                "devboule",
                 STRUCTURE_SUBCOMMAND,
                 "--bogus",
                 "x",

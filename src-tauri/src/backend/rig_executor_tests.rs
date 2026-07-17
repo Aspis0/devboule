@@ -2,7 +2,7 @@
 //!
 //! Every test is `#[ignore]` — run with:
 //! ```sh
-//! cargo test -p aspis-management rig_executor -- --ignored
+//! cargo test -p devboule rig_executor -- --ignored
 //! ```
 //!
 //! Mirrors the `mini_coder_executor_tests.rs` house pattern: child module of
@@ -929,7 +929,7 @@ fn test_agentic_allowlist_blocks_out_of_scope_write() {
 /// executor. The other 3 sites (timeout reap, stuck-launching reap, parent-gone
 /// reap) are bypass paths that DO NOT go through `finalize_finished_mini`.
 ///
-/// Run with: cargo test -p aspis-management rig_executor -- --ignored
+/// Run with: cargo test -p devboule rig_executor -- --ignored
 #[test]
 #[ignore = "rig layer B: run with --ignored"]
 fn test_stuck_report_persists_on_directive_row() {

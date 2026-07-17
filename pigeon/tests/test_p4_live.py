@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]   # .../Aspis-management
+REPO = Path(__file__).resolve().parents[2]   # .../Devboule
 PYTHON = sys.executable
 
 

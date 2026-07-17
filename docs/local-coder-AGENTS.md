@@ -14,7 +14,7 @@ report `needs_clarification` — never guess.
 ## Environment
 - macOS on Apple Silicon (some users on Windows). You run LOCALLY via oMLX/Ollama on an
   OpenAI-compatible endpoint.
-- Project: **devboule / Aspis-management** — a **Tauri** app. Rust backend in
+- Project: **devboule / Devboule** — a **Tauri** app. Rust backend in
   `src-tauri/src/backend/`; a standalone `devboule-coder/` Rust crate; React/TypeScript
   frontend in `src/`; Python MCP/oracle under `oracle/`.
 - Prefer `rg` over `grep`, and `fd` over `find` when available.

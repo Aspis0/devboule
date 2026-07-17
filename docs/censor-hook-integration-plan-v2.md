@@ -331,7 +331,7 @@ pub struct EscalationFinding { ... }  // ← TIPO CHE VIENE RIMOSSO
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Aspis Management                                 │
+│                         Devboule                                 │
 │                                                                          │
 │  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐   │
 │  │  Devboule-Coder   │    │    Censor        │    │  Oracle MCP      │   │

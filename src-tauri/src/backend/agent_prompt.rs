@@ -261,7 +261,7 @@ Working root: {root_path}\n\
 Launch token: {launch_token}\n\
 {task_line}\
 \n\
-Use the MCP server named aspis-management.\n\
+Use the MCP server named devboule.\n\
 First call agent_register(agent_id=\"{agent_id}\", role=\"{role}\", model=\"{model_value}\", message=\"starting {project_id}\", launch_token=\"{launch_token}\"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.\n\
 Keep the returned sessionToken private and pass it as session_token=\"<sessionToken>\" on every later MCP call.\n\
 Then call provider_credentials_status(agent_id=\"{agent_id}\", role=\"{role}\", session_token=\"<sessionToken>\"), project_get(project_id=\"{project_id}\", agent_id=\"{agent_id}\", role=\"{role}\", session_token=\"<sessionToken>\") and oracle_context(query=\"<specific question>\", agent_id=\"{agent_id}\", role=\"{role}\", project_id=\"{project_id}\", session_token=\"<sessionToken>\") before acting.\n\

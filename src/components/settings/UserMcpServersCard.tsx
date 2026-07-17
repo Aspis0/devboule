@@ -322,7 +322,7 @@ export function McpServerList({ scope, projectRoot }: McpServerListProps) {
   );
 }
 
-// Settings card: GLOBAL scope. The Oracle (`aspis-management`) is a built-in and
+// Settings card: GLOBAL scope. The Oracle (`devboule`) is a built-in and
 // is excluded from this list by the backend (the backend never puts it in the
 // user-mcp-servers.json file). No projectRoot is needed for global scope.
 export function UserMcpServersCard() {

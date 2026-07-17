@@ -1623,7 +1623,7 @@ fn prepare_or_launch_project_agent(
     // role always equals what the binary registers as (`agent_register`, config.rs).
     let role =
         super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
-    // "app" -> hosted PTY inside Aspis Management; anything else (incl. None and
+    // "app" -> hosted PTY inside Devboule; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
     let host = normalize_agent_host(input.host.as_deref());
@@ -4144,7 +4144,7 @@ pub(crate) struct OrchestratorLaunchConfig {
     pub(crate) agent_id: String,
     /// `DEVBOULE_PROJECT_ROOT`: the project folder being worked on.
     pub(crate) project_root: PathBuf,
-    /// `DEVBOULE_APP_BIN`: the running Aspis Management app binary (owns the headless
+    /// `DEVBOULE_APP_BIN`: the running Devboule app binary (owns the headless
     /// `structure --root <path>` subcommand). The orchestrator binary forwards this to
     /// the MCP child it spawns as `ASPIS_APP_BIN`, so the server's read-only
     /// `project_structure` tool can shell out to the Rust structure builder (zero
@@ -4810,7 +4810,7 @@ pub(crate) fn mcp_client_config_json(
     // Oracle FIRST and unaffected (design §5.1). Build the map, then append user servers.
     let mut servers = serde_json::Map::new();
     servers.insert(
-        "aspis-management".into(),
+        "devboule".into(),
         serde_json::json!({
             "command": python,
             "args": [
@@ -4828,7 +4828,7 @@ pub(crate) fn mcp_client_config_json(
     for server in user_servers {
         // Defense in depth: a reserved name can never have reached here (the add command and
         // the fail-open reader both reject it), but skip it anyway so the Oracle entry can
-        // never be overwritten by a user server keyed `aspis-management`.
+        // never be overwritten by a user server keyed `devboule`.
         if servers.contains_key(&server.name) {
             continue;
         }
@@ -5596,7 +5596,7 @@ fn resolve_context_window(
     8192
 }
 
-/// Resolve the RUNNING app binary path (`aspis-management`), which owns the headless
+/// Resolve the RUNNING app binary path (`devboule`), which owns the headless
 /// `structure --root <path>` subcommand. Threaded to every MCP launch site as the
 /// `ASPIS_APP_BIN` env var so the shared, read-only `project_structure` MCP tool can shell
 /// out to it and REUSE the Rust structure builder (zero tree-sitter duplication). Returns
@@ -8051,7 +8051,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn mcp_client_configs_enable_cloudflare_profile_mode_without_tokens() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
         let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
@@ -8070,15 +8070,15 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // `project_structure` tool can shell out to the Rust structure builder. When the
         // app binary is unavailable (None) the env key must be ENTIRELY absent (so the
         // Python tool fails closed with a clear error, never an empty path).
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
-        let app_bin = "/opt/aspis/aspis-management";
+        let app_bin = "/opt/aspis/devboule";
 
         let codex_with =
             codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).join(" ");
         let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]);
         assert!(
-            codex_with.contains("mcp_servers.aspis-management.env.ASPIS_APP_BIN="),
+            codex_with.contains("mcp_servers.devboule.env.ASPIS_APP_BIN="),
             "codex args must set ASPIS_APP_BIN: {codex_with}"
         );
         assert!(
@@ -8135,7 +8135,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn user_server_appears_in_claude_and_codex_configs_after_oracle() {
         // Phase A.2 acceptance: a configured "my-db" server appears in BOTH the claude
         // `.mcp.json` and the codex `-c mcp_servers.*` args, AFTER the Oracle entry.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let servers = [user_server_fixture()];
 
@@ -8144,7 +8144,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
         let oracle_pos_claude = claude
-            .find("\"aspis-management\"")
+            .find("\"devboule\"")
             .expect("oracle key present");
         let user_pos_claude = claude.find("\"my-db\"").expect("user key present");
         assert!(
@@ -8159,7 +8159,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         // Codex: Oracle tokens come first, then the user-server tokens.
         let oracle_pos_codex = codex
-            .find("mcp_servers.aspis-management.command")
+            .find("mcp_servers.devboule.command")
             .expect("oracle command");
         let user_pos_codex = codex
             .find("mcp_servers.my-db.command")
@@ -8180,7 +8180,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // byte-identical to passing an empty slice (the only call shape after A.2).
         // We assert the empty-slice output equals a hand-built Oracle-only expectation
         // by checking it contains exactly the Oracle key and no stray user keys.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
         let claude_empty = mcp_client_config_json("python3", &root, &projects, None, &[]);
@@ -8192,20 +8192,20 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             1,
             "only the Oracle command"
         );
-        assert!(claude_empty.contains("\"aspis-management\""));
-        // The codex args carry only `mcp_servers.aspis-management.*` tokens.
-        assert!(codex_empty.contains("mcp_servers.aspis-management.command"));
+        assert!(claude_empty.contains("\"devboule\""));
+        // The codex args carry only `mcp_servers.devboule.*` tokens.
+        assert!(codex_empty.contains("mcp_servers.devboule.command"));
         assert!(!codex_empty.contains("mcp_servers.my-db"));
         // And the Oracle is unaffected: its standard env keys are all present.
         assert!(claude_empty.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(codex_empty.contains("mcp_servers.aspis-management.env.PYTHONPATH"));
+        assert!(codex_empty.contains("mcp_servers.devboule.env.PYTHONPATH"));
     }
 
     #[test]
     fn user_server_with_empty_args_omits_the_args_token() {
         // FIX 5: a user server with NO args must NOT emit `mcp_servers.<name>.args=[]` (matches
         // the Oracle, which never emits an empty args token). `command` is always present.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let mut server = user_server_fixture();
         server.args = Vec::new();
@@ -8387,7 +8387,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // enabled subset, injects exactly those — the merge filter is unit-tested in
         // user_mcp_config. Here: passing an empty slice (the disabled-only case) yields
         // no user keys.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let claude = mcp_client_config_json("python3", &root, &projects, None, &[]);
         assert!(!claude.contains("\"my-db\""));
@@ -8415,7 +8415,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             mcp_projects_dir: PathBuf::from("/srv/aspis-mcp-root/projects"),
             agent_id: "orchestrator-sentinel-42".to_string(),
             project_root: PathBuf::from("/work/the-project"),
-            app_bin: "/opt/aspis/aspis-management".to_string(),
+            app_bin: "/opt/aspis/devboule".to_string(),
             activity_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl".to_string(),
             steer_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl.steer".to_string(),
             // 3c — the project key the planner submits under. 3b — plan-first ON.
@@ -8479,7 +8479,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             "/srv/aspis-mcp-root/projects",
             "orchestrator-sentinel-42",
             "/work/the-project",
-            "/opt/aspis/aspis-management",
+            "/opt/aspis/devboule",
             "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl",
             // 3c — the project key value.
             "the-project-sentinel",
@@ -8738,7 +8738,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // and it stalls in launch_pending. The interpreter is threaded in as a
         // parameter so the launch path resolves it ONCE via resolve_oracle_python().
         // These two builders are compiled on every platform.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
@@ -8759,7 +8759,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn macos_launch_lines_use_resolved_interpreter_not_bare_python() {
         // BUG #14, macOS launch lines (cfg-gated, so this test is too — otherwise
         // the symbol is absent on Windows/Linux and the test module won't compile).
-        let root = PathBuf::from("/Users/me/Aspis Management");
+        let root = PathBuf::from("/Users/me/Devboule");
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
@@ -8779,7 +8779,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // (claude) / `-m <m>` (codex) when a model is selected, and emit NOTHING
         // model-related when None (so the CLI uses its own default). These two
         // builders are compiled on every platform.
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
@@ -8804,7 +8804,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[test]
     fn macos_launch_lines_pass_selected_model_to_the_cli() {
         // BUG #15 on the macOS launch lines (cfg-gated, so this test is too).
-        let root = PathBuf::from("/Users/me/Aspis Management");
+        let root = PathBuf::from("/Users/me/Devboule");
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
@@ -8827,7 +8827,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn codex_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
         let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
@@ -8842,7 +8842,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn claude_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
         let claude = claude_launch_script("python3", &root, &projects, None, None, &[]);
@@ -8911,7 +8911,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // reference the prompt only as a piped PowerShell variable, never inline
         // the prompt text onto the codex/claude command line.
         let prompt = "model=\"<your model>\", message=\"starting <run>\"\nsecond line";
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
         let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
@@ -8934,7 +8934,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[cfg(windows)]
     #[test]
     fn windows_bare_client_script_never_echoes_prompt_to_pty() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let (prompt_file, script) = build_windows_agent_script(
             "coder-1",
@@ -8967,7 +8967,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[cfg(windows)]
     #[test]
     fn windows_codex_claude_scripts_never_echo_prompt_to_pty() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         for client in ["codex", "claude"] {
             let (prompt_file, script) = build_windows_agent_script(
@@ -9009,7 +9009,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[cfg(windows)]
     #[test]
     fn windows_agent_script_neutralizes_inherited_git_credentials() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let (prompt_file, script) = build_windows_agent_script(
             "coder-1",
@@ -9447,7 +9447,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[cfg(windows)]
     #[test]
     fn windows_custom_client_script_uses_prompt_file_env_and_never_echoes_token() {
-        let root = PathBuf::from("C:\\Aspis Management");
+        let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
         let command = "deepseek chat --flag";
         let (prompt_file, script) = build_windows_agent_script(
@@ -10725,7 +10725,7 @@ Working root: C:\Users\gualt\Desktop\aspis bio
 Launch token: test-launch-token
 Preferred task_id: T1
 
-Use the MCP server named aspis-management.
+Use the MCP server named devboule.
 First call agent_register(agent_id="coder-1", role="coder", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
 Then call provider_credentials_status(agent_id="coder-1", role="coder", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="coder-1", role="coder", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="coder-1", role="coder", project_id="scrna-seq", session_token="<sessionToken>") before acting.
@@ -10767,7 +10767,7 @@ Agent id: verifier-1
 Working root: C:\Users\gualt\Desktop\aspis bio
 Launch token: test-launch-token
 
-Use the MCP server named aspis-management.
+Use the MCP server named devboule.
 First call agent_register(agent_id="verifier-1", role="verifier", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
 Then call provider_credentials_status(agent_id="verifier-1", role="verifier", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="verifier-1", role="verifier", project_id="scrna-seq", session_token="<sessionToken>") before acting.
@@ -10807,7 +10807,7 @@ Working root: C:\Users\gualt\Desktop\aspis bio
 Launch token: test-launch-token
 Preferred task_id: T1
 
-Use the MCP server named aspis-management.
+Use the MCP server named devboule.
 First call agent_register(agent_id="orch-1", role="orchestrator", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
 Then call provider_credentials_status(agent_id="orch-1", role="orchestrator", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="orch-1", role="orchestrator", project_id="scrna-seq", session_token="<sessionToken>") before acting.

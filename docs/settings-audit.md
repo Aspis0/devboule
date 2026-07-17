@@ -1,7 +1,7 @@
 # Settings Surface Audit — Full Inventory
 
 **Date:** 2026-07-08  
-**App:** Aspis Management (Tauri + React)  
+**App:** Devboule (Tauri + React)  
 **Purpose:** Complete map of every Settings card, its config keys, backend commands, runtime consumers, overlaps, and obsolescence.  
 
 ---
@@ -128,7 +128,7 @@ The `DetectedProvidersStrip` and `DesignLlmBackendCard` both focus on local dete
 
 **Card:** `CliAgentsCard` ("CLI AGENTS — Give the local Claude/Codex CLI the Oracle MCP")
 
-**What it writes:** `~/.claude.json` (user-scope Claude config). Adds an `mcpServers.aspis-management` entry with `command`, `args`, and `env`. The command points at the Oracle venv Python (`aspis_mcp.py -m oracle.server.aspis_mcp --root ... --projects-dir ...`). **No API token is stored.** Backed up to `~/.claude.json.aspis-bak`.
+**What it writes:** `~/.claude.json` (user-scope Claude config). Adds an `mcpServers.devboule` entry with `command`, `args`, and `env`. The command points at the Oracle venv Python (`aspis_mcp.py -m oracle.server.aspis_mcp --root ... --projects-dir ...`). **No API token is stored.** Backed up to `~/.claude.json.aspis-bak`.
 
 **Runtime consumer:** Any `claude` CLI started in a terminal reads `~/.claude.json` and starts the Oracle MCP alongside. The Oracle MCP (`aspis_mcp.py`) then resolves its own auth token from the `.aspis-agents.json` discovery file written by the app.
 

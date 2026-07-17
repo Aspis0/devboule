@@ -196,7 +196,7 @@ fn cost_for(tokens: &TokenCounts, model: Option<&str>) -> Option<f64> {
 
 /// Mangle an absolute cwd to Claude Code's `~/.claude/projects/<dir>` directory
 /// name. Derived from THIS repo's own observed dir:
-///   `C:\Users\gualt\Desktop\Aspis Management` -> `C--Users-gualt-Desktop-Aspis-Management`
+///   `C:\Users\gualt\Desktop\Devboule` -> `C--Users-gualt-Desktop-Devboule`
 /// The rule Claude Code uses: every character that is NOT `[A-Za-z0-9]` is replaced
 /// by a single `-` (so `:`, `\`, `/`, space, and `.` all become `-`). Note the
 /// leading drive `C:` becomes `C-` and the following `\` adds another `-`, yielding
@@ -496,8 +496,8 @@ mod tests {
     fn mangles_known_repo_path_to_observed_dir() {
         // The exact rule, derived from this repo's real dir under ~/.claude/projects.
         assert_eq!(
-            mangle_cwd_to_project_dir(r"C:\Users\gualt\Desktop\Aspis Management"),
-            "C--Users-gualt-Desktop-Aspis-Management"
+            mangle_cwd_to_project_dir(r"C:\Users\gualt\Desktop\Devboule"),
+            "C--Users-gualt-Desktop-Devboule"
         );
     }
 

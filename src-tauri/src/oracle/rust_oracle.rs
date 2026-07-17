@@ -304,7 +304,7 @@ mod live_test {
     //! client carrying the operator token — exactly as the app's reqwest client
     //! does. Requires the model symlinked/copied at `<repo>/oracle-data/models/
     //! qwen3-onnx/`. Run:
-    //!   cargo test -p aspis-management --lib rust_oracle::live_test -- --ignored --nocapture
+    //!   cargo test -p devboule --lib rust_oracle::live_test -- --ignored --nocapture
 
     use super::*;
     use std::sync::atomic::AtomicBool;
@@ -400,7 +400,7 @@ mod live_test {
     /// lands in the repo. Skips if the key is unset. Invoke e.g.:
     ///   ORACLE_LLM_PROVIDER=deepseek ORACLE_LLM_MODEL=deepseek-chat \
     ///   ORACLE_LLM_API_KEY=sk-... \
-    ///   cargo test -p aspis-management --lib rust_oracle::live_test::ask_llm_live \
+    ///   cargo test -p devboule --lib rust_oracle::live_test::ask_llm_live \
     ///     -- --ignored --nocapture
     #[test]
     #[ignore]

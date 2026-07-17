@@ -2730,7 +2730,7 @@ root_path: "{escaped_work_root}"
     def test_app_vault_target_matches_rust_keyring_convention(self):
         self.assertEqual(
             app_vault_target("provider:cloudflare"),
-            "provider:cloudflare.Aspis Management",
+            "provider:cloudflare.Devboule",
         )
 
     def test_provider_mcp_reads_existing_app_vault_fields(self):
@@ -3176,7 +3176,7 @@ root_path: "{escaped_work_root}"
         # resolved output on every OS: on Windows "C:/tmp/..." is already
         # absolute (resolve is a no-op); on POSIX it is relative, so both
         # sides must be anchored the same way before comparing.
-        root = Path("C:/tmp/Aspis Management").resolve()
+        root = Path("C:/tmp/Devboule").resolve()
         with patch.dict("os.environ", {}, clear=True):
             paths = mcp_oracle_paths(root / "projects")
 

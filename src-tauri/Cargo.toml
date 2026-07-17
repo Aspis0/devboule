@@ -1,22 +1,22 @@
 [package]
-name = "aspis-management"
+name = "devboule"
 version = "0.1.0"
 description = "Devboule — local agent orchestration dashboard"
 edition = "2021"
 # With two `[[bin]]` targets declared below, `cargo run` (as invoked by `tauri dev`)
 # cannot infer which to launch. Pin the GUI binary as the default so `tauri dev`/`build`
 # run the app; `claude_consent_hook` is built but only spawned explicitly by Claude Code.
-default-run = "aspis-management"
+default-run = "devboule"
 
 [lib]
-name = "aspis_management_lib"
+name = "devboule_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 # The default GUI binary. Declared EXPLICITLY because adding the second `[[bin]]` below
 # disables Cargo's auto-discovery of `src/main.rs` — without this entry the app binary
 # would silently stop building.
 [[bin]]
-name = "aspis-management"
+name = "devboule"
 path = "src/main.rs"
 
 # Slice 5b: the standalone Claude Code PreToolUse hook helper. A separate process (no
@@ -24,7 +24,7 @@ path = "src/main.rs"
 # through the .aspis-agents.json consent file-bridge into the app's consent UI. The body
 # lives in the lib (`run_claude_consent_hook`) so it reuses the same file-lock +
 # serializer; this bin is a thin shim. Declared explicitly so it builds alongside the
-# default `aspis-management` GUI binary (src/main.rs).
+# default `devboule` GUI binary (src/main.rs).
 [[bin]]
 name = "claude_consent_hook"
 path = "src/bin/claude_consent_hook.rs"

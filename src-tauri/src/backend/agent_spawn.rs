@@ -496,7 +496,7 @@ $promptFile = {prompt_path_label}\n\
 $prompt = Get-Content -Raw -LiteralPath $promptFile\n\
 {prompt_file_lifecycle}\
 Set-Clipboard -Value $prompt\n\
-$env:ASPIS_MANAGEMENT_ROOT = {management_root_label}\n\
+$env:DEVBOULE_ROOT = {management_root_label}\n\
 $env:ASPIS_PROJECTS_DIR = {projects_dir_label}\n\
 $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
 $env:GIT_TERMINAL_PROMPT = '0'\n\
@@ -729,7 +729,7 @@ pub(crate) fn build_macos_agent_script(
     }
     // Export the same env vars the Windows path sets.
     script.push_str(&format!(
-        "export ASPIS_MANAGEMENT_ROOT={}\n",
+        "export DEVBOULE_ROOT={}\n",
         sh_single_quote(&management_root.display().to_string())
     ));
     script.push_str(&format!(
@@ -1078,7 +1078,7 @@ fn shell_env_name(name: &str) -> String {
 /// macOS-only: build the codex CLI invocation line for the launch script. Mirrors
 /// `codex_launch_script` (the Windows/PowerShell variant) but emits a single
 /// POSIX-shell line that pipes the prompt via STDIN (keeping the launch token off
-/// the argv) and passes the same `-c mcp_servers.aspis-management.*` config.
+/// the argv) and passes the same `-c mcp_servers.devboule.*` config.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_codex_launch_line(
@@ -1104,32 +1104,32 @@ pub(crate) fn macos_codex_launch_line(
     ]);
     let mut config_args: Vec<String> = vec![
         format!(
-            "mcp_servers.aspis-management.command={}",
+            "mcp_servers.devboule.command={}",
             toml_string(python)
         ),
-        format!("mcp_servers.aspis-management.args={mcp_args}"),
+        format!("mcp_servers.devboule.args={mcp_args}"),
         format!(
-            "mcp_servers.aspis-management.cwd={}",
+            "mcp_servers.devboule.cwd={}",
             toml_string(&management_root_s)
         ),
         format!(
-            "mcp_servers.aspis-management.env.PYTHONPATH={}",
+            "mcp_servers.devboule.env.PYTHONPATH={}",
             toml_string(&management_root_s)
         ),
         format!(
-            "mcp_servers.aspis-management.env.PYTHONIOENCODING={}",
+            "mcp_servers.devboule.env.PYTHONIOENCODING={}",
             toml_string("utf-8")
         ),
         format!(
-            "mcp_servers.aspis-management.env.HF_HUB_OFFLINE={}",
+            "mcp_servers.devboule.env.HF_HUB_OFFLINE={}",
             toml_string("1")
         ),
         format!(
-            "mcp_servers.aspis-management.env.TRANSFORMERS_OFFLINE={}",
+            "mcp_servers.devboule.env.TRANSFORMERS_OFFLINE={}",
             toml_string("1")
         ),
         format!(
-            "mcp_servers.aspis-management.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
+            "mcp_servers.devboule.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
             toml_string("1")
         ),
     ];
@@ -1138,7 +1138,7 @@ pub(crate) fn macos_codex_launch_line(
     // tree-sitter duplication). Omitted when `current_exe` is unavailable. NOT a secret.
     if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
         config_args.push(format!(
-            "mcp_servers.aspis-management.env.ASPIS_APP_BIN={}",
+            "mcp_servers.devboule.env.ASPIS_APP_BIN={}",
             toml_string(app_bin)
         ));
     }
@@ -1350,7 +1350,7 @@ pub(crate) fn macos_claude_launch_line(
 // {agent_register, oracle_context} — project-mutation / spawn_mini_coder /
 // censor_dispose are rejected at the MCP role gate, not hidden by config.
 
-/// P3: the codex `-c mcp_servers.aspis-management.*` config tokens, UNQUOTED —
+/// P3: the codex `-c mcp_servers.devboule.*` config tokens, UNQUOTED —
 /// each caller applies its own shell quoting (PowerShell vs `/bin/sh`). Shared
 /// by the FULL coder launch (`codex_launch_script`) and the read-only mini
 /// grant (mini_coder_executor): both wire the SAME server; the mini's scope is
@@ -1379,39 +1379,39 @@ pub(crate) fn codex_mcp_config_args(
     let mut out = vec![
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.command={}",
+            "mcp_servers.devboule.command={}",
             toml_string(python)
         ),
         "-c".to_string(),
-        format!("mcp_servers.aspis-management.args={mcp_args}"),
+        format!("mcp_servers.devboule.args={mcp_args}"),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.cwd={}",
+            "mcp_servers.devboule.cwd={}",
             toml_string(&management_root_s)
         ),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.env.PYTHONPATH={}",
+            "mcp_servers.devboule.env.PYTHONPATH={}",
             toml_string(&management_root_s)
         ),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.env.PYTHONIOENCODING={}",
+            "mcp_servers.devboule.env.PYTHONIOENCODING={}",
             toml_string("utf-8")
         ),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.env.HF_HUB_OFFLINE={}",
+            "mcp_servers.devboule.env.HF_HUB_OFFLINE={}",
             toml_string("1")
         ),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.env.TRANSFORMERS_OFFLINE={}",
+            "mcp_servers.devboule.env.TRANSFORMERS_OFFLINE={}",
             toml_string("1")
         ),
         "-c".to_string(),
         format!(
-            "mcp_servers.aspis-management.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
+            "mcp_servers.devboule.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
             toml_string("1")
         ),
     ];
@@ -1422,7 +1422,7 @@ pub(crate) fn codex_mcp_config_args(
     if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
         out.push("-c".to_string());
         out.push(format!(
-            "mcp_servers.aspis-management.env.ASPIS_APP_BIN={}",
+            "mcp_servers.devboule.env.ASPIS_APP_BIN={}",
             toml_string(app_bin)
         ));
     }
@@ -1440,7 +1440,7 @@ pub(crate) fn codex_mcp_config_args(
 /// each in a `-c` pair) and the macOS `macos_codex_launch_line` (which shell-quotes each
 /// and prefixes `-c`), so the two codex paths cannot drift. Reuses the SAME
 /// `toml_string`/`toml_array` helpers as the Oracle tokens. `name` is guarded
-/// (no reserved prefix, never `aspis-management`) before it reaches here.
+/// (no reserved prefix, never `devboule`) before it reaches here.
 fn codex_user_server_config_settings(server: &user_mcp_config::UserMcpServer) -> Vec<String> {
     let name = &server.name;
     // `command` is always emitted. `args` is emitted ONLY when non-empty — matching the

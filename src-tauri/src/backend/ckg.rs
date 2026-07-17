@@ -45,7 +45,7 @@ pub struct CkgGraph {
     pub capped: bool,
 }
 
-/// The argv token that selects the headless CKG bridge: `aspis-management ckg --root <path>`.
+/// The argv token that selects the headless CKG bridge: `devboule ckg --root <path>`.
 pub const CKG_SUBCOMMAND: &str = "ckg";
 
 /// Build the Code Knowledge Graph for `project_root`: one FILE node per parseable file plus

@@ -5395,7 +5395,7 @@ pub(crate) fn session_recently_seen(
 ///   1. EXACT rel-path match: the normalized input equals a building's
 ///      `file_path`. The strongest, unambiguous signal.
 ///   2. SUFFIX match: a building's `file_path` is a path-segment suffix of the
-///      normalized input (e.g. input `.../Aspis Management/src/main.rs` ends with
+///      normalized input (e.g. input `.../Devboule/src/main.rs` ends with
 ///      building `src/main.rs`). Handles absolute / project-rooted inputs whose
 ///      tail is the scanned-relative path. Segment-aligned so `lib.rs` never
 ///      matches `sublib.rs`. Among multiple suffix hits we pick the LONGEST
@@ -9537,7 +9537,7 @@ import { cdn } from 'https://cdn.example.com/x';
         assert_eq!(
             resolve_file_to_building(
                 &buildings,
-                "C:/Users/x/Aspis Management/src/util/helpers.rs"
+                "C:/Users/x/Devboule/src/util/helpers.rs"
             )
             .as_deref(),
             Some("fid-util")
@@ -10248,13 +10248,13 @@ import { cdn } from 'https://cdn.example.com/x';
     // real agents are folded in only by the Tauri command via attach_agents).
     //
     // Run with:  cargo test dump_real_city_state -- --ignored --nocapture
-    // Output:    polis-dev-city.json at the Aspis Management root
+    // Output:    polis-dev-city.json at the Devboule root
     //            (override with POLIS_DEV_CITY_OUT).
     // -----------------------------------------------------------------------
     #[test]
     #[ignore = "dev fixture dump; run explicitly with --ignored"]
     fn dump_real_city_state() {
-        // Resolve the Aspis Management root. Prefer an explicit override, else
+        // Resolve the Devboule root. Prefer an explicit override, else
         // walk up from CARGO_MANIFEST_DIR (../ from `src-tauri`).
         let root = std::env::var("POLIS_DEV_CITY_ROOT")
             .map(PathBuf::from)

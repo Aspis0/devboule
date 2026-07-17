@@ -1,6 +1,6 @@
 # Oracle M4 — port the pi-oracle MCP rail to Rust/rmcp
 
-**Branch:** `oracle/m4-rail-port` (worktree `Aspis-management-m4`), base
+**Branch:** `oracle/m4-rail-port` (worktree `Devboule-m4`), base
 `phase1/infra` @ `0c6c37a` (M3 done + pushed). **Owner committed, 2026-07-16.**
 
 ## Goal
@@ -102,7 +102,7 @@ orchestrator runs `cargo build/test` → 1 deepseek-v4-pro review → fix → co
   `design_request` from the oracle rail (they live on the `aspis` server).
 - Edit `~/.pi/agent/mcp.json`: `oracle-figlyph` → same binary + its figlyph
   `ORACLE_DIR`. Drop the now-dead `PYTHONPATH`.
-- Leave the `aspis` / `aspis-management` servers untouched (they carry the app
+- Leave the `aspis` / `devboule` servers untouched (they carry the app
   tools + run on their own venv).
 
 ### P4 — delete the Python retrieval modules + fat requirements (mechanical)

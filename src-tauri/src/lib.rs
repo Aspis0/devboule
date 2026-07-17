@@ -27,7 +27,7 @@ pub fn run_auth_helper_from_args() -> Option<i32> {
 }
 
 /// Headless STRUCTURE bridge dispatch (Phase 11.2). When the process is invoked as
-/// `aspis-management structure --root <path>` this prints the deterministic
+/// `devboule structure --root <path>` this prints the deterministic
 /// `StructureGraph` as JSON to stdout and returns `Some(exit_code)` (0 ok, non-zero on a
 /// bad/missing root); a normal launch returns `None` so `main` proceeds to the GUI.
 ///
@@ -39,7 +39,7 @@ pub fn run_structure_cli_from_args() -> Option<i32> {
     backend::structure::run_structure_cli(std::env::args())
 }
 
-/// Headless CKG bridge: `aspis-management ckg --root <path>` prints the code-knowledge-graph
+/// Headless CKG bridge: `devboule ckg --root <path>` prints the code-knowledge-graph
 /// JSON and exits with NO GUI. Reused by the Python CKG ingester by shelling this binary.
 pub fn run_ckg_cli_from_args() -> Option<i32> {
     backend::ckg::run_ckg_cli(std::env::args())

@@ -10,5 +10,5 @@
 //! uses; this shim only forwards the exit code.
 
 fn main() {
-    std::process::exit(aspis_management_lib::run_claude_consent_hook());
+    std::process::exit(devboule_lib::run_claude_consent_hook());
 }

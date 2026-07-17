@@ -1,7 +1,7 @@
 //! Portable, runtime-resolved registration of the Aspis Oracle MCP server into a
 //! collaborator's user-scope CLI agent configs, so a bare `claude` (and, when a
 //! TOML dependency lands, `codex`) in any terminal already has the
-//! `aspis-management` MCP server.
+//! `devboule` MCP server.
 //!
 //! Everything is resolved at runtime — interpreter, package root and projects
 //! dir — so it works on any install/username/OS. There is a manual hardcoded
@@ -35,7 +35,7 @@ use crate::oracle::python_oracle::find_oracle_package_root;
 /// The MCP server key written into every supported client config. Stable so that
 /// re-running `configure` overwrites in place (idempotent) and `unconfigure`
 /// removes exactly this entry.
-const MCP_KEY: &str = "aspis-management";
+const MCP_KEY: &str = "devboule";
 /// Filename of the user-scope Claude config under the home directory.
 const CLAUDE_CONFIG_FILENAME: &str = ".claude.json";
 /// Persisted backup written next to the Claude config before any mutation.
@@ -46,11 +46,11 @@ const CLAUDE_BACKUP_FILENAME: &str = ".claude.json.aspis-bak";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CliAgentsStatus {
-    /// The `aspis-management` MCP entry is present in `~/.claude.json`.
+    /// The `devboule` MCP entry is present in `~/.claude.json`.
     pub claude_configured: bool,
     /// Absolute path to the Claude config (whether or not it exists yet).
     pub claude_config_path: Option<String>,
-    /// The `aspis-management` MCP entry is present in `~/.codex/config.toml`.
+    /// The `devboule` MCP entry is present in `~/.codex/config.toml`.
     pub codex_configured: bool,
     /// Human-readable note about Codex support state (e.g. deferred).
     pub codex_note: Option<String>,
@@ -206,7 +206,7 @@ fn build_mcp_entry(interpreter: &str, root: &Path, projects_dir: &Path) -> Value
     })
 }
 
-/// PURE merge: set `mcpServers["aspis-management"] = entry` on the Claude config,
+/// PURE merge: set `mcpServers["devboule"] = entry` on the Claude config,
 /// `setdefault`-ing the `mcpServers` object, preserving every other key exactly.
 /// Idempotent (running twice yields the same object).
 ///
@@ -229,7 +229,7 @@ fn upsert_claude_mcp_entry(config: &mut Value, entry: &Value) -> Result<(), Stri
     Ok(())
 }
 
-/// PURE removal: drop `mcpServers["aspis-management"]` if present, leaving every
+/// PURE removal: drop `mcpServers["devboule"]` if present, leaving every
 /// other key untouched. Idempotent; a missing entry/`mcpServers` is Ok. A
 /// non-object config or non-object `mcpServers` is left untouched and reported Ok
 /// (nothing of ours to remove — never clobber).
@@ -395,7 +395,7 @@ fn cli_agents_write_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Resolve paths at runtime and idempotently register the `aspis-management` MCP
+/// Resolve paths at runtime and idempotently register the `devboule` MCP
 /// entry in `~/.claude.json` (Codex deferred — no toml dep). Auth-gated.
 #[tauri::command]
 pub async fn configure_cli_agents(
@@ -489,7 +489,7 @@ fn cli_agents_status_blocking() -> CliAgentsStatus {
     status
 }
 
-/// Remove the `aspis-management` entry from the Claude config (and Codex when
+/// Remove the `devboule` entry from the Claude config (and Codex when
 /// built). Idempotent: a missing entry/file is Ok. Auth-gated.
 #[tauri::command]
 pub async fn unconfigure_cli_agents(

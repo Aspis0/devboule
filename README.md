@@ -945,7 +945,7 @@ Now there is **one resident Oracle server, supervised by the app**:
 - Agents are **thin clients**: they ask that one shared server over
   `http://127.0.0.1` (no per-agent model load). When the app is closed there is
   **no fallback** (M3 deleted the in-process Python engine): agent oracle calls
-  fail with an actionable "open the Aspis Management app" error.
+  fail with an actionable "open the Devboule app" error.
 - Agents discover the server through a small file the app writes,
   `projects/.oracle-server.json` (`baseUrl`, `authToken`, `indexRoot`). The file
   is written with owner-only permissions and **deleted when you lock**.

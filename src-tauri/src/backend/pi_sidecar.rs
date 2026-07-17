@@ -1512,7 +1512,7 @@ fn spawn_pi_session_inner(
     }
 
     // F2: write/merge the project-scoped pi MCP config so the session discovers
-    // aspis-management tools. Fail-SOFT: on error, log a warning and continue
+    // devboule tools. Fail-SOFT: on error, log a warning and continue
     // the spawn (a chat without tools is better than no chat).
     //
     // NOTE: we cannot surface the failure via `inject_console_entry` here, because
@@ -1534,7 +1534,7 @@ fn spawn_pi_session_inner(
                 eprintln!("[pi-sidecar] F2: MCP config merge failed: {e}");
                 // Surface a console banner so the user sees why aspis tools are absent.
                 mcp_config_banner = Some(format!(
-                    "aspis-management MCP config could not be written: {e}. Aspis tools may be unavailable."
+                    "devboule MCP config could not be written: {e}. Aspis tools may be unavailable."
                 ));
             }
         }
@@ -4925,7 +4925,7 @@ mod tests {
         // root is writable.
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
-        let management = PathBuf::from("/tmp/aspis-management");
+        let management = PathBuf::from("/tmp/devboule");
         let policy = pi_sandbox_policy(&root, &projects, &management);
         assert!(
             !policy
@@ -4942,7 +4942,7 @@ mod tests {
         // The project root must be writable so pi's edit/write/bash land inside it.
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
-        let management = PathBuf::from("/tmp/aspis-management");
+        let management = PathBuf::from("/tmp/devboule");
         let policy = pi_sandbox_policy(&root, &projects, &management);
         assert!(
             policy.writable_paths.contains(&root),
@@ -4957,7 +4957,7 @@ mod tests {
         // F3: aspis_mcp python child writes plans/tasks into projects_dir.
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
-        let management = PathBuf::from("/tmp/aspis-management");
+        let management = PathBuf::from("/tmp/devboule");
         let policy = pi_sandbox_policy(&root, &projects, &management);
         assert!(
             policy.writable_paths.contains(&projects),
@@ -4971,7 +4971,7 @@ mod tests {
         // F3: session tree now includes MCP stdio servers as children of node.
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
-        let management = PathBuf::from("/tmp/aspis-management");
+        let management = PathBuf::from("/tmp/devboule");
         let policy = pi_sandbox_policy(&root, &projects, &management);
         assert_eq!(
             policy.rlimits.max_procs, 8,
@@ -4988,7 +4988,7 @@ mod tests {
     fn pi_sandbox_policy_uses_explicit_root_for_deny() {
         let explicit = PathBuf::from("/Users/user/Projects/MyApp");
         let projects = PathBuf::from("/Users/user/Projects/MyApp/projects");
-        let management = PathBuf::from("/Users/user/Projects/Aspis-management");
+        let management = PathBuf::from("/Users/user/Projects/Devboule");
         let policy = pi_sandbox_policy(&explicit, &projects, &management);
         assert_eq!(
             policy.readonly_root, explicit,

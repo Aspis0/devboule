@@ -27,7 +27,7 @@
 //! - PROJECT — `<project_root>/.devboule/mcp-servers.json` (git-versionable, per-repo).
 //!
 //! Merge (design §2.1, §5.1): `global ∪ project`, PROJECT WINS on a name collision, then
-//! filter to `enabled == true`. The Oracle (`aspis-management`) is NOT in this list — the
+//! filter to `enabled == true`. The Oracle (`devboule`) is NOT in this list — the
 //! launch builders add it separately, always first.
 //!
 //! Reads FAIL OPEN: a missing/oversized/malformed file ⇒ empty (never crash a launch); a
@@ -56,7 +56,7 @@ const STDIO_TRANSPORT: &str = "stdio";
 
 /// Reserved name PREFIXES a user server may not start with (case-insensitive). Blocks a
 /// user server from masquerading as Oracle/Devboule infrastructure or hijacking dispatch
-/// routing (design §5.3). `aspis` covers the `aspis-management` Oracle server key itself.
+/// routing (design §5.3). `aspis` covers the `devboule` Oracle server key itself.
 const RESERVED_NAME_PREFIXES: &[&str] = &["oracle", "devboule", "aspis"];
 
 /// The exact Oracle MCP tool names (the authoritative surface declared in
@@ -617,7 +617,7 @@ fn load_allowed_commands_from_path(path: &Path) -> BTreeSet<String> {
 /// Global-scoped servers are exempt from the allowlist (the user owns their global config).
 ///
 /// FAIL-OPEN end to end: every read returns empty on any failure, so a missing/broken
-/// config never blocks a coder launch. The Oracle (`aspis-management`) is NOT included —
+/// config never blocks a coder launch. The Oracle (`devboule`) is NOT included —
 /// the launch builders add it separately, always first.
 ///
 /// `project_root` is the project directory; an empty/unreadable root contributes no project
@@ -1068,7 +1068,7 @@ mod tests {
             "oracle",
             "Oracle",
             "devboule",
-            "aspis-management",
+            "devboule",
             "oracle_ask",
         ] {
             let err = add_validated(&path, srv(bad, "python", true)).unwrap_err();

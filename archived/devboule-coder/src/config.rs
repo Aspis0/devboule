@@ -48,7 +48,7 @@ const ENV_MCP_PROJECTS_DIR: &str = "DEVBOULE_MCP_PROJECTS_DIR";
 const ENV_AGENT_ID: &str = "DEVBOULE_AGENT_ID";
 const ENV_PROJECT_ROOT: &str = "DEVBOULE_PROJECT_ROOT";
 const ENV_EXA_API_KEY: &str = "EXA_API_KEY";
-/// The Aspis Management app binary path the launch wiring set in OUR env (L2.4 /
+/// The Devboule app binary path the launch wiring set in OUR env (L2.4 /
 /// Phase 11.2). We FORWARD it to the MCP child as `ASPIS_APP_BIN` so the server's
 /// read-only `project_structure` tool can shell out to the Rust structure builder
 /// (zero tree-sitter duplication). Absent when the app could not resolve `current_exe`;
@@ -500,7 +500,7 @@ const MAX_USER_MCP_SERVERS: usize = 20;
 /// because it must NOT trust `DEVBOULE_USER_MCP_SERVERS` blindly: a crafted/hand-edited
 /// env could carry an entry the src-tauri config layer would have rejected, and a user
 /// server registered under an Oracle/Devboule name could shadow Oracle routing. `aspis`
-/// covers the `aspis-management` Oracle server key.
+/// covers the `devboule` Oracle server key.
 const RESERVED_NAME_PREFIXES: &[&str] = &["oracle", "devboule", "aspis"];
 
 /// Exact Oracle MCP tool names a user server may not take (MIRRORS the src-tauri
@@ -689,7 +689,7 @@ mod tests {
         // FIX 4: the binary must NOT trust its env — re-reject reserved prefixes, exact
         // Oracle tool names, and the unsafe charset, mirroring the src-tauri guard.
         for bad in [
-            "oracle", "Oracle", "devboule", "devboule-x", "aspis", "aspis-management",
+            "oracle", "Oracle", "devboule", "devboule-x", "aspis", "devboule",
             "oracle_ask", "spawn_mini_coder", "plan_submit", "project_get", "censor_dispose",
         ] {
             assert!(
@@ -843,7 +843,7 @@ mod tests {
     /// (the documented tradeoff over masking `/`-joined base64).
     #[test]
     fn sanitize_offline_reason_keeps_slash_as_a_separator_for_path_readability() {
-        let path = "/Users/user/Projects/aspis-management-workspace-root/repo";
+        let path = "/Users/user/Projects/devboule-workspace-root/repo";
         assert_eq!(
             sanitize_offline_reason(path),
             path,

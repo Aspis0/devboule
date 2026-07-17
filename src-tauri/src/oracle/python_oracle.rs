@@ -172,7 +172,7 @@ fn root_has_venv(root: &Path) -> bool {
 /// pollute the build tree (dev).
 ///
 /// FIX 4: match the staging shape, not any component literally named `target`.
-/// A user dir like `C:\Users\alice\target\Aspis Management` is legitimate and
+/// A user dir like `C:\Users\alice\target\Devboule` is legitimate and
 /// must NOT be excluded. We only treat a path as staged when it is the recorded
 /// bundle root / an ancestor of it, OR it contains a `target` component
 /// IMMEDIATELY followed by `debug` / `release` / `bundle` (the Cargo build-profile
@@ -215,7 +215,7 @@ fn is_bundled_or_staged_root(root: &Path) -> bool {
 /// at the same place):
 /// 1. Among the SAME candidate set as the package finder, prefer the NON-staged
 ///    candidate that ALREADY contains `oracle-data/venv` (complete or partial). In
-///    dev this is the source repo `Aspis Management`, never the staged `_up_` copy.
+///    dev this is the source repo `Devboule`, never the staged `_up_` copy.
 /// 2. Fresh install (no venv anywhere yet): pick the best candidate that holds the
 ///    `oracle/` package source AND is writable — i.e. NOT the bundled/staged
 ///    read-only path. In dev this is again the source repo.
@@ -240,7 +240,7 @@ pub fn oracle_data_root() -> Option<PathBuf> {
 /// the security-critical fail-closed rule is unit-testable without `#[cfg]`.
 ///
 /// SECURITY (FIX 1 — release RCE): a RELEASE build MUST NOT derive the writable
-/// data root from the live environment (cwd, exe ancestors, `ASPIS_MANAGEMENT_ROOT`,
+/// data root from the live environment (cwd, exe ancestors, `DEVBOULE_ROOT`,
 /// `~/Desktop/...`, etc.). Those are user-droppable locations; selecting one as the
 /// data root would let `install_oracle_runtime` create a trusted venv there and run
 /// `pip install` against attacker-controlled code = RCE. So in release the recorded
@@ -299,7 +299,7 @@ fn oracle_root_candidates(graph_root: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(bundled) = bundled_oracle_root() {
         candidates.push(bundled);
     }
-    if let Ok(root) = std::env::var("ASPIS_MANAGEMENT_ROOT") {
+    if let Ok(root) = std::env::var("DEVBOULE_ROOT") {
         add_candidate_with_ancestors(&mut candidates, PathBuf::from(root));
     }
     if let Ok(root) = std::env::var("ORACLE_INDEX_ROOT") {
@@ -373,7 +373,7 @@ fn add_default_user_roots(candidates: &mut Vec<PathBuf>) {
         return;
     };
     for base in ["Desktop", "Documents", "Downloads"] {
-        add_candidate_with_ancestors(candidates, profile.join(base).join("Aspis Management"));
+        add_candidate_with_ancestors(candidates, profile.join(base).join("Devboule"));
     }
 }
 
@@ -1827,13 +1827,13 @@ mod tests {
 
     /// FIX 4: `is_bundled_or_staged_root` must match the Cargo/Tauri staging SHAPE,
     /// not any path component literally named `target`. A legitimate user dir like
-    /// `~/target/Aspis Management` must NOT be excluded; `.../target/debug/_up_`
+    /// `~/target/Devboule` must NOT be excluded; `.../target/debug/_up_`
     /// (and `target/release`, `target/bundle`, or any `_up_`) MUST be excluded.
     #[test]
     fn is_bundled_or_staged_root_matches_staging_shape_not_any_target() {
         // A user dir that merely happens to contain a `target` component — NOT
         // followed by a build profile and with no `_up_` — must be allowed.
-        let user_dir = PathBuf::from("/home/alice/target/Aspis Management");
+        let user_dir = PathBuf::from("/home/alice/target/Devboule");
         assert!(
             !is_bundled_or_staged_root(&user_dir),
             "a user dir named `target` (no debug/release/bundle/_up_) must not be excluded"

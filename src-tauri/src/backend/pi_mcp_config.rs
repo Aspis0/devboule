@@ -1,14 +1,14 @@
 //! Project-scoped pi MCP config writer — ensures `<project_root>/.pi/mcp.json`
-//! contains an `aspis-management` server entry so pi sessions discover it via
+//! contains an `devboule` server entry so pi sessions discover it via
 //! the pi-mcp-adapter's project-local config sources (`.pi/mcp.json` and
 //! `.mcp.json`).
 //!
-//! Mirrors the `aspis-management` MCP entry that claude/codex receive via
+//! Mirrors the `devboule` MCP entry that claude/codex receive via
 //! `cli_agents.rs` / `mcp_client_config_json`, but writes it into the pi JSON
 //! format that `pi-mcp-adapter/config.ts:getConfigSources` reads.
 //!
 //! The merge is preserve-and-overwrite: existing foreign keys in `mcpServers`
-//! are kept byte-equivalent; only the `aspis-management` key is set/updated.
+//! are kept byte-equivalent; only the `devboule` key is set/updated.
 //! Atomic write (tmp + rename) prevents corruption on crash.
 
 use std::fs;
@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 /// per-call `<pid>.<seq>` suffix and the rename stays atomic.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Build the `aspis-management` MCP server entry for the pi mcp.json format.
+/// Build the `devboule` MCP server entry for the pi mcp.json format.
 /// Uses the same resolution chain as the claude/codex MCP wiring — the caller
 /// passes pre-resolved values so this function stays pure and testable.
 fn build_aspis_entry(
@@ -61,7 +61,7 @@ fn build_aspis_entry(
     })
 }
 
-/// Ensure `<project_root>/.pi/mcp.json` contains an `aspis-management` MCP
+/// Ensure `<project_root>/.pi/mcp.json` contains an `devboule` MCP
 /// server entry. Reads the existing file (if any), merges the entry, and writes
 /// atomically (tmp + rename). Creates the `.pi` directory if missing.
 ///
@@ -78,7 +78,7 @@ fn build_aspis_entry(
 /// # Arguments
 /// * `project_root` — the target project's working folder (e.g. the repo root).
 /// * `python` — resolved Python interpreter path (via `resolve_oracle_python`).
-/// * `management_root` — the Aspis management package root.
+/// * `management_root` — the Devboule package root.
 /// * `projects_dir` — the managed projects directory.
 /// * `app_bin` — optional running app binary path for `ASPIS_APP_BIN`.
 pub(crate) fn ensure_project_pi_mcp_config(
@@ -137,9 +137,9 @@ pub(crate) fn ensure_project_pi_mcp_config(
         }
     };
 
-    // Set/overwrite the aspis-management entry. Foreign keys are preserved.
+    // Set/overwrite the devboule entry. Foreign keys are preserved.
     let entry = build_aspis_entry(python, management_root, projects_dir, app_bin);
-    mcp_servers.insert("aspis-management".into(), entry);
+    mcp_servers.insert("devboule".into(), entry);
 
     // Atomic write: tmp + rename. The tmp filename is unique per call (pid + a
     // monotonic counter) so concurrent spawns don't clobber each other.
@@ -206,7 +206,7 @@ fn ensure_pi_gitignore(pi_dir: &Path) {
     }
 }
 
-/// Resolve the paths needed for the aspis-management MCP entry. Reuses the
+/// Resolve the paths needed for the devboule MCP entry. Reuses the
 /// EXISTING resolution chain from the claude/codex MCP wiring so the pi path
 /// stays in lock-step.
 ///
@@ -278,7 +278,7 @@ mod tests {
         )
         .unwrap();
 
-        // Verify: foreign key preserved, aspis-management added.
+        // Verify: foreign key preserved, devboule added.
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let servers = result["mcpServers"].as_object().unwrap();
         assert!(
@@ -286,11 +286,11 @@ mod tests {
             "foreign key must be preserved"
         );
         assert!(
-            servers.contains_key("aspis-management"),
-            "aspis-management must be added"
+            servers.contains_key("devboule"),
+            "devboule must be added"
         );
         assert_eq!(
-            servers["aspis-management"]["command"],
+            servers["devboule"]["command"],
             "/usr/bin/python3"
         );
         cleanup_project(&root);
@@ -303,10 +303,10 @@ mod tests {
         fs::create_dir_all(&pi_dir).unwrap();
         let config_path = pi_dir.join("mcp.json");
 
-        // Write a config with a stale aspis-management entry.
+        // Write a config with a stale devboule entry.
         let existing = json!({
             "mcpServers": {
-                "aspis-management": {
+                "devboule": {
                     "command": "/old/python",
                     "args": ["-m", "old_module"],
                     "transport": "stdio"
@@ -328,12 +328,12 @@ mod tests {
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let servers = result["mcpServers"].as_object().unwrap();
         assert_eq!(
-            servers["aspis-management"]["command"],
+            servers["devboule"]["command"],
             "/usr/bin/python3"
         );
         // Old command must NOT be there.
         assert_ne!(
-            servers["aspis-management"]["command"],
+            servers["devboule"]["command"],
             "/old/python"
         );
         cleanup_project(&root);
@@ -386,9 +386,9 @@ mod tests {
 
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let servers = result["mcpServers"].as_object().unwrap();
-        assert!(servers.contains_key("aspis-management"));
+        assert!(servers.contains_key("devboule"));
 
-        let entry = &servers["aspis-management"];
+        let entry = &servers["devboule"];
         assert_eq!(entry["command"], "/usr/bin/python3");
         assert_eq!(entry["transport"], "stdio");
         assert_eq!(entry["lifecycle"], "eager");
@@ -417,7 +417,7 @@ mod tests {
 
         let config_path = root.join(".pi").join("mcp.json");
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        let env = &result["mcpServers"]["aspis-management"]["env"];
+        let env = &result["mcpServers"]["devboule"]["env"];
         assert_eq!(env["ASPIS_APP_BIN"], "/usr/local/bin/aspis-app");
         cleanup_project(&root);
     }
@@ -437,7 +437,7 @@ mod tests {
 
         let config_path = root.join(".pi").join("mcp.json");
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        let env = &result["mcpServers"]["aspis-management"]["env"];
+        let env = &result["mcpServers"]["devboule"]["env"];
         assert!(
             env.get("ASPIS_APP_BIN").is_none(),
             "ASPIS_APP_BIN must be absent when app_bin is None"

@@ -7,7 +7,7 @@ use keyring::{Entry, Error as KeyringError};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-const SERVICE: &str = "Aspis Management";
+const SERVICE: &str = "Devboule";
 
 #[derive(Debug, Clone, Copy)]
 pub struct CloudflareAgentTokenProfileSpec {
@@ -941,7 +941,7 @@ pub fn save_oracle_index_preferences(
 }
 
 /// TEST SEAM: unit tests must NEVER reach the OS keyring through this read. On a
-/// dev machine the "Aspis Management" keychain item EXISTS but the per-build test
+/// dev machine the "Devboule" keychain item EXISTS but the per-build test
 /// binary is not in the item's ACL, so `get_password()` blocks forever on an
 /// authorization prompt no headless test can answer — two resolver tests
 /// (`http_command_root_resolver_is_the_workspace_resolver`,

@@ -512,7 +512,7 @@ async fn lance_non_default_dims_roundtrip() {
 #[ignore]
 #[tokio::test]
 async fn real_store_smoke() {
-    let base = Path::new("/Users/user/Projects/Aspis-management/oracle-data");
+    let base = Path::new("/Users/user/Projects/Devboule/oracle-data");
     let chunks = LanceStore::new(&base.join("chunks.lancedb"));
     let n = chunks.count().await.unwrap();
     assert!(n > 0, "chunks.lancedb had {n} rows");

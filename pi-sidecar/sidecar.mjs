@@ -85,7 +85,7 @@ function emitError(context, err) {
 // either `~/.pi/agent/mcp.json` or `~/.pi/mcp.json`. If not, `oracle_ask`
 // (which the Rust side surfaces via the Oracle MCP) will not work. We only
 // check config presence here — actual reachability is the MCP client's concern.
-// F4: renamed semantics — checks whether ANY aspis MCP server (aspis-management
+// F4: renamed semantics — checks whether ANY aspis MCP server (devboule
 // or oracle-figlyph) is configured. Checks:
 // 1. Global: ~/.pi/agent/mcp.json and ~/.pi/mcp.json
 // 2. Project-scoped: <DEVBOULE_PROJECT_ROOT>/.pi/mcp.json and .mcp.json
@@ -105,8 +105,8 @@ function isAspisMcpConfigured() {
 		for (const p of candidates) {
 			if (!existsSync(p)) continue;
 			const cfg = JSON.parse(readFileSync(p, "utf8"));
-			// Accept either aspis-management OR oracle-figlyph as "MCP configured".
-			if (cfg?.mcpServers?.["aspis-management"]) return true;
+			// Accept either devboule OR oracle-figlyph as "MCP configured".
+			if (cfg?.mcpServers?.["devboule"]) return true;
 			if (cfg?.mcpServers?.["oracle-figlyph"]) return true;
 			if (Object.hasOwn(cfg, "oracle-figlyph")) return true;
 		}
@@ -586,7 +586,7 @@ async function main() {
 	const aspisMcpAvailable = isAspisMcpConfigured();
 	if (!aspisMcpAvailable) {
 		console.error(
-			"[pi-sidecar] Aspis MCP (aspis-management / oracle-figlyph) NOT configured — aspis tools may not work.",
+			"[pi-sidecar] Aspis MCP (devboule / oracle-figlyph) NOT configured — aspis tools may not work.",
 		);
 	} else {
 		console.error("[pi-sidecar] Aspis MCP configured.");

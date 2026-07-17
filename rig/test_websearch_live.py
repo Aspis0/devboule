@@ -56,14 +56,14 @@ WEBSEARCH_QUERY = "anthropic claude"
 
 
 def _ensure_project_pi_mcp_config(project_root: Path) -> None:
-    """Write <project_root>/.pi/mcp.json with an aspis-management entry."""
+    """Write <project_root>/.pi/mcp.json with an devboule entry."""
     import json as _json
 
     pi_dir = project_root / ".pi"
     pi_dir.mkdir(parents=True, exist_ok=True)
     mcp_cfg = {
         "mcpServers": {
-            "aspis-management": {
+            "devboule": {
                 "command": sys.executable,
                 "args": [
                     "-m",

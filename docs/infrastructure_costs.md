@@ -5,7 +5,7 @@ Living document tracking actual + projected monthly costs across the Aspis stack
 Last updated: **2026-05-29**.
 Pricing reference: **Scaleway June 1st 2026 schedule** (see §6 for the full pricing table).
 
-Live audit source, 2026-05-29: Aspis Management vault credentials + Cloudflare REST + Scaleway REST. The app sees 8 Aspis Bio Cloudflare Workers after filtering 7 sibling workers, Cloudflare AI Search instance `aspis-bio-papers`, 5 Scaleway Serverless Containers, 5 Scaleway Object Storage buckets, and 0 currently running/stopped Scaleway Instance VMs after the lifecycle smoke cleanup.
+Live audit source, 2026-05-29: Devboule vault credentials + Cloudflare REST + Scaleway REST. The app sees 8 Aspis Bio Cloudflare Workers after filtering 7 sibling workers, Cloudflare AI Search instance `aspis-bio-papers`, 5 Scaleway Serverless Containers, 5 Scaleway Object Storage buckets, and 0 currently running/stopped Scaleway Instance VMs after the lifecycle smoke cleanup.
 
 ---
 
@@ -248,7 +248,7 @@ Below ~10,000 pipeline runs/month → **€0**. Above that, each additional run 
 
 Per memory `orasis_gpu_live_2026_05_28`: snapshot 6f923b3a, image+snapshot ready, cellpose-gpu serves cpsam via tunnel `gpu.aspis-bio.com`.
 
-2026-05-29 live check from Aspis Management: no Scaleway Instance VMs are currently running or stopped in the Aspis Bio project after the smoke lifecycle cleanup. This section models the ephemeral GPU path; it is not evidence of an always-on VM.
+2026-05-29 live check from Devboule: no Scaleway Instance VMs are currently running or stopped in the Aspis Bio project after the smoke lifecycle cleanup. This section models the ephemeral GPU path; it is not evidence of an always-on VM.
 
 | Resource | Pricing (June 2026) | Notes |
 |---|---|---|
@@ -382,7 +382,7 @@ The `aspis-bio-papers` worker:
 
 Current state: **59.8 MB of papers (2,094 objects)** = roughly 30M tokens. One-off indexing cost: **~$3 total**, already paid (or being paid during the "waiting" sync now).
 
-2026-05-29 Aspis Management live check: Cloudflare REST returns AI Search namespace `default`, AI Search instance `aspis-bio-papers`, and legacy AutoRAG jobs/files for `aspis-bio-papers`. The app provider console now lists the AI Search namespace/instance directly.
+2026-05-29 Devboule live check: Cloudflare REST returns AI Search namespace `default`, AI Search instance `aspis-bio-papers`, and legacy AutoRAG jobs/files for `aspis-bio-papers`. The app provider console now lists the AI Search namespace/instance directly.
 
 Per query: 1 embedding call (~$0.0001) + retrieval (negligible). At 100 queries/day: **~$0.30/month**.
 

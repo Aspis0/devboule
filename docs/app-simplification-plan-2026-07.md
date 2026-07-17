@@ -66,7 +66,7 @@ branch — fixed numbers would go stale).
 Prompt ALWAYS via `$(cat file)`, ALWAYS `< /dev/null`, stdout ALWAYS redirected to a
 file you then Read (terminal stdout is untrusted). NEVER run pi with
 run_in_background. This plan runs in an ISOLATED WORKTREE
-(`/Users/user/Projects/Aspis-management-simpl`) — run frontend-task pi dispatches
+(`/Users/user/Projects/Devboule-simpl`) — run frontend-task pi dispatches
 from `<worktree>/src`, Rust-task dispatches from `<worktree>/src-tauri`. Thinking
 ALWAYS `high` (hy3 has `reasoning:false` so the flag is a no-op there — pass it
 anyway, it does no harm).

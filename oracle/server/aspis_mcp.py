@@ -43,7 +43,7 @@ ORACLE_HTTP_TOKEN_ENV = "ASPIS_ORACLE_AUTH_TOKEN"
 ORACLE_DISCOVERY_FILENAME = ".oracle-server.json"
 
 # Phase 11.2 STRUCTURE bridge. The read-only `project_structure` tool shells out to the
-# Aspis Management app binary (`<app> structure --root <path>`) which REUSES the Rust
+# Devboule app binary (`<app> structure --root <path>`) which REUSES the Rust
 # tree-sitter structure builder (`src-tauri/.../backend/structure.rs`) — there is NO
 # second parser in Python (zero duplication / no drift). The launch wiring sets the
 # binary path in this env at every MCP launch site; absent ⇒ the tool fails closed with
@@ -256,7 +256,7 @@ CF_ASPIS_BIO_WORKERS = {
     "aspis-bio-mta-sts",
     "aspis-bio-resend-webhooks",
 }
-APP_VAULT_SERVICE = "Aspis Management"
+APP_VAULT_SERVICE = "Devboule"
 APP_VAULT_ACCOUNTS = {
     "cloudflare_token": "provider:cloudflare",
     "cloudflare_account_id": "scope:cloudflare_account_id",
@@ -1079,7 +1079,7 @@ def normalize_current_file_path(value: Any) -> str | None:
     None for an empty/blank input so an absent file leaves the session field
     untouched. Control chars or an over-long path raise, matching the other path
     validators. Unlike `clean_text`, internal spaces are preserved (paths may
-    legitimately contain spaces, e.g. "Aspis Management/src/main.tsx").
+    legitimately contain spaces, e.g. "Devboule/src/main.tsx").
     """
     text = str(value if value is not None else "").strip()
     if not text:
@@ -1313,7 +1313,7 @@ def validate_management_root(candidate: Path) -> Path:
         or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file()
     ):
         raise McpError(
-            "Devboule MCP management root is invalid. Run from Devboule, pass --root, or set ASPIS_MANAGEMENT_ROOT."
+            "Devboule MCP management root is invalid. Run from Devboule, pass --root, or set DEVBOULE_ROOT."
         )
     root.joinpath("projects").mkdir(parents=True, exist_ok=True)
     return root
@@ -1418,8 +1418,8 @@ def validate_project_work_root(
 def resolve_root(root: str | Path | None = None) -> Path:
     if root:
         return validate_management_root(Path(root))
-    if os.environ.get("ASPIS_MANAGEMENT_ROOT"):
-        return validate_management_root(Path(os.environ["ASPIS_MANAGEMENT_ROOT"]))
+    if os.environ.get("DEVBOULE_ROOT"):
+        return validate_management_root(Path(os.environ["DEVBOULE_ROOT"]))
     return validate_management_root(Path.cwd())
 
 
@@ -1427,7 +1427,7 @@ def resolve_projects_dir(
     root: str | Path | None = None, projects_dir: str | Path | None = None
 ) -> Path:
     management_root = resolve_root(root)
-    os.environ["ASPIS_MANAGEMENT_ROOT"] = str(management_root)
+    os.environ["DEVBOULE_ROOT"] = str(management_root)
     env_dir = str(projects_dir or os.environ.get("ASPIS_PROJECTS_DIR") or "").strip()
     if env_dir and env_dir.strip():
         projects = Path(env_dir.strip()).expanduser().resolve()
@@ -1443,7 +1443,7 @@ def management_root_from_projects_dir(projects_dir: Path) -> Path:
         return validate_management_root(parent)
     except McpError:
         pass
-    env_root = os.environ.get("ASPIS_MANAGEMENT_ROOT")
+    env_root = os.environ.get("DEVBOULE_ROOT")
     if env_root and env_root.strip():
         return validate_management_root(Path(env_root))
     return parent
@@ -3712,14 +3712,14 @@ def _require_concrete_scope(allowed_file_ids: set[str] | None) -> None:
 
 
 # ── M3-P12c: Oracle routing is HTTP-only — there is no in-process fallback ──
-# The oracle runtime lives in the Aspis Management app (Rust). The MCP server
+# The oracle runtime lives in the Devboule app (Rust). The MCP server
 # is a thin client: it forwards `oracle_ask` / `oracle_context` to the resident
 # HTTP server, forwarding the locally-computed `allowed_file_ids` scope
 # verbatim (the server never widens it). If no HTTP target resolves or the
 # HTTP call fails, we raise McpError — there is no second engine to fall back
 # on, and silently dropping the query would mask a real outage.
 _UNREACHABLE_MESSAGE = (
-    "Oracle server unreachable — open the Aspis Management app "
+    "Oracle server unreachable — open the Devboule app "
     "(the resident Oracle server answers this tool; there is no "
     "in-process fallback anymore)."
 )
@@ -4138,7 +4138,7 @@ class OracleHttpError(Exception):
     """Raised inside the thin-client when an HTTP Oracle call fails.
 
     The handler catches it, logs (redacted), and surfaces it to the agent as
-    a McpError pointing at the Aspis Management app (M3-P12c — there is no
+    a McpError pointing at the Devboule app (M3-P12c — there is no
     in-process fallback anymore, so a transport failure cannot be hidden).
     """
 
@@ -5410,7 +5410,7 @@ _STRUCTURE_BUILD_SLOT_TIMEOUT_S = 15.0
 
 
 def resolve_structure_bridge_binary() -> str:
-    """The Aspis Management app binary that owns the headless `structure` subcommand,
+    """The Devboule app binary that owns the headless `structure` subcommand,
     from `ASPIS_APP_BIN` (wired by the launch sites). Validated to be an existing,
     executable file so a stale/empty/non-executable env fails closed with a clear message
     instead of an opaque spawn error (e.g. EACCES). NEVER a bare command name or a guessed
@@ -9163,7 +9163,7 @@ def handle_tool_call(
         # (no local gate). The scope is computed locally and forwarded; the
         # resident server never widens it. On no-target or HTTP failure the
         # dispatch raises McpError — propagate it untouched so the agent sees
-        # the actionable "open the Aspis Management app" error.
+        # the actionable "open the Devboule app" error.
         result, index_status = dispatch_oracle_ask(
             projects_dir,
             clean_text(args.get("query"), "Query", 2000),
@@ -9214,7 +9214,7 @@ def handle_tool_call(
         # M3-P12c: dispatch is HTTP-only — the resident server owns readiness
         # (no local gate). On no-target or HTTP failure the dispatch raises
         # McpError — propagate it untouched so the agent sees the actionable
-        # "open the Aspis Management app" error.
+        # "open the Devboule app" error.
         chunks, index_status = dispatch_oracle_context(
             projects_dir,
             query,

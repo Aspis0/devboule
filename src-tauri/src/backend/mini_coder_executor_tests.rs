@@ -2406,7 +2406,7 @@ fn codex_mini_command_wires_mcp_flags_only_with_roots_p3() {
     .0;
     let with_line = format!("{with:?}");
     assert!(
-        with_line.contains("mcp_servers.aspis-management.command"),
+        with_line.contains("mcp_servers.devboule.command"),
         "granted codex must wire the MCP server flags"
     );
 
@@ -2525,7 +2525,7 @@ fn build_command_codex_uses_codex_exec_and_pipes_prompt_via_stdin() {
     );
     // NO MCP -c flags when oracle not granted.
     assert!(
-        !script.contains("mcp_servers.aspis-management"),
+        !script.contains("mcp_servers.devboule"),
         "oracle grant leaked: {script}"
     );
     // B1: the prompt is read from the file then DELETED; never Write-Host'd.
@@ -2836,7 +2836,7 @@ fn build_command_codex_never_adds_mcp_config_flags_even_with_roots() {
     // MINOR 9: a mini gets NO MCP grant. Even when McpRoots are supplied (the
     // plumbing is kept for a future read-only oracle scope), build_mini_command_impl
     // must NOT emit any `-c mcp_servers...` flags — the mini works from front-loaded
-    // context only, never the full mutation-capable aspis-management server.
+    // context only, never the full mutation-capable devboule server.
     let root = std::env::temp_dir();
     let result_target = root.join("d1.json");
     let prompt_file = root.join("fake-prompt.txt");
@@ -2885,7 +2885,7 @@ fn build_mini_command_wires_mcp_when_roots_present_windows() {
         build_mini_command(&b, &root, &result_target, &prompt, Some(&roots), false).unwrap();
     let script = argv_strings(&build.command).pop().unwrap();
     assert!(
-        script.contains("mcp_servers.aspis-management.command"),
+        script.contains("mcp_servers.devboule.command"),
         "granted mini must wire the MCP flags: {script}"
     );
     super::super::projects::remove_restricted_temp_file(&build.prompt_file.unwrap());
@@ -3687,7 +3687,7 @@ fn macos_codex_adds_mcp_flags_only_with_roots_p3() {
         "model flag missing: {script}"
     );
     assert!(
-        script.contains("mcp_servers.aspis-management.command"),
+        script.contains("mcp_servers.devboule.command"),
         "granted mini must carry the MCP server flags: {script}"
     );
 
