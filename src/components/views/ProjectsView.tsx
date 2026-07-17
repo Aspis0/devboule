@@ -1317,7 +1317,7 @@ export function ProjectsView() {
 		const lastIsAssistant =
 			plannerConvo.length > 0 &&
 			plannerConvo[plannerConvo.length - 1].role === "assistant";
-		if (!tail || tail.text.length === 0 || lastIsAssistant) return plannerConvo;
+		if (!tail || tail.text.trim().length === 0 || lastIsAssistant) return plannerConvo;
 		return [
 			...plannerConvo,
 			{ role: "assistant" as const, text: tail.text, streaming: true },

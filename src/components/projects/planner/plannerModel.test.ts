@@ -154,6 +154,34 @@ describe("chatMessagesWithMilestones", () => {
       ]),
     ).toEqual([]);
   });
+
+  it("drops whitespace-only chat entries (defense-in-depth: never emit a blank bubble)", () => {
+    // The local Qwen model emits whitespace-only text blocks between thinking/tool
+    // segments; even if a future backend regression let one through, the model
+    // must never surface as a blank pill.
+    const entries: ConsoleEntry[] = [
+      { type: "chat", role: "user", text: "hi", time: "1" },
+      { type: "chat", role: "assistant", text: "   ", time: "2" },
+      { type: "chat", role: "assistant", text: "\n", time: "3" },
+      { type: "chat", role: "assistant", text: "\t \n", time: "4" },
+    ];
+    expect(chatMessagesWithMilestones(entries)).toEqual([
+      { role: "user", text: "hi" },
+    ]);
+  });
+
+  it("drops whitespace-only coder/spawn milestone entries", () => {
+    // Same root cause on the milestone side — a blank milestone row is just
+    // a blank pill in disguise. Skip empty coder/spawn text.
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "", time: "1" },
+      { type: "coder", text: "   ", time: "2" },
+      { type: "coder", text: "Planning: 3 files", time: "3" },
+    ];
+    expect(chatMessagesWithMilestones(entries)).toEqual([
+      { role: "milestone", text: "Planning: 3 files" },
+    ]);
+  });
 });
 
 describe("pickProjectDesign", () => {

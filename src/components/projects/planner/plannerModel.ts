@@ -194,6 +194,8 @@ export function chatMessagesWithMilestones(
       // role:"plan" entries are structured plan payloads for the Plan stage, not
       // conversation — never render them as a chat bubble.
       if (e.role === "plan") continue;
+      // never render a blank chat bubble
+      if (e.text.trim().length === 0) continue;
       out.push(
         // D3: thread the echoed msgId through so `mergePendingSends` can drain
         // the optimistic copy by identity (omit the key entirely when absent).
@@ -215,6 +217,8 @@ export function chatMessagesWithMilestones(
         prev.text = `${prev.text} · ${preview}`;
         continue;
       }
+      // skip blank milestone rows
+      if (text.trim().length === 0) continue;
       out.push({ role: "milestone", text });
     }
   }

@@ -2582,7 +2582,7 @@ impl EventMapper {
                 Some(self.evicted_count)
             },
             task_cost_estimate_usd: None,
-            streaming_chat: if self.running && !self.accumulated_text.is_empty() {
+            streaming_chat: if self.running && !self.accumulated_text.trim().is_empty() {
                 Some(super::mini_activity::StreamingChat {
                     seq: self.turn_seq,
                     text: self.accumulated_text.clone(),
@@ -2611,7 +2611,7 @@ impl EventMapper {
     }
 
     fn flush_text_block(&mut self) {
-        if !self.accumulated_text.is_empty() {
+        if !self.accumulated_text.trim().is_empty() {
             // Take the text out FIRST so the `push_entry(&mut self)` call does
             // not conflict with the mutable borrow of `self.accumulated_text`.
             let text = std::mem::take(&mut self.accumulated_text);
@@ -2622,6 +2622,9 @@ impl EventMapper {
                 msg_id: None,
             });
         }
+        // A whitespace-only block never became an entry; drop it so it doesn't leak
+        // into the next flush.
+        self.accumulated_text.clear();
         self.active_content_index = None;
     }
 
@@ -2641,7 +2644,7 @@ impl EventMapper {
             let valid = idx < self.entries.len()
                 && matches!(self.entries[idx], ConsoleEntry::Thinking { .. });
             if valid {
-                if !self.accumulated_thinking.is_empty() {
+                if !self.accumulated_thinking.trim().is_empty() {
                     // Non-empty: finalize the existing live row in place.
                     let text = std::mem::take(&mut self.accumulated_thinking);
                     self.entries[idx] = ConsoleEntry::Thinking {
@@ -2653,16 +2656,16 @@ impl EventMapper {
                     // mutated in place); we persist ONLY here at finalization.
                     self.persist_bridge_line(&self.entries[idx]);
                 } else {
-                    // Empty thinking (delta never carried text): the row already
-                    // shows the streamed (empty) Thinking entry, so just finalize
-                    // the tracker + accumulator WITHOUT removing it — raw `remove`
-                    // would shift `active_tool_progress` indices out from under us.
+                    // Whitespace-only thinking (every delta carried only spaces/newlines):
+                    // the live row already shows the streamed (whitespace) text, so
+                    // just clear the accumulator and let the tracker reset below.
+                    // Avoid shipping a blank Thinking bubble.
                     self.accumulated_thinking.clear();
                 }
             } else {
                 // Guard failed (tracker stale / row mutated): push a fresh entry
                 // if there is any content; never corrupt an unrelated row.
-                if !self.accumulated_thinking.is_empty() {
+                if !self.accumulated_thinking.trim().is_empty() {
                     let text = std::mem::take(&mut self.accumulated_thinking);
                     self.push_entry(ConsoleEntry::Thinking {
                         text,
@@ -2674,13 +2677,19 @@ impl EventMapper {
                         self.persist_bridge_line(last);
                     }
                 } else {
+                    // Whitespace-only content: same reasoning as the valid-branch
+                    // skip path — don't ship a blank Thinking bubble.
                     self.accumulated_thinking.clear();
                 }
             }
             self.live_thinking_idx = None;
-        } else if !self.accumulated_thinking.is_empty() {
+        } else if !self.accumulated_thinking.trim().is_empty() {
             // Take the text out FIRST so the `push_entry(&mut self)` call does
             // not conflict with the mutable borrow of `self.accumulated_thinking`.
+            // Trim-guarded so a whitespace-only accumulator (same Qwen bug class
+            // as the text side — flushed_text_block) never pushes a blank
+            // Thinking bubble. The full untrimmed text is shipped on the
+            // non-empty path; trim is used only for the emptiness decision.
             let text = std::mem::take(&mut self.accumulated_thinking);
             self.push_entry(ConsoleEntry::Thinking {
                 text,
@@ -2691,6 +2700,11 @@ impl EventMapper {
             if let Some(last) = self.entries.last() {
                 self.persist_bridge_line(last);
             }
+        } else {
+            // Whitespace-only fallback: no live row to finalize, nothing
+            // contentful to push. Clear the accumulator so leftover whitespace
+            // doesn't leak into the next think block / agent_start reset.
+            self.accumulated_thinking.clear();
         }
     }
 
@@ -2702,6 +2716,11 @@ impl EventMapper {
     /// arm of `apply_message_delta`; `message_update` re-emits the snapshot right after,
     /// so each delta is broadcast live (no snapshot change needed).
     fn upsert_live_thinking(&mut self) {
+        // Never create a blank live thinking entry: if nothing has accumulated yet and
+        // there's no live row to update, there is nothing to show.
+        if self.live_thinking_idx.is_none() && self.accumulated_thinking.trim().is_empty() {
+            return;
+        }
         let live_idx = match self.live_thinking_idx {
             Some(idx) => {
                 if idx < self.entries.len()
@@ -2747,7 +2766,14 @@ impl EventMapper {
             }
             "text_delta" => {
                 if let Some(ref d) = delta.delta {
-                    self.accumulated_text.push_str(d);
+                    // Don't let leading whitespace-only deltas contaminate the block;
+                    // only begin accumulating once there is real content (empty-bubble
+                    // guard). Once real content exists, everything — including internal
+                    // whitespace/newlines — accumulates normally so we don't lose
+                    // formatting.
+                    if !self.accumulated_text.is_empty() || !d.trim().is_empty() {
+                        self.accumulated_text.push_str(d);
+                    }
                 }
             }
             "thinking_start" => {
@@ -2759,7 +2785,14 @@ impl EventMapper {
             }
             "thinking_delta" => {
                 if let Some(ref d) = delta.delta {
-                    self.accumulated_thinking.push_str(d);
+                    // Same leading-whitespace guard as text_delta: a purely-whitespace
+                    // delta before any real content must not be accumulated, or it
+                    // would leak as leading whitespace into the first real Thinking
+                    // entry. Once the accumulator holds real content, internal
+                    // whitespace/newlines accumulate normally.
+                    if !self.accumulated_thinking.is_empty() || !d.trim().is_empty() {
+                        self.accumulated_thinking.push_str(d);
+                    }
                 }
                 // #2a: stream thinking LIVE into a single in-place Thinking entry.
                 self.upsert_live_thinking();
@@ -7432,6 +7465,162 @@ mod tests {
                 .expect("parses as thinking");
         assert_eq!(thinking_text, "live fragment");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Bug A: whitespace-only assistant text must NOT create a blank chat bubble --
+    // The local Qwen model emits whitespace-only text blocks ("\n", " ") between
+    // thinking/tool segments; without this guard they became blank Chat pills
+    // in the planner UI. The fix: `flush_text_block` guards on
+    // `trim().is_empty()` and clears the accumulator even on the dropped path
+    // so a stale whitespace tail never leaks into the next flush.
+
+    #[test]
+    fn flush_text_block_drops_whitespace_only_block() {
+        // text_start -> text_delta("\n\n") -> text_start (flush): the whitespace
+        // block must NOT produce a Chat entry, and the accumulator must be
+        // empty after the flush so the next delta starts fresh.
+        let mut mapper = EventMapper::new("pi-ws-drop", Arc::new(Mutex::new(Vec::new())));
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "text_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "text_delta".to_string(),
+            delta: Some("\n\n".to_string()),
+            content_index: Some(0),
+        });
+        // Next text_start triggers flush_text_block.
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "text_start".to_string(),
+            delta: None,
+            content_index: Some(1),
+        });
+        let chat_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Chat { .. }))
+            .count();
+        assert_eq!(chat_count, 0, "whitespace-only block must NOT become a Chat entry");
+        assert!(
+            mapper.accumulated_text.is_empty(),
+            "accumulator must be cleared on the dropped path so the next delta starts fresh"
+        );
+    }
+
+    #[test]
+    fn flush_text_block_pushes_real_text() {
+        // Non-empty text must still flush as a Chat entry — no regression to
+        // the happy path. Matches the contract that only whitespace-only
+        // blocks are dropped.
+        let mut mapper = EventMapper::new("pi-ws-keep", Arc::new(Mutex::new(Vec::new())));
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "text_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&super::AssistantMessageEvent {
+            delta_type: "text_delta".to_string(),
+            delta: Some("Hello".to_string()),
+            content_index: Some(0),
+        });
+        mapper.flush_text_block();
+        let chat = mapper.entries.iter().find_map(|e| match e {
+            ConsoleEntry::Chat { role, text, .. } if role == "assistant" => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(chat.as_deref(), Some("Hello"), "non-empty text flushes as Chat");
+    }
+
+    #[test]
+    fn upsert_live_thinking_skips_blank_then_pushes_real() {
+        // Bug A (thinking side): `upsert_live_thinking` must NOT push a live
+        // Thinking entry while the accumulator is whitespace-only (Qwen emits
+        // "\n\n" / " " between tool/thinking segments). A subsequent real delta
+        // must surface a live Thinking row — no regression to streaming.
+        let mut mapper = EventMapper::new("pi-think-blank", Arc::new(Mutex::new(Vec::new())));
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        // Whitespace-only delta: the early-return guard must suppress the live row.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("   ".to_string()),
+            content_index: Some(0),
+        });
+        assert!(
+            mapper.entries.is_empty(),
+            "whitespace-only thinking_delta must NOT create a blank Thinking entry"
+        );
+        assert!(
+            mapper.live_thinking_idx.is_none(),
+            "no live tracker while accumulator is whitespace-only"
+        );
+        // Now stream real reasoning — the live Thinking entry must appear.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("reasoning".to_string()),
+            content_index: Some(0),
+        });
+        let thinking_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(thinking_count, 1, "real delta must surface a live Thinking entry");
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => assert_eq!(text, "reasoning"),
+            other => panic!("expected live Thinking entry, got {other:?}"),
+        }
+        assert!(
+            mapper.live_thinking_idx.is_some(),
+            "live tracker is set after the first contentful delta"
+        );
+    }
+
+    #[test]
+    fn flush_thinking_block_drops_whitespace_only_block() {
+        // Gap-1 follow-up: when `thinking_end` fires and the accumulator is
+        // whitespace-only (the live row was suppressed by `upsert_live_thinking`,
+        // so `live_thinking_idx` is None), `flush_thinking_block` must NOT push
+        // a blank Thinking entry. Mirrors the `flush_text_block_drops_whitespace_only_block`
+        // test on the text side.
+        let mut mapper = EventMapper::new("pi-think-flush-ws", Arc::new(Mutex::new(Vec::new())));
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("\n\n".to_string()),
+            content_index: Some(0),
+        });
+        // thinking_end → flush_thinking_block
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        let thinking_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(
+            thinking_count, 0,
+            "whitespace-only thinking block must NOT become a Thinking entry on flush"
+        );
+        assert!(
+            mapper.live_thinking_idx.is_none(),
+            "live tracker cleared after flush"
+        );
+        assert!(
+            mapper.accumulated_thinking.is_empty(),
+            "accumulator cleared on the dropped path"
+        );
     }
 }
 
