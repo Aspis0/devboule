@@ -3,6 +3,7 @@
 //! Port of `oracle/server/aspis_mcp.py` by phase — see `docs/devboule-mcp-port-plan.md`.
 //! Branding: server process is **devboule-mcp** (not aspis_mcp).
 
+pub mod project_file;
 pub mod state;
 pub mod tools;
 
@@ -17,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use state::resolve_projects_dir;
-use tools::agent_lifecycle;
+use tools::{agent_lifecycle, project};
 
 /// SSoT role rules (same file as the Tauri app and legacy Python MCP).
 const ROLE_RULES_JSON: &str = include_str!("../../oracle/server/role_rules.json");
@@ -32,6 +33,14 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "agent_register",
     "agent_heartbeat",
     "agent_state",
+    "project_list",
+    "project_get",
+    "project_next_task",
+    "project_claim_task",
+    "project_update_status",
+    "project_append_note",
+    "project_set_title",
+    "project_create_followup",
 ];
 
 #[derive(Clone)]
@@ -82,6 +91,83 @@ pub struct AgentStateArgs {
     pub session_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectListArgs {
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectIdArgs {
+    pub project_id: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectClaimArgs {
+    pub project_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectUpdateStatusArgs {
+    pub project_id: String,
+    pub task_id: String,
+    pub status: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectAppendNoteArgs {
+    pub project_id: String,
+    pub text: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectSetTitleArgs {
+    pub project_id: String,
+    pub title: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectCreateFollowupArgs {
+    pub project_id: String,
+    pub title: String,
+    pub reason: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 #[tool_router]
 impl DevbouleMcp {
     pub fn new() -> Self {
@@ -90,11 +176,11 @@ impl DevbouleMcp {
         }
     }
 
-    /// Practical roles for Devboule agents (P1: lifecycle tools).
+    /// Practical roles for Devboule agents (P2: lifecycle + project/Kanban).
     ///
     /// Each role keeps only `role`, filtered `allowedTools`, and a short summary.
     #[tool(
-        description = "Return Devboule agent role rules for this Rust MCP (P1: agent_rules + register/heartbeat/state). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for full tools and full role prose."
+        description = "Return Devboule agent role rules for this Rust MCP (P2: lifecycle + project tools). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for plan/cloud/oracle tools and full role prose."
     )]
     pub async fn agent_rules(
         &self,
@@ -107,8 +193,8 @@ impl DevbouleMcp {
             "backend": "rust",
             "roles": rules,
             "implementedTools": IMPLEMENTED_TOOLS,
-            "portPhase": "P1",
-            "note": "Partial Rust MCP (P1). Lifecycle tools implemented; project/cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover.",
+            "portPhase": "P2",
+            "note": "Partial Rust MCP (P2). Lifecycle + project/Kanban tools implemented; plan/cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover.",
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -181,6 +267,170 @@ impl DevbouleMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(description = "List local Markdown projects.")]
+    pub async fn project_list(
+        &self,
+        Parameters(args): Parameters<ProjectListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_list(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Read a project with its tasks, notes, revision and path.")]
+    pub async fn project_get(
+        &self,
+        Parameters(args): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_get(
+            &projects,
+            &args.project_id,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Suggest the next incomplete task for a role.")]
+    pub async fn project_next_task(
+        &self,
+        Parameters(args): Parameters<ProjectIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_next_task(
+            &projects,
+            &args.project_id,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Create a lease claim on the task.")]
+    pub async fn project_claim_task(
+        &self,
+        Parameters(args): Parameters<ProjectClaimArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_claim_task(
+            &projects,
+            &args.project_id,
+            &args.task_id,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Update task/project status with notes and an auditable event.")]
+    pub async fn project_update_status(
+        &self,
+        Parameters(args): Parameters<ProjectUpdateStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_update_status(
+            &projects,
+            &args.project_id,
+            &args.task_id,
+            &args.status,
+            &args.agent_id,
+            &args.role,
+            args.evidence.as_deref(),
+            args.confidence,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Append a structured note to the project.")]
+    pub async fn project_append_note(
+        &self,
+        Parameters(args): Parameters<ProjectAppendNoteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_append_note(
+            &projects,
+            &args.project_id,
+            &args.text,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Rename a project title (durable frontmatter write).")]
+    pub async fn project_set_title(
+        &self,
+        Parameters(args): Parameters<ProjectSetTitleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_set_title(
+            &projects,
+            &args.project_id,
+            &args.title,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Create a follow-up TODO task. category: feature|hardening|bug|other (default other)."
+    )]
+    pub async fn project_create_followup(
+        &self,
+        Parameters(args): Parameters<ProjectCreateFollowupArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = project::project_create_followup(
+            &projects,
+            &args.project_id,
+            &args.title,
+            &args.reason,
+            &args.agent_id,
+            &args.role,
+            args.category.as_deref(),
+            args.description.as_deref(),
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -188,7 +438,7 @@ impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Devboule app-tools MCP (Rust). P1: agent_rules + agent_register + agent_heartbeat + agent_state. Prefer DEVBOULE_MCP_BACKEND=python until cutover for full tool set."
+                "Devboule app-tools MCP (Rust). P2: lifecycle + project/Kanban tools. Prefer DEVBOULE_MCP_BACKEND=python until cutover for plan/cloud/oracle tools."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -205,8 +455,8 @@ impl ServerHandler for DevbouleMcp {
 }
 
 /// Short per-role summary for the slim payload.
-const P1_ROLE_SUMMARY: &str =
-    "P1 Rust MCP: agent_rules, agent_register, agent_heartbeat, agent_state (role-filtered). Use DEVBOULE_MCP_BACKEND=python for project/cloud/oracle tools.";
+const P2_ROLE_SUMMARY: &str =
+    "P2 Rust MCP: lifecycle + project/Kanban tools (role-filtered). Use DEVBOULE_MCP_BACKEND=python for plan/cloud/oracle tools.";
 
 /// Load role rules, filter `allowedTools` to `IMPLEMENTED_TOOLS`, and strip prose.
 fn load_role_rules_for_client() -> Result<Value> {
@@ -261,7 +511,7 @@ fn slim_roles_for_client(roles: &mut Value) {
         *role = json!({
             "role": role_name,
             "allowedTools": tools,
-            "summary": P1_ROLE_SUMMARY,
+            "summary": P2_ROLE_SUMMARY,
         });
     }
 }
@@ -372,7 +622,7 @@ mod tests {
                     role.get("role")
                 );
             }
-            assert_eq!(role["summary"], P1_ROLE_SUMMARY);
+            assert_eq!(role["summary"], P2_ROLE_SUMMARY);
         }
     }
 
@@ -398,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_gets_lifecycle_tools() {
+    fn coder_gets_lifecycle_and_project_tools() {
         let roles = load_role_rules_for_client().expect("parse");
         let coder = roles
             .as_array()
@@ -417,9 +667,54 @@ mod tests {
             "agent_register",
             "agent_heartbeat",
             "agent_state",
+            "project_list",
+            "project_get",
+            "project_claim_task",
+            "project_update_status",
+            "project_set_title",
+            "project_create_followup",
         ] {
             assert!(tools.contains(&need), "coder missing {need}");
         }
+    }
+
+    #[test]
+    fn verifier_lacks_set_title_and_followup() {
+        let roles = load_role_rules_for_client().expect("parse");
+        let verifier = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == "verifier")
+            .expect("verifier");
+        let tools: Vec<&str> = verifier["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(tools.contains(&"project_claim_task"));
+        assert!(tools.contains(&"project_update_status"));
+        assert!(!tools.contains(&"project_set_title"));
+        assert!(!tools.contains(&"project_create_followup"));
+    }
+
+    #[test]
+    fn mini_gets_no_project_tools() {
+        let roles = load_role_rules_for_client().expect("parse");
+        let mini = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == "mini")
+            .expect("mini");
+        let tools: Vec<&str> = mini["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(!tools.iter().any(|t| t.starts_with("project_")));
     }
 
     #[test]
@@ -432,12 +727,12 @@ mod tests {
             "cloudflare_rotate",
             "request_git_push",
             "censor_dispose",
-            "project_set_status",
+            "project_create_plan_tasks",
             "oracle_context",
         ] {
             assert!(
                 !dumped.contains(banned),
-                "P1 role payload must not mention unimplemented tool {banned}: {dumped}"
+                "P2 role payload must not mention unimplemented tool {banned}: {dumped}"
             );
         }
     }
@@ -453,8 +748,8 @@ mod tests {
             .expect("coder");
         let n = coder["allowedTools"].as_array().unwrap().len();
         assert!(
-            n > IMPLEMENTED_TOOLS.len(),
-            "expected full role_rules to list more tools than P1 implements (got {n})"
+            n > IMPLEMENTED_TOOLS.len() - 1, // agent_rules not in role_rules
+            "expected full role_rules to list more tools than P2 implements (got {n})"
         );
     }
 

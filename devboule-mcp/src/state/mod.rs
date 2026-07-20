@@ -6,7 +6,7 @@ mod lock;
 mod paths;
 mod tokens;
 
-pub use lock::{with_agents_lock, AgentStateError};
+pub use lock::{with_agents_lock, with_file_lock, AgentStateError};
 pub use paths::{agents_state_path, resolve_projects_dir, AGENTS_STATE_FILE};
 pub use tokens::{
     generate_session_token, hash_launch_token, hash_session_token,
@@ -159,7 +159,8 @@ pub fn normalize_model(value: Option<&str>) -> String {
     cleaned
 }
 
-fn clean_text(value: &str, label: &str, limit: usize) -> ToolResult<String> {
+/// Collapse whitespace, require non-empty, cap length (Python `clean_text`).
+pub fn clean_text(value: &str, label: &str, limit: usize) -> ToolResult<String> {
     let text: String = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let text = text.trim();
     if text.is_empty() {
@@ -411,7 +412,7 @@ pub fn write_agents_state(projects_dir: &Path, mut state: Value) -> ToolResult<V
     let content = serde_json::to_string_pretty(&state).map_err(|e| {
         ToolError::new(format!("Could not serialize agent state: {e}"))
     })?;
-    write_text_crash_safe(&path, &content)?;
+    write_text_crash_safe(&path, &content, "agent state file")?;
     Ok(state)
 }
 
@@ -419,14 +420,20 @@ pub fn write_agents_state(projects_dir: &Path, mut state: Value) -> ToolResult<V
 ///
 /// Matches Python `write_text_crash_safe` + app `fs_replace.rs` Windows semantics
 /// (`std::fs::rename` does NOT replace existing files on Windows).
-fn write_text_crash_safe(path: &Path, content: &str) -> ToolResult<()> {
+/// Temp/bak paths append `.{pid}-{ns}.tmp` to the full filename so `.md` and
+/// `.json` targets keep their real suffix (Python `path.with_suffix(suffix+".tmp")`).
+pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolResult<()> {
     let pid = std::process::id();
     let ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let temp_path = path.with_extension(format!("json.{pid}-{ns}.tmp"));
-    let backup_path = path.with_extension(format!("json.{pid}-{ns}.bak"));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let temp_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.tmp"));
+    let backup_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.bak"));
     let write_result = (|| -> std::io::Result<()> {
         {
             use std::io::Write;
@@ -452,9 +459,7 @@ fn write_text_crash_safe(path: &Path, content: &str) -> ToolResult<()> {
         }
         // Best-effort: drop leftover bak after restore attempt.
         let _ = std::fs::remove_file(&backup_path);
-        return Err(ToolError::new(format!(
-            "Could not save agent state file: {e}"
-        )));
+        return Err(ToolError::new(format!("Could not save {label}: {e}")));
     }
     Ok(())
 }
@@ -708,19 +713,27 @@ pub fn add_event(
     role: &str,
     event_type: &str,
     message: &str,
+    project_id: Option<&str>,
+    task_id: Option<&str>,
+    status: Option<&str>,
+    evidence: Option<&str>,
 ) -> ToolResult<()> {
     let msg = clean_text(message, "Event message", 1000)?;
+    let evidence_val = match evidence {
+        Some(e) if !e.trim().is_empty() => json!(clean_text(e, "Evidence", 2000)?),
+        _ => Value::Null,
+    };
     let event = json!({
         "id": event_id(),
         "timestamp": now_rfc3339(),
         "agentId": agent_id,
         "role": role,
         "eventType": event_type,
-        "projectId": null,
-        "taskId": null,
-        "status": null,
+        "projectId": project_id,
+        "taskId": task_id,
+        "status": status,
         "message": msg,
-        "evidence": null,
+        "evidence": evidence_val,
     });
     if let Some(events) = state
         .as_object_mut()
@@ -742,6 +755,8 @@ pub fn upsert_session(
     client: Option<&str>,
     file_path: Option<&str>,
     subagents: Option<Value>,
+    project_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> ToolResult<()> {
     let clean_agent_id = normalize_agent_id(agent_id)?;
     let raw_status = clean_text(status, "Agent status", 80)?;
@@ -817,6 +832,12 @@ pub fn upsert_session(
         }
         if let Some(fp) = normalized_file_path {
             session.insert("currentFilePath".into(), json!(fp));
+        }
+        if let Some(pid) = project_id {
+            session.insert("currentProjectId".into(), json!(pid));
+        }
+        if let Some(tid) = task_id {
+            session.insert("currentTaskId".into(), json!(tid));
         }
         session.insert("lastSeenAt".into(), json!(now_rfc3339()));
         if let Some(subs) = normalized_subagents {
@@ -1041,10 +1062,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
 
-        write_text_crash_safe(&path, "first").unwrap();
+        write_text_crash_safe(&path, "first", "test file").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "first");
 
-        write_text_crash_safe(&path, "second").unwrap();
+        write_text_crash_safe(&path, "second", "test file").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second");
 
         // No leftover temp/bak next to the target.
@@ -1190,7 +1211,9 @@ mod tests {
                 None,
                 None,
                 None,
-            )
+            None,
+            None
+        )
             .unwrap_err();
             assert!(
                 err.message.contains("reserved"),
@@ -1209,6 +1232,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None
         )
         .unwrap();
         assert_eq!(
@@ -1237,6 +1262,8 @@ mod tests {
                 {"label": "", "count": 1},
                 {"label": "ok", "count": 0},
             ])),
+            None,
+            None
         )
         .unwrap();
         let subs = find_session(&state, "agent-1")
@@ -1260,6 +1287,8 @@ mod tests {
             None,
             None,
             Some(json!("not-a-list")),
+            None,
+            None
         )
         .unwrap();
         assert_eq!(
@@ -1278,6 +1307,8 @@ mod tests {
             None,
             None,
             Some(json!([])),
+            None,
+            None
         )
         .unwrap();
         assert_eq!(

@@ -101,6 +101,8 @@ pub fn agent_register(
             client,
             None,
             None,
+            None,
+            None,
         )?;
         {
             let session = find_session_mut(&mut state, &agent_id)
@@ -122,6 +124,10 @@ pub fn agent_register(
             &role,
             "register",
             message.unwrap_or("Agent registered."),
+            None,
+            None,
+            None,
+            None,
         )?;
         if normalize_model(model).is_empty() {
             add_event(
@@ -130,6 +136,10 @@ pub fn agent_register(
                 &role,
                 "register_incomplete",
                 "Agent registered without reporting a model; declare `model` at agent_register.",
+                None,
+                None,
+                None,
+                None,
             )?;
         }
         let written = write_agents_state(projects_dir, state)?;
@@ -195,10 +205,63 @@ pub fn agent_heartbeat(
             None,
             file_path,
             subagents,
+            None,
+            None,
         )?;
         // Heartbeat NEVER echoes sessionToken.
         let written = write_agents_state(projects_dir, state)?;
         Ok(compact_session_ack(&written, &agent_id, None))
+    })
+}
+
+/// Require a registered agent with matching role, session token, and tool allowlist.
+///
+/// Mirrors Python `require_agent_tool` / `require_registered_role`.
+pub fn require_agent_tool(
+    projects_dir: &Path,
+    agent_id: &str,
+    role: &str,
+    tool_name: &str,
+    session_token: Option<&str>,
+) -> ToolResult<(String, String)> {
+    let agent_id = normalize_agent_id(agent_id)?;
+    let role = normalize_role(role)?;
+    with_agents_lock(projects_dir, || {
+        let state = read_agents_state(projects_dir)?;
+        let session = find_session(&state, &agent_id).ok_or_else(|| {
+            ToolError::new(
+                "Agent must call agent_register before using project or provider tools.",
+            )
+        })?;
+        let status_lc = session
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if status_lc == "launch_pending" {
+            return Err(ToolError::new(
+                "Agent launch is pending. Call agent_register before using project or provider tools.",
+            ));
+        }
+        let registered_role = normalize_role(
+            session
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )?;
+        if registered_role != role {
+            return Err(ToolError::new(format!(
+                "Agent role mismatch: registered as {registered_role}, requested {role}."
+            )));
+        }
+        if !role_allows(&role, tool_name) {
+            return Err(ToolError::new(format!(
+                "{role} agents cannot use {tool_name}."
+            )));
+        }
+        require_session_token(session, session_token)?;
+        Ok((agent_id.clone(), role.clone()))
     })
 }
 

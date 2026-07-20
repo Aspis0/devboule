@@ -1,4 +1,4 @@
-//! Exclusive flock on `.aspis-agents.json.lock` (same 100×50ms spin as agents.rs).
+//! Exclusive flock helpers (same 100×50ms spin as agents.rs / aspis_mcp.py).
 
 use super::paths::agents_lock_path;
 use fs2::FileExt;
@@ -18,44 +18,58 @@ impl std::fmt::Display for AgentStateError {
 
 impl std::error::Error for AgentStateError {}
 
-struct AgentStateFileLock {
+struct FileLockGuard {
     _file: File,
 }
 
-fn acquire_lock(projects_dir: &Path) -> Result<AgentStateFileLock, AgentStateError> {
-    fs::create_dir_all(projects_dir).map_err(|e| {
-        AgentStateError(format!("Could not create projects folder: {e}"))
-    })?;
-    let lock_path = agents_lock_path(projects_dir);
+fn acquire_lock_at(lock_path: &Path) -> Result<FileLockGuard, AgentStateError> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            AgentStateError(format!("Could not create lock parent {}: {e}", parent.display()))
+        })?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(&lock_path)
+        .open(lock_path)
         .map_err(|e| {
             AgentStateError(format!(
-                "Could not open agent state lock {}: {e}",
+                "Could not open lock {}: {e}",
                 lock_path.display()
             ))
         })?;
     for _ in 0..100 {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(AgentStateFileLock { _file: file }),
+            Ok(()) => return Ok(FileLockGuard { _file: file }),
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     }
     Err(AgentStateError(format!(
-        "Could not acquire agent state lock: {}",
+        "Could not acquire lock: {}",
         lock_path.display()
     )))
 }
 
-/// Hold exclusive flock for the duration of `f`.
+/// Hold exclusive flock on an arbitrary lock path for the duration of `f`.
+pub fn with_file_lock<T, E, F>(lock_path: &Path, f: F) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+    E: From<AgentStateError>,
+{
+    let _guard = acquire_lock_at(lock_path)?;
+    f()
+}
+
+/// Hold exclusive flock on `.aspis-agents.json.lock` for the duration of `f`.
 pub fn with_agents_lock<T, E, F>(projects_dir: &Path, f: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, E>,
     E: From<AgentStateError>,
 {
-    let _guard = acquire_lock(projects_dir)?;
-    f()
+    fs::create_dir_all(projects_dir).map_err(|e| {
+        AgentStateError(format!("Could not create projects folder: {e}"))
+    })?;
+    let lock_path = agents_lock_path(projects_dir);
+    with_file_lock(&lock_path, f)
 }

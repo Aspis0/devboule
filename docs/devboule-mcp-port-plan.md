@@ -399,8 +399,8 @@ Resolution order for binary path:
 - [x] **P0 audit** hostile reviewer → fix (2 review rounds; ship-safe default python + optional rust via absolute `DEVBOULE_MCP_BIN`)  
 - [x] **P1** Session tools (`agent_register` / `agent_heartbeat` / `agent_state` + lock + `launchConsumedAt`)  
 - [x] **P1 audit** → fix (Windows atomic replace, subagents normalize, reserved status, path control chars)  
-- [ ] **P2** Project/Kanban  
-- [ ] **P2 audit** → fix  
+- [x] **P2** Project/Kanban (8 tools + project_file parse/write)  
+- [x] **P2 audit** → fix (path confinement fail-closed, list symlink check, evidence chars, reopen lease)  
 - [ ] **P3** Human gates  
 - [ ] **P3 audit** → fix  
 - [ ] **P4** Mini/main coder  
