@@ -733,11 +733,9 @@ pub fn delete_device_signing_private_key() -> Result<(), String> {
 /// the vault selection is defensive even if a caller forgets to normalize. Mirrors
 /// `agent_role::canonicalize_launch_role` and ROLE_ALIASES in aspis_mcp.py.
 /// "orchestrator" is FIRST-CLASS (it no longer folds to coder as an alias; it is
-/// its own arm) — for TOKEN selection it deliberately holds the same write profile
-/// as the coder (owner decision: the orchestrator is the frontier planning tier
-/// that sees AND manages the project's providers; mutations stay task-audited
-/// server-side). What it never holds is a file-write path — that's the mini/coder
-/// executor's job, not a token concern.
+/// its own arm). Token selection: orchestrator is **read-only** on Cloudflare
+/// (audit F-04-020 / product non-negotiable — plan and delegate, no provider
+/// mutations). Coder holds the scoped write profile.
 fn canonical_agent_role(role: &str) -> &'static str {
     match role.trim().to_ascii_lowercase().as_str() {
         "verifier" => "verifier",
@@ -749,12 +747,10 @@ fn canonical_agent_role(role: &str) -> &'static str {
 }
 
 pub fn cloudflare_agent_token_profile_id_for_role(role: &str) -> Option<&'static str> {
-    // coder AND orchestrator -> the scoped write profile (the orchestrator manages
-    // the infra it plans — owner decision, role untangle 2026-07); verifier ->
-    // read-only. Explicit per-role arms, no alias fold hiding the decision.
+    // coder -> scoped write; orchestrator + verifier -> read-only.
     match canonical_agent_role(role) {
-        "verifier" => Some("verifier-readonly"),
-        "coder" | "orchestrator" => Some("coder-worker-write"),
+        "verifier" | "orchestrator" => Some("verifier-readonly"),
+        "coder" => Some("coder-worker-write"),
         _ => None,
     }
 }
@@ -847,19 +843,14 @@ pub fn all_cloudflare_agent_token_profile_statuses(
         .collect()
 }
 
-/// D1: profile ids a given agent role is allowed to receive. Canonical role model
-/// after the Phase B merge: verifier gets the read-only profile only; coder gets
-/// its scoped write profile. The launch path normalizes "orchestrator" -> "coder"
-/// before this call (and canonical_agent_role folds any stray alias defensively),
-/// so the merged former-orchestrator legitimately receives the coder WRITE profile
-/// BY DESIGN — it plans AND writes. The secrets-rotator profile is NEVER injected
-/// into a launched agent through this path (reserved for guarded mutation tools).
+/// D1: profile ids a given agent role is allowed to receive. Verifier and
+/// orchestrator get read-only only; coder gets scoped write. Secrets-rotator is
+/// NEVER injected into a launched agent through this path (reserved for guarded
+/// mutation tools). Audit F-04-020: orchestrator must not hold write CF tokens.
 pub fn cloudflare_agent_token_profile_ids_for_role(role: &str) -> &'static [&'static str] {
     match canonical_agent_role(role) {
-        "verifier" => &["verifier-readonly"],
-        // Orchestrator holds the same write profile as the coder (owner decision,
-        // role untangle 2026-07 — it plans AND manages the infra).
-        "coder" | "orchestrator" => &["coder-worker-write"],
+        "verifier" | "orchestrator" => &["verifier-readonly"],
+        "coder" => &["coder-worker-write"],
         _ => &[],
     }
 }
@@ -1795,14 +1786,10 @@ mod tests {
 
     #[test]
     fn cloudflare_agent_profile_ids_are_role_least_privilege() {
-        // ROLE UNTANGLE (2026-07, owner decision): the orchestrator is FIRST-CLASS
-        // and holds the SAME scoped write profile as the coder — it is the frontier
-        // planning tier that sees and manages the project's providers (mutations
-        // stay claimed-task + evidence audited server-side). Explicit arm, not an
-        // alias fold.
+        // Orchestrator is plan/read-only for Cloudflare tokens (audit F-04-020).
         assert_eq!(
             cloudflare_agent_token_profile_ids_for_role("orchestrator"),
-            &["coder-worker-write"]
+            &["verifier-readonly"]
         );
         // Verifier remains strictly read-only.
         assert_eq!(

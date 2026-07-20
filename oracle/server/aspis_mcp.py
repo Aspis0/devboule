@@ -3017,12 +3017,13 @@ def matching_active_claim(
 
 
 def require_provider_mutation_role(role: str) -> None:
-    # ROLE UNTANGLE (2026-07, owner decision): the orchestrator — the frontier
-    # planning tier — mutates providers exactly like a coder (same claimed-task +
-    # evidence context, enforced by require_provider_mutation_context callers).
-    if normalize_role(role) not in CODER_LIKE_ROLES:
+    # Product rule: only coders mutate Cloudflare/Scaleway. Orchestrators plan and
+    # delegate (spawn_mini_coder / main coder); they keep list/read tools only.
+    # Defense-in-depth on top of ROLE_ALLOWED_TOOLS (audit F-04-020).
+    if normalize_role(role) != "coder":
         raise McpError(
-            "Only coder or orchestrator agents can mutate Cloudflare or Scaleway. Verifiers are read-only."
+            "Only coder agents can mutate Cloudflare or Scaleway. "
+            "Orchestrators and verifiers are read-only for provider mutations."
         )
 
 

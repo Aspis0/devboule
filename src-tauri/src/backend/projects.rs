@@ -7850,15 +7850,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn agent_roles_map_to_cloudflare_profile_tokens() {
-        // ROLE UNTANGLE (2026-07, owner decision): the orchestrator is FIRST-CLASS
-        // and — as the frontier planning tier that manages the infra it plans —
-        // holds the SAME scoped write profile as the coder, via its own explicit
-        // arm (no alias fold, no launch-time strip-hack). Provider MUTATIONS remain
-        // claimed-task + evidence audited server-side (aspis_mcp.py
-        // require_provider_mutation_role accepts CODER_LIKE_ROLES).
+        // Orchestrator is CF read-only (audit F-04-020); coder holds write profile.
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            Some("coder-worker-write")
+            Some("verifier-readonly")
         );
         // Verifier stays strictly read-only.
         assert_eq!(

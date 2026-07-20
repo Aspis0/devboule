@@ -167,8 +167,10 @@ class AllowedToolsOrderPinTests(unittest.TestCase):
             "project_claim_task", "project_update_status", "project_append_note",
             "project_set_title", "project_create_followup",
             "project_create_plan_tasks", "provider_credentials_status",
-            "cloudflare_list_workers", "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources", "scaleway_resource_action",
+            # Provider mutations (rotate secret / SCW action) are coder-only
+            # (audit F-04-020 / product non-negotiable: orchestrator is read/plan).
+            "cloudflare_list_workers",
+            "scaleway_list_resources",
             "oracle_ask", "oracle_context", "project_structure",
             "get_neighborhood", "find_imports",
             "spawn_mini_coder", "spawn_main_coder", "steer_mini_coder",
