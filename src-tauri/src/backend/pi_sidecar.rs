@@ -1392,14 +1392,24 @@ fn spawn_pi_session_inner(
     // for python imports) to the sandbox policy.
     let policy = pi_sandbox_policy(&effective_project_root, &projects_dir, &management_root);
     let script_arg = script.to_string_lossy().into_owned();
+    // Audit F-04-012: never spawn bare `node` (GUI apps often lack Homebrew PATH).
+    // Resolve an absolute path via the same augmented_path scan as provider_detect.
+    let node = crate::backend::provider_detect::resolve_program("node").ok_or_else(|| {
+        "node not found (install Node.js, or ensure /opt/homebrew/bin is reachable)".to_string()
+    })?;
+    let node_s = node.to_string_lossy().into_owned();
     let (program, args): (String, Vec<String>) = if sandboxed {
-        let wrapped =
-            crate::backend::sandbox::wrap(&policy, "node", &[script_arg], &effective_project_root);
-        eprintln!("[pi-sidecar] sandbox: enabled (macOS Seatbelt)");
+        let wrapped = crate::backend::sandbox::wrap(
+            &policy,
+            &node_s,
+            &[script_arg],
+            &effective_project_root,
+        );
+        eprintln!("[pi-sidecar] sandbox: enabled (macOS Seatbelt); node={node_s}");
         (wrapped.program, wrapped.args)
     } else {
-        eprintln!("[pi-sidecar] sandbox: disabled (non-macOS or env override)");
-        ("node".to_string(), vec![script_arg])
+        eprintln!("[pi-sidecar] sandbox: disabled (non-macOS or env override); node={node_s}");
+        (node_s, vec![script_arg])
     };
 
     let mut cmd = Command::new(&program);
