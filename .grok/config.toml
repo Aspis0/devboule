@@ -1,7 +1,7 @@
-# Project MCP for Grok Build — DEV agent UI drive for **Devboule** only.
-# (Figlyph uses a separate server name on that repo; do not mix them.)
-# Requires folder trust. Refresh with /mcps → r.
+# Project MCP for Grok Build — single DEV UI-drive server for **Devboule**.
+# Do not also put pilot in root .mcp.json (Grok would show a duplicate).
 # App must be running: npm run devboule-pilot:app (FE :1420 + cargo --features ui-pilot).
+# Refresh: /mcps → r
 
 [mcp_servers.devboule_pilot]
 command = "python3"

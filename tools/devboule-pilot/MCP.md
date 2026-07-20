@@ -26,18 +26,16 @@ Upstream binary is still `tauri-pilot` on PATH.
 
 ## Claude Code / Cursor
 
-```json
-{
-  "mcpServers": {
-    "devboule-pilot": {
-      "command": "tauri-pilot",
-      "args": ["mcp"]
-    }
-  }
-}
+Root `.mcp.json` is **empty on purpose** so Grok does not double-load pilot.
+
+Copy when using Claude/Cursor:
+
+```bash
+cp tools/devboule-pilot/mcp.claude.json .mcp.json
+# or merge the "devboule-pilot" block into your client MCP config
 ```
 
-Repo root [`.mcp.json`](../../.mcp.json) already uses **`devboule-pilot`**.
+Server id: **`devboule-pilot`**.
 
 ## Workflow
 

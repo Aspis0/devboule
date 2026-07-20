@@ -1,11 +1,3 @@
 {
-  "mcpServers": {
-    "devboule-pilot": {
-      "command": "tauri-pilot",
-      "args": ["mcp"],
-      "env": {
-        "PATH": "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-      }
-    }
-  }
+  "mcpServers": {}
 }
