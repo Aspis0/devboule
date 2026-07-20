@@ -20,6 +20,10 @@ from typing import Any
 
 
 PILOT_BIN = os.environ.get("TAURI_PILOT_BIN", "tauri-pilot")
+# Pin Devboule app socket so we never hit Figlyph when both are running.
+# Identifier comes from src-tauri/tauri.conf.json → com.devboule.app
+DEFAULT_SOCKET = "/tmp/tauri-pilot-com.devboule.app.sock"
+PILOT_SOCKET = os.environ.get("TAURI_PILOT_SOCKET", DEFAULT_SOCKET)
 
 
 def to_grok(name: str) -> str:
@@ -90,13 +94,18 @@ def pump(src, dst, transform, label: str) -> None:
 
 def main() -> int:
     try:
+        cmd = [PILOT_BIN]
+        if PILOT_SOCKET:
+            cmd.extend(["--socket", PILOT_SOCKET])
+        cmd.append("mcp")
         proc = subprocess.Popen(
-            [PILOT_BIN, "mcp"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
             text=True,
             bufsize=1,
+            env={**os.environ, "TAURI_PILOT_SOCKET": PILOT_SOCKET},
         )
     except FileNotFoundError:
         sys.stderr.write(

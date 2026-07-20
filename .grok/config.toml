@@ -8,4 +8,4 @@ command = "python3"
 args = ["tools/devboule-pilot/mcp_proxy_for_grok.py"]
 enabled = true
 startup_timeout_sec = 30
-env = { PATH = "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }
+env = { PATH = "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin", TAURI_PILOT_SOCKET = "/tmp/tauri-pilot-com.devboule.app.sock" }
