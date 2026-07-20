@@ -72,12 +72,23 @@ Rust only when this binary resolves; otherwise it defaults to Python (packaged
 apps without a sidecar). If the env var is **set** to rust, missing binary →
 **fail closed** (never silent Python switch).
 
+### Package / soak
+
+```bash
+# Stage for Tauri externalBin (also runs in beforeBuildCommand)
+npm run mcp:stage
+
+# Full soak: stage + unit tests + stdio MCP smoke
+npm run mcp:soak
+```
+
 Resolution order for the binary when backend is Rust:
 
 1. `DEVBOULE_MCP_BIN` (must be an **executable** file)
-2. next to the running app executable / `resources/`
-3. `devboule-mcp/target/{debug,release}/devboule-mcp` (**debug builds only**, via
-   `CARGO_MANIFEST_DIR` — not baked into release)
+2. path recorded at app startup (`set_bundled_mcp_bin` / externalBin next to exe)
+3. next to the running app executable / `Resources/` / `resources/`
+4. staged `src-tauri/binaries/devboule-mcp` + cargo target tree (**debug only**)
+5. `PATH`
 4. `PATH`
 
 ### Packaging honesty (P7)

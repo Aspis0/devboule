@@ -75,3 +75,8 @@ src-tauri/.devboule/
 
 # devboule-mcp build artifacts
 devboule-mcp/target/
+
+# Staged Tauri externalBin binaries (rebuilt by scripts/stage-devboule-mcp.sh)
+src-tauri/binaries/devboule-mcp
+src-tauri/binaries/devboule-mcp-*
+!src-tauri/binaries/README.md

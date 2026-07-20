@@ -327,6 +327,15 @@ continue with a stale Python entry under the rust backend.
 4. Update README, management_root checks.  
 5. Archive `aspis_mcp.py` → `archived/aspis_mcp.py` (or delete after soak).  
 
+**P7 packaging (bundled sidecar):**
+
+1. `scripts/stage-devboule-mcp.sh` builds release `devboule-mcp` into
+   `src-tauri/binaries/devboule-mcp-<host-triple>`.
+2. `tauri.conf.json` → `bundle.externalBin: ["binaries/devboule-mcp"]` +
+   `beforeBuildCommand` runs the stage script.
+3. Runtime: `discover_and_record_bundled_mcp_bin` + exe siblings / Resources.
+4. Soak: `npm run mcp:soak` (stage + unit tests + stdio initialize/tools/list).
+
 **P7 note (this cutover):** dual-stack default (hostile-audit fix):
 - `DEVBOULE_MCP_BACKEND` **set** → honor strictly (`rust` / `python` aliases). Rust
   with missing binary → **fail-closed** at entry build (never silent Python switch).
@@ -337,13 +346,14 @@ Python module is **kept on disk** for soak (do **not** delete yet). Archive/dele
 follow-up after soak. Dual-write Aspis env keys stay for one more release.
 `management_root` accepts `oracle/server/aspis_mcp.py` **or** `devboule-mcp/Cargo.toml`
 **or** a valid `DEVBOULE_MCP_BIN`, and **fails closed** (no silent `projects_dir.parent()`).
-Binary is still **not** auto-bundled in Tauri resources — installs need
+Binary **is** staged via `externalBin` when you run `npm run mcp:stage` /
+`tauri build` (beforeBuildCommand). Without staging, installs need
 `DEVBOULE_MCP_BIN` / dev tree / PATH. `CARGO_MANIFEST_DIR` cargo-target probe is
 **debug-only** (release must not bake build-machine paths).
 
 **P7 residual risks (honest):**
-- Packaged release without bin + without env still runs **Python** soak path (needs
-  `aspis_mcp.py` on disk) — not pure-Rust cutover until binary is bundled.
+- Packaged release without a staged `externalBin` (CI forgot `mcp:stage`) falls back
+  to **Python** when `BACKEND` unset (dual-stack); explicit `rust` still fail-closed.
 - `cli_agents` Rust path no longer requires the Oracle venv; status UI may report a
   dummy interpreter string when backend is Rust.
 - Agents filename still `.aspis-agents.json` until P7.1.

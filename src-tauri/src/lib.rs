@@ -394,6 +394,10 @@ pub fn run() {
                 // runner resolves an absolute local `--config` path instead of the
                 // network registry. Dev/test builds use a crate-relative fallback.
                 backend::censor::runners::semgrep::set_censor_resource_dir(&dir);
+                // P7: locate Tauri externalBin / resource-staged `devboule-mcp`.
+                backend::mcp_backend::discover_and_record_bundled_mcp_bin(Some(&dir));
+            } else {
+                backend::mcp_backend::discover_and_record_bundled_mcp_bin(None);
             }
             // RELEASE: data root = app_data_dir (writable). The bundled package
             // root above is read-only, so the `oracle-data/venv` runtime must be

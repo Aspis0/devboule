@@ -12,13 +12,18 @@
 //! - **unset** → prefer Rust **only if** [`resolve_devboule_mcp_bin`] succeeds;
 //!   else default Python so packaged apps without a sidecar keep working.
 //!
-//! **Packaging:** the Rust backend is still **not** auto-bundled in Tauri
-//! resources. Set `DEVBOULE_MCP_BIN` / build the crate / put the binary next to
-//! the app or on PATH to enable the Rust path without an explicit env backend.
+//! **Packaging:** `scripts/stage-devboule-mcp.sh` builds the release binary into
+//! `src-tauri/binaries/devboule-mcp-<triple>` for Tauri `bundle.externalBin`.
+//! At runtime the sidecar lands next to the app executable; setup also records
+//! a resolved path via [`set_bundled_mcp_bin`].
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
+
+/// Absolute path to the bundled/staged MCP binary, recorded once at app startup.
+static BUNDLED_MCP_BIN: OnceLock<PathBuf> = OnceLock::new();
 
 /// Env var selecting the MCP implementation.
 pub const ENV_BACKEND: &str = "DEVBOULE_MCP_BACKEND";
@@ -112,11 +117,75 @@ pub fn with_backend_override<R>(backend: McpBackend, f: impl FnOnce() -> R) -> R
     })
 }
 
+/// Record the absolute path of the bundled/staged `devboule-mcp` binary.
+///
+/// Call once from the Tauri setup hook after probing `current_exe` siblings and
+/// `resource_dir`. Subsequent calls are ignored (`OnceLock`).
+pub fn set_bundled_mcp_bin(path: &Path) {
+    if !crate::backend::provider_detect::is_executable_file(path) {
+        return;
+    }
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let _ = BUNDLED_MCP_BIN.set(abs);
+}
+
+/// Best-effort discovery at app startup: siblings of the main exe (Tauri
+/// `externalBin` lands here) and common resource_dir layouts.
+pub fn discover_and_record_bundled_mcp_bin(resource_dir: Option<&Path>) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Bare name first (Tauri externalBin strips the triple at package time).
+            // Also accept triple-suffixed names if a packager left them in place.
+            let mut candidates: Vec<PathBuf> = vec![dir.join(bin_name())];
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            candidates.push(dir.join("devboule-mcp-aarch64-apple-darwin"));
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            candidates.push(dir.join("devboule-mcp-x86_64-apple-darwin"));
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            candidates.push(dir.join("devboule-mcp-x86_64-unknown-linux-gnu"));
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            candidates.push(dir.join("devboule-mcp-aarch64-unknown-linux-gnu"));
+            #[cfg(windows)]
+            candidates.push(dir.join("devboule-mcp.exe"));
+            for cand in candidates {
+                if crate::backend::provider_detect::is_executable_file(&cand) {
+                    set_bundled_mcp_bin(&cand);
+                    return;
+                }
+            }
+            // macOS app: Resources/ next to MacOS/
+            if let Some(resources) = dir.parent().map(|p| p.join("Resources")) {
+                for name in [bin_name(), &format!("bin/{}", bin_name())] {
+                    let cand = resources.join(name);
+                    if crate::backend::provider_detect::is_executable_file(&cand) {
+                        set_bundled_mcp_bin(&cand);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(dir) = resource_dir {
+        for name in [
+            bin_name(),
+            &format!("bin/{}", bin_name()),
+            &format!("binaries/{}", bin_name()),
+            &format!("resources/bin/{}", bin_name()),
+        ] {
+            let cand = dir.join(name);
+            if crate::backend::provider_detect::is_executable_file(&cand) {
+                set_bundled_mcp_bin(&cand);
+                return;
+            }
+        }
+    }
+}
+
 /// Resolve `devboule-mcp` absolute path when backend is Rust.
 ///
 /// Order: `DEVBOULE_MCP_BIN` (error if set but missing/not executable),
-/// debug-only cargo target tree (`CARGO_MANIFEST_DIR`), `current_exe` siblings,
-/// then PATH via `resolve_program`.
+/// [`set_bundled_mcp_bin`] path, debug-only cargo target tree, `current_exe`
+/// siblings / Resources, staged `src-tauri/binaries/` (dev), then PATH.
 pub fn resolve_devboule_mcp_bin() -> Result<PathBuf, String> {
     resolve_devboule_mcp_bin_with(std::env::var(ENV_BIN).ok().as_deref())
 }
@@ -147,6 +216,12 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
         });
     }
 
+    if let Some(bundled) = BUNDLED_MCP_BIN.get() {
+        if crate::backend::provider_detect::is_executable_file(bundled) {
+            return Ok(bundled.clone());
+        }
+    }
+
     // Compile-time sibling `devboule-mcp/target/...` only in debug builds.
     // Release must not bake developer absolute paths from the build machine.
     if cfg!(debug_assertions) {
@@ -163,6 +238,11 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
                 return Ok(abs);
             }
         }
+        // Staged externalBin copy for local tauri dev (scripts/stage-devboule-mcp.sh).
+        let staged = manifest.join("binaries").join(bin_name());
+        if let Some(abs) = absolute_if_executable(&staged) {
+            return Ok(abs);
+        }
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -175,13 +255,19 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
             if let Some(abs) = absolute_if_executable(&cand) {
                 return Ok(abs);
             }
+            if let Some(resources) = dir.parent().map(|p| p.join("Resources")) {
+                let cand = resources.join(bin_name());
+                if let Some(abs) = absolute_if_executable(&cand) {
+                    return Ok(abs);
+                }
+            }
         }
     }
 
     crate::backend::provider_detect::resolve_program("devboule-mcp").ok_or_else(|| {
         format!(
-            "devboule-mcp binary not found (set {ENV_BIN} or build crate devboule-mcp; \
-             not auto-bundled in Tauri resources — use DEVBOULE_MCP_BACKEND=python to fall back)"
+            "devboule-mcp binary not found (set {ENV_BIN}, run scripts/stage-devboule-mcp.sh, \
+             or package with Tauri externalBin; use DEVBOULE_MCP_BACKEND=python for soak)"
         )
     })
 }

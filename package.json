@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "mcp:stage": "bash scripts/stage-devboule-mcp.sh",
+    "mcp:soak": "bash scripts/soak-devboule-mcp.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "rig:smoke": "RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v",
