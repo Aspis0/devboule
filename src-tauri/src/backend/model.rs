@@ -1098,6 +1098,15 @@ pub struct PlanApprovalRequest {
     /// approve. NO-CHURN: skip-if-none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Set `true` by MCP `project_create_plan_tasks` after a successful one-shot
+    /// materialize. MUST round-trip through Tauri rewrites of agents state —
+    /// stripping it re-enables a second materialize. NO-CHURN: skip-if-none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_created: Option<bool>,
+    /// RFC3339 timestamp when plan tasks were materialized (paired with
+    /// `tasksCreated`). NO-CHURN: skip-if-none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_materialized_at: Option<String>,
 }
 
 /// Per-session `pendingQuestion` (Phase 1): written by the agent's MCP `ask_user`

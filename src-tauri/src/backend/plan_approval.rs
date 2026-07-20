@@ -627,6 +627,8 @@ mod tests {
             created_at: created_at.into(),
             decided_at: None,
             note: None,
+            tasks_created: None,
+            tasks_materialized_at: None,
         }
     }
 
@@ -643,6 +645,8 @@ mod tests {
             created_at: "2026-06-09T00:00:00Z".into(),
             decided_at: None,
             note: None,
+            tasks_created: None,
+            tasks_materialized_at: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"agentId\""), "json: {json}");
@@ -655,9 +659,38 @@ mod tests {
         // No-churn: absent optionals do not serialize.
         assert!(!json.contains("decidedAt"), "json: {json}");
         assert!(!json.contains("\"note\""), "json: {json}");
+        assert!(!json.contains("tasksCreated"), "json: {json}");
+        assert!(!json.contains("tasksMaterializedAt"), "json: {json}");
         assert!(!json.contains("project_id"), "snake leaked: {json}");
         let back: PlanApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn tasks_created_flags_round_trip() {
+        // P3 BLOCKER: MCP stamps tasksCreated/tasksMaterializedAt; Tauri must not strip.
+        let json = r#"{
+            "id": "r1",
+            "agentId": "a",
+            "projectId": "p",
+            "title": "t",
+            "status": "approved",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "tasksCreated": true,
+            "tasksMaterializedAt": "2026-01-02T00:00:00Z"
+        }"#;
+        let r: PlanApprovalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(r.tasks_created, Some(true));
+        assert_eq!(
+            r.tasks_materialized_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(out.contains("\"tasksCreated\":true"), "out: {out}");
+        assert!(
+            out.contains("\"tasksMaterializedAt\":\"2026-01-02T00:00:00Z\""),
+            "out: {out}"
+        );
     }
 
     #[test]
@@ -683,6 +716,8 @@ mod tests {
         assert_eq!(r.title, "");
         assert_eq!(r.decided_at, None);
         assert_eq!(r.note, None);
+        assert_eq!(r.tasks_created, None);
+        assert_eq!(r.tasks_materialized_at, None);
     }
 
     // -- transitions --------------------------------------------------------

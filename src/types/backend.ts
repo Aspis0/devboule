@@ -1279,6 +1279,10 @@ export interface PlanApprovalRequest {
 	createdAt: string;
 	decidedAt?: string | null;
 	note?: string | null;
+	/** Set true after project_create_plan_tasks one-shot materialize. */
+	tasksCreated?: boolean | null;
+	/** RFC3339 when plan tasks were materialized. */
+	tasksMaterializedAt?: string | null;
 }
 
 // A pending question the agent asked the user via the MCP ask_user tool.

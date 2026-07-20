@@ -18,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use state::resolve_projects_dir;
-use tools::{agent_lifecycle, project};
+use tools::{agent_lifecycle, human_gates, project};
 
 /// SSoT role rules (same file as the Tauri app and legacy Python MCP).
 const ROLE_RULES_JSON: &str = include_str!("../../oracle/server/role_rules.json");
@@ -41,6 +41,11 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "project_append_note",
     "project_set_title",
     "project_create_followup",
+    "project_create_plan_tasks",
+    "plan_submit",
+    "plan_status",
+    "request_git_push",
+    "ask_user",
 ];
 
 #[derive(Clone)]
@@ -168,6 +173,62 @@ pub struct ProjectCreateFollowupArgs {
     pub session_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanSubmitArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub project_id: String,
+    pub title: String,
+    pub plan_markdown: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanStatusArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub plan_id: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestGitPushArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub force: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskUserArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub question: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectCreatePlanTasksArgs {
+    pub project_id: String,
+    pub plan_id: String,
+    /// Each task: {id, title, scope?, acceptance?, dependsOn?, weight?}
+    pub tasks: Vec<Value>,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 #[tool_router]
 impl DevbouleMcp {
     pub fn new() -> Self {
@@ -176,11 +237,11 @@ impl DevbouleMcp {
         }
     }
 
-    /// Practical roles for Devboule agents (P2: lifecycle + project/Kanban).
+    /// Practical roles for Devboule agents (P3: lifecycle + project + human gates).
     ///
     /// Each role keeps only `role`, filtered `allowedTools`, and a short summary.
     #[tool(
-        description = "Return Devboule agent role rules for this Rust MCP (P2: lifecycle + project tools). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for plan/cloud/oracle tools and full role prose."
+        description = "Return Devboule agent role rules for this Rust MCP (P3: lifecycle + project + human gates). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for mini/cloud/oracle tools and full role prose."
     )]
     pub async fn agent_rules(
         &self,
@@ -193,8 +254,8 @@ impl DevbouleMcp {
             "backend": "rust",
             "roles": rules,
             "implementedTools": IMPLEMENTED_TOOLS,
-            "portPhase": "P2",
-            "note": "Partial Rust MCP (P2). Lifecycle + project/Kanban tools implemented; plan/cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover.",
+            "portPhase": "P3",
+            "note": "Partial Rust MCP (P3). Lifecycle + project/Kanban + human gates (plan/git/ask) implemented; mini/cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover. MCP never self-approves plans/pushes — human UI owns terminal verdicts; unlock is not required on the agent MCP path.",
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -431,6 +492,118 @@ impl DevbouleMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Coder-only: SUBMIT an implementation plan for human approval and BLOCK on the verdict (approved/rejected/timeout). Does not self-approve."
+    )]
+    pub async fn plan_submit(
+        &self,
+        Parameters(args): Parameters<PlanSubmitArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = human_gates::plan_submit(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            &args.project_id,
+            &args.title,
+            &args.plan_markdown,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Coder or verifier: read the current status of a previously submitted plan (pending_approval/approved/rejected/timeout/not_found)."
+    )]
+    pub async fn plan_status(
+        &self,
+        Parameters(args): Parameters<PlanStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = human_gates::plan_status(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            &args.plan_id,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Coder-only: REQUEST human approval to git push (you may COMMIT freely, but every PUSH is approved by the human). BLOCKS until pushed/push_failed/denied/timeout."
+    )]
+    pub async fn request_git_push(
+        &self,
+        Parameters(args): Parameters<RequestGitPushArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = human_gates::request_git_push(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            &args.project_id,
+            args.branch.as_deref(),
+            args.remote.as_deref(),
+            args.force.unwrap_or(false),
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Coder or verifier: ask the HUMAN a blocking question and wait for the reply (or timeout)."
+    )]
+    pub async fn ask_user(
+        &self,
+        Parameters(args): Parameters<AskUserArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = human_gates::ask_user(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            &args.question,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Bulk-create an approved plan's tasks on the project Kanban as todo, tagged with planId. Requires plan status=approved (human gate)."
+    )]
+    pub async fn project_create_plan_tasks(
+        &self,
+        Parameters(args): Parameters<ProjectCreatePlanTasksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = human_gates::project_create_plan_tasks(
+            &projects,
+            &args.project_id,
+            &args.plan_id,
+            &args.tasks,
+            &args.agent_id,
+            &args.role,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -438,7 +611,7 @@ impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Devboule app-tools MCP (Rust). P2: lifecycle + project/Kanban tools. Prefer DEVBOULE_MCP_BACKEND=python until cutover for plan/cloud/oracle tools."
+                "Devboule app-tools MCP (Rust). P3: lifecycle + project/Kanban + human gates (plan_submit/plan_status/request_git_push/ask_user/project_create_plan_tasks). Prefer DEVBOULE_MCP_BACKEND=python until cutover for mini/cloud/oracle tools. Agents never self-approve plans/pushes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -455,8 +628,8 @@ impl ServerHandler for DevbouleMcp {
 }
 
 /// Short per-role summary for the slim payload.
-const P2_ROLE_SUMMARY: &str =
-    "P2 Rust MCP: lifecycle + project/Kanban tools (role-filtered). Use DEVBOULE_MCP_BACKEND=python for plan/cloud/oracle tools.";
+const P3_ROLE_SUMMARY: &str =
+    "P3 Rust MCP: lifecycle + project/Kanban + human gates (role-filtered). Use DEVBOULE_MCP_BACKEND=python for mini/cloud/oracle tools.";
 
 /// Load role rules, filter `allowedTools` to `IMPLEMENTED_TOOLS`, and strip prose.
 fn load_role_rules_for_client() -> Result<Value> {
@@ -511,7 +684,7 @@ fn slim_roles_for_client(roles: &mut Value) {
         *role = json!({
             "role": role_name,
             "allowedTools": tools,
-            "summary": P2_ROLE_SUMMARY,
+            "summary": P3_ROLE_SUMMARY,
         });
     }
 }
@@ -622,7 +795,7 @@ mod tests {
                     role.get("role")
                 );
             }
-            assert_eq!(role["summary"], P2_ROLE_SUMMARY);
+            assert_eq!(role["summary"], P3_ROLE_SUMMARY);
         }
     }
 
@@ -648,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_gets_lifecycle_and_project_tools() {
+    fn coder_gets_lifecycle_project_and_human_gate_tools() {
         let roles = load_role_rules_for_client().expect("parse");
         let coder = roles
             .as_array()
@@ -673,13 +846,18 @@ mod tests {
             "project_update_status",
             "project_set_title",
             "project_create_followup",
+            "project_create_plan_tasks",
+            "plan_submit",
+            "plan_status",
+            "request_git_push",
+            "ask_user",
         ] {
             assert!(tools.contains(&need), "coder missing {need}");
         }
     }
 
     #[test]
-    fn verifier_lacks_set_title_and_followup() {
+    fn verifier_lacks_set_title_followup_and_plan_submit() {
         let roles = load_role_rules_for_client().expect("parse");
         let verifier = roles
             .as_array()
@@ -695,8 +873,13 @@ mod tests {
             .collect();
         assert!(tools.contains(&"project_claim_task"));
         assert!(tools.contains(&"project_update_status"));
+        assert!(tools.contains(&"plan_status"));
+        assert!(tools.contains(&"ask_user"));
         assert!(!tools.contains(&"project_set_title"));
         assert!(!tools.contains(&"project_create_followup"));
+        assert!(!tools.contains(&"plan_submit"));
+        assert!(!tools.contains(&"request_git_push"));
+        assert!(!tools.contains(&"project_create_plan_tasks"));
     }
 
     #[test]
@@ -722,19 +905,22 @@ mod tests {
         let roles = load_role_rules_for_client().expect("parse");
         let dumped = roles.to_string();
         for banned in [
-            "plan_submit",
             "spawn_mini_coder",
             "cloudflare_rotate",
-            "request_git_push",
             "censor_dispose",
-            "project_create_plan_tasks",
             "oracle_context",
+            "scaleway_resource_action",
         ] {
             assert!(
                 !dumped.contains(banned),
-                "P2 role payload must not mention unimplemented tool {banned}: {dumped}"
+                "P3 role payload must not mention unimplemented tool {banned}: {dumped}"
             );
         }
+        // P3 human gates must appear for coder.
+        assert!(dumped.contains("plan_submit"));
+        assert!(dumped.contains("request_git_push"));
+        assert!(dumped.contains("ask_user"));
+        assert!(dumped.contains("project_create_plan_tasks"));
     }
 
     #[test]
@@ -749,7 +935,7 @@ mod tests {
         let n = coder["allowedTools"].as_array().unwrap().len();
         assert!(
             n > IMPLEMENTED_TOOLS.len() - 1, // agent_rules not in role_rules
-            "expected full role_rules to list more tools than P2 implements (got {n})"
+            "expected full role_rules to list more tools than P3 implements (got {n})"
         );
     }
 

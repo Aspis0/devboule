@@ -401,8 +401,8 @@ Resolution order for binary path:
 - [x] **P1 audit** → fix (Windows atomic replace, subagents normalize, reserved status, path control chars)  
 - [x] **P2** Project/Kanban (8 tools + project_file parse/write)  
 - [x] **P2 audit** → fix (path confinement fail-closed, list symlink check, evidence chars, reopen lease)  
-- [ ] **P3** Human gates  
-- [ ] **P3 audit** → fix  
+- [x] **P3** Human gates (plan_submit/status, request_git_push, ask_user, project_create_plan_tasks)  
+- [x] **P3 audit** → fix (queue-only authz, one-shot materialize + Tauri fields, needsUser, honest push status)  
 - [ ] **P4** Mini/main coder  
 - [ ] **P4 audit** → fix  
 - [ ] **P5** Cloud  

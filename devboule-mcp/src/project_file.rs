@@ -424,7 +424,7 @@ fn find_state_block(content: &str) -> ToolResult<(Value, (usize, usize))> {
     Err(ToolError::new("Project state block is not closed."))
 }
 
-fn validate_project_state(state: &Value) -> ToolResult<()> {
+pub fn validate_project_state(state: &Value) -> ToolResult<()> {
     let obj = state
         .as_object()
         .ok_or_else(|| ToolError::new("Project state must be a JSON object."))?;
@@ -544,7 +544,7 @@ fn validate_project_state(state: &Value) -> ToolResult<()> {
     Ok(())
 }
 
-fn validate_task_dependency_dag(deps_by_id: &[(String, Vec<String>)]) -> ToolResult<()> {
+pub fn validate_task_dependency_dag(deps_by_id: &[(String, Vec<String>)]) -> ToolResult<()> {
     let known: std::collections::HashSet<&str> =
         deps_by_id.iter().map(|(id, _)| id.as_str()).collect();
     for (task_id, deps) in deps_by_id {
