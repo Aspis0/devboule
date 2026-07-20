@@ -1,0 +1,21 @@
+[package]
+name = "devboule-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Devboule app-tools MCP server (Rust) — replaces oracle.server.aspis_mcp"
+license = "Apache-2.0"
+
+[lib]
+name = "devboule_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devboule-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "io-std"] }
+rmcp = { version = "0.7", features = ["server", "transport-io", "macros"] }

@@ -46,6 +46,7 @@ pub mod graph;
 pub mod hardware;
 pub mod local_coder;
 pub mod main_coder;
+pub mod mcp_backend;
 pub mod mini_activity;
 pub mod mini_coder;
 pub mod mini_coder_executor;
