@@ -94,6 +94,7 @@ fn stamp_sessions_from_ledger(
         session.launch_token_issued_at = None;
         session.session_token_hash = None;
         session.session_token_issued_at = None;
+        session.launch_consumed_at = None;
         if let Some(entry) = ledger.get(&session.agent_id) {
             session.client = Some(entry.client.clone());
             session.host = entry.host.clone();
@@ -608,6 +609,8 @@ pub fn record_launch_pending(
             session.last_seen_at = Some(timestamp.clone());
             session.launch_token_hash = Some(token_hash.into());
             session.launch_token_issued_at = Some(timestamp.clone());
+            // Fresh app launch re-arms the one-shot credential (SEC#7).
+            session.launch_consumed_at = None;
         }
         None => live_state.sessions.push(AgentSession {
             agent_id: agent_id.into(),
@@ -625,6 +628,7 @@ pub fn record_launch_pending(
             launch_token_issued_at: Some(timestamp.clone()),
             session_token_hash: None,
             session_token_issued_at: None,
+            launch_consumed_at: None,
             subagents: Vec::new(),
             needs_user: None,
             // host is a read-time stamp from the ledger (get_agent_live_state),
@@ -2337,6 +2341,7 @@ mod tests {
             launch_token_issued_at: None,
             session_token_hash: None,
             session_token_issued_at: None,
+            launch_consumed_at: None,
             subagents: Vec::new(),
             needs_user: None,
             host: None,
@@ -2499,6 +2504,7 @@ mod tests {
             launch_token_issued_at: Some("2026-01-01T00:00:00Z".into()),
             session_token_hash: Some("LEAK".into()),
             session_token_issued_at: Some("2026-01-01T00:00:00Z".into()),
+            launch_consumed_at: Some("LEAK".into()),
             subagents: Vec::new(),
             needs_user: None,
             host: host_seed.map(String::from),
@@ -2548,6 +2554,7 @@ mod tests {
         assert_eq!(sessions[0].session_token_hash, None);
         assert_eq!(sessions[0].launch_token_issued_at, None);
         assert_eq!(sessions[0].session_token_issued_at, None);
+        assert_eq!(sessions[0].launch_consumed_at, None);
         // ext-agent: host "external" from the ledger.
         assert_eq!(sessions[1].host.as_deref(), Some("external"));
         assert_eq!(sessions[1].client.as_deref(), Some("codex"));
@@ -2748,6 +2755,7 @@ mod tests {
             launch_token_issued_at: None,
             session_token_hash: None,
             session_token_issued_at: None,
+            launch_consumed_at: None,
             subagents: vec![
                 AgentSubagent {
                     label: "coders".into(),

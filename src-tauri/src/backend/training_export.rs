@@ -952,6 +952,7 @@ mod tests {
             launch_token_issued_at: None,
             session_token_hash: None,
             session_token_issued_at: None,
+            launch_consumed_at: None,
             subagents: vec![],
             needs_user: None,
             host: None,

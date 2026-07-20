@@ -1167,6 +1167,12 @@ pub struct AgentSession {
     pub session_token_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_token_issued_at: Option<String>,
+    // SEC#7: stamped when a managed launch token is consumed by agent_register.
+    // Blocks tokenless re-register after the one-shot credential is spent.
+    // Cleared when the app records a fresh launch_pending with a new token.
+    // Scrubbed from UI/public paths like the other token fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_consumed_at: Option<String>,
     // Subagent breakdown reported by the agent (orchestrator fan-out, coder
     // helpers, etc). Additive + skip-if-empty so older JSON and the Python MCP
     // round-trip (which owns this file) still deserialize and Rust never injects

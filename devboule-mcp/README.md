@@ -9,7 +9,9 @@ See the full port plan: [`docs/devboule-mcp-port-plan.md`](../docs/devboule-mcp-
 
 | Phase | Tools | Default |
 |-------|-------|---------|
-| **P0** (this crate) | `agent_rules` only | Agents still use **Python** unless flagged |
+| **P1** (this crate) | `agent_rules`, `agent_register`, `agent_heartbeat`, `agent_state` | Agents still use **Python** unless flagged |
+
+Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive flock + crash-safe write). Prefer `DEVBOULE_MCP_PROJECTS_DIR` / `DEVBOULE_MCP_ROOT`; Aspis env names still accepted.
 
 ## Backend flag (app / shell)
 
@@ -70,7 +72,13 @@ Smoke (stdio MCP; needs an MCP client or raw initialize handshake):
 ## Honesty rule
 
 `agent_rules` returns a **slim** role payload: only `role`, filtered
-`allowedTools` (tools this binary actually implements), and a short P0 `summary`.
-It does **not** echo forbidden lists, contracts, or launch prompts that name
-unimplemented tools. Full SSoT still lives in `oracle/server/role_rules.json`
-for the Python backend.
+`allowedTools` (intersection of role allowlist and tools this binary implements),
+and a short summary. Meta tool `agent_rules` is always listed; mini does **not**
+see `agent_heartbeat` / `agent_state`. Full SSoT still lives in
+`oracle/server/role_rules.json` for the Python backend.
+
+## Kill switches (dual-read)
+
+| Devboule | Legacy Aspis | Effect |
+|----------|--------------|--------|
+| `DEVBOULE_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS=1` | `ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS=1` | Allow self-registration without app launch token (session token still enforced when a hash exists) |

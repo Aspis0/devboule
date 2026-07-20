@@ -807,6 +807,7 @@ mod tests {
             launch_token_issued_at: None,
             session_token_hash: None,
             session_token_issued_at: None,
+            launch_consumed_at: None,
             subagents: Vec::new(),
             needs_user: Some(super::super::model::AgentNeedsUser {
                 reason: reason.into(),

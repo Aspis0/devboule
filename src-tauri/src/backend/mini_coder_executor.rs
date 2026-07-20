@@ -3041,6 +3041,7 @@ fn upsert_mini_session(
         launch_token_issued_at: oracle_token_hash.map(|_| timestamp_now.clone()),
         session_token_hash: None,
         session_token_issued_at: None,
+        launch_consumed_at: None,
         subagents: Vec::new(),
         needs_user: None,
         host: Some(super::agents::HOST_APP.to_string()),

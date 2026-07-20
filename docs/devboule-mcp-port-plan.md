@@ -397,8 +397,8 @@ Resolution order for binary path:
 
 - [x] **P0** Scaffold `devboule-mcp` + agent_rules + backend flag + dual env names  
 - [x] **P0 audit** hostile reviewer → fix (2 review rounds; ship-safe default python + optional rust via absolute `DEVBOULE_MCP_BIN`)  
-- [ ] **P1** Session tools  
-- [ ] **P1 audit** → fix  
+- [x] **P1** Session tools (`agent_register` / `agent_heartbeat` / `agent_state` + lock + `launchConsumedAt`)  
+- [x] **P1 audit** → fix (Windows atomic replace, subagents normalize, reserved status, path control chars)  
 - [ ] **P2** Project/Kanban  
 - [ ] **P2 audit** → fix  
 - [ ] **P3** Human gates  

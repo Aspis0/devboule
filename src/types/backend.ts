@@ -1313,6 +1313,8 @@ export interface AgentSession {
 	launchTokenIssuedAt?: string | null;
 	sessionTokenHash?: string | null;
 	sessionTokenIssuedAt?: string | null;
+	/** SEC#7: set when launch token consumed; scrubbed from UI paths. */
+	launchConsumedAt?: string | null;
 	// Subagent breakdown the agent reports (orchestrator fan-out, coder helpers).
 	// Optional/absent for sessions that never reported any.
 	subagents?: AgentSubagent[];
