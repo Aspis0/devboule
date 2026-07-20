@@ -405,7 +405,7 @@ Resolution order for binary path:
 - [x] **P3 audit** → fix (queue-only authz, one-shot materialize + Tauri fields, needsUser, honest push status)  
 - [x] **P4** Mini/main coder (spawn/steer/result + spawn_main_coder via directives)  
 - [x] **P4 audit** → fix (hard queue caps, ownership fail-closed, no stamp-over-terminal, spawn_blocking)  
-- [ ] **P5** Cloud  
+- [x] **P5** Cloud (5 tools + env tokens + pin/confirm/claim/approval guards; HTTP via reqwest)  
 - [ ] **P5 audit** → fix  
 - [ ] **P6** Oracle/CKG/censor/design  
 - [ ] **P6 audit** → fix  
