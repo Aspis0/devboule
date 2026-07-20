@@ -386,8 +386,10 @@ pub fn list_pending_design_requests(
 #[tauri::command]
 pub fn design_request_claim(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     directive_id: String,
 ) -> Result<Option<crate::backend::design_request::DesignRequestDirective>, String> {
+    state.ensure_unlocked()?;
     let now = Utc::now().to_rfc3339();
     mutate_agent_live_state(&app, |state| {
         let d = state
@@ -409,11 +411,13 @@ pub fn design_request_claim(
 #[tauri::command]
 pub fn design_request_complete(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     directive_id: String,
     design_project_path: Option<String>,
     registry_id: Option<String>,
     error: Option<String>,
 ) -> Result<(), String> {
+    state.ensure_unlocked()?;
     use crate::backend::design_request::DesignRequestOutcome;
     let outcome = match (design_project_path, registry_id) {
         (Some(path), Some(id)) => DesignRequestOutcome::done(path, id),

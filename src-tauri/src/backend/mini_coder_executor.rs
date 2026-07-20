@@ -42,9 +42,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::agents;
+use super::state::BackendState;
 use super::mini_coder::{
     self, MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective, MiniCoderOutcome,
     MiniCoderStatus, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS, MAX_DIRECTIVES,
@@ -3985,9 +3986,13 @@ pub fn mini_coder_kill(app: AppHandle, agent_id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn mini_coder_steer(
     app: AppHandle,
+    state: State<'_, BackendState>,
     agent_id: String,
     message: String,
 ) -> Result<serde_json::Value, String> {
+    // Audit F-02-003: steer injects work into a mini; Stop (mini_coder_kill) stays
+    // unlock-free by design (safety override). Steer is not an emergency stop.
+    state.ensure_unlocked()?;
     crate::backend::agent_pty::validate_agent_id(&agent_id)?;
     // CO-WRITER PARITY with the Python `steer_mini_coder` tool (clean_text ->
     // strip_invisible_and_bidi + whitespace collapse, THEN the shared cap): C2 — strip

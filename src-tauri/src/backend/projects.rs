@@ -4223,10 +4223,13 @@ pub(crate) fn steer_no_session_fallback() -> Result<(), String> {
 #[tauri::command]
 pub fn orchestrator_steer(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     agent_id: String,
     message: String,
     msg_id: Option<String>,
 ) -> Result<(), String> {
+    // Audit F-02-002 / F-LCK-001: steer is a sensitive control-plane action.
+    state.ensure_unlocked()?;
     // Newline-flatten + 2000-char cap — applied before either route below.
     let msg: String = message
         .trim()
@@ -4298,8 +4301,11 @@ pub(crate) fn wipe_planner_files(
 #[tauri::command]
 pub fn planner_reset_chat(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     agent_id: String,
 ) -> Result<(), String> {
+    // Audit F-02-002: reset kills processes + wipes planner files — unlock required.
+    state.ensure_unlocked()?;
     // 1. Stop whatever process holds this agent id. `stop_agent_process_only`
     //    routes pi sessions, cloud duplex and PTYs; a "nothing to stop" result
     //    is fine — we still wipe the files.

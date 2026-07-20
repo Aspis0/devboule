@@ -852,8 +852,14 @@ pub fn polis_fix_sin(
 }
 
 #[tauri::command]
-pub fn polis_debug_log(line: String) {
+pub fn polis_debug_log(
+    state: State<'_, BackendState>,
+    line: String,
+) -> Result<(), String> {
+    // Audit F-02-012: diagnostic append still requires unlock (no free IPC while locked).
+    state.ensure_unlocked()?;
     polis_debug_append(&line);
+    Ok(())
 }
 
 /// Hard ceiling for the diagnostic log: once `%TEMP%/aspis-polis-debug.log` exceeds

@@ -27,7 +27,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, State};
+
+use super::state::BackendState;
 
 use super::cloud_claude::ClaudeNormalizer;
 use super::cloud_codex::CodexNormalizer;
@@ -652,8 +654,10 @@ pub fn cloud_duplex_interrupt(
 #[tauri::command]
 pub fn project_cloud_orchestrator_interrupt(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     agent_id: String,
 ) -> Result<(), String> {
+    state.ensure_unlocked()?;
     let sessions = app.state::<CloudDuplexSessions>();
     cloud_duplex_interrupt(&sessions, &agent_id)
 }
@@ -715,6 +719,7 @@ pub fn kill_all_on_exit(app: &tauri::AppHandle) {
 #[tauri::command]
 pub fn project_cloud_orchestrator_send(
     app: tauri::AppHandle,
+    state: State<'_, BackendState>,
     agent_id: String,
     message: String,
     // D3: the frontend's send id, echoed into the bridge (`msgId`) so the optimistic
@@ -722,6 +727,8 @@ pub fn project_cloud_orchestrator_send(
     // the echo line byte-identical to before.
     msg_id: Option<String>,
 ) -> Result<(), String> {
+    // Audit F-02-001 / F-02-014: writing to a live cloud agent requires unlock.
+    state.ensure_unlocked()?;
     let sessions = app.state::<CloudDuplexSessions>();
     let result = cloud_duplex_send(&sessions, &agent_id, &message, msg_id.as_deref());
     // SELF-HEAL: "no live session" here means the ledger/state row is a GHOST —
@@ -776,7 +783,12 @@ pub fn cloud_duplex_compact(sessions: &CloudDuplexSessions, agent_id: &str) -> R
 
 /// IPC: compact a live Codex duplex session's context (frontend Compact button for Codex).
 #[tauri::command]
-pub fn project_cloud_compact(app: tauri::AppHandle, agent_id: String) -> Result<(), String> {
+pub fn project_cloud_compact(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    agent_id: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
     let sessions = app.state::<CloudDuplexSessions>();
     cloud_duplex_compact(&sessions, &agent_id)
 }

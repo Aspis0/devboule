@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
+
+use super::state::BackendState;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -796,7 +798,13 @@ pub fn pi_extensions_list(app: AppHandle) -> Result<Vec<PiExtensionInfo>, String
 
 /// Install an extension by source.
 #[tauri::command]
-pub async fn pi_extension_install(app: AppHandle, source: String) -> Result<String, String> {
+pub async fn pi_extension_install(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    source: String,
+) -> Result<String, String> {
+    // Audit F-02-005: installing third-party extensions requires unlock.
+    state.ensure_unlocked()?;
     // Reject if bootstrap is still running (issue 3b).
     if bootstrap_is_running() {
         return Err(
@@ -819,7 +827,12 @@ pub async fn pi_extension_install(app: AppHandle, source: String) -> Result<Stri
 
 /// Remove an extension by source.
 #[tauri::command]
-pub async fn pi_extension_remove(app: AppHandle, source: String) -> Result<String, String> {
+pub async fn pi_extension_remove(
+    app: AppHandle,
+    state: State<'_, BackendState>,
+    source: String,
+) -> Result<String, String> {
+    state.ensure_unlocked()?;
     // Reject if bootstrap is still running (issue 3b).
     if bootstrap_is_running() {
         return Err(
