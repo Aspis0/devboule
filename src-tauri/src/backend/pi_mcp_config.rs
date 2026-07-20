@@ -26,39 +26,29 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Build the `devboule` MCP server entry for the pi mcp.json format.
 /// Uses the same resolution chain as the claude/codex MCP wiring — the caller
 /// passes pre-resolved values so this function stays pure and testable.
+///
+/// Honors `DEVBOULE_MCP_BACKEND` (default python). Dual-writes Devboule + Aspis
+/// env keys via `mcp_backend`. Pi-specific `transport` / `lifecycle` are added
+/// on top of the shared Claude/Codex entry shape.
 fn build_aspis_entry(
     python: &str,
     management_root: &Path,
     projects_dir: &Path,
     app_bin: Option<&str>,
-) -> Value {
-    let mut env = Map::new();
-    env.insert(
-        "PYTHONPATH".into(),
-        management_root.to_string_lossy().into_owned().into(),
-    );
-    env.insert("PYTHONIOENCODING".into(), "utf-8".into());
-    env.insert("HF_HUB_OFFLINE".into(), "1".into());
-    env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());
-    env.insert(
-        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".into(),
-        "1".into(),
-    );
-    if let Some(bin) = app_bin.filter(|s| !s.trim().is_empty()) {
-        env.insert("ASPIS_APP_BIN".into(), bin.to_string().into());
+) -> Result<Value, String> {
+    let mut entry = super::mcp_backend::build_devboule_mcp_server_entry(
+        super::mcp_backend::McpBackend::from_env(),
+        python,
+        management_root,
+        projects_dir,
+        app_bin,
+    )?;
+    // Pi mcp.json extras (not used by Claude/Codex).
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("transport".into(), json!("stdio"));
+        obj.insert("lifecycle".into(), json!("eager"));
     }
-
-    json!({
-        "command": python,
-        "args": [
-            "-m", "oracle.server.aspis_mcp",
-            "--root", management_root.to_string_lossy(),
-            "--projects-dir", projects_dir.to_string_lossy(),
-        ],
-        "transport": "stdio",
-        "lifecycle": "eager",
-        "env": env,
-    })
+    Ok(entry)
 }
 
 /// Ensure `<project_root>/.pi/mcp.json` contains an `devboule` MCP
@@ -138,7 +128,7 @@ pub(crate) fn ensure_project_pi_mcp_config(
     };
 
     // Set/overwrite the devboule entry. Foreign keys are preserved.
-    let entry = build_aspis_entry(python, management_root, projects_dir, app_bin);
+    let entry = build_aspis_entry(python, management_root, projects_dir, app_bin)?;
     mcp_servers.insert("devboule".into(), entry);
 
     // Atomic write: tmp + rename. The tmp filename is unique per call (pid + a
@@ -418,7 +408,11 @@ mod tests {
         let config_path = root.join(".pi").join("mcp.json");
         let result: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let env = &result["mcpServers"]["devboule"]["env"];
+        // Dual-write: Devboule + legacy Aspis app-bin keys.
+        assert_eq!(env["DEVBOULE_APP_BIN"], "/usr/local/bin/aspis-app");
         assert_eq!(env["ASPIS_APP_BIN"], "/usr/local/bin/aspis-app");
+        assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], "1");
+        assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], "1");
         cleanup_project(&root);
     }
 

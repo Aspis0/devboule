@@ -1005,22 +1005,67 @@ fn mcp_command_hint_for_paths(
     projects_dir: &Path,
     pigeon_env: Option<(&str, &str)>,
 ) -> String {
-    // NO-CHURN: with `pigeon_env` None (the default / Pigeon disabled) this is byte-identical
-    // to before this slice. When Some, append the two `$env:` exports next to the existing ones.
-    let pigeon_exports = match pigeon_env {
-        Some((port, token)) => {
-            format!(" $env:PIGEON_PORT=\"{port}\"; $env:PIGEON_AUTH_TOKEN=\"{token}\";")
+    // Derive the PowerShell one-liner from the shared MCP entry builder so the
+    // UI hint tracks DEVBOULE_MCP_BACKEND (python default / rust when selected).
+    let entry = match crate::backend::mcp_backend::build_devboule_mcp_server_entry(
+        crate::backend::mcp_backend::McpBackend::from_env(),
+        "python",
+        root,
+        projects_dir,
+        None,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return format!(
+                "# devboule MCP unavailable: {e} (set DEVBOULE_MCP_BIN or use DEVBOULE_MCP_BACKEND=python)"
+            );
         }
-        None => String::new(),
     };
-    format!(
-        "cd \"{}\"; $env:PYTHONPATH=\"{}\"; $env:PYTHONIOENCODING=\"utf-8\"; $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE=\"1\";{} python -m oracle.server.aspis_mcp --root \"{}\" --projects-dir \"{}\"",
-        root.to_string_lossy(),
-        root.to_string_lossy(),
-        pigeon_exports,
-        root.to_string_lossy(),
-        projects_dir.to_string_lossy()
-    )
+
+    let command = entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("python");
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut parts = vec![format!("cd \"{}\"", root.to_string_lossy())];
+    if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
+        for (key, value) in env {
+            if let Some(s) = value.as_str() {
+                parts.push(format!("$env:{key}=\"{s}\""));
+            }
+        }
+    }
+    if let Some((port, token)) = pigeon_env {
+        parts.push(format!("$env:PIGEON_PORT=\"{port}\""));
+        parts.push(format!("$env:PIGEON_AUTH_TOKEN=\"{token}\""));
+    }
+
+    // Command + args. Quote the command when it looks like a path (rust binary).
+    let cmd_token = if command.contains('/') || command.contains('\\') {
+        format!("\"{command}\"")
+    } else {
+        command.to_string()
+    };
+    let mut cmd = cmd_token;
+    for a in args {
+        cmd.push(' ');
+        if a.contains(' ') || a.contains('\\') {
+            cmd.push('"');
+            cmd.push_str(a);
+            cmd.push('"');
+        } else {
+            cmd.push_str(a);
+        }
+    }
+    parts.push(cmd);
+
+    // Join with "; " so the shape matches the historical PowerShell one-liner.
+    parts.join("; ")
 }
 
 fn mcp_client_config_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
@@ -1038,36 +1083,39 @@ fn mcp_client_config_hint_for_paths(
     projects_dir: &Path,
     pigeon_env: Option<(&str, &str)>,
 ) -> String {
-    // Build the env map, then conditionally add the Pigeon coordinates. With `pigeon_env`
-    // None the map is byte-identical to before this slice (NO-CHURN).
-    let mut env = json!({
-        "PYTHONPATH": root.to_string_lossy(),
-        "PYTHONIOENCODING": "utf-8",
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
-        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
-    });
-    if let Some((port, token)) = pigeon_env {
-        if let Some(map) = env.as_object_mut() {
-            map.insert("PIGEON_PORT".into(), json!(port));
-            map.insert("PIGEON_AUTH_TOKEN".into(), json!(token));
+    // Shared builder + optional Pigeon env. Fail closed with a short JSON error
+    // object if the entry cannot be built (rust bin missing).
+    let mut entry = match crate::backend::mcp_backend::build_devboule_mcp_server_entry(
+        crate::backend::mcp_backend::McpBackend::from_env(),
+        "python",
+        root,
+        projects_dir,
+        None,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return format!(
+                "{{\n  \"error\": \"devboule MCP unavailable: {}\"\n}}",
+                e.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+    };
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("cwd".into(), json!(root.to_string_lossy()));
+        if let Some((port, token)) = pigeon_env {
+            let env = obj
+                .entry("env")
+                .or_insert_with(|| json!({}))
+                .as_object_mut();
+            if let Some(map) = env {
+                map.insert("PIGEON_PORT".into(), json!(port));
+                map.insert("PIGEON_AUTH_TOKEN".into(), json!(token));
+            }
         }
     }
     serde_json::to_string_pretty(&json!({
         "mcpServers": {
-            "devboule": {
-                "command": "python",
-                "args": [
-                    "-m",
-                    "oracle.server.aspis_mcp",
-                    "--root",
-                    root.to_string_lossy(),
-                    "--projects-dir",
-                    projects_dir.to_string_lossy()
-                ],
-                "cwd": root.to_string_lossy(),
-                "env": env
-            }
+            "devboule": entry
         }
     }))
     .unwrap_or_default()

@@ -4402,13 +4402,19 @@ fn build_cloud_duplex_launch(
     let provider = crate::backend::cloud_duplex::Provider::from_client(client)?;
     let python = crate::oracle::oracle_setup::resolve_oracle_python();
     let app_bin = resolve_app_binary().map(|p| p.to_string_lossy().into_owned());
+    // Fail-closed: missing MCP entry aborts the duplex launch (None → caller Err).
     let mcp = mcp_client_config_json(
         &python,
         management_root,
         projects_dir,
         app_bin.as_deref(),
         user_servers,
-    );
+    )
+    .map_err(|e| {
+        eprintln!("[mcp] cloud duplex MCP config failed: {e}");
+        e
+    })
+    .ok()?;
 
     let mut args: Vec<String> = Vec::new();
     let program = match provider {
@@ -4732,6 +4738,11 @@ fn build_cloud_duplex_launch(
         .map(|e| (e.name.clone(), e.value.clone()))
         .collect();
     // Mirror the env the PTY launch script sets for the CLI process itself.
+    // Dual-write Devboule + legacy Aspis (P0 branding; one release).
+    envs.push((
+        "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE".to_string(),
+        "1".to_string(),
+    ));
     envs.push((
         "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".to_string(),
         "1".to_string(),
@@ -4796,41 +4807,25 @@ pub(crate) fn mcp_client_config_json(
     // param existed (the Oracle map is unchanged), so the no-user-servers path is a clean
     // regression. The MINI never gets these — this builder is the MAIN-coder launch path.
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> String {
-    let mut env = serde_json::Map::new();
-    env.insert(
-        "PYTHONPATH".into(),
-        management_root.to_string_lossy().into_owned().into(),
-    );
-    env.insert("PYTHONIOENCODING".into(), "utf-8".into());
-    env.insert("HF_HUB_OFFLINE".into(), "1".into());
-    env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());
-    env.insert("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".into(), "1".into());
-    // ASPIS_APP_BIN: the running app binary path so the server's read-only
-    // `project_structure` tool can shell out to the Rust structure builder (zero
-    // tree-sitter duplication). Omitted when unavailable (the Python tool errors
-    // clearly instead of guessing). NOT a secret.
-    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
-        env.insert("ASPIS_APP_BIN".into(), app_bin.to_string().into());
+) -> Result<String, String> {
+    // Shared builder: honors DEVBOULE_MCP_BACKEND + dual-writes Devboule/Aspis env.
+    // Fail-closed: if the entry cannot be built (e.g. rust backend, bin missing), return Err
+    // so spawn/config never silently launches without Oracle/devboule tools.
+    let mut entry = crate::backend::mcp_backend::build_devboule_mcp_server_entry(
+        crate::backend::mcp_backend::McpBackend::from_env(),
+        python,
+        management_root,
+        projects_dir,
+        app_bin,
+    )?;
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(
+            "cwd".into(),
+            serde_json::json!(management_root.to_string_lossy()),
+        );
     }
-    // Oracle FIRST and unaffected (design §5.1). Build the map, then append user servers.
     let mut servers = serde_json::Map::new();
-    servers.insert(
-        "devboule".into(),
-        serde_json::json!({
-            "command": python,
-            "args": [
-                "-m",
-                "oracle.server.aspis_mcp",
-                "--root",
-                management_root.to_string_lossy(),
-                "--projects-dir",
-                projects_dir.to_string_lossy(),
-            ],
-            "cwd": management_root.to_string_lossy(),
-            "env": env,
-        }),
-    );
+    servers.insert("devboule".into(), entry);
     for server in user_servers {
         // Defense in depth: a reserved name can never have reached here (the add command and
         // the fail-open reader both reject it), but skip it anyway so the Oracle entry can
@@ -4852,16 +4847,8 @@ pub(crate) fn mcp_client_config_json(
             }),
         );
     }
-    // Worst-case fallback: serializing this `serde_json::Map` of string-keyed JSON values
-    // effectively never fails, but if it ever did, `.unwrap_or_default()` would yield `""` —
-    // and claude launched with `--mcp-config ""` starts with NO MCP servers AT ALL (no
-    // Oracle), silently losing every tool. Fall back to a VALID-JSON empty config instead so
-    // the worst case is "claude launches degraded (no servers)" rather than a malformed flag
-    // value. (This builder returns String and threads through several launch-line callers; a
-    // Result would cascade into a large signature change for a path that cannot realistically
-    // fail, so the valid-JSON fallback is the proportionate fix.)
     serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))
-        .unwrap_or_else(|_| "{\"mcpServers\":{}}".to_string())
+        .map_err(|e| format!("failed to serialize MCP client config: {e}"))
 }
 
 fn cloudflare_agent_provider_env_for_role(role: &str) -> Result<Vec<AgentLaunchEnv>, String> {
@@ -8055,11 +8042,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
 
         assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+        // Dual-write Devboule counterparts (P0 branding).
+        assert!(codex.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
+        assert!(claude.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(!codex.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
         assert!(!claude.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
     }
@@ -8076,11 +8066,15 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let app_bin = "/opt/aspis/devboule";
 
         let codex_with =
-            codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).join(" ");
-        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]);
+            codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).unwrap().join(" ");
+        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]).unwrap();
         assert!(
             codex_with.contains("mcp_servers.devboule.env.ASPIS_APP_BIN="),
             "codex args must set ASPIS_APP_BIN: {codex_with}"
+        );
+        assert!(
+            codex_with.contains("mcp_servers.devboule.env.DEVBOULE_APP_BIN="),
+            "codex args must dual-write DEVBOULE_APP_BIN: {codex_with}"
         );
         assert!(
             codex_with.contains(app_bin),
@@ -8091,26 +8085,42 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             "claude env must set ASPIS_APP_BIN: {claude_with}"
         );
         assert!(
+            claude_with.contains("\"DEVBOULE_APP_BIN\""),
+            "claude env must dual-write DEVBOULE_APP_BIN: {claude_with}"
+        );
+        assert!(
             claude_with.contains(app_bin),
             "claude env must carry the binary path"
         );
 
         // None / empty → the key is omitted entirely.
-        let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
-        let claude_none = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[]).unwrap().join(" ");
+        let claude_none = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
         let codex_blank =
-            codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).join(" ");
+            codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).unwrap().join(" ");
         assert!(
             !codex_none.contains("ASPIS_APP_BIN"),
             "absent app bin ⇒ no codex key"
+        );
+        assert!(
+            !codex_none.contains("DEVBOULE_APP_BIN"),
+            "absent app bin ⇒ no DEVBOULE_APP_BIN codex key"
         );
         assert!(
             !claude_none.contains("ASPIS_APP_BIN"),
             "absent app bin ⇒ no claude key"
         );
         assert!(
+            !claude_none.contains("DEVBOULE_APP_BIN"),
+            "absent app bin ⇒ no DEVBOULE_APP_BIN claude key"
+        );
+        assert!(
             !codex_blank.contains("ASPIS_APP_BIN"),
             "blank app bin ⇒ no codex key"
+        );
+        assert!(
+            !codex_blank.contains("DEVBOULE_APP_BIN"),
+            "blank app bin ⇒ no DEVBOULE_APP_BIN codex key"
         );
     }
 
@@ -8140,8 +8150,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let servers = [user_server_fixture()];
 
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &servers);
-        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).join(" ");
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &servers).unwrap();
+        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).unwrap().join(" ");
 
         // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
         let oracle_pos_claude = claude
@@ -8184,8 +8194,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
-        let claude_empty = mcp_client_config_json("python3", &root, &projects, None, &[]);
-        let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
+        let claude_empty = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
+        let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[]).unwrap().join(" ");
 
         // Exactly ONE server key in the claude config (the Oracle), no user-server noise.
         assert_eq!(
@@ -8212,7 +8222,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         server.args = Vec::new();
         let servers = [server];
 
-        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).join(" ");
+        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).unwrap().join(" ");
         assert!(
             codex.contains("mcp_servers.my-db.command="),
             "command token must still be present: {codex}"
@@ -8226,7 +8236,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         // And the same for the macOS launch line (it shares codex_user_server_config_settings).
         let macos =
-            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers);
+            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers).unwrap();
         assert!(macos.contains("mcp_servers.my-db.command="));
         assert!(
             !macos.contains("mcp_servers.my-db.args="),
@@ -8390,7 +8400,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // no user keys.
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
         assert!(!claude.contains("\"my-db\""));
     }
 
@@ -8743,8 +8753,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let claude_json = mcp_client_config_json(python, &root, &projects, None, &[]);
-        let codex_args = codex_mcp_config_args(python, &root, &projects, None, &[]).join(" ");
+        let claude_json = mcp_client_config_json(python, &root, &projects, None, &[]).unwrap();
+        let codex_args = codex_mcp_config_args(python, &root, &projects, None, &[]).unwrap().join(" ");
 
         // The resolved interpreter is what actually runs the MCP server.
         assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
@@ -8764,8 +8774,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None, &[]);
-        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None, &[]);
+        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None, &[]).unwrap();
+        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None, &[]).unwrap();
 
         assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
         assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
@@ -8785,10 +8795,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let model = "test-model-xyz";
 
         let codex_with =
-            codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]);
-        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None, &[]);
-        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
-        let claude_none = claude_launch_script("python3", &root, &projects, None, None, &[]);
+            codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]).unwrap();
+        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None, &[]).unwrap();
+        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+        let claude_none = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
         // Selected model reaches the CLI.
         assert!(claude_with.contains("--model"));
@@ -8810,12 +8820,12 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let model = "test-model-xyz";
 
         let codex_with =
-            macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]);
+            macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]).unwrap();
         let claude_with =
-            macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]);
+            macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]).unwrap();
         let codex_none =
-            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]);
-        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None, &[]);
+            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]).unwrap();
+        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None, &[]).unwrap();
 
         assert!(claude_with.contains("--model"));
         assert!(claude_with.contains(model));
@@ -8831,7 +8841,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
 
         // The prompt must be piped into codex via STDIN so PowerShell never
         // word-splits it (which would mangle `<`/`>` and leak the launch token).
@@ -8846,7 +8856,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
-        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]);
+        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
         assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
         assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
@@ -8915,8 +8925,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let root = PathBuf::from("C:\\Devboule");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
-        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
         // The literal prompt text is never embedded in either launch script: it
         // is supplied at runtime through the `$prompt` variable piped over STDIN.

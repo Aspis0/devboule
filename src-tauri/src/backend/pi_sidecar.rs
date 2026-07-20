@@ -1369,9 +1369,20 @@ fn spawn_pi_session_inner(
 
     // F3: resolve projects_dir and management_root for the sandbox policy and
     // the MCP config. These use the same resolution chain as claude/codex MCP
-    // wiring. Fail-soft: if resolution fails, proceed without MCP config and
-    // use a minimal sandbox (the session works, just without aspis tools).
-    let mcp_paths = crate::backend::pi_mcp_config::resolve_mcp_paths(app).ok();
+    // wiring.
+    // Python: fail-soft if resolution fails (session works without Devboule tools).
+    // Rust: fail-hard — soft-continue would leave a stale Python entry in `.pi/mcp.json`.
+    let mcp_backend = crate::backend::mcp_backend::McpBackend::from_env();
+    let mcp_paths = match crate::backend::pi_mcp_config::resolve_mcp_paths(app) {
+        Ok(p) => Some(p),
+        Err(e) if mcp_backend == crate::backend::mcp_backend::McpBackend::Rust => {
+            return Err(format!(
+                "devboule MCP paths could not be resolved (Rust backend requires a valid \
+                 management root; refusing to spawn with a possibly-stale Python MCP entry): {e}"
+            ));
+        }
+        Err(_) => None,
+    };
     let (projects_dir, management_root) = mcp_paths
         .as_ref()
         .map(|(_, mgr, proj, _)| (proj.clone(), mgr.clone()))
@@ -1522,17 +1533,48 @@ fn spawn_pi_session_inner(
     }
 
     // F2: write/merge the project-scoped pi MCP config so the session discovers
-    // devboule tools. Fail-SOFT: on error, log a warning and continue
-    // the spawn (a chat without tools is better than no chat).
+    // devboule tools.
     //
-    // NOTE: we cannot surface the failure via `inject_console_entry` here, because
+    // Python backend: fail-SOFT (log + banner; chat without tools is better than no chat).
+    // Rust backend: fail-HARD — a soft-fail would leave a stale Python `devboule`
+    // entry from a previous session, which is worse than refusing the spawn when
+    // the operator explicitly selected the Rust MCP.
+    //
+    // NOTE: we cannot surface soft-fail via `inject_console_entry` here, because
     // the session slot's `inner` is not populated yet (that happens in
     // get_or_spawn_session Phase 3, after this fn returns). inject_console_entry
     // would always err with "has empty slot (spawning?)" and the banner would be
     // swallowed. Instead we capture the text in `mcp_config_banner` and push it
     // directly into the injection queue once it exists (we own the queue mid-spawn).
     let mut mcp_config_banner: Option<String> = None;
-    if let Some(ref root) = project_root {
+    if mcp_backend == crate::backend::mcp_backend::McpBackend::Rust {
+        // Rust: every gate that would skip writing MCP config is hard-fail.
+        // Soft-continue would leave a stale Python `devboule` entry on disk.
+        let root = project_root.as_ref().ok_or_else(|| {
+            "devboule MCP (Rust backend): project root is required to write .pi/mcp.json; \
+             refusing to spawn with a possibly-stale Python entry"
+                .to_string()
+        })?;
+        let (ref python, ref mgr_root, ref proj_dir, ref app_bin_str) =
+            mcp_paths.as_ref().ok_or_else(|| {
+                "devboule MCP (Rust backend): MCP paths unavailable after resolve; \
+                 refusing to spawn with a possibly-stale Python entry"
+                    .to_string()
+            })?;
+        crate::backend::pi_mcp_config::ensure_project_pi_mcp_config(
+            root,
+            python,
+            mgr_root,
+            proj_dir,
+            app_bin_str.as_deref(),
+        )
+        .map_err(|e| {
+            format!(
+                "devboule MCP config could not be written (Rust backend requires a valid \
+                 project MCP entry; refusing to spawn with a possibly-stale Python entry): {e}"
+            )
+        })?;
+    } else if let Some(ref root) = project_root {
         if let Some((ref python, ref mgr_root, ref proj_dir, ref app_bin_str)) = mcp_paths {
             if let Err(e) = crate::backend::pi_mcp_config::ensure_project_pi_mcp_config(
                 root,
@@ -1542,9 +1584,9 @@ fn spawn_pi_session_inner(
                 app_bin_str.as_deref(),
             ) {
                 eprintln!("[pi-sidecar] F2: MCP config merge failed: {e}");
-                // Surface a console banner so the user sees why aspis tools are absent.
+                // Surface a console banner so the user sees why tools are absent.
                 mcp_config_banner = Some(format!(
-                    "devboule MCP config could not be written: {e}. Aspis tools may be unavailable."
+                    "devboule MCP config could not be written: {e}. Devboule tools may be unavailable."
                 ));
             }
         }

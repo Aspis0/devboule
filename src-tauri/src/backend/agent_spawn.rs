@@ -226,6 +226,7 @@ fn spawn_agent_terminal_app_impl(
     let mut cmd = CommandBuilder::new("powershell.exe");
     cmd.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", &script]);
     cmd.cwd(root_path);
+    cmd.env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1");
     cmd.env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1");
     for env in provider_env {
         cmd.env(&env.name, &env.value);
@@ -294,6 +295,7 @@ fn spawn_agent_terminal_app_impl(
     let mut cmd = CommandBuilder::new(shell);
     cmd.args(["-ic", &script]);
     cmd.cwd(root_path);
+    cmd.env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1");
     cmd.env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1");
     for env in provider_env {
         cmd.env(&env.name, &env.value);
@@ -402,7 +404,7 @@ pub(crate) fn build_windows_agent_script(
             model,
             app_bin.as_deref(),
             user_servers,
-        )
+        )?
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -413,7 +415,7 @@ pub(crate) fn build_windows_agent_script(
             model,
             app_bin.as_deref(),
             user_servers,
-        )
+        )?
     } else {
         executable.to_string()
     };
@@ -498,6 +500,7 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n\
 Set-Clipboard -Value $prompt\n\
 $env:DEVBOULE_ROOT = {management_root_label}\n\
 $env:ASPIS_PROJECTS_DIR = {projects_dir_label}\n\
+$env:DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
 $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
 $env:GIT_TERMINAL_PROMPT = '0'\n\
 $env:GIT_CONFIG_NOSYSTEM = '1'\n\
@@ -553,6 +556,7 @@ fn spawn_agent_terminal_impl(
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
+        .env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1")
         .env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1")
         .envs(
             provider_env
@@ -673,7 +677,7 @@ pub(crate) fn build_macos_agent_script(
             model,
             app_bin.as_deref(),
             user_servers,
-        )
+        )?
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -684,7 +688,7 @@ pub(crate) fn build_macos_agent_script(
             model,
             app_bin.as_deref(),
             user_servers,
-        )
+        )?
     } else {
         sh_single_quote(executable)
     };
@@ -736,6 +740,7 @@ pub(crate) fn build_macos_agent_script(
         "export ASPIS_PROJECTS_DIR={}\n",
         sh_single_quote(&projects_dir.display().to_string())
     ));
+    script.push_str("export DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE='1'\n");
     script.push_str("export ASPIS_MCP_CLOUDFLARE_PROFILE_MODE='1'\n");
     // GH-P5 (cooperative push enforcement, NOT a security sandbox) — mirror of the
     // Windows builder's git neutralizers, exported on the SPAWNED agent's environment
@@ -1079,6 +1084,9 @@ fn shell_env_name(name: &str) -> String {
 /// `codex_launch_script` (the Windows/PowerShell variant) but emits a single
 /// POSIX-shell line that pipes the prompt via STDIN (keeping the launch token off
 /// the argv) and passes the same `-c mcp_servers.devboule.*` config.
+///
+/// Honors `DEVBOULE_MCP_BACKEND` via the shared entry builder. Fail-closed: `Err`
+/// when the backend cannot be resolved (e.g. rust selected but bin missing).
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_codex_launch_line(
@@ -1090,58 +1098,16 @@ pub(crate) fn macos_codex_launch_line(
     app_bin: Option<&str>,
     // User-declared MCP servers (design Phase A.2). EMPTY ⇒ byte-identical to before.
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> String {
+) -> Result<String, String> {
     let root_s = root_path.to_string_lossy().into_owned();
-    let management_root_s = management_root.to_string_lossy().into_owned();
-    let projects_dir_s = projects_dir.to_string_lossy().into_owned();
-    let mcp_args = toml_array(&[
-        "-m",
-        "oracle.server.aspis_mcp",
-        "--root",
-        &management_root_s,
-        "--projects-dir",
-        &projects_dir_s,
-    ]);
-    let mut config_args: Vec<String> = vec![
-        format!(
-            "mcp_servers.devboule.command={}",
-            toml_string(python)
-        ),
-        format!("mcp_servers.devboule.args={mcp_args}"),
-        format!(
-            "mcp_servers.devboule.cwd={}",
-            toml_string(&management_root_s)
-        ),
-        format!(
-            "mcp_servers.devboule.env.PYTHONPATH={}",
-            toml_string(&management_root_s)
-        ),
-        format!(
-            "mcp_servers.devboule.env.PYTHONIOENCODING={}",
-            toml_string("utf-8")
-        ),
-        format!(
-            "mcp_servers.devboule.env.HF_HUB_OFFLINE={}",
-            toml_string("1")
-        ),
-        format!(
-            "mcp_servers.devboule.env.TRANSFORMERS_OFFLINE={}",
-            toml_string("1")
-        ),
-        format!(
-            "mcp_servers.devboule.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
-            toml_string("1")
-        ),
-    ];
-    // ASPIS_APP_BIN: the running app binary so the server's read-only
-    // `project_structure` tool can shell out to the Rust structure builder (zero
-    // tree-sitter duplication). Omitted when `current_exe` is unavailable. NOT a secret.
-    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
-        config_args.push(format!(
-            "mcp_servers.devboule.env.ASPIS_APP_BIN={}",
-            toml_string(app_bin)
-        ));
-    }
+    let entry = crate::backend::mcp_backend::build_devboule_mcp_server_entry(
+        crate::backend::mcp_backend::McpBackend::from_env(),
+        python,
+        management_root,
+        projects_dir,
+        app_bin,
+    )?;
+    let mut config_args = codex_devboule_settings_from_entry(&entry, management_root)?;
     // User servers AFTER the Oracle config args (design §5.1). EMPTY ⇒ no change.
     for server in user_servers {
         config_args.extend(codex_user_server_config_settings(server));
@@ -1156,7 +1122,7 @@ pub(crate) fn macos_codex_launch_line(
         line.push_str(" -c ");
         line.push_str(&sh_single_quote(config));
     }
-    line
+    Ok(line)
 }
 
 pub(crate) fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static str, String)> {
@@ -1320,6 +1286,7 @@ pub(crate) fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> S
 /// macOS-only: build the claude CLI invocation line for the launch script.
 /// Mirrors `claude_launch_script`: passes the same MCP client config JSON via
 /// `--mcp-config` and pipes the prompt over STDIN.
+/// Fail-closed when the MCP entry cannot be built (rust bin missing, etc.).
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_claude_launch_line(
@@ -1329,18 +1296,18 @@ pub(crate) fn macos_claude_launch_line(
     model: Option<&str>,
     app_bin: Option<&str>,
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> String {
+) -> Result<String, String> {
     let config =
-        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers);
+        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers)?;
     let model_flag = match model {
         Some(model) => format!("--model {} ", sh_single_quote(model)),
         None => String::new(),
     };
-    format!(
+    Ok(format!(
         "printf '%s' \"$PROMPT\" | claude {}--mcp-config {}",
         model_flag,
         sh_single_quote(&config)
-    )
+    ))
 }
 
 // MINOR 9 → P3: the old full-server mini grant stayed removed; the read-only,
@@ -1356,6 +1323,9 @@ pub(crate) fn macos_claude_launch_line(
 /// grant (mini_coder_executor): both wire the SAME server; the mini's scope is
 /// narrowed SERVER-side by its "mini" role (oracle_context only), never by the
 /// client config. Extracted so the two call sites cannot drift.
+///
+/// Built from [`crate::backend::mcp_backend::build_devboule_mcp_server_entry`] so
+/// Codex honors `DEVBOULE_MCP_BACKEND`. Fail-closed on resolution failure.
 pub(crate) fn codex_mcp_config_args(
     python: &str,
     management_root: &Path,
@@ -1365,66 +1335,18 @@ pub(crate) fn codex_mcp_config_args(
     // tokens AFTER the Oracle tokens. EMPTY ⇒ byte-identical to the pre-A.2 token list.
     // The mini wires the SAME server but passes an empty slice (mini-exclusion §6).
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> Vec<String> {
-    let management_root_s = management_root.to_string_lossy().into_owned();
-    let projects_dir_s = projects_dir.to_string_lossy().into_owned();
-    let mcp_args = toml_array(&[
-        "-m",
-        "oracle.server.aspis_mcp",
-        "--root",
-        &management_root_s,
-        "--projects-dir",
-        &projects_dir_s,
-    ]);
-    let mut out = vec![
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.command={}",
-            toml_string(python)
-        ),
-        "-c".to_string(),
-        format!("mcp_servers.devboule.args={mcp_args}"),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.cwd={}",
-            toml_string(&management_root_s)
-        ),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.env.PYTHONPATH={}",
-            toml_string(&management_root_s)
-        ),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.env.PYTHONIOENCODING={}",
-            toml_string("utf-8")
-        ),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.env.HF_HUB_OFFLINE={}",
-            toml_string("1")
-        ),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.env.TRANSFORMERS_OFFLINE={}",
-            toml_string("1")
-        ),
-        "-c".to_string(),
-        format!(
-            "mcp_servers.devboule.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
-            toml_string("1")
-        ),
-    ];
-    // ASPIS_APP_BIN: the running app binary path so the server's read-only
-    // `project_structure` tool can shell out to the Rust structure builder (zero
-    // tree-sitter duplication). Omitted when `current_exe` is unavailable; the Python
-    // tool then degrades to a clear error instead of guessing a path. NOT a secret.
-    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
+) -> Result<Vec<String>, String> {
+    let entry = crate::backend::mcp_backend::build_devboule_mcp_server_entry(
+        crate::backend::mcp_backend::McpBackend::from_env(),
+        python,
+        management_root,
+        projects_dir,
+        app_bin,
+    )?;
+    let mut out = Vec::new();
+    for setting in codex_devboule_settings_from_entry(&entry, management_root)? {
         out.push("-c".to_string());
-        out.push(format!(
-            "mcp_servers.devboule.env.ASPIS_APP_BIN={}",
-            toml_string(app_bin)
-        ));
+        out.push(setting);
     }
     // User servers AFTER the Oracle tokens (design §5.1: Oracle first). Each emits a
     // `-c mcp_servers.<name>.*` block. With NO user servers this loop adds nothing, so the
@@ -1432,7 +1354,54 @@ pub(crate) fn codex_mcp_config_args(
     for server in user_servers {
         out.extend(codex_user_server_config_tokens(server));
     }
-    out
+    Ok(out)
+}
+
+/// Convert a shared MCP server entry JSON into Codex `mcp_servers.devboule.*`
+/// KEY=VALUE settings (no `-c` prefix). Command, optional non-empty args, cwd,
+/// and every string env key from the entry.
+fn codex_devboule_settings_from_entry(
+    entry: &serde_json::Value,
+    management_root: &Path,
+) -> Result<Vec<String>, String> {
+    let command = entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "devboule MCP entry missing command".to_string())?;
+    let mut settings = vec![format!(
+        "mcp_servers.devboule.command={}",
+        toml_string(command)
+    )];
+
+    if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
+        let arg_refs: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+        // Match user-server / empty-args convention: omit `args=[]` (codex defaults
+        // missing args to no arguments). Python backend always has non-empty args.
+        if !arg_refs.is_empty() {
+            settings.push(format!(
+                "mcp_servers.devboule.args={}",
+                toml_array(&arg_refs)
+            ));
+        }
+    }
+
+    let management_root_s = management_root.to_string_lossy();
+    settings.push(format!(
+        "mcp_servers.devboule.cwd={}",
+        toml_string(management_root_s.as_ref())
+    ));
+
+    if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
+        for (key, value) in env {
+            if let Some(s) = value.as_str() {
+                settings.push(format!(
+                    "mcp_servers.devboule.env.{key}={}",
+                    toml_string(s)
+                ));
+            }
+        }
+    }
+    Ok(settings)
 }
 
 /// Build the codex config KEY=VALUE strings for ONE user server (no `-c` prefix; the
@@ -1483,7 +1452,7 @@ pub(crate) fn codex_launch_script(
     model: Option<&str>,
     app_bin: Option<&str>,
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> String {
+) -> Result<String, String> {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
     if let Some(model) = model {
@@ -1496,7 +1465,7 @@ pub(crate) fn codex_launch_script(
         projects_dir,
         app_bin,
         user_servers,
-    ));
+    )?);
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -1513,7 +1482,9 @@ pub(crate) fn codex_launch_script(
     // stream. It is delivered to the CLI over STDIN and to the user via the
     // clipboard ONLY — there is no `Write-Host $prompt`/`echo $prompt` anywhere,
     // so the token cannot leak into the ConPTY ring buffer / snapshot / xterm.
-    format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
+    Ok(format!(
+        "$codexArgs = @({args})\n$prompt | & codex @codexArgs"
+    ))
 }
 
 pub(crate) fn claude_launch_script(
@@ -1523,9 +1494,9 @@ pub(crate) fn claude_launch_script(
     model: Option<&str>,
     app_bin: Option<&str>,
     user_servers: &[user_mcp_config::UserMcpServer],
-) -> String {
+) -> Result<String, String> {
     let config =
-        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers)
+        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers)?
             .replace("'@", "' @");
     let model_flag = match model {
         Some(model) => format!("--model {} ", ps_single_quote(model)),
@@ -1539,7 +1510,9 @@ pub(crate) fn claude_launch_script(
     // B1 INVARIANT: same as codex — the prompt/launch token is delivered over
     // STDIN and the clipboard ONLY; it is NEVER written to the PTY stream (no
     // `Write-Host $prompt`), so it cannot leak into the ConPTY snapshot/xterm.
-    format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig")
+    Ok(format!(
+        "$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig"
+    ))
 }
 
 

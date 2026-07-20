@@ -234,6 +234,13 @@ Carry forward audit findings already fixed or open:
 
 **Exit:** binary builds; default agents still use Python; flag can point to Rust.
 
+**Packaging honesty (P0 audit):** selecting `DEVBOULE_MCP_BACKEND=rust` requires
+`DEVBOULE_MCP_BIN` or a local `devboule-mcp` tree build / PATH install. The Rust
+binary is **not** bundled in Tauri resources until **P7**. Default remains
+`python`. Config writers (Claude/Codex/pi) fail closed when rust is selected and
+the binary cannot be resolved — no silent Python fallback, and pi does not soft-
+continue with a stale Python entry under the rust backend.
+
 ---
 
 ### P1 — Agent session lifecycle
@@ -388,8 +395,8 @@ Resolution order for binary path:
 
 ## 11. Checklist (live)
 
-- [ ] **P0** Scaffold `devboule-mcp` + agent_rules + backend flag + dual env names  
-- [ ] **P0 audit** hostile reviewer → fix  
+- [x] **P0** Scaffold `devboule-mcp` + agent_rules + backend flag + dual env names  
+- [x] **P0 audit** hostile reviewer → fix (2 review rounds; ship-safe default python + optional rust via absolute `DEVBOULE_MCP_BIN`)  
 - [ ] **P1** Session tools  
 - [ ] **P1 audit** → fix  
 - [ ] **P2** Project/Kanban  

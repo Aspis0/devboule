@@ -185,25 +185,20 @@ fn resolve_paths() -> Option<ResolvedPaths> {
 /// interpreter path), NOT the bare `"python"` the app-launch path relies on an
 /// app-set PATH for. No auth token is included — the AGENT token comes from the
 /// discovery file at runtime. Pure: no I/O, deterministic, unit-testable.
-fn build_mcp_entry(interpreter: &str, root: &Path, projects_dir: &Path) -> Value {
-    serde_json::json!({
-        "command": interpreter,
-        "args": [
-            "-m",
-            "oracle.server.aspis_mcp",
-            "--root",
-            root.to_string_lossy(),
-            "--projects-dir",
-            projects_dir.to_string_lossy(),
-        ],
-        "env": {
-            "PYTHONPATH": root.to_string_lossy(),
-            "PYTHONIOENCODING": "utf-8",
-            "HF_HUB_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "ORACLE_REQUIRE_REAL_EMBEDDER": "1",
-        },
-    })
+fn build_mcp_entry(
+    interpreter: &str,
+    root: &Path,
+    projects_dir: &Path,
+) -> Result<Value, String> {
+    // Honor DEVBOULE_MCP_BACKEND (default python). Rust is fail-closed if the
+    // binary cannot be resolved (no silent Python fallback when rust is chosen).
+    super::mcp_backend::build_devboule_mcp_server_entry(
+        super::mcp_backend::McpBackend::from_env(),
+        interpreter,
+        root,
+        projects_dir,
+        None,
+    )
 }
 
 /// PURE merge: set `mcpServers["devboule"] = entry` on the Claude config,
@@ -428,13 +423,16 @@ fn configure_with_resolved(
     config_path: &Path,
     resolved: &ResolvedPaths,
 ) -> Result<CliAgentsStatus, String> {
-    // FIX 2 (fail-closed): refuse to write a permanently-red entry. A bare OS
-    // python (the fallback when the venv is absent) cannot `import mcp`, so
-    // registering it would break every Claude session. NOTE: true release
-    // portability also depends on the separate writable-data-dir work (the venv
-    // currently resolves under the read-only resource root in an installed
-    // build); until that lands, this refusal is the correct containment.
-    if !runtime_usable_for_write(resolved.runtime_ready, resolved.interpreter_is_venv) {
+    // Backend-aware readiness gate:
+    // - Python: refuse to write a permanently-red entry. A bare OS python (the
+    //   fallback when the venv is absent) cannot `import mcp`, so registering it
+    //   would break every Claude session.
+    // - Rust: skip the Oracle venv gate; instead require `build_mcp_entry` to
+    //   succeed (binary resolvable). Fail-closed if the rust bin is missing.
+    let backend = super::mcp_backend::McpBackend::from_env();
+    if backend == super::mcp_backend::McpBackend::Python
+        && !runtime_usable_for_write(resolved.runtime_ready, resolved.interpreter_is_venv)
+    {
         return Err(RUNTIME_NOT_READY_REFUSAL.to_string());
     }
 
@@ -442,7 +440,7 @@ fn configure_with_resolved(
         &resolved.interpreter,
         &resolved.root,
         &resolved.projects_dir,
-    );
+    )?;
 
     // FIX 4: serialize the whole read-modify-write + backup. FIX 6: keep the
     // read→modify→write window as TIGHT as possible — load immediately before
@@ -659,7 +657,7 @@ mod tests {
     fn build_mcp_entry_has_exact_args_and_env_shape() {
         let root = PathBuf::from("/code/root");
         let projects = PathBuf::from("/data/projects");
-        let entry = build_mcp_entry("/venv/bin/python3", &root, &projects);
+        let entry = build_mcp_entry("/venv/bin/python3", &root, &projects).expect("mcp entry");
 
         // command is the resolved interpreter, NOT bare "python".
         assert_eq!(entry["command"], json!("/venv/bin/python3"));
@@ -678,6 +676,9 @@ mod tests {
         assert_eq!(env["HF_HUB_OFFLINE"], json!("1"));
         assert_eq!(env["TRANSFORMERS_OFFLINE"], json!("1"));
         assert_eq!(env["ORACLE_REQUIRE_REAL_EMBEDDER"], json!("1"));
+        // Dual-write Devboule + legacy Aspis profile-mode keys (P0 branding).
+        assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
+        assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
         // No token of any kind is baked in.
         assert!(env.get("ORACLE_AGENT_AUTH_TOKEN").is_none());
         assert!(env.get("ORACLE_AUTH_TOKEN").is_none());
@@ -749,7 +750,8 @@ mod tests {
             "/fake/venv/python",
             &home.join("code"),
             &home.join("projects"),
-        );
+        )
+        .expect("mcp entry");
         assert_eq!(entry["command"], json!("/fake/venv/python"));
     }
 
@@ -785,7 +787,9 @@ mod tests {
         )
         .unwrap();
 
-        let entry = build_mcp_entry("/venv/python", &home.join("code"), &home.join("projects"));
+        let entry =
+            build_mcp_entry("/venv/python", &home.join("code"), &home.join("projects"))
+                .expect("mcp entry");
         let mut config = load_claude_config(&config_path).unwrap();
         upsert_claude_mcp_entry(&mut config, &entry).unwrap();
         let text = serde_json::to_string_pretty(&config).unwrap();

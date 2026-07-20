@@ -239,8 +239,10 @@ pub fn resolve_program(name: &str) -> Option<PathBuf> {
 /// execute bit (a non-executable file on PATH is not a command). On Windows the file
 /// extension carries executability (handled by [`program_candidates`]), so an existing
 /// regular file is sufficient.
+///
+/// Shared with `mcp_backend` for `DEVBOULE_MCP_BIN` / candidate binary resolution.
 #[cfg(unix)]
-fn is_executable_file(candidate: &std::path::Path) -> bool {
+pub(crate) fn is_executable_file(candidate: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(candidate) {
         Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
@@ -249,7 +251,7 @@ fn is_executable_file(candidate: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(candidate: &std::path::Path) -> bool {
+pub(crate) fn is_executable_file(candidate: &std::path::Path) -> bool {
     candidate.is_file()
 }
 

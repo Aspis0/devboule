@@ -200,7 +200,7 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
                     // user-MCP type, so this file keeps ZERO references to the user-MCP
                     // config code.
                     &[],
-                ));
+                )?);
             }
             if let Some(model) = backend.model.as_deref() {
                 if !model.trim().is_empty() {
@@ -930,7 +930,7 @@ pub(crate) fn build_mini_command_impl(
                         // user-MCP type, so this file keeps ZERO references to the user-MCP
                         // config code.
                         &[],
-                    ));
+                    )?);
                 }
                 if let Some(model) = backend.model.as_deref() {
                     if !model.trim().is_empty() {
@@ -1039,7 +1039,7 @@ pub(crate) fn build_mini_command_impl(
                         // user-MCP type, so this file keeps ZERO references to the user-MCP
                         // config code.
                         &[],
-                    ));
+                    )?);
                 }
                 if let Some(model) = backend.model.as_deref() {
                     if !model.trim().is_empty() {
