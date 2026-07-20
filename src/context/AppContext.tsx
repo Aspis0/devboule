@@ -59,10 +59,16 @@ import type {
   OracleIndexedFiles,
   CliAgentsStatus,
   LocalRoleStatus,
+  AgentLiveState,
 } from "../types/backend";
 import { toOracleError } from "../utils/oracleError";
 import { mapLegacyViewTarget } from "../utils/deepLink";
 import { installVisibilityLock } from "../utils/visibilityLock";
+import {
+  countLiveAgentSessions,
+  softLockActiveAgentsNotice,
+} from "../components/agents/agentFleet";
+import { useAgentAttentionStore } from "../store/agentAttentionStore";
 
 const LIVE_SYNC_INTERVAL_MS = 60_000;
 // Auto-lock only after the window has stayed hidden this long — bumped from
@@ -110,6 +116,8 @@ interface AppState {
   error: string | null;
   isDesktopRuntime: boolean;
   isLocked: boolean;
+  /** Soft-lock: copy about agents still running when the vault locked (null if none). */
+  lockActiveAgentsNotice: string | null;
   authState: AuthState | null;
   cloudSnapshot: CloudDashboardSnapshot | null;
   oracleSnapshot: OracleSnapshot | null;
@@ -431,6 +439,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [isDesktopRuntime] = useState(() => isTauriRuntime());
   const [isLocked, setIsLocked] = useState(true);
+  const [lockActiveAgentsNotice, setLockActiveAgentsNotice] = useState<
+    string | null
+  >(null);
   const [authState, setAuthState] = useState<AuthState | null>(null);
   const [cloudSnapshot, setCloudSnapshot] =
     useState<CloudDashboardSnapshot | null>(null);
@@ -2262,6 +2273,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (!next.locked) {
         authEpochRef.current += 1;
         clearUnlockRetryCooldown();
+        setLockActiveAgentsNotice(null);
       }
       applyAuthState(next);
       if (next.locked) {
@@ -2285,6 +2297,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const lock = useCallback(async () => {
     if (unlockInFlightRef.current) return;
+
+    // Soft lock: agents keep running. Snapshot live count BEFORE lock_app so we
+    // can warn on the lock screen (get_agent_live_state requires unlock).
+    let notice: string | null = null;
+    try {
+      const live = await invokeBackendCommand<AgentLiveState>(
+        "get_agent_live_state",
+      );
+      notice = softLockActiveAgentsNotice(
+        countLiveAgentSessions(live.sessions ?? []),
+      );
+    } catch {
+      const cached = useAgentAttentionStore.getState().sessions;
+      notice = softLockActiveAgentsNotice(countLiveAgentSessions(cached));
+    }
+    setLockActiveAgentsNotice(notice);
+
     authEpochRef.current += 1;
     setIsLocked(true);
     clearSensitiveState();
@@ -2675,6 +2704,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       error,
       isDesktopRuntime,
       isLocked,
+      lockActiveAgentsNotice,
       authState,
       cloudSnapshot,
       oracleSnapshot,
@@ -2700,6 +2730,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       error,
       isDesktopRuntime,
       isLocked,
+      lockActiveAgentsNotice,
       authState,
       cloudSnapshot,
       oracleSnapshot,

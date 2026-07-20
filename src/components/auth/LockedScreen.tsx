@@ -8,6 +8,8 @@ interface LockedScreenProps {
   error?: string | null;
   desktopRuntimeAvailable?: boolean;
   helloAvailable?: boolean | null;
+  /** Soft-lock: agents keep running; warn when any were live at lock time. */
+  activeAgentsNotice?: string | null;
 }
 
 export function LockedScreen({
@@ -17,6 +19,7 @@ export function LockedScreen({
   error,
   desktopRuntimeAvailable = true,
   helloAvailable = null,
+  activeAgentsNotice = null,
 }: LockedScreenProps) {
   const helloUnavailable = desktopRuntimeAvailable && helloAvailable === false;
   const unlockDisabled = isLoading || unlockRetryBlocked || !desktopRuntimeAvailable || helloUnavailable;
@@ -82,6 +85,15 @@ export function LockedScreen({
               (!desktopRuntimeAvailable
                 ? "Browser preview cannot access Tauri or device authentication. Launch Devboule as the desktop app."
                 : "Set up device authentication (Windows Hello or Touch ID) in your system settings before using this app.")}
+          </p>
+        )}
+
+        {activeAgentsNotice && (
+          <p
+            role="status"
+            className="mx-auto mt-4 max-w-sm rounded-xl border border-amber-200/80 bg-amber-50 px-3 py-2.5 text-[12px] leading-5 text-amber-900"
+          >
+            {activeAgentsNotice}
           </p>
         )}
 

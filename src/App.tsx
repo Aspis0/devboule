@@ -74,6 +74,7 @@ function AppShell() {
     error,
     isDesktopRuntime,
     isLocked,
+    lockActiveAgentsNotice,
     authState,
     roleStatus,
     unlock,
@@ -143,6 +144,7 @@ function AppShell() {
           error={error}
           desktopRuntimeAvailable={isDesktopRuntime}
           helloAvailable={authState?.helloAvailable ?? null}
+          activeAgentsNotice={lockActiveAgentsNotice}
         />
         <HelpModeOverlay />
       </>

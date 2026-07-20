@@ -30,6 +30,25 @@ function isClosed(session: AgentSession, nowMs: number): boolean {
   return sessionHealth(session, nowMs) === "closed";
 }
 
+/** Live (non-closed) sessions — used for soft-lock warning copy. */
+export function countLiveAgentSessions(
+  sessions: AgentSession[],
+  nowMs: number = Date.now(),
+): number {
+  return sessions.filter((s) => !isClosed(s, nowMs)).length;
+}
+
+/** Human-readable soft-lock banner when agents keep running after vault lock. */
+export function softLockActiveAgentsNotice(
+  liveCount: number,
+): string | null {
+  if (liveCount <= 0) return null;
+  if (liveCount === 1) {
+    return "1 agent is still running in the background. Soft lock does not stop it — unlock to manage or stop agents.";
+  }
+  return `${liveCount} agents are still running in the background. Soft lock does not stop them — unlock to manage or stop agents.`;
+}
+
 const ROLE_ORDER: Record<string, number> = {
   orchestrator: 0,
   coder: 1,

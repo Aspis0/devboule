@@ -5,6 +5,8 @@ import {
   attentionSessions,
   reportedSubagentTotal,
   fleetHeadlineSuffix,
+  countLiveAgentSessions,
+  softLockActiveAgentsNotice,
   type FleetCount,
 } from "./agentFleet";
 import type { AgentSession } from "../../types/backend";
@@ -304,5 +306,21 @@ describe("attentionSessions", () => {
     expect(attentionSessions([s], NOW).map((x) => x.agentId)).toEqual([
       "blocked",
     ]);
+  });
+});
+
+describe("countLiveAgentSessions / softLockActiveAgentsNotice", () => {
+  it("counts only non-closed sessions", () => {
+    const sessions = [
+      session({ agentId: "live", lastSeenAt: FRESH }),
+      session({ agentId: "done", status: "closed", lastSeenAt: FRESH }),
+    ];
+    expect(countLiveAgentSessions(sessions, NOW)).toBe(1);
+  });
+
+  it("builds soft-lock notice copy", () => {
+    expect(softLockActiveAgentsNotice(0)).toBeNull();
+    expect(softLockActiveAgentsNotice(1)).toMatch(/1 agent is still running/);
+    expect(softLockActiveAgentsNotice(3)).toMatch(/3 agents are still running/);
   });
 });
