@@ -18,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use state::resolve_projects_dir;
-use tools::{agent_lifecycle, human_gates, project};
+use tools::{agent_lifecycle, human_gates, mini_coder, project};
 
 /// SSoT role rules (same file as the Tauri app and legacy Python MCP).
 const ROLE_RULES_JSON: &str = include_str!("../../oracle/server/role_rules.json");
@@ -46,6 +46,10 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "plan_status",
     "request_git_push",
     "ask_user",
+    "spawn_mini_coder",
+    "steer_mini_coder",
+    "mini_coder_result",
+    "spawn_main_coder",
 ];
 
 #[derive(Clone)]
@@ -229,6 +233,63 @@ pub struct ProjectCreatePlanTasksArgs {
     pub session_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpawnMiniCoderArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub task: String,
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub allow_oracle: Option<bool>,
+    #[serde(default)]
+    pub write: Option<bool>,
+    #[serde(default)]
+    pub wait: Option<bool>,
+    #[serde(default)]
+    pub write_mode: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpawnMainCoderArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub task: String,
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub allow_oracle: Option<bool>,
+    #[serde(default)]
+    pub wait: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SteerMiniCoderArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub directive_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MiniCoderResultArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub directive_id: String,
+    #[serde(default)]
+    pub wait: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 #[tool_router]
 impl DevbouleMcp {
     pub fn new() -> Self {
@@ -237,11 +298,11 @@ impl DevbouleMcp {
         }
     }
 
-    /// Practical roles for Devboule agents (P3: lifecycle + project + human gates).
+    /// Practical roles for Devboule agents (P4: lifecycle + project + human gates + mini/main coder).
     ///
     /// Each role keeps only `role`, filtered `allowedTools`, and a short summary.
     #[tool(
-        description = "Return Devboule agent role rules for this Rust MCP (P3: lifecycle + project + human gates). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for mini/cloud/oracle tools and full role prose."
+        description = "Return Devboule agent role rules for this Rust MCP (P4: lifecycle + project + human gates + mini/main coder). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for cloud/oracle tools and full role prose."
     )]
     pub async fn agent_rules(
         &self,
@@ -254,8 +315,8 @@ impl DevbouleMcp {
             "backend": "rust",
             "roles": rules,
             "implementedTools": IMPLEMENTED_TOOLS,
-            "portPhase": "P3",
-            "note": "Partial Rust MCP (P3). Lifecycle + project/Kanban + human gates (plan/git/ask) implemented; mini/cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover. MCP never self-approves plans/pushes — human UI owns terminal verdicts; unlock is not required on the agent MCP path.",
+            "portPhase": "P4",
+            "note": "Partial Rust MCP (P4). Lifecycle + project/Kanban + human gates + mini/main coder (directive queue for Tauri mini_coder_executor). Cloud/oracle still require DEVBOULE_MCP_BACKEND=python until cutover. Mini spawn is fail-closed when the app executor is offline (poll returns failed/timeout). MCP never self-approves plans/pushes.",
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -604,6 +665,115 @@ impl DevbouleMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Coder/orchestrator: delegate a sub-task to a one-shot mini-coder hosted by the app (writes a pending directive the Tauri mini_coder_executor claims). Default wait=true blocks until terminal result (poll capped at 1800s, runs on a blocking pool); wait=false returns directiveId for steer_mini_coder / mini_coder_result. Fail-closed if the app executor is offline."
+    )]
+    pub async fn spawn_mini_coder(
+        &self,
+        Parameters(args): Parameters<SpawnMiniCoderArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // wait=true polls with thread::sleep — offload so the async runtime stays free.
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            mini_coder::spawn_mini_coder(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                &args.task,
+                &args.files,
+                args.backend.as_deref(),
+                args.allow_oracle.unwrap_or(false),
+                args.write,
+                args.write_mode.as_deref(),
+                args.wait,
+                args.session_token.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("spawn_mini_coder join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Orchestrator only: dispatch a substantial task to the local MAIN coder (tier=main, always agentic write). Same supervision as spawn_mini_coder (wait=false + steer_mini_coder + mini_coder_result). wait=true poll is capped at 1800s and runs on a blocking pool."
+    )]
+    pub async fn spawn_main_coder(
+        &self,
+        Parameters(args): Parameters<SpawnMainCoderArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            mini_coder::spawn_main_coder(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                &args.task,
+                &args.files,
+                args.backend.as_deref(),
+                args.allow_oracle.unwrap_or(false),
+                args.wait,
+                args.session_token.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("spawn_main_coder join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Coder/orchestrator: steer a RUNNING mini you spawned (append mid-flight correction, or message 'stop' to abort via kill path). Pass directiveId from spawn_mini_coder / spawn_main_coder."
+    )]
+    pub async fn steer_mini_coder(
+        &self,
+        Parameters(args): Parameters<SteerMiniCoderArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let projects = resolve_projects_dir();
+        let body = mini_coder::steer_mini_coder(
+            &projects,
+            &args.agent_id,
+            &args.role,
+            &args.directive_id,
+            &args.message,
+            args.session_token.as_deref(),
+        )
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Coder/orchestrator: collect the outcome of a mini delegated with spawn_mini_coder(wait=false). wait=true (default) blocks until terminal (poll capped at 1800s, runs on a blocking pool); wait=false is a single non-blocking read returning the real directive status."
+    )]
+    pub async fn mini_coder_result(
+        &self,
+        Parameters(args): Parameters<MiniCoderResultArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            mini_coder::mini_coder_result(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                &args.directive_id,
+                args.wait,
+                args.session_token.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("mini_coder_result join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -611,7 +781,7 @@ impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Devboule app-tools MCP (Rust). P3: lifecycle + project/Kanban + human gates (plan_submit/plan_status/request_git_push/ask_user/project_create_plan_tasks). Prefer DEVBOULE_MCP_BACKEND=python until cutover for mini/cloud/oracle tools. Agents never self-approve plans/pushes."
+                "Devboule app-tools MCP (Rust). P4: lifecycle + project/Kanban + human gates + mini/main coder (spawn_mini_coder/steer_mini_coder/mini_coder_result/spawn_main_coder). Prefer DEVBOULE_MCP_BACKEND=python until cutover for cloud/oracle tools. Mini directives require the Tauri app executor; fail-closed when offline. Agents never self-approve plans/pushes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -628,8 +798,8 @@ impl ServerHandler for DevbouleMcp {
 }
 
 /// Short per-role summary for the slim payload.
-const P3_ROLE_SUMMARY: &str =
-    "P3 Rust MCP: lifecycle + project/Kanban + human gates (role-filtered). Use DEVBOULE_MCP_BACKEND=python for mini/cloud/oracle tools.";
+const P4_ROLE_SUMMARY: &str =
+    "P4 Rust MCP: lifecycle + project/Kanban + human gates + mini/main coder (role-filtered). Use DEVBOULE_MCP_BACKEND=python for cloud/oracle tools.";
 
 /// Load role rules, filter `allowedTools` to `IMPLEMENTED_TOOLS`, and strip prose.
 fn load_role_rules_for_client() -> Result<Value> {
@@ -684,7 +854,7 @@ fn slim_roles_for_client(roles: &mut Value) {
         *role = json!({
             "role": role_name,
             "allowedTools": tools,
-            "summary": P3_ROLE_SUMMARY,
+            "summary": P4_ROLE_SUMMARY,
         });
     }
 }
@@ -795,7 +965,7 @@ mod tests {
                     role.get("role")
                 );
             }
-            assert_eq!(role["summary"], P3_ROLE_SUMMARY);
+            assert_eq!(role["summary"], P4_ROLE_SUMMARY);
         }
     }
 
@@ -821,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_gets_lifecycle_project_and_human_gate_tools() {
+    fn coder_gets_lifecycle_project_human_gate_and_mini_tools() {
         let roles = load_role_rules_for_client().expect("parse");
         let coder = roles
             .as_array()
@@ -851,9 +1021,16 @@ mod tests {
             "plan_status",
             "request_git_push",
             "ask_user",
+            "spawn_mini_coder",
+            "steer_mini_coder",
+            "mini_coder_result",
         ] {
             assert!(tools.contains(&need), "coder missing {need}");
         }
+        assert!(
+            !tools.contains(&"spawn_main_coder"),
+            "coder must not get spawn_main_coder"
+        );
     }
 
     #[test]
@@ -905,22 +1082,47 @@ mod tests {
         let roles = load_role_rules_for_client().expect("parse");
         let dumped = roles.to_string();
         for banned in [
-            "spawn_mini_coder",
             "cloudflare_rotate",
             "censor_dispose",
             "oracle_context",
             "scaleway_resource_action",
+            "visual_check",
+            "design_request",
         ] {
             assert!(
                 !dumped.contains(banned),
-                "P3 role payload must not mention unimplemented tool {banned}: {dumped}"
+                "P4 role payload must not mention unimplemented tool {banned}: {dumped}"
             );
         }
-        // P3 human gates must appear for coder.
+        // P4: human gates + mini coder must appear for coder.
         assert!(dumped.contains("plan_submit"));
         assert!(dumped.contains("request_git_push"));
         assert!(dumped.contains("ask_user"));
         assert!(dumped.contains("project_create_plan_tasks"));
+        assert!(dumped.contains("spawn_mini_coder"));
+        assert!(dumped.contains("steer_mini_coder"));
+        assert!(dumped.contains("mini_coder_result"));
+    }
+
+    #[test]
+    fn orchestrator_gets_spawn_main_coder() {
+        let roles = load_role_rules_for_client().expect("parse");
+        let orch = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == "orchestrator")
+            .expect("orchestrator");
+        let tools: Vec<&str> = orch["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(tools.contains(&"spawn_main_coder"));
+        assert!(tools.contains(&"spawn_mini_coder"));
+        assert!(tools.contains(&"steer_mini_coder"));
+        assert!(tools.contains(&"mini_coder_result"));
     }
 
     #[test]
@@ -935,7 +1137,7 @@ mod tests {
         let n = coder["allowedTools"].as_array().unwrap().len();
         assert!(
             n > IMPLEMENTED_TOOLS.len() - 1, // agent_rules not in role_rules
-            "expected full role_rules to list more tools than P3 implements (got {n})"
+            "expected full role_rules to list more tools than P4 implements (got {n})"
         );
     }
 

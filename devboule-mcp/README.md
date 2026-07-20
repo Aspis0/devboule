@@ -9,9 +9,17 @@ See the full port plan: [`docs/devboule-mcp-port-plan.md`](../docs/devboule-mcp-
 
 | Phase | Tools | Default |
 |-------|-------|---------|
-| **P1** (this crate) | `agent_rules`, `agent_register`, `agent_heartbeat`, `agent_state` | Agents still use **Python** unless flagged |
+| **P4** (this crate) | lifecycle + project/Kanban + human gates + **mini/main coder** (`spawn_mini_coder`, `steer_mini_coder`, `mini_coder_result`, `spawn_main_coder`) | Agents still use **Python** unless flagged |
+| Not yet | cloud, oracle/CKG, censor, design, visual | Use `DEVBOULE_MCP_BACKEND=python` |
 
-Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive flock + crash-safe write). Prefer `DEVBOULE_MCP_PROJECTS_DIR` / `DEVBOULE_MCP_ROOT`; Aspis env names still accepted.
+Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive flock + crash-safe write), including `miniCoderDirectives` for the app’s `mini_coder_executor`. Prefer `DEVBOULE_MCP_PROJECTS_DIR` / `DEVBOULE_MCP_ROOT`; Aspis env names still accepted.
+
+### Mini/main coder (P4)
+
+- MCP **does not** run the LLM: it only enqueues directives; the **Tauri app** must be running to claim/execute them.
+- `wait=true` (default) polls up to ~30 min (`DEVBOULE_MCP_MINI_CODER_POLL_TIMEOUT_SECS`); if the executor never starts the mini, returns `failed` / `timeout` (**fail-closed**).
+- Caps match Python/Rust co-writers: 64 files (mini), 10 (main + write), steer queue 8×2000 chars, directive queue 50.
+- Pigeon mailbox path is **not** ported; file-queue only.
 
 ## Backend flag (app / shell)
 

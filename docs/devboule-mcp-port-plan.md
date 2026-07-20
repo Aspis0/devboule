@@ -403,8 +403,8 @@ Resolution order for binary path:
 - [x] **P2 audit** → fix (path confinement fail-closed, list symlink check, evidence chars, reopen lease)  
 - [x] **P3** Human gates (plan_submit/status, request_git_push, ask_user, project_create_plan_tasks)  
 - [x] **P3 audit** → fix (queue-only authz, one-shot materialize + Tauri fields, needsUser, honest push status)  
-- [ ] **P4** Mini/main coder  
-- [ ] **P4 audit** → fix  
+- [x] **P4** Mini/main coder (spawn/steer/result + spawn_main_coder via directives)  
+- [x] **P4 audit** → fix (hard queue caps, ownership fail-closed, no stamp-over-terminal, spawn_blocking)  
 - [ ] **P5** Cloud  
 - [ ] **P5 audit** → fix  
 - [ ] **P6** Oracle/CKG/censor/design  
