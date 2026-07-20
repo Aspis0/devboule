@@ -30,9 +30,9 @@ name = "claude_consent_hook"
 path = "src/bin/claude_consent_hook.rs"
 
 # ---------------------------------------------------------------------------
-# DEV ONLY — agent UI automation (never production `tauri build`):
-#   ui-pilot — tauri-pilot CLI/MCP so Grok/Claude can drive the live app
-# Detach: drop feature + optional dep + cfg in lib.rs + tools/tauri-pilot/
+# DEV ONLY — agent UI automation for Devboule (never production `tauri build`):
+#   ui-pilot — host for devboule-pilot (tools/devboule-pilot + upstream tauri-pilot CLI)
+# Detach: drop feature + optional dep + cfg in lib.rs + tools/devboule-pilot/
 # ---------------------------------------------------------------------------
 [features]
 default = []

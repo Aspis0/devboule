@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DEV ONLY — verify tauri-pilot CLI + live Devboule app with real UI drive.
+# DEV ONLY — devboule-pilot smoke (upstream CLI is still named tauri-pilot).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -50,18 +50,17 @@ echo "  cd $ROOT && npm run dev"
 echo
 echo "  # Terminal app"
 echo "  cd $TAURI"
-echo "  cp $CAP_SRC $CAP_DST"
-echo "  export TAURI_CONFIG=\$(cat tauri.pilot.conf.json)"
-echo "  cargo run --features ui-pilot"
-echo "  # cleanup: rm -f $CAP_DST"
+echo "  npm run devboule-pilot:app"
+echo "  # or: cd $TAURI && cp $CAP_SRC $CAP_DST && \\"
+echo "  #   export TAURI_CONFIG=\$(cat tauri.pilot.conf.json) && cargo run --features ui-pilot"
 echo
 echo "Or: START_FRONTEND=1 $0  (starts vite preview if :1420 is down)"
 echo
-echo "==> building with ui-pilot to verify plugin links..."
+echo "==> cargo check --features ui-pilot (link smoke; app not running)"
 cp "$CAP_SRC" "$CAP_DST"
 trap 'rm -f "$CAP_DST"' EXIT
 export TAURI_CONFIG
 TAURI_CONFIG="$(cat "$TAURI/tauri.pilot.conf.json")"
 (cd "$TAURI" && cargo check --features ui-pilot)
-echo "cargo check --features ui-pilot OK (app was not running — start it for full smoke)"
+echo "cargo check --features ui-pilot OK — start app for full UI smoke"
 exit 1

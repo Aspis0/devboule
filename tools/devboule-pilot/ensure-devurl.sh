@@ -6,7 +6,7 @@
 # title/eval/snapshot hang or timeout.
 #
 # Usage:
-#   source tools/tauri-pilot/ensure-devurl.sh
+#   source tools/devboule-pilot/ensure-devurl.sh
 #   devboule_ensure_devurl            # check only (exit 1 if down)
 #   devboule_ensure_devurl --start    # start vite preview if down
 set -euo pipefail

@@ -1,10 +1,11 @@
-# Project MCP for Grok Build — DEV agent UI drive (tauri-pilot).
+# Project MCP for Grok Build — DEV agent UI drive for **Devboule** only.
+# (Figlyph uses a separate server name on that repo; do not mix them.)
 # Requires folder trust. Refresh with /mcps → r.
-# App must be running: npm run pilot:app (FE on :1420 + cargo --features ui-pilot).
+# App must be running: npm run devboule-pilot:app (FE :1420 + cargo --features ui-pilot).
 
-[mcp_servers.tauri_pilot]
+[mcp_servers.devboule_pilot]
 command = "python3"
-args = ["tools/tauri-pilot/mcp_proxy_for_grok.py"]
+args = ["tools/devboule-pilot/mcp_proxy_for_grok.py"]
 enabled = true
 startup_timeout_sec = 30
 env = { PATH = "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }

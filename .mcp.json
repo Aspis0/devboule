@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "tauri-pilot": {
+    "devboule-pilot": {
       "command": "tauri-pilot",
       "args": ["mcp"],
       "env": {

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""stdio MCP proxy: rewrite tauri-pilot tool names for Grok Build.
+"""stdio MCP proxy for **devboule-pilot** (Grok Build name rewrite).
 
-Grok's use_tool rejects dotted tool names (e.g. pilot.ping → invalid tool name).
-tauri-pilot 0.7.2 exposes tools as pilot.<cmd>. This proxy:
+Grok rejects dotted tool names (pilot.ping → invalid). Upstream binary
+`tauri-pilot mcp` still emits pilot.<cmd>; this proxy:
 
   tools/list  → pilot.ping  becomes  pilot_ping
-  tools/call  → pilot_ping  maps back to pilot.ping for the real server
+  tools/call  → pilot_ping  maps back to pilot.ping
 
-Line-delimited JSON only (matches tauri-pilot mcp).
+MCP server id in Grok config: devboule_pilot (not figlyph / not tauri_pilot).
 """
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def main() -> int:
         )
     except FileNotFoundError:
         sys.stderr.write(
-            f"tauri-pilot not found ({PILOT_BIN}). Install:\n"
+            f"devboule-pilot: upstream CLI not found ({PILOT_BIN}). Install:\n"
             "  cargo install tauri-pilot-cli --version 0.7.2 --locked\n"
         )
         return 1

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# DEV ONLY — launch Devboule with ui-pilot (requires FE on :1420).
+# DEV ONLY — launch Devboule with ui-pilot for **devboule-pilot** agent drive.
+# Requires FE on :1420. (Upstream plugin/CLI package name remains tauri-pilot.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"

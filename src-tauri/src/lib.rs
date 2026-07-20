@@ -362,8 +362,8 @@ pub fn run() {
         // to the in-app Header pill when denied/unsupported.
         .plugin(tauri_plugin_notification::init());
 
-    // tauri-pilot (agent-native UI automation for Grok/Claude): DEV ONLY.
-    // Detach: feature ui-pilot + this block + tools/tauri-pilot/.
+    // devboule-pilot (agent UI drive for Grok/Claude on this app): DEV ONLY.
+    // Upstream crate: tauri-plugin-pilot. Host glue: tools/devboule-pilot/.
     // Never enable for production installers.
     #[cfg(all(debug_assertions, feature = "ui-pilot"))]
     {
