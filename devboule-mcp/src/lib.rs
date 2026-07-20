@@ -18,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use state::resolve_projects_dir;
-use tools::{agent_lifecycle, cloud, human_gates, mini_coder, project};
+use tools::{agent_lifecycle, censor, ckg_structure, cloud, design_visual, human_gates, mini_coder, oracle, project};
 
 /// SSoT role rules (same file as the Tauri app and legacy Python MCP).
 const ROLE_RULES_JSON: &str = include_str!("../../oracle/server/role_rules.json");
@@ -55,6 +55,16 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "scaleway_list_resources",
     "cloudflare_rotate_worker_secret",
     "scaleway_resource_action",
+    "oracle_ask",
+    "oracle_context",
+    "oracle_find",
+    "project_structure",
+    "get_neighborhood",
+    "find_imports",
+    "censor_findings",
+    "censor_dispose",
+    "visual_check",
+    "design_request",
 ];
 
 #[derive(Clone)]
@@ -373,6 +383,154 @@ pub struct ScalewayResourceActionArgs {
     pub evidence: Option<String>,
 }
 
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OracleAskArgs {
+    pub query: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub group_by_file: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OracleContextArgs {
+    pub query: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub imports: Option<Vec<String>>,
+    #[serde(default)]
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OracleFindArgs {
+    pub query: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectStructureArgs {
+    pub project_id: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub full: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetNeighborhoodArgs {
+    pub project_id: String,
+    pub node_id: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub k: Option<i64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindImportsArgs {
+    pub project_id: String,
+    pub file: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CensorFindingsArgs {
+    pub project_id: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub drain_queue: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CensorDisposeArgs {
+    pub project_id: String,
+    pub file: String,
+    pub id: String,
+    pub disposition: String,
+    pub agent_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VisualCheckArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub html_path: String,
+    #[serde(default)]
+    pub focus: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DesignRequestArgs {
+    pub agent_id: String,
+    pub role: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub context: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub frame: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 #[tool_router]
 impl DevbouleMcp {
     pub fn new() -> Self {
@@ -385,7 +543,7 @@ impl DevbouleMcp {
     ///
     /// Each role keeps only `role`, filtered `allowedTools`, and a short summary.
     #[tool(
-        description = "Return Devboule agent role rules for this Rust MCP (P5: lifecycle + project + human gates + mini/main coder + cloud). Roles are slim: role, allowedTools, summary. Use DEVBOULE_MCP_BACKEND=python for oracle/CKG/censor/design tools and full role prose."
+        description = "Return Devboule agent role rules for this Rust MCP (P6: lifecycle + project + human gates + mini/main coder + cloud + oracle/CKG/censor/design/visual). Roles are slim: role, allowedTools, summary."
     )]
     pub async fn agent_rules(
         &self,
@@ -398,8 +556,8 @@ impl DevbouleMcp {
             "backend": "rust",
             "roles": rules,
             "implementedTools": IMPLEMENTED_TOOLS,
-            "portPhase": "P5",
-            "note": "Partial Rust MCP (P5). Lifecycle + project/Kanban + human gates + mini/main coder + cloud (CF/SCW list + coder-only mutate with claim/evidence/pin/confirm). Oracle/CKG/censor/design still require DEVBOULE_MCP_BACKEND=python until cutover. Provider tokens from env only (app injects). MCP never self-approves plans/pushes or logs secrets.",
+            "portPhase": "P6",
+            "note": "Rust MCP (P6). Lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle (HTTP loopback fail-closed) + project_structure/CKG + censor + visual_check + design_request. Scope fail-closed; no full-corpus leak. Provider tokens from env only. MCP never self-approves plans/pushes or logs secrets.",
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -998,6 +1156,287 @@ impl DevbouleMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Ask the Oracle for information about the project's architecture (HTTP to resident server; fail-closed if app offline). Pre-filter with kind/language/symbols. Scope is project-bounded (never full corpus)."
+    )]
+    pub async fn oracle_ask(
+        &self,
+        Parameters(args): Parameters<OracleAskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            oracle::oracle_ask(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.query,
+                args.limit,
+                args.project_id.as_deref(),
+                args.kind.as_deref(),
+                args.language.as_deref(),
+                args.symbols.as_deref(),
+                args.group_by_file.unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("oracle_ask join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Returns semantically relevant text chunks (HTTP to resident Oracle; fail-closed if offline). Pre-filter with kind/language/symbols/imports/module. Scope fail-closed."
+    )]
+    pub async fn oracle_context(
+        &self,
+        Parameters(args): Parameters<OracleContextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            oracle::oracle_context(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.query,
+                args.limit,
+                args.project_id.as_deref(),
+                args.kind.as_deref(),
+                args.language.as_deref(),
+                args.symbols.as_deref(),
+                args.imports.as_deref(),
+                args.module.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("oracle_context join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "PRECISE search: find EXACT symbols/functions/structs/classes by name via Oracle context with symbol filter. Faster than oracle_ask for 'where is X defined?'."
+    )]
+    pub async fn oracle_find(
+        &self,
+        Parameters(args): Parameters<OracleFindArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            oracle::oracle_find(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.query,
+                args.limit,
+                args.project_id.as_deref(),
+                args.kind.as_deref(),
+                args.language.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("oracle_find join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Read-only: architecturally central files (spine) + summary counts via app structure bridge (DEVBOULE_APP_BIN). Fail-closed if binary unset."
+    )]
+    pub async fn project_structure(
+        &self,
+        Parameters(args): Parameters<ProjectStructureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            ckg_structure::project_structure(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.project_id,
+                args.full.unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("project_structure join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Read-only (CKG): k-hop neighborhood of a symbol/file node. Scoped to project allowed file_ids only."
+    )]
+    pub async fn get_neighborhood(
+        &self,
+        Parameters(args): Parameters<GetNeighborhoodArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            ckg_structure::get_neighborhood(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.project_id,
+                &args.node_id,
+                args.k,
+                args.kind.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("get_neighborhood join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Read-only (CKG): IMPORT edges out of a file, scoped to the project."
+    )]
+    pub async fn find_imports(
+        &self,
+        Parameters(args): Parameters<FindImportsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            ckg_structure::find_imports(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.project_id,
+                &args.file,
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("find_imports join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Reads Censor OPEN findings (local linters + Gemma) for a project; filter by file; optional drain_queue."
+    )]
+    pub async fn censor_findings(
+        &self,
+        Parameters(args): Parameters<CensorFindingsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            censor::censor_findings(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.project_id,
+                args.file.as_deref(),
+                args.drain_queue.unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("censor_findings join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Sets the disposition of a Censor finding (open|fixed|fp|wontfix) with provenance. Coder cannot override verifier fp/wontfix."
+    )]
+    pub async fn censor_dispose(
+        &self,
+        Parameters(args): Parameters<CensorDisposeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            censor::censor_dispose(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.project_id,
+                &args.file,
+                &args.id,
+                &args.disposition,
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("censor_dispose join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Ask the app to render a self-contained HTML artifact, run a local visual critique, and return text feedback (directive queue; fail-closed if executor offline)."
+    )]
+    pub async fn visual_check(
+        &self,
+        Parameters(args): Parameters<VisualCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            design_visual::visual_check(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.html_path,
+                args.focus.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("visual_check join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Orchestrator/coder: ask the DESIGNER AI to generate a UI screen. Returns design path + registry id. Outcome paths validated (relative only, F-02-013). Fail-closed if designer offline."
+    )]
+    pub async fn design_request(
+        &self,
+        Parameters(args): Parameters<DesignRequestArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            design_visual::design_request(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.prompt,
+                args.context.as_deref(),
+                args.mode.as_deref(),
+                args.frame.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("design_request join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1005,7 +1444,7 @@ impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Devboule app-tools MCP (Rust). P5: lifecycle + project/Kanban + human gates + mini/main coder + cloud (provider_credentials_status, cloudflare_list_workers, cloudflare_rotate_worker_secret, scaleway_list_resources, scaleway_resource_action). Prefer DEVBOULE_MCP_BACKEND=python until cutover for oracle/CKG/censor/design. Cloud mutate is coder-only with claim+evidence+pin/confirm. Tokens from env only; never log secrets. Agents never self-approve plans/pushes."
+                "Devboule app-tools MCP (Rust). P6: lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle_ask/context/find (HTTP loopback fail-closed) + project_structure + get_neighborhood/find_imports + censor_findings/dispose + visual_check + design_request. Scope fail-closed; path confinement; design outcome path validation (F-02-013). Cloud mutate coder-only. Tokens from env only; never log secrets. Agents never self-approve plans/pushes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -1022,8 +1461,8 @@ impl ServerHandler for DevbouleMcp {
 }
 
 /// Short per-role summary for the slim payload.
-const P5_ROLE_SUMMARY: &str =
-    "P5 Rust MCP: lifecycle + project/Kanban + human gates + mini/main coder + cloud list/mutate (role-filtered). Use DEVBOULE_MCP_BACKEND=python for oracle/CKG/censor/design.";
+const P6_ROLE_SUMMARY: &str =
+    "P6 Rust MCP: lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle/CKG/censor/design/visual (role-filtered).";
 
 /// Load role rules, filter `allowedTools` to `IMPLEMENTED_TOOLS`, and strip prose.
 fn load_role_rules_for_client() -> Result<Value> {
@@ -1078,7 +1517,7 @@ fn slim_roles_for_client(roles: &mut Value) {
         *role = json!({
             "role": role_name,
             "allowedTools": tools,
-            "summary": P5_ROLE_SUMMARY,
+            "summary": P6_ROLE_SUMMARY,
         });
     }
 }
@@ -1189,7 +1628,7 @@ mod tests {
                     role.get("role")
                 );
             }
-            assert_eq!(role["summary"], P5_ROLE_SUMMARY);
+            assert_eq!(role["summary"], P6_ROLE_SUMMARY);
         }
     }
 
@@ -1303,42 +1742,64 @@ mod tests {
             .iter()
             .filter_map(|t| t.as_str())
             .collect();
-        assert!(!tools.iter().any(|t| t.starts_with("project_")));
+        // Mini may use project_structure (read-only spine) but never Kanban mutation tools.
+        for banned in [
+            "project_list",
+            "project_get",
+            "project_claim_task",
+            "project_update_status",
+            "project_append_note",
+            "project_set_title",
+            "project_create_followup",
+            "project_create_plan_tasks",
+        ] {
+            assert!(!tools.contains(&banned), "mini must not get {banned}");
+        }
+        assert!(tools.contains(&"project_structure") || tools.contains(&"oracle_context"));
     }
 
     #[test]
-    fn client_roles_payload_does_not_name_unimplemented_tools() {
+    fn client_roles_payload_includes_p6_tools_for_coder() {
         let roles = load_role_rules_for_client().expect("parse");
         let dumped = roles.to_string();
-        for banned in [
-            "censor_dispose",
-            "oracle_context",
+        // P6 tools present for roles that allow them.
+        for required in [
             "oracle_ask",
-            "visual_check",
-            "design_request",
+            "oracle_context",
             "project_structure",
             "get_neighborhood",
             "find_imports",
             "censor_findings",
+            "censor_dispose",
+            "visual_check",
+            "design_request",
+            "plan_submit",
+            "request_git_push",
+            "spawn_mini_coder",
+            "provider_credentials_status",
+            "cloudflare_rotate_worker_secret",
         ] {
             assert!(
-                !dumped.contains(banned),
-                "P5 role payload must not mention unimplemented tool {banned}: {dumped}"
+                dumped.contains(required),
+                "P6 role payload missing tool {required}: {dumped}"
             );
         }
-        // P5: human gates + mini coder + cloud must appear for coder.
-        assert!(dumped.contains("plan_submit"));
-        assert!(dumped.contains("request_git_push"));
-        assert!(dumped.contains("ask_user"));
-        assert!(dumped.contains("project_create_plan_tasks"));
-        assert!(dumped.contains("spawn_mini_coder"));
-        assert!(dumped.contains("steer_mini_coder"));
-        assert!(dumped.contains("mini_coder_result"));
-        assert!(dumped.contains("provider_credentials_status"));
-        assert!(dumped.contains("cloudflare_list_workers"));
-        assert!(dumped.contains("cloudflare_rotate_worker_secret"));
-        assert!(dumped.contains("scaleway_list_resources"));
-        assert!(dumped.contains("scaleway_resource_action"));
+        // oracle_find is implemented but not on any role allowlist yet.
+        let coder = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == "coder")
+            .expect("coder");
+        let tools: Vec<&str> = coder["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert!(tools.contains(&"oracle_ask"));
+        assert!(tools.contains(&"censor_dispose"));
+        assert!(!tools.contains(&"oracle_find")); // not in role_rules
     }
 
     #[test]
@@ -1372,9 +1833,12 @@ mod tests {
             .find(|r| r["role"] == "coder")
             .expect("coder");
         let n = coder["allowedTools"].as_array().unwrap().len();
+        // P6 implements nearly the full allowlist; raw must still be non-empty.
+        assert!(n >= 20, "expected full role_rules coder allowlist (got {n})");
         assert!(
-            n > IMPLEMENTED_TOOLS.len() - 1, // agent_rules not in role_rules
-            "expected full role_rules to list more tools than P5 implements (got {n})"
+            IMPLEMENTED_TOOLS.contains(&"oracle_ask")
+                && IMPLEMENTED_TOOLS.contains(&"design_request"),
+            "P6 tools must be listed in IMPLEMENTED_TOOLS"
         );
     }
 

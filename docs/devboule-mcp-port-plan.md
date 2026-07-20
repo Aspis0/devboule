@@ -406,8 +406,8 @@ Resolution order for binary path:
 - [x] **P4** Mini/main coder (spawn/steer/result + spawn_main_coder via directives)  
 - [x] **P4 audit** → fix (hard queue caps, ownership fail-closed, no stamp-over-terminal, spawn_blocking)  
 - [x] **P5** Cloud (5 tools + env tokens + pin/confirm/claim/approval guards; HTTP via reqwest)  
-- [ ] **P5 audit** → fix  
-- [ ] **P6** Oracle/CKG/censor/design  
+- [x] **P5 audit** → fix (volume fail-closed, DELETE cascade, pin name, static IAM errors)  
+- [x] **P6** Oracle/CKG/censor/design  
 - [ ] **P6 audit** → fix  
 - [ ] **P7** Cutover + archive Python  
 - [ ] **P7 audit** → fix  

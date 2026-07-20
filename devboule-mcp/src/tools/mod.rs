@@ -1,7 +1,11 @@
 //! MCP tool handlers (business logic). Wired from `lib.rs` via rmcp macros.
 
 pub mod agent_lifecycle;
+pub mod censor;
+pub mod ckg_structure;
 pub mod cloud;
+pub mod design_visual;
 pub mod human_gates;
 pub mod mini_coder;
+pub mod oracle;
 pub mod project;
