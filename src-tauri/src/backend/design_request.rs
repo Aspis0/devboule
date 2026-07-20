@@ -29,6 +29,34 @@ pub struct DesignRequestOutcome {
     pub error: Option<String>,
 }
 
+/// Reject path-like strings that must never be stored as a design outcome
+/// (absolute paths, drive letters, `..` traversal). Relative project paths only.
+/// Audit F-02-013 — complete used to accept any client-supplied path string.
+pub fn validate_design_outcome_path(path: &str) -> Result<(), String> {
+    let s = path.trim();
+    if s.is_empty() {
+        return Err("design project path is empty".into());
+    }
+    if s.len() > 1024 {
+        return Err("design project path is too long".into());
+    }
+    let normalized = s.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.starts_with('~') {
+        return Err("design project path must be relative".into());
+    }
+    // Windows drive / UNC
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err("design project path must be relative".into());
+    }
+    for seg in normalized.split('/') {
+        if seg == ".." {
+            return Err("design project path must not contain '..'".into());
+        }
+    }
+    Ok(())
+}
+
 impl DesignRequestOutcome {
     pub fn done(design_project_path: impl Into<String>, registry_id: impl Into<String>) -> Self {
         Self {
@@ -197,5 +225,15 @@ mod tests {
         assert!(json.contains("\"android\""), "frame value: {json}");
         let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn validate_design_outcome_path_rejects_escapes() {
+        assert!(validate_design_outcome_path("designs/foo").is_ok());
+        assert!(validate_design_outcome_path("/etc/passwd").is_err());
+        assert!(validate_design_outcome_path("~/secrets").is_err());
+        assert!(validate_design_outcome_path("a/../../b").is_err());
+        assert!(validate_design_outcome_path("C:\\Windows\\system32").is_err());
+        assert!(validate_design_outcome_path("").is_err());
     }
 }

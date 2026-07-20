@@ -420,7 +420,14 @@ pub fn design_request_complete(
     state.ensure_unlocked()?;
     use crate::backend::design_request::DesignRequestOutcome;
     let outcome = match (design_project_path, registry_id) {
-        (Some(path), Some(id)) => DesignRequestOutcome::done(path, id),
+        (Some(path), Some(id)) => {
+            crate::backend::design_request::validate_design_outcome_path(&path)?;
+            let id = id.trim();
+            if id.is_empty() || id.len() > 256 {
+                return Err("registry id is invalid".into());
+            }
+            DesignRequestOutcome::done(path.trim(), id)
+        }
         _ => DesignRequestOutcome::failed(
             error.unwrap_or_else(|| "design generation failed".to_string()),
         ),
