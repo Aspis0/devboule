@@ -10,6 +10,8 @@
     "tauri": "tauri",
     "mcp:stage": "bash scripts/stage-devboule-mcp.sh",
     "mcp:soak": "bash scripts/soak-devboule-mcp.sh",
+    "pilot:app": "bash tools/tauri-pilot/run-app.sh",
+    "pilot:smoke": "bash tools/tauri-pilot/smoke-ping.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "rig:smoke": "RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v",

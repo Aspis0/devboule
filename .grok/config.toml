@@ -1,0 +1,10 @@
+# Project MCP for Grok Build — DEV agent UI drive (tauri-pilot).
+# Requires folder trust. Refresh with /mcps → r.
+# App must be running: npm run pilot:app (FE on :1420 + cargo --features ui-pilot).
+
+[mcp_servers.tauri_pilot]
+command = "python3"
+args = ["tools/tauri-pilot/mcp_proxy_for_grok.py"]
+enabled = true
+startup_timeout_sec = 30
+env = { PATH = "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin" }

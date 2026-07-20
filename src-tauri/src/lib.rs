@@ -351,7 +351,7 @@ pub fn run() {
     let mini_coder_state = MiniCoderState::new();
     let design_gen_state = DesignGenState::new();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         // OS folder/file picker for the Polis "Open folder" action (folder-agnostic
         // map). Only the `dialog:allow-open` permission is granted in the
         // capabilities file — no save/message/ask surface is exposed.
@@ -360,7 +360,17 @@ pub fn run() {
         // `notification:default` permission is granted in the capabilities file;
         // the frontend requests OS permission on first use and degrades silently
         // to the in-app Header pill when denied/unsupported.
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+
+    // tauri-pilot (agent-native UI automation for Grok/Claude): DEV ONLY.
+    // Detach: feature ui-pilot + this block + tools/tauri-pilot/.
+    // Never enable for production installers.
+    #[cfg(all(debug_assertions, feature = "ui-pilot"))]
+    {
+        builder = builder.plugin(tauri_plugin_pilot::init());
+    }
+
+    builder
         .manage(backend_state)
         .manage(polis_state)
         .manage(agent_pty_sessions)

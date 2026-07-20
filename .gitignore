@@ -80,3 +80,6 @@ devboule-mcp/target/
 src-tauri/binaries/devboule-mcp
 src-tauri/binaries/devboule-mcp-*
 !src-tauri/binaries/README.md
+
+# tauri-pilot DEV capability (copied only for pilot runs; never production)
+src-tauri/capabilities/pilot.json
