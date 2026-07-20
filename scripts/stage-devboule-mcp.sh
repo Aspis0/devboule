@@ -43,7 +43,13 @@ echo "stage-devboule-mcp: building ${NAME} (${PROFILE}) for ${TARGET}…"
     STAGED="${STAGED}.exe"
   fi
   cp -f "$SRC" "$STAGED"
-  chmod +x "$STAGED" 2>/dev/null || true
+  if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+    chmod +x "$STAGED"
+  fi
+  if [[ ! -x "$STAGED" && "$(uname -s)" != MINGW* ]]; then
+    echo "stage-devboule-mcp: staged binary is not executable: $STAGED" >&2
+    exit 1
+  fi
 
   # Convenience un-suffixed copy for local resolve / PATH testing (not used by Tauri).
   LOCAL="${OUT_DIR}/${NAME}"
@@ -51,7 +57,13 @@ echo "stage-devboule-mcp: building ${NAME} (${PROFILE}) for ${TARGET}…"
     LOCAL="${LOCAL}.exe"
   fi
   cp -f "$SRC" "$LOCAL"
-  chmod +x "$LOCAL" 2>/dev/null || true
+  if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+    chmod +x "$LOCAL"
+  fi
+  if [[ ! -x "$LOCAL" && "$(uname -s)" != MINGW* ]]; then
+    echo "stage-devboule-mcp: local binary is not executable: $LOCAL" >&2
+    exit 1
+  fi
 
   echo "stage-devboule-mcp: staged → $STAGED"
   ls -la "$STAGED" "$LOCAL"

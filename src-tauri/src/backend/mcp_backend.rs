@@ -222,12 +222,16 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
         }
     }
 
-    // Compile-time sibling `devboule-mcp/target/...` only in debug builds.
+    // Compile-time sibling paths only in debug builds.
     // Release must not bake developer absolute paths from the build machine.
+    // Prefer staged externalBin (fresh release stage) over stale target/debug.
     if cfg!(debug_assertions) {
-        let profiles: &[&str] = &["debug", "release"];
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for profile in profiles {
+        let staged = manifest.join("binaries").join(bin_name());
+        if let Some(abs) = absolute_if_executable(&staged) {
+            return Ok(abs);
+        }
+        for profile in ["release", "debug"] {
             let cand = manifest
                 .join("..")
                 .join("devboule-mcp")
@@ -237,11 +241,6 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
             if let Some(abs) = absolute_if_executable(&cand) {
                 return Ok(abs);
             }
-        }
-        // Staged externalBin copy for local tauri dev (scripts/stage-devboule-mcp.sh).
-        let staged = manifest.join("binaries").join(bin_name());
-        if let Some(abs) = absolute_if_executable(&staged) {
-            return Ok(abs);
         }
     }
 
