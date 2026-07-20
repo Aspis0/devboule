@@ -72,3 +72,6 @@ src-tauri/.devboule/
 # prompts). The rest of .pi/ (e.g. mcp.json, sessions) stays ignored.
 !.pi/agents/
 !.pi/agents/*.md
+
+# devboule-mcp build artifacts
+devboule-mcp/target/
