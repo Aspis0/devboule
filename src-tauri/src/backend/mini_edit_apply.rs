@@ -473,9 +473,30 @@ pub(crate) fn apply_emitted_edits(
     }
 
     // PASS 2 — flush, one write per touched file, pre-image hook first.
+    // Re-assert confinement at write time (audit F-04-011): PASS1 resolved paths
+    // under `canon_root`, but a concurrent swap of a path for a symlink could
+    // otherwise make `fs::write(join)` follow outside the project.
     for rel in &order {
         pre_write(rel);
         let abs = canon_root.join(rel);
+        if abs.symlink_metadata().is_ok() {
+            let canon_target = std::fs::canonicalize(&abs).map_err(|e| {
+                format!("write {rel}: cannot re-resolve path before write: {e}")
+            })?;
+            if !canon_target.starts_with(&canon_root) {
+                return Err(format!("write {rel}: path escapes the project root"));
+            }
+        } else {
+            let parent = abs
+                .parent()
+                .ok_or_else(|| format!("write {rel}: has no parent directory"))?;
+            let canon_parent = std::fs::canonicalize(parent).map_err(|_| {
+                format!("write {rel}: parent directory does not exist at write time")
+            })?;
+            if !canon_parent.starts_with(&canon_root) {
+                return Err(format!("write {rel}: path escapes the project root"));
+            }
+        }
         std::fs::write(&abs, contents[rel].as_bytes()).map_err(|e| format!("write {rel}: {e}"))?;
     }
 
