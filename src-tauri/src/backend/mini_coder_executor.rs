@@ -3361,7 +3361,7 @@ fn console_mark_stopped(app: &AppHandle, directive: &MiniCoderDirective) {
 /// backend simply gets NO oracle grant (the mini still runs, just without Oracle).
 fn resolve_mcp_roots(app: &AppHandle) -> Option<McpRoots> {
     let projects_dir = super::projects::ensure_projects_dir(app).ok()?;
-    let management_root = agents::management_root_for_mcp(app, &projects_dir);
+    let management_root = agents::management_root_for_mcp(app, &projects_dir).ok()?;
     Some(McpRoots {
         management_root,
         projects_dir,

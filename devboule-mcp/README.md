@@ -1,7 +1,10 @@
 # devboule-mcp
 
-Native **Devboule app-tools MCP** server (Rust / `rmcp`). Replaces
-`python -m oracle.server.aspis_mcp` tool-by-tool.
+Native **Devboule app-tools MCP** server (Rust / `rmcp`). **Default backend since P7.**
+
+Replaces `python -m oracle.server.aspis_mcp` for agent launch configs written by the
+Tauri app (`cli_agents`, `pi_mcp_config`, Claude/Codex spawn). The Python module remains
+on disk for `DEVBOULE_MCP_BACKEND=python` soak — it is **not** deleted in P7.
 
 See the full port plan: [`docs/devboule-mcp-port-plan.md`](../docs/devboule-mcp-port-plan.md).
 
@@ -9,10 +12,10 @@ See the full port plan: [`docs/devboule-mcp-port-plan.md`](../docs/devboule-mcp-
 
 | Phase | Tools | Default |
 |-------|-------|---------|
-| **P4** (this crate) | lifecycle + project/Kanban + human gates + **mini/main coder** (`spawn_mini_coder`, `steer_mini_coder`, `mini_coder_result`, `spawn_main_coder`) | Agents still use **Python** unless flagged |
-| Not yet | cloud, oracle/CKG, censor, design, visual | Use `DEVBOULE_MCP_BACKEND=python` |
+| **P7** (cutover) | Full app-tools surface ported in prior phases | Agents use **`devboule-mcp` (Rust)** when unset |
+| Soak | Python `oracle.server.aspis_mcp` | Explicit `DEVBOULE_MCP_BACKEND=python` |
 
-Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive flock + crash-safe write), including `miniCoderDirectives` for the app’s `mini_coder_executor`. Prefer `DEVBOULE_MCP_PROJECTS_DIR` / `DEVBOULE_MCP_ROOT`; Aspis env names still accepted.
+Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive flock + crash-safe write), including `miniCoderDirectives` for the app’s `mini_coder_executor`. Prefer `DEVBOULE_MCP_PROJECTS_DIR` / `DEVBOULE_MCP_ROOT`; Aspis env names still accepted (dual-write for one more release). Filename rename to `.devboule-agents.json` is **P7.1** (deferred).
 
 ### Mini/main coder (P4)
 
@@ -21,37 +24,69 @@ Co-writes `{projects_dir}/.aspis-agents.json` with the Tauri app (exclusive floc
 - Caps match Python/Rust co-writers: 64 files (mini), 10 (main + write), steer queue 8×2000 chars, directive queue 50.
 - Pigeon mailbox path is **not** ported; file-queue only.
 
+## Launch (Devboule-branded)
+
+```bash
+# Default (P7): Rust binary — app config writers emit this when BACKEND is unset.
+export DEVBOULE_MCP_ROOT=/path/to/devboule
+export DEVBOULE_MCP_PROJECTS_DIR=/path/to/devboule/projects
+# optional:
+export DEVBOULE_MCP_BIN=/absolute/path/to/devboule-mcp
+
+./target/release/devboule-mcp
+# or: cargo run --release
+```
+
+Manual Claude/Codex entry shape (what the app writes):
+
+```json
+{
+  "mcpServers": {
+    "devboule": {
+      "command": "/absolute/path/to/devboule-mcp",
+      "args": [],
+      "env": {
+        "DEVBOULE_MCP_ROOT": "/path/to/devboule",
+        "DEVBOULE_MCP_PROJECTS_DIR": "/path/to/devboule/projects",
+        "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE": "1",
+        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
+      }
+    }
+  }
+}
+```
+
 ## Backend flag (app / shell)
 
 ```bash
-# default until P7 cutover
-export DEVBOULE_MCP_BACKEND=python
-
-# use this binary (must be resolvable)
+# default since P7 (empty / unset → rust)
 export DEVBOULE_MCP_BACKEND=rust
 export DEVBOULE_MCP_BIN=/absolute/path/to/devboule-mcp   # optional override
+
+# soak / fallback — keep Python aspis_mcp.py for one release
+export DEVBOULE_MCP_BACKEND=python
 ```
 
-Resolution order for the binary when `BACKEND=rust`:
+**P7 dual-stack default:** if `DEVBOULE_MCP_BACKEND` is **unset**, the app prefers
+Rust only when this binary resolves; otherwise it defaults to Python (packaged
+apps without a sidecar). If the env var is **set** to rust, missing binary →
+**fail closed** (never silent Python switch).
+
+Resolution order for the binary when backend is Rust:
 
 1. `DEVBOULE_MCP_BIN` (must be an **executable** file)
-2. `devboule-mcp/target/{debug,release}/devboule-mcp` (dev tree via `CARGO_MANIFEST_DIR`;
-   prefers the profile matching this build, then the other)
-3. next to the running app executable / `resources/`
+2. next to the running app executable / `resources/`
+3. `devboule-mcp/target/{debug,release}/devboule-mcp` (**debug builds only**, via
+   `CARGO_MANIFEST_DIR` — not baked into release)
 4. `PATH`
 
-If `rust` is selected and the binary cannot be found, config writers **fail closed**
-(no silent Python fallback).
+### Packaging honesty (P7)
 
-### Packaging honesty (P0)
-
-The Rust MCP is **not** bundled in Tauri app resources until **P7**. Selecting
-`DEVBOULE_MCP_BACKEND=rust` in P0 requires either:
+The Rust MCP is still **not** auto-bundled into Tauri app resources. Unset env
+without a resolvable binary falls back to Python soak. To force Rust:
 
 - `DEVBOULE_MCP_BIN=/absolute/path/to/devboule-mcp`, or
-- a local `cargo build` of this crate (dev tree / PATH).
-
-Released app installs keep the default **python** backend until cutover.
+- a local `cargo build --release` of this crate (dev tree / PATH / sibling of the app).
 
 ## Branding env (dual-write for one release)
 

@@ -398,7 +398,14 @@ fn resolve_scan_path(
             .map(|l| projects_dir_from_state_path(&l.state_path))
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("projects"));
-        crate::backend::agents::management_root_for_mcp(app, &projects_dir)
+        crate::backend::agents::management_root_for_mcp(app, &projects_dir).unwrap_or_else(|e| {
+            // UI map scan only — never use an unvalidated parent for MCP launch.
+            // Prefer cwd so Polis still opens something useful in dev.
+            eprintln!(
+                "[polis] MCP management root unavailable ({e}); scanning cwd. Set DEVBOULE_ROOT."
+            );
+            std::env::current_dir().unwrap_or_else(|_| projects_dir.clone())
+        })
     } else {
         PathBuf::from(raw.trim())
     }

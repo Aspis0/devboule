@@ -58,9 +58,11 @@ These are product rules, not suggestions.
 - Vite: frontend build.
 - Tailwind CSS: UI styling.
 - Lucide React: icons.
-- Python: the `aspis_mcp` app-tools MCP server (project/cloud/Kanban tools) — slim
-  (httpx-only). Oracle retrieval + indexing are Rust now (`oracle-core`); the
-  pi-oracle rail is the native `oracle-mcp` binary (M4, July 2026).
+- Rust `devboule-mcp`: default app-tools MCP server for agents (project/cloud/Kanban
+  tools) since P7. Python `oracle.server.aspis_mcp` remains as an explicit
+  `DEVBOULE_MCP_BACKEND=python` soak path (not deleted yet). Oracle retrieval +
+  indexing are Rust (`oracle-core`); the pi-oracle rail is the native `oracle-mcp`
+  binary (M4, July 2026).
 - LanceDB / local Oracle data: chunk/vector storage + a local embedder (GPU-aware),
   driven by the Rust `oracle-core` crate.
 - PixiJS 8: the Polis isometric "city of the codebase" renderer.
@@ -750,47 +752,58 @@ Important limitation:
 ## Local MCP Server
 
 The local MCP server is the contract between CLI agents and the app/project
-system.
+system. **Default (P7): native `devboule-mcp` (Rust).** Python
+`oracle.server.aspis_mcp` is the explicit soak fallback
+(`DEVBOULE_MCP_BACKEND=python`).
 
-Manual command shape:
+### Default launch (Rust / Devboule-branded)
 
-```powershell
-cd "C:\Users\gualt\Desktop\Devboule"
-python -m oracle.server.aspis_mcp --root "C:\Users\gualt\Desktop\Devboule" --projects-dir "C:\Users\gualt\Desktop\Devboule\projects"
+```bash
+# Build once
+cd devboule-mcp && cargo build --release
+
+# Run (stdio MCP). Roots via env (preferred):
+export DEVBOULE_MCP_ROOT="/path/to/Devboule"
+export DEVBOULE_MCP_PROJECTS_DIR="/path/to/Devboule/projects"
+# optional absolute override:
+# export DEVBOULE_MCP_BIN="/path/to/devboule-mcp"
+
+./target/release/devboule-mcp
 ```
 
-Preflight:
-
-```powershell
-python -m pip install -r oracle\requirements-mcp.txt
-python -m unittest oracle.tests.test_aspis_mcp
-```
-
-Client config shape:
+Client config shape (what the app writes when backend is Rust / unset):
 
 ```json
 {
   "mcpServers": {
     "devboule": {
-      "command": "python",
-      "args": [
-        "-m",
-        "oracle.server.aspis_mcp",
-        "--root",
-        "C:\\Users\\gualt\\Desktop\\Devboule",
-        "--projects-dir",
-        "C:\\Users\\gualt\\Desktop\\Devboule\\projects"
-      ],
-      "cwd": "C:\\Users\\gualt\\Desktop\\Devboule",
+      "command": "/absolute/path/to/devboule-mcp",
+      "args": [],
       "env": {
-        "PYTHONPATH": "C:\\Users\\gualt\\Desktop\\Devboule",
-        "PYTHONIOENCODING": "utf-8",
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1"
+        "DEVBOULE_MCP_ROOT": "/path/to/Devboule",
+        "DEVBOULE_MCP_PROJECTS_DIR": "/path/to/Devboule/projects",
+        "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE": "1",
+        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
       }
     }
   }
 }
+```
+
+Binary resolution order: `DEVBOULE_MCP_BIN` → local `devboule-mcp/target/{debug,release}`
+→ next to app exe / `resources/` → `PATH`. If Rust is selected and the binary is
+missing, config writers **fail closed** (no silent Python fallback).
+
+### Python soak (explicit)
+
+```bash
+export DEVBOULE_MCP_BACKEND=python
+python -m oracle.server.aspis_mcp --root "/path/to/Devboule" --projects-dir "/path/to/Devboule/projects"
+```
+
+```powershell
+python -m pip install -r oracle\requirements-mcp.txt
+python -m unittest oracle.tests.test_aspis_mcp
 ```
 
 Important MCP behavior:

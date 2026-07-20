@@ -992,7 +992,14 @@ pub fn role_launch_prompt(role: &str) -> Option<&'static str> {
 }
 
 fn mcp_command_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
-    let root = management_root_for_mcp(app, projects_dir);
+    let root = match management_root_for_mcp(app, projects_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return format!(
+                "# devboule MCP management root unavailable: {e} (set DEVBOULE_ROOT)"
+            );
+        }
+    };
     // Slice 3: inject the Pigeon coordinates ONLY when Pigeon is enabled (else None ⇒
     // byte-identical launch env). The Python MCP server reads PIGEON_PORT/PIGEON_AUTH_TOKEN
     // to learn that the durable mailbox transport is available (`_pigeon_enabled()`).
@@ -1010,7 +1017,7 @@ fn mcp_command_hint_for_paths(
     pigeon_env: Option<(&str, &str)>,
 ) -> String {
     // Derive the PowerShell one-liner from the shared MCP entry builder so the
-    // UI hint tracks DEVBOULE_MCP_BACKEND (python default / rust when selected).
+    // UI hint tracks DEVBOULE_MCP_BACKEND (rust default since P7 / python soak).
     let entry = match crate::backend::mcp_backend::build_devboule_mcp_server_entry(
         crate::backend::mcp_backend::McpBackend::from_env(),
         "python",
@@ -1073,7 +1080,15 @@ fn mcp_command_hint_for_paths(
 }
 
 fn mcp_client_config_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
-    let root = management_root_for_mcp(app, projects_dir);
+    let root = match management_root_for_mcp(app, projects_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return format!(
+                "{{\n  \"error\": \"devboule MCP management root unavailable: {}\"\n}}",
+                e.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+    };
     let pigeon = crate::backend::pigeon_service::pigeon_spawn_env(app);
     mcp_client_config_hint_for_paths(
         &root,
@@ -1125,45 +1140,85 @@ fn mcp_client_config_hint_for_paths(
     .unwrap_or_default()
 }
 
-pub fn management_root_for_mcp(app: &tauri::AppHandle, projects_dir: &Path) -> PathBuf {
+/// Resolve the management root used as MCP `--root` / `DEVBOULE_MCP_ROOT`.
+///
+/// Fail-closed: only returns a path that passes [`is_valid_management_root`]
+/// (config.json + MCP package marker). Never silently uses
+/// `projects_dir.parent()` without validation — that used to point MCP children
+/// at a directory with no package and broke the whole fleet.
+///
+/// Set `DEVBOULE_ROOT` to force a root (still validated).
+pub fn management_root_for_mcp(
+    app: &tauri::AppHandle,
+    projects_dir: &Path,
+) -> Result<PathBuf, String> {
+    let resource_dir = app.path().resource_dir().ok();
+    management_root_from_candidates(projects_dir, resource_dir.as_deref())
+}
+
+/// Handle-free management-root resolution (CLI agents / tests).
+///
+/// Same validation as [`management_root_for_mcp`] without Tauri resource_dir.
+pub fn management_root_for_mcp_handle_free(projects_dir: &Path) -> Result<PathBuf, String> {
+    management_root_from_candidates(projects_dir, None)
+}
+
+fn management_root_from_candidates(
+    projects_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
     if let Ok(value) = std::env::var("DEVBOULE_ROOT") {
-        if let Some(path) = normalize_management_root_candidate(&PathBuf::from(value.trim())) {
-            return path;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            if let Some(path) = normalize_management_root_candidate(&PathBuf::from(trimmed)) {
+                return Ok(path);
+            }
+            return Err(format!(
+                "DEVBOULE_ROOT={trimmed} is set but is not a valid MCP management root \
+                 (need config.json + aspis_mcp.py or devboule-mcp/Cargo.toml or DEVBOULE_MCP_BIN)"
+            ));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(path) = normalize_management_root_candidate(&cwd) {
-            return path;
+            return Ok(path);
         }
         if let Some(parent) = cwd.parent() {
             if let Some(path) = normalize_management_root_candidate(parent) {
-                return path;
+                return Ok(path);
             }
         }
     }
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        if let Some(path) = normalize_management_root_candidate(&resource_dir) {
-            return path;
+    if let Some(resource_dir) = resource_dir {
+        if let Some(path) = normalize_management_root_candidate(resource_dir) {
+            return Ok(path);
         }
     }
-    projects_dir.parent().unwrap_or(projects_dir).to_path_buf()
+    // projects_dir / parent only when they actually validate — never a silent fallback.
+    if let Some(path) = normalize_management_root_candidate(projects_dir) {
+        return Ok(path);
+    }
+    if let Some(parent) = projects_dir.parent() {
+        if let Some(path) = normalize_management_root_candidate(parent) {
+            return Ok(path);
+        }
+    }
+    Err(
+        "MCP management root not found (set DEVBOULE_ROOT to a directory with config.json and \
+         oracle/server/aspis_mcp.py or devboule-mcp/Cargo.toml, or set DEVBOULE_MCP_BIN)"
+            .into(),
+    )
 }
 
 fn normalize_management_root_candidate(candidate: &Path) -> Option<PathBuf> {
     let mut path = candidate.to_path_buf();
     if path.file_name().and_then(|value| value.to_str()) == Some("src-tauri") {
         if let Some(parent) = path.parent() {
-            // LOCK-STEP with `validate_management_root` in oracle/server/aspis_mcp.py:
-            // hop to the parent ONLY when it actually carries the oracle package; a
-            // self-contained directory that merely happens to be named `src-tauri`
-            // otherwise validates on its own merits (the unconditional hop made the
-            // two implementations disagree on that layout — reviewer finding).
-            if parent
-                .join("oracle")
-                .join("server")
-                .join("aspis_mcp.py")
-                .is_file()
-            {
+            // Hop to the parent ONLY when it actually carries an MCP package
+            // marker (Python aspis_mcp.py and/or Rust devboule-mcp crate). A
+            // self-contained directory that merely happens to be named
+            // `src-tauri` otherwise validates on its own merits.
+            if has_mcp_package_marker(parent) {
                 path = parent.to_path_buf();
             }
         }
@@ -1180,15 +1235,46 @@ fn is_valid_management_root(path: &Path) -> bool {
     // carry only `src-tauri/config.json`. Accept either location — requiring
     // the root copy made every candidate invalid the moment the root copy
     // disappeared, and the silent `projects_dir.parent()` fallback then pointed
-    // the MCP children at a directory with no `oracle` package.
+    // the MCP children at a directory with no MCP package.
     let has_config =
         path.join("config.json").is_file() || path.join("src-tauri").join("config.json").is_file();
-    has_config
-        && path
-            .join("oracle")
-            .join("server")
-            .join("aspis_mcp.py")
-            .is_file()
+    has_config && has_mcp_package_marker(path)
+}
+
+/// MCP package presence for management-root validation (P7).
+///
+/// Accepts **either**:
+/// - Python: `oracle/server/aspis_mcp.py` (existing installs + `BACKEND=python` soak)
+/// - Rust crate tree: `devboule-mcp/Cargo.toml` (dev checkout)
+/// - Env marker: `DEVBOULE_MCP_BIN` points at an executable file (packaged /
+///   custom install without the Python package on disk)
+///
+/// Do **not** require both; pure-Python installs must keep working.
+///
+/// `pub(crate)` so `lib.rs` bootstrap keeps the same marker set (no drift).
+pub(crate) fn has_mcp_package_marker(path: &Path) -> bool {
+    if path
+        .join("oracle")
+        .join("server")
+        .join("aspis_mcp.py")
+        .is_file()
+    {
+        return true;
+    }
+    if path.join("devboule-mcp").join("Cargo.toml").is_file() {
+        return true;
+    }
+    // Explicit bin override: validates that *some* MCP server is configured even
+    // when neither package tree is present under this root (e.g. archived Python).
+    if let Ok(bin) = std::env::var(crate::backend::mcp_backend::ENV_BIN) {
+        let trimmed = bin.trim();
+        if !trimmed.is_empty()
+            && crate::backend::provider_detect::is_executable_file(std::path::Path::new(trimmed))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Unique, stable window-title marker for an agent's dedicated console window.
@@ -2161,12 +2247,37 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// P7: management root validates with the Rust crate marker alone (no
+    /// `aspis_mcp.py`), so pure-Rust checkouts / post-archive layouts still resolve.
+    #[test]
+    fn management_root_accepts_devboule_mcp_crate_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "devboule-root-rust-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("devboule-mcp")).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        assert!(
+            normalize_management_root_candidate(&root).is_none(),
+            "config alone is not enough"
+        );
+        fs::write(root.join("devboule-mcp").join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            normalize_management_root_candidate(&root),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// F1 (mute-orchestrator fix): the dev app (cwd = src-tauri) writes
     /// `config.json` under `src-tauri/`, not the repo root. A root that has the
     /// oracle package but ONLY `src-tauri/config.json` must still validate —
-    /// before this, NO directory validated, `management_root_for_mcp` silently
-    /// fell back to `projects_dir.parent()` (= src-tauri), and every MCP child
-    /// died on `import oracle` → the whole fleet lost registration.
+    /// before this, NO directory validated, `management_root_for_mcp` used to
+    /// silently fall back to `projects_dir.parent()` (= src-tauri), and every MCP
+    /// child died on `import oracle` → the whole fleet lost registration.
+    /// (P7 audit: that silent parent fallback is now removed — fail-closed Err.)
     #[test]
     fn management_root_accepts_split_layout_config_under_src_tauri() {
         let root = std::env::temp_dir().join(format!(
@@ -2225,43 +2336,50 @@ mod tests {
 
     #[test]
     fn manual_mcp_hints_enable_cloudflare_profile_mode() {
-        let root = std::env::temp_dir().join(format!(
-            "devboule-mcp-hint-test-{}",
-            std::process::id()
-        ));
-        let projects = root.join("projects");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
-        fs::create_dir_all(&projects).unwrap();
-        fs::write(root.join("config.json"), "{}").unwrap();
-        fs::write(
-            root.join("oracle").join("server").join("aspis_mcp.py"),
-            "# test",
-        )
-        .unwrap();
+        // Pin Python: P7 default is Rust; this asserts dual-write env on the soak path.
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                let root = std::env::temp_dir().join(format!(
+                    "devboule-mcp-hint-test-{}",
+                    std::process::id()
+                ));
+                let projects = root.join("projects");
+                let _ = fs::remove_dir_all(&root);
+                fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+                fs::create_dir_all(&projects).unwrap();
+                fs::write(root.join("config.json"), "{}").unwrap();
+                fs::write(
+                    root.join("oracle").join("server").join("aspis_mcp.py"),
+                    "# test",
+                )
+                .unwrap();
 
-        // None pigeon env ⇒ the byte-identical (pre-Slice-3) hints.
-        let command = mcp_command_hint_for_paths(&root, &projects, None);
-        let config = mcp_client_config_hint_for_paths(&root, &projects, None);
+                // None pigeon env ⇒ the byte-identical (pre-Slice-3) hints.
+                let command = mcp_command_hint_for_paths(&root, &projects, None);
+                let config = mcp_client_config_hint_for_paths(&root, &projects, None);
 
-        assert!(command.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(config.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        // NO-CHURN: Pigeon env is absent when None.
-        assert!(!command.contains("PIGEON_PORT"));
-        assert!(!config.contains("PIGEON_PORT"));
+                assert!(command.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+                assert!(config.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+                // NO-CHURN: Pigeon env is absent when None.
+                assert!(!command.contains("PIGEON_PORT"));
+                assert!(!config.contains("PIGEON_PORT"));
 
-        // When enabled, both hints carry the two Pigeon env vars.
-        let command_on = mcp_command_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
-        let config_on =
-            mcp_client_config_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
-        assert!(command_on.contains("PIGEON_PORT=\"28771\""), "{command_on}");
-        assert!(
-            command_on.contains("PIGEON_AUTH_TOKEN=\"abc123\""),
-            "{command_on}"
+                // When enabled, both hints carry the two Pigeon env vars.
+                let command_on =
+                    mcp_command_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
+                let config_on =
+                    mcp_client_config_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
+                assert!(command_on.contains("PIGEON_PORT=\"28771\""), "{command_on}");
+                assert!(
+                    command_on.contains("PIGEON_AUTH_TOKEN=\"abc123\""),
+                    "{command_on}"
+                );
+                assert!(config_on.contains("\"PIGEON_PORT\""), "{config_on}");
+                assert!(config_on.contains("abc123"), "{config_on}");
+                let _ = fs::remove_dir_all(&root);
+            },
         );
-        assert!(config_on.contains("\"PIGEON_PORT\""), "{config_on}");
-        assert!(config_on.contains("abc123"), "{config_on}");
-        let _ = fs::remove_dir_all(&root);
     }
 
     // Part B: the launch ledger must record an arbitrary CUSTOM client id verbatim

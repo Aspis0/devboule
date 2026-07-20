@@ -106,20 +106,14 @@ fn resolve_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
 }
 
 /// Where to bootstrap a missing `config.json`: the PARENT of `cwd` when it is
-/// recognizably the management root (it carries the oracle MCP entrypoint),
-/// else `cwd` itself (standalone/unusual layouts keep the old behavior). Pure
-/// (filesystem-read only) so it is unit-testable. Keep the marker in lock-step
-/// with `is_valid_management_root` in backend/agents.rs and
-/// `validate_management_root` in oracle/server/aspis_mcp.py.
+/// recognizably the management root (it carries an MCP package marker), else
+/// `cwd` itself (standalone/unusual layouts keep the old behavior). Pure
+/// (filesystem-read only) so it is unit-testable. Marker set is shared with
+/// [`backend::agents::has_mcp_package_marker`] (Python `aspis_mcp.py` **or**
+/// Rust `devboule-mcp/Cargo.toml` **or** executable `DEVBOULE_MCP_BIN`).
 fn bootstrap_config_dir(cwd: &std::path::Path) -> std::path::PathBuf {
     cwd.parent()
-        .filter(|parent| {
-            parent
-                .join("oracle")
-                .join("server")
-                .join("aspis_mcp.py")
-                .is_file()
-        })
+        .filter(|parent| backend::agents::has_mcp_package_marker(parent))
         .map(|parent| parent.to_path_buf())
         .unwrap_or_else(|| cwd.to_path_buf())
 }

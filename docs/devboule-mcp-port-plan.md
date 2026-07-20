@@ -327,9 +327,30 @@ continue with a stale Python entry under the rust backend.
 4. Update README, management_root checks.  
 5. Archive `aspis_mcp.py` → `archived/aspis_mcp.py` (or delete after soak).  
 
-**P7.1 (optional follow-up):** rename `.aspis-agents.json` → `.devboule-agents.json` with one-shot migrate.
+**P7 note (this cutover):** dual-stack default (hostile-audit fix):
+- `DEVBOULE_MCP_BACKEND` **set** → honor strictly (`rust` / `python` aliases). Rust
+  with missing binary → **fail-closed** at entry build (never silent Python switch).
+- **unset** → prefer Rust **only if** `devboule-mcp` resolves; else Python so packaged
+  apps without a sidecar keep working. This is **not** a silent fallback when rust is
+  explicit.
+Python module is **kept on disk** for soak (do **not** delete yet). Archive/delete is a
+follow-up after soak. Dual-write Aspis env keys stay for one more release.
+`management_root` accepts `oracle/server/aspis_mcp.py` **or** `devboule-mcp/Cargo.toml`
+**or** a valid `DEVBOULE_MCP_BIN`, and **fails closed** (no silent `projects_dir.parent()`).
+Binary is still **not** auto-bundled in Tauri resources — installs need
+`DEVBOULE_MCP_BIN` / dev tree / PATH. `CARGO_MANIFEST_DIR` cargo-target probe is
+**debug-only** (release must not bake build-machine paths).
 
-**Audit focus:** whole cutover regression, no silent Python fallback in release builds.
+**P7 residual risks (honest):**
+- Packaged release without bin + without env still runs **Python** soak path (needs
+  `aspis_mcp.py` on disk) — not pure-Rust cutover until binary is bundled.
+- `cli_agents` Rust path no longer requires the Oracle venv; status UI may report a
+  dummy interpreter string when backend is Rust.
+- Agents filename still `.aspis-agents.json` until P7.1.
+
+**P7.1 (optional follow-up):** rename `.aspis-agents.json` → `.devboule-agents.json` with one-shot migrate (filename rename deferred).
+
+**Audit focus:** whole cutover regression; no silent Python fallback when rust is **explicit**; dual-stack only when env unset.
 
 ---
 
@@ -358,15 +379,17 @@ Do **not** parallelize implementer + reviewer of the **same** phase.
 ## 8. Rollout flag
 
 ```text
-DEVBOULE_MCP_BACKEND=python   # default until P7
-DEVBOULE_MCP_BACKEND=rust     # use devboule-mcp binary
+DEVBOULE_MCP_BACKEND=rust     # explicit rust (fail-closed if bin missing)
+DEVBOULE_MCP_BACKEND=python   # explicit soak / fallback → aspis_mcp.py
+# unset                    → rust if bin resolves, else python (P7 dual-stack)
 ```
 
 Resolution order for binary path:
 
 1. `DEVBOULE_MCP_BIN`  
 2. next to app executable / resources  
-3. `target/debug/devboule-mcp` or `target/release/devboule-mcp` (dev)  
+3. `devboule-mcp/target/{debug,release}/devboule-mcp` (**debug builds only**)  
+4. `PATH`
 
 ---
 
@@ -384,12 +407,12 @@ Resolution order for binary path:
 
 ## 10. Success criteria (whole project)
 
-- [ ] Default agent MCP is `devboule-mcp` (Rust)  
-- [ ] No runtime dependency on `oracle.server.aspis_mcp` in default config  
+- [x] Default agent MCP is `devboule-mcp` (Rust) when bin resolves; else Python dual-stack  
+- [x] No runtime dependency on `oracle.server.aspis_mcp` when Rust backend is active  
 - [ ] All tools in role_rules allowlists implemented or intentionally removed with doc  
 - [ ] Orchestrator cannot mutate CF/SCW  
 - [ ] Hostile audit recorded per phase  
-- [ ] README launch path is Devboule-branded  
+- [x] README launch path is Devboule-branded  
 
 ---
 
@@ -409,9 +432,10 @@ Resolution order for binary path:
 - [x] **P5 audit** → fix (volume fail-closed, DELETE cascade, pin name, static IAM errors)  
 - [x] **P6** Oracle/CKG/censor/design  
 - [ ] **P6 audit** → fix  
-- [ ] **P7** Cutover + archive Python  
-- [ ] **P7 audit** → fix  
+- [x] **P7** Cutover dual-stack default (rust if bin, else python; Python kept for soak)  
+- [x] **P7 audit** → fix (safe default, resolve_paths rust, management_root fail-closed, debug-only CARGO_MANIFEST_DIR)  
 - [ ] **P7.1** Optional agents filename rename  
+- [ ] **Post-soak** Archive/delete `oracle/server/aspis_mcp.py` after python fallback retired
 
 ---
 

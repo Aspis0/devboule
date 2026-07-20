@@ -148,15 +148,39 @@ fn runtime_usable_for_write(runtime_ready: bool, interpreter_is_venv: bool) -> b
 }
 
 /// Resolve interpreter + package root + projects dir at runtime. `None` when the
-/// bundled `oracle/` package root or the projects dir cannot be located — in that
-/// case there is nothing meaningful to register.
+/// management root or the projects dir cannot be located — in that case there is
+/// nothing meaningful to register.
+///
+/// **P7 dual-stack:** when backend is Rust, do **not** require
+/// `find_oracle_package_root` / `aspis_mcp.py`. Management root is resolved via
+/// the shared dual markers (`aspis_mcp.py` **or** `devboule-mcp/Cargo.toml` **or**
+/// `DEVBOULE_MCP_BIN`); the python interpreter field is a dummy (builder ignores
+/// it for the rust entry).
 fn resolve_paths() -> Option<ResolvedPaths> {
+    let projects_dir = crate::backend::oracle_service::resolve_projects_dir_handle_free()?;
+    let backend = super::mcp_backend::McpBackend::from_env();
+
+    if backend == super::mcp_backend::McpBackend::Rust {
+        let root =
+            crate::backend::agents::management_root_for_mcp_handle_free(&projects_dir).ok()?;
+        // Dummy interpreter: `build_devboule_mcp_server_entry` ignores it for Rust.
+        // runtime_ready / interpreter_is_venv are unused for the rust write gate
+        // (configure_with_resolved skips the Python venv check).
+        return Some(ResolvedPaths {
+            interpreter: "python".to_string(),
+            root,
+            projects_dir,
+            runtime_ready: true,
+            interpreter_is_venv: true,
+        });
+    }
+
+    // Python soak path: need the oracle package + venv interpreter.
     // PACKAGE root: the `oracle/` source, used as `--root` and PYTHONPATH for the
     // MCP entry. DATA root: where the venv (the interpreter) lives — separate in
     // release (read-only bundle vs. writable app-data).
     let root = find_oracle_package_root(None)?;
     let data_root = crate::oracle::python_oracle::oracle_data_root()?;
-    let projects_dir = crate::backend::oracle_service::resolve_projects_dir_handle_free()?;
     // The venv interpreter when the runtime is installed; otherwise the OS default
     // (which lacks `mcp`/`lancedb`). `runtime_ready` captures whether the resolved
     // interpreter can actually import the deps so the UI can warn.
@@ -190,7 +214,7 @@ fn build_mcp_entry(
     root: &Path,
     projects_dir: &Path,
 ) -> Result<Value, String> {
-    // Honor DEVBOULE_MCP_BACKEND (default python). Rust is fail-closed if the
+    // Honor DEVBOULE_MCP_BACKEND (default rust since P7). Fail-closed if the
     // binary cannot be resolved (no silent Python fallback when rust is chosen).
     super::mcp_backend::build_devboule_mcp_server_entry(
         super::mcp_backend::McpBackend::from_env(),
@@ -655,33 +679,40 @@ mod tests {
 
     #[test]
     fn build_mcp_entry_has_exact_args_and_env_shape() {
-        let root = PathBuf::from("/code/root");
-        let projects = PathBuf::from("/data/projects");
-        let entry = build_mcp_entry("/venv/bin/python3", &root, &projects).expect("mcp entry");
+        // Pin Python: P7 default is Rust; this asserts the soak/fallback shape.
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                let root = PathBuf::from("/code/root");
+                let projects = PathBuf::from("/data/projects");
+                let entry =
+                    build_mcp_entry("/venv/bin/python3", &root, &projects).expect("mcp entry");
 
-        // command is the resolved interpreter, NOT bare "python".
-        assert_eq!(entry["command"], json!("/venv/bin/python3"));
+                // command is the resolved interpreter, NOT bare "python".
+                assert_eq!(entry["command"], json!("/venv/bin/python3"));
 
-        let args = entry["args"].as_array().unwrap();
-        assert_eq!(args[0], json!("-m"));
-        assert_eq!(args[1], json!("oracle.server.aspis_mcp"));
-        assert_eq!(args[2], json!("--root"));
-        assert_eq!(args[3], json!("/code/root"));
-        assert_eq!(args[4], json!("--projects-dir"));
-        assert_eq!(args[5], json!("/data/projects"));
+                let args = entry["args"].as_array().unwrap();
+                assert_eq!(args[0], json!("-m"));
+                assert_eq!(args[1], json!("oracle.server.aspis_mcp"));
+                assert_eq!(args[2], json!("--root"));
+                assert_eq!(args[3], json!("/code/root"));
+                assert_eq!(args[4], json!("--projects-dir"));
+                assert_eq!(args[5], json!("/data/projects"));
 
-        let env = &entry["env"];
-        assert_eq!(env["PYTHONPATH"], json!("/code/root"));
-        assert_eq!(env["PYTHONIOENCODING"], json!("utf-8"));
-        assert_eq!(env["HF_HUB_OFFLINE"], json!("1"));
-        assert_eq!(env["TRANSFORMERS_OFFLINE"], json!("1"));
-        assert_eq!(env["ORACLE_REQUIRE_REAL_EMBEDDER"], json!("1"));
-        // Dual-write Devboule + legacy Aspis profile-mode keys (P0 branding).
-        assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
-        assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
-        // No token of any kind is baked in.
-        assert!(env.get("ORACLE_AGENT_AUTH_TOKEN").is_none());
-        assert!(env.get("ORACLE_AUTH_TOKEN").is_none());
+                let env = &entry["env"];
+                assert_eq!(env["PYTHONPATH"], json!("/code/root"));
+                assert_eq!(env["PYTHONIOENCODING"], json!("utf-8"));
+                assert_eq!(env["HF_HUB_OFFLINE"], json!("1"));
+                assert_eq!(env["TRANSFORMERS_OFFLINE"], json!("1"));
+                assert_eq!(env["ORACLE_REQUIRE_REAL_EMBEDDER"], json!("1"));
+                // Dual-write Devboule + legacy Aspis profile-mode keys (P0 branding).
+                assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
+                assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
+                // No token of any kind is baked in.
+                assert!(env.get("ORACLE_AGENT_AUTH_TOKEN").is_none());
+                assert!(env.get("ORACLE_AUTH_TOKEN").is_none());
+            },
+        );
     }
 
     #[test]
@@ -746,12 +777,17 @@ mod tests {
         let config_path = home.join(CLAUDE_CONFIG_FILENAME);
         assert!(config_path.ends_with(".claude.json"));
 
-        let entry = build_mcp_entry(
-            "/fake/venv/python",
-            &home.join("code"),
-            &home.join("projects"),
-        )
-        .expect("mcp entry");
+        let entry = crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                build_mcp_entry(
+                    "/fake/venv/python",
+                    &home.join("code"),
+                    &home.join("projects"),
+                )
+                .expect("mcp entry")
+            },
+        );
         assert_eq!(entry["command"], json!("/fake/venv/python"));
     }
 
@@ -787,9 +823,13 @@ mod tests {
         )
         .unwrap();
 
-        let entry =
-            build_mcp_entry("/venv/python", &home.join("code"), &home.join("projects"))
-                .expect("mcp entry");
+        let entry = crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                build_mcp_entry("/venv/python", &home.join("code"), &home.join("projects"))
+                    .expect("mcp entry")
+            },
+        );
         let mut config = load_claude_config(&config_path).unwrap();
         upsert_claude_mcp_entry(&mut config, &entry).unwrap();
         let text = serde_json::to_string_pretty(&config).unwrap();
@@ -911,46 +951,57 @@ mod tests {
     /// path-free refusal.
     #[test]
     fn configure_refuses_and_does_not_write_when_runtime_not_ready() {
-        let home = temp_home("notready");
-        let config_path = home.join(CLAUDE_CONFIG_FILENAME);
-        // OS fallback interpreter, runtime not installed.
-        let resolved = resolved_fixture("python", false, false);
+        // Python gate only applies when backend is Python (P7 default is Rust).
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                let home = temp_home("notready");
+                let config_path = home.join(CLAUDE_CONFIG_FILENAME);
+                // OS fallback interpreter, runtime not installed.
+                let resolved = resolved_fixture("python", false, false);
 
-        let err = configure_with_resolved(&home, &config_path, &resolved).unwrap_err();
-        assert_eq!(err, RUNTIME_NOT_READY_REFUSAL);
-        assert!(
-            !config_path.exists(),
-            "config must not be written when not ready"
+                let err = configure_with_resolved(&home, &config_path, &resolved).unwrap_err();
+                assert_eq!(err, RUNTIME_NOT_READY_REFUSAL);
+                assert!(
+                    !config_path.exists(),
+                    "config must not be written when not ready"
+                );
+                assert!(!home.join(CLAUDE_BACKUP_FILENAME).exists());
+
+                let _ = std::fs::remove_dir_all(&home);
+            },
         );
-        assert!(!home.join(CLAUDE_BACKUP_FILENAME).exists());
-
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// FIX 2 + FIX 6: with the runtime ready and the venv interpreter, `configure`
     /// writes the entry and the success status carries the reopen reminder.
     #[test]
     fn configure_writes_when_runtime_ready_and_warns_to_reopen() {
-        let home = temp_home("ready");
-        let config_path = home.join(CLAUDE_CONFIG_FILENAME);
-        let venv_py = if cfg!(windows) {
-            r"C:\venv\Scripts\python.exe"
-        } else {
-            "/venv/bin/python3"
-        };
-        let resolved = resolved_fixture(venv_py, true, true);
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                let home = temp_home("ready");
+                let config_path = home.join(CLAUDE_CONFIG_FILENAME);
+                let venv_py = if cfg!(windows) {
+                    r"C:\venv\Scripts\python.exe"
+                } else {
+                    "/venv/bin/python3"
+                };
+                let resolved = resolved_fixture(venv_py, true, true);
 
-        let status = configure_with_resolved(&home, &config_path, &resolved).unwrap();
+                let status = configure_with_resolved(&home, &config_path, &resolved).unwrap();
 
-        assert!(config_path.exists(), "config should be written when ready");
-        let reloaded = load_claude_config(&config_path).unwrap();
-        assert!(claude_has_entry(&reloaded));
-        assert_eq!(reloaded["mcpServers"][MCP_KEY]["command"], json!(venv_py));
-        assert!(status.claude_configured);
-        assert!(status.runtime_ready);
-        assert_eq!(status.warning.as_deref(), Some(REOPEN_CLAUDE_NOTE));
+                assert!(config_path.exists(), "config should be written when ready");
+                let reloaded = load_claude_config(&config_path).unwrap();
+                assert!(claude_has_entry(&reloaded));
+                assert_eq!(reloaded["mcpServers"][MCP_KEY]["command"], json!(venv_py));
+                assert!(status.claude_configured);
+                assert!(status.runtime_ready);
+                assert_eq!(status.warning.as_deref(), Some(REOPEN_CLAUDE_NOTE));
 
-        let _ = std::fs::remove_dir_all(&home);
+                let _ = std::fs::remove_dir_all(&home);
+            },
+        );
     }
 
     /// FIX 4: the process write lock serializes concurrent `configure` calls so a
@@ -959,6 +1010,11 @@ mod tests {
     /// entry present exactly once and the user's other keys intact.
     #[test]
     fn write_lock_serializes_concurrent_configure() {
+        // Thread-local override does not inherit to spawned threads — set env for
+        // the duration of this multi-thread test (serialized via process write lock
+        // under test; env mutation is restored after).
+        let prev = std::env::var(crate::backend::mcp_backend::ENV_BACKEND).ok();
+        std::env::set_var(crate::backend::mcp_backend::ENV_BACKEND, "python");
         let home = temp_home("race");
         let config_path = home.join(CLAUDE_CONFIG_FILENAME);
         std::fs::write(
@@ -972,31 +1028,40 @@ mod tests {
             "/venv/bin/python3"
         };
 
-        std::thread::scope(|scope| {
-            for _ in 0..2 {
-                let home = home.clone();
-                let config_path = config_path.clone();
-                scope.spawn(move || {
-                    let resolved = resolved_fixture(venv_py, true, true);
-                    configure_with_resolved(&home, &config_path, &resolved).unwrap();
-                });
-            }
-        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    let home = home.clone();
+                    let config_path = config_path.clone();
+                    scope.spawn(move || {
+                        let resolved = resolved_fixture(venv_py, true, true);
+                        configure_with_resolved(&home, &config_path, &resolved).unwrap();
+                    });
+                }
+            });
 
-        // No corruption: still valid JSON, user key intact, our entry present once.
-        let reloaded = load_claude_config(&config_path).unwrap();
-        assert_eq!(reloaded["numStartups"], json!(5));
-        assert_eq!(reloaded["mcpServers"]["keep"], json!({ "command": "node" }));
-        assert!(claude_has_entry(&reloaded));
-        let server_keys: Vec<&str> = reloaded["mcpServers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(server_keys.iter().filter(|k| **k == MCP_KEY).count(), 1);
+            // No corruption: still valid JSON, user key intact, our entry present once.
+            let reloaded = load_claude_config(&config_path).unwrap();
+            assert_eq!(reloaded["numStartups"], json!(5));
+            assert_eq!(reloaded["mcpServers"]["keep"], json!({ "command": "node" }));
+            assert!(claude_has_entry(&reloaded));
+            let server_keys: Vec<&str> = reloaded["mcpServers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(server_keys.iter().filter(|k| **k == MCP_KEY).count(), 1);
+        }));
 
+        match prev {
+            Some(v) => std::env::set_var(crate::backend::mcp_backend::ENV_BACKEND, v),
+            None => std::env::remove_var(crate::backend::mcp_backend::ENV_BACKEND),
+        }
         let _ = std::fs::remove_dir_all(&home);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// FIX 4: the transient rename backup uses a unique per-write name (derived

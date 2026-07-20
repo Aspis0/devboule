@@ -27,9 +27,9 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Uses the same resolution chain as the claude/codex MCP wiring — the caller
 /// passes pre-resolved values so this function stays pure and testable.
 ///
-/// Honors `DEVBOULE_MCP_BACKEND` (default python). Dual-writes Devboule + Aspis
-/// env keys via `mcp_backend`. Pi-specific `transport` / `lifecycle` are added
-/// on top of the shared Claude/Codex entry shape.
+/// Honors `DEVBOULE_MCP_BACKEND` (default rust since P7). Dual-writes Devboule +
+/// Aspis env keys via `mcp_backend`. Pi-specific `transport` / `lifecycle` are
+/// added on top of the shared Claude/Codex entry shape.
 fn build_aspis_entry(
     python: &str,
     management_root: &Path,
@@ -208,7 +208,7 @@ pub(crate) fn resolve_mcp_paths(
 ) -> Result<(String, PathBuf, PathBuf, Option<String>), String> {
     let python = crate::oracle::oracle_setup::resolve_oracle_python();
     let projects_path = super::projects::ensure_projects_dir(app)?;
-    let management_root = super::agents::management_root_for_mcp(app, &projects_path);
+    let management_root = super::agents::management_root_for_mcp(app, &projects_path)?;
     let app_bin = super::projects::resolve_app_binary()
         .map(|p| p.to_string_lossy().into_owned());
     Ok((python, management_root, projects_path, app_bin))
@@ -240,6 +240,28 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// P7 default is Rust; these tests assert the Python soak/fallback config shape.
+    fn ensure_python(
+        project_root: &Path,
+        python: &str,
+        management_root: &Path,
+        projects_dir: &Path,
+        app_bin: Option<&str>,
+    ) -> Result<(), String> {
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            || {
+                ensure_project_pi_mcp_config(
+                    project_root,
+                    python,
+                    management_root,
+                    projects_dir,
+                    app_bin,
+                )
+            },
+        )
+    }
+
     #[test]
     fn merge_preserves_foreign_keys() {
         let root = setup_project();
@@ -259,7 +281,7 @@ mod tests {
         });
         fs::write(&config_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -305,7 +327,7 @@ mod tests {
         });
         fs::write(&config_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -342,7 +364,7 @@ mod tests {
         });
         fs::write(&config_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        let result = ensure_project_pi_mcp_config(
+        let result = ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -361,7 +383,7 @@ mod tests {
     fn creates_file_from_scratch() {
         let root = setup_project();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -396,7 +418,7 @@ mod tests {
     fn includes_app_bin_when_provided() {
         let root = setup_project();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -420,7 +442,7 @@ mod tests {
     fn omits_app_bin_when_none() {
         let root = setup_project();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -445,7 +467,7 @@ mod tests {
     fn creates_gitignore_with_mcp_json_for_fresh_project() {
         let root = setup_project();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -473,7 +495,7 @@ mod tests {
         let gitignore = pi_dir.join(".gitignore");
         fs::write(&gitignore, "settings.json\n*.log\n").unwrap();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -511,7 +533,7 @@ mod tests {
         let original = "settings.json\nmcp.json\n";
         fs::write(&gitignore, original).unwrap();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),
@@ -539,7 +561,7 @@ mod tests {
         let original: Vec<u8> = vec![0xFF, 0xFE, 0x0A];
         fs::write(&gitignore, &original).unwrap();
 
-        ensure_project_pi_mcp_config(
+        ensure_python(
             &root,
             "/usr/bin/python3",
             Path::new("/opt/management"),

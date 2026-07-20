@@ -1,13 +1,20 @@
 //! Which app-tools MCP backend agents should use.
 //!
-//! - `python` (default until cutover): `python -m oracle.server.aspis_mcp`
 //! - `rust`: the native `devboule-mcp` binary
+//! - `python`: `python -m oracle.server.aspis_mcp` (explicit soak / packaged fallback)
 //!
 //! See `docs/devboule-mcp-port-plan.md`.
 //!
-//! **Packaging (P0 honesty):** the Rust backend is **not** bundled in Tauri
-//! resources until P7. Selecting `rust` requires `DEVBOULE_MCP_BIN` or a local
-//! `devboule-mcp` tree build / PATH install.
+//! **P7 dual-stack default (not silent fallback when rust is explicit):**
+//! - `DEVBOULE_MCP_BACKEND` **set** → honor strictly (`rust` / `python` aliases).
+//!   Rust chosen but binary missing → fail-closed at [`build_devboule_mcp_server_entry`]
+//!   (never silently switches to Python).
+//! - **unset** → prefer Rust **only if** [`resolve_devboule_mcp_bin`] succeeds;
+//!   else default Python so packaged apps without a sidecar keep working.
+//!
+//! **Packaging:** the Rust backend is still **not** auto-bundled in Tauri
+//! resources. Set `DEVBOULE_MCP_BIN` / build the crate / put the binary next to
+//! the app or on PATH to enable the Rust path without an explicit env backend.
 
 use std::path::{Path, PathBuf};
 
@@ -31,24 +38,85 @@ pub enum McpBackend {
 }
 
 impl McpBackend {
-    /// Parse a backend string (testable without global env).
+    /// Parse a backend string (testable without global env / binary probe).
+    ///
+    /// **Target default:** empty / unknown → [`Self::Rust`] (prefer rust when the
+    /// caller already decided a value). Only explicit `python` aliases select
+    /// Python. Prefer [`Self::from_env`] at runtime: it applies the dual-stack
+    /// binary probe when the env var is unset.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "rust" | "devboule-mcp" | "native" => Self::Rust,
-            _ => Self::Python,
+            "python" | "py" | "aspis" | "aspis_mcp" => Self::Python,
+            // empty, "rust", "native", "devboule-mcp", or anything else → Rust
+            _ => Self::Rust,
         }
     }
 
-    /// Parse from env. Default **Python** until P7 cutover.
+    /// Resolve backend from env with P7 dual-stack default.
+    ///
+    /// - `DEVBOULE_MCP_BACKEND` set (non-empty) → [`Self::parse`] strictly.
+    /// - unset / empty → Rust if `devboule-mcp` resolves, else Python.
+    ///
+    /// In unit tests, prefer [`with_backend_override`] over mutating process env
+    /// (thread-local, race-free under `cargo test` parallelism).
     pub fn from_env() -> Self {
-        Self::parse(&std::env::var(ENV_BACKEND).unwrap_or_default())
+        #[cfg(test)]
+        {
+            if let Some(overridden) = test_backend_override() {
+                return overridden;
+            }
+        }
+        match std::env::var(ENV_BACKEND) {
+            Ok(v) if !v.trim().is_empty() => Self::parse(&v),
+            _ => {
+                // Unset: rust if binary available, else python (soak / packaged
+                // without sidecar). Not a silent fallback when rust is explicit.
+                if resolve_devboule_mcp_bin().is_ok() {
+                    Self::Rust
+                } else {
+                    Self::Python
+                }
+            }
+        }
     }
+}
+
+// ---- test-only backend override (thread-local; no process-env races) --------
+
+#[cfg(test)]
+thread_local! {
+    static BACKEND_OVERRIDE: std::cell::Cell<Option<McpBackend>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_backend_override() -> Option<McpBackend> {
+    BACKEND_OVERRIDE.with(|c| c.get())
+}
+
+/// Run `f` with [`McpBackend::from_env`] forced to `backend` on **this thread**.
+///
+/// Restores the previous override (if any) even on panic. Prefer this over
+/// `std::env::set_var(DEVBOULE_MCP_BACKEND, …)` in tests.
+#[cfg(test)]
+pub fn with_backend_override<R>(backend: McpBackend, f: impl FnOnce() -> R) -> R {
+    BACKEND_OVERRIDE.with(|c| {
+        let prev = c.get();
+        c.set(Some(backend));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// Resolve `devboule-mcp` absolute path when backend is Rust.
 ///
-/// Order: `DEVBOULE_MCP_BIN` (error if set but missing/not executable), compile-time
-/// crate target paths, `current_exe` siblings, then PATH via `resolve_program`.
+/// Order: `DEVBOULE_MCP_BIN` (error if set but missing/not executable),
+/// debug-only cargo target tree (`CARGO_MANIFEST_DIR`), `current_exe` siblings,
+/// then PATH via `resolve_program`.
 pub fn resolve_devboule_mcp_bin() -> Result<PathBuf, String> {
     resolve_devboule_mcp_bin_with(std::env::var(ENV_BIN).ok().as_deref())
 }
@@ -79,26 +147,21 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
         });
     }
 
-    // Prefer the profile matching this binary, then the other.
-    // debug_assertions → debug then release; release builds → release then debug.
-    let profiles: &[&str] = if cfg!(debug_assertions) {
-        &["debug", "release"]
-    } else {
-        &["release", "debug"]
-    };
-
-    // Compile-time path to this crate's sibling `devboule-mcp/target/...`
-    // (works for `cargo test` / `cargo run` from src-tauri without runtime env).
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for profile in profiles {
-        let cand = manifest
-            .join("..")
-            .join("devboule-mcp")
-            .join("target")
-            .join(profile)
-            .join(bin_name());
-        if let Some(abs) = absolute_if_executable(&cand) {
-            return Ok(abs);
+    // Compile-time sibling `devboule-mcp/target/...` only in debug builds.
+    // Release must not bake developer absolute paths from the build machine.
+    if cfg!(debug_assertions) {
+        let profiles: &[&str] = &["debug", "release"];
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for profile in profiles {
+            let cand = manifest
+                .join("..")
+                .join("devboule-mcp")
+                .join("target")
+                .join(profile)
+                .join(bin_name());
+            if let Some(abs) = absolute_if_executable(&cand) {
+                return Ok(abs);
+            }
         }
     }
 
@@ -118,7 +181,7 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
     crate::backend::provider_detect::resolve_program("devboule-mcp").ok_or_else(|| {
         format!(
             "devboule-mcp binary not found (set {ENV_BIN} or build crate devboule-mcp; \
-             not bundled in Tauri resources until P7)"
+             not auto-bundled in Tauri resources — use DEVBOULE_MCP_BACKEND=python to fall back)"
         )
     })
 }
@@ -273,11 +336,70 @@ mod tests {
 
     #[test]
     fn parse_backend_strings() {
-        assert_eq!(McpBackend::parse(""), McpBackend::Python);
-        assert_eq!(McpBackend::parse("python"), McpBackend::Python);
+        // Pure parse target default: empty / unknown → Rust; only python aliases → Python.
+        // Runtime dual-stack probe lives in `from_env` (unset → rust if bin, else python).
+        assert_eq!(McpBackend::parse(""), McpBackend::Rust);
+        assert_eq!(McpBackend::parse("   "), McpBackend::Rust);
         assert_eq!(McpBackend::parse("rust"), McpBackend::Rust);
         assert_eq!(McpBackend::parse("NATIVE"), McpBackend::Rust);
         assert_eq!(McpBackend::parse("devboule-mcp"), McpBackend::Rust);
+        assert_eq!(McpBackend::parse("garbage"), McpBackend::Rust);
+        assert_eq!(McpBackend::parse("python"), McpBackend::Python);
+        assert_eq!(McpBackend::parse("PY"), McpBackend::Python);
+        assert_eq!(McpBackend::parse("aspis_mcp"), McpBackend::Python);
+        assert_eq!(McpBackend::parse("aspis"), McpBackend::Python);
+    }
+
+    #[test]
+    fn from_env_honors_thread_local_override() {
+        // Prefer override over process env so parallel cargo tests stay race-free.
+        assert_eq!(
+            with_backend_override(McpBackend::Python, || McpBackend::from_env()),
+            McpBackend::Python
+        );
+        assert_eq!(
+            with_backend_override(McpBackend::Rust, || McpBackend::from_env()),
+            McpBackend::Rust
+        );
+        // Nested override restores outer.
+        let nested = with_backend_override(McpBackend::Python, || {
+            assert_eq!(McpBackend::from_env(), McpBackend::Python);
+            with_backend_override(McpBackend::Rust, || {
+                assert_eq!(McpBackend::from_env(), McpBackend::Rust);
+            });
+            McpBackend::from_env()
+        });
+        assert_eq!(nested, McpBackend::Python);
+    }
+
+    #[test]
+    fn from_env_unset_prefers_rust_when_bin_resolves() {
+        // Under cargo test (debug), sibling devboule-mcp/target usually exists after
+        // a workspace build; if not, dual-stack falls back to Python — both valid.
+        // This asserts the probe is wired: result matches resolve_devboule_mcp_bin.
+        let expected = if resolve_devboule_mcp_bin().is_ok() {
+            McpBackend::Rust
+        } else {
+            McpBackend::Python
+        };
+        // No thread-local override; process ENV_BACKEND may be set by the operator —
+        // only assert the dual-stack probe contract when the var is unset/empty.
+        match std::env::var(ENV_BACKEND) {
+            Ok(v) if !v.trim().is_empty() => {
+                assert_eq!(McpBackend::from_env(), McpBackend::parse(&v));
+            }
+            _ => {
+                assert_eq!(McpBackend::from_env(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_explicit_rust_is_strict() {
+        // Explicit rust must not be rewritten to python by parse (fail-closed later
+        // at build_entry if the binary is missing).
+        assert_eq!(McpBackend::parse("rust"), McpBackend::Rust);
+        assert_eq!(McpBackend::parse("RUST"), McpBackend::Rust);
     }
 
     #[test]

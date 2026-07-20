@@ -1888,7 +1888,7 @@ fn prepare_or_launch_project_agent(
         return launch_result;
     }
     let projects_path = ensure_projects_dir(&app)?;
-    let management_root = management_root_for_mcp(&app, &projects_path);
+    let management_root = management_root_for_mcp(&app, &projects_path)?;
     // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
     // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
     // Owner decision: the orchestrator receives the SAME provider env as a coder —
@@ -5623,6 +5623,16 @@ pub(crate) fn hash_launch_token(token: &str) -> String {
 mod tests {
     use super::*;
 
+    /// P7 default MCP backend is Rust. Tests that assert the Python launch shape
+    /// (module args, PYTHONPATH, interpreter command) pin Python via the
+    /// thread-local override so parallel `cargo test` stays race-free.
+    fn with_python_mcp<R>(f: impl FnOnce() -> R) -> R {
+        crate::backend::mcp_backend::with_backend_override(
+            crate::backend::mcp_backend::McpBackend::Python,
+            f,
+        )
+    }
+
     // --- D1 (planner-chat demolition): stable orchestrator identity ---------------
 
     #[test]
@@ -8039,19 +8049,22 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn mcp_client_configs_enable_cloudflare_profile_mode_without_tokens() {
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
+            let codex =
+                codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+            let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
 
-        assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        // Dual-write Devboule counterparts (P0 branding).
-        assert!(codex.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(claude.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(!codex.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
-        assert!(!claude.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
+            assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+            assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+            // Dual-write Devboule counterparts (P0 branding).
+            assert!(codex.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
+            assert!(claude.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
+            assert!(!codex.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
+            assert!(!claude.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
+        });
     }
 
     #[test]
@@ -8061,67 +8074,75 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // `project_structure` tool can shell out to the Rust structure builder. When the
         // app binary is unavailable (None) the env key must be ENTIRELY absent (so the
         // Python tool fails closed with a clear error, never an empty path).
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let app_bin = "/opt/aspis/devboule";
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let app_bin = "/opt/aspis/devboule";
 
-        let codex_with =
-            codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).unwrap().join(" ");
-        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]).unwrap();
-        assert!(
-            codex_with.contains("mcp_servers.devboule.env.ASPIS_APP_BIN="),
-            "codex args must set ASPIS_APP_BIN: {codex_with}"
-        );
-        assert!(
-            codex_with.contains("mcp_servers.devboule.env.DEVBOULE_APP_BIN="),
-            "codex args must dual-write DEVBOULE_APP_BIN: {codex_with}"
-        );
-        assert!(
-            codex_with.contains(app_bin),
-            "codex args must carry the binary path"
-        );
-        assert!(
-            claude_with.contains("\"ASPIS_APP_BIN\""),
-            "claude env must set ASPIS_APP_BIN: {claude_with}"
-        );
-        assert!(
-            claude_with.contains("\"DEVBOULE_APP_BIN\""),
-            "claude env must dual-write DEVBOULE_APP_BIN: {claude_with}"
-        );
-        assert!(
-            claude_with.contains(app_bin),
-            "claude env must carry the binary path"
-        );
+            let codex_with = codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[])
+                .unwrap()
+                .join(" ");
+            let claude_with =
+                mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]).unwrap();
+            assert!(
+                codex_with.contains("mcp_servers.devboule.env.ASPIS_APP_BIN="),
+                "codex args must set ASPIS_APP_BIN: {codex_with}"
+            );
+            assert!(
+                codex_with.contains("mcp_servers.devboule.env.DEVBOULE_APP_BIN="),
+                "codex args must dual-write DEVBOULE_APP_BIN: {codex_with}"
+            );
+            assert!(
+                codex_with.contains(app_bin),
+                "codex args must carry the binary path"
+            );
+            assert!(
+                claude_with.contains("\"ASPIS_APP_BIN\""),
+                "claude env must set ASPIS_APP_BIN: {claude_with}"
+            );
+            assert!(
+                claude_with.contains("\"DEVBOULE_APP_BIN\""),
+                "claude env must dual-write DEVBOULE_APP_BIN: {claude_with}"
+            );
+            assert!(
+                claude_with.contains(app_bin),
+                "claude env must carry the binary path"
+            );
 
-        // None / empty → the key is omitted entirely.
-        let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[]).unwrap().join(" ");
-        let claude_none = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
-        let codex_blank =
-            codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).unwrap().join(" ");
-        assert!(
-            !codex_none.contains("ASPIS_APP_BIN"),
-            "absent app bin ⇒ no codex key"
-        );
-        assert!(
-            !codex_none.contains("DEVBOULE_APP_BIN"),
-            "absent app bin ⇒ no DEVBOULE_APP_BIN codex key"
-        );
-        assert!(
-            !claude_none.contains("ASPIS_APP_BIN"),
-            "absent app bin ⇒ no claude key"
-        );
-        assert!(
-            !claude_none.contains("DEVBOULE_APP_BIN"),
-            "absent app bin ⇒ no DEVBOULE_APP_BIN claude key"
-        );
-        assert!(
-            !codex_blank.contains("ASPIS_APP_BIN"),
-            "blank app bin ⇒ no codex key"
-        );
-        assert!(
-            !codex_blank.contains("DEVBOULE_APP_BIN"),
-            "blank app bin ⇒ no DEVBOULE_APP_BIN codex key"
-        );
+            // None / empty → the key is omitted entirely.
+            let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[])
+                .unwrap()
+                .join(" ");
+            let claude_none =
+                mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
+            let codex_blank = codex_mcp_config_args("python3", &root, &projects, Some("   "), &[])
+                .unwrap()
+                .join(" ");
+            assert!(
+                !codex_none.contains("ASPIS_APP_BIN"),
+                "absent app bin ⇒ no codex key"
+            );
+            assert!(
+                !codex_none.contains("DEVBOULE_APP_BIN"),
+                "absent app bin ⇒ no DEVBOULE_APP_BIN codex key"
+            );
+            assert!(
+                !claude_none.contains("ASPIS_APP_BIN"),
+                "absent app bin ⇒ no claude key"
+            );
+            assert!(
+                !claude_none.contains("DEVBOULE_APP_BIN"),
+                "absent app bin ⇒ no DEVBOULE_APP_BIN claude key"
+            );
+            assert!(
+                !codex_blank.contains("ASPIS_APP_BIN"),
+                "blank app bin ⇒ no codex key"
+            );
+            assert!(
+                !codex_blank.contains("DEVBOULE_APP_BIN"),
+                "blank app bin ⇒ no DEVBOULE_APP_BIN codex key"
+            );
+        });
     }
 
     // --- Phase A.2: user MCP server injection into claude/codex configs --------
@@ -8146,43 +8167,46 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn user_server_appears_in_claude_and_codex_configs_after_oracle() {
         // Phase A.2 acceptance: a configured "my-db" server appears in BOTH the claude
         // `.mcp.json` and the codex `-c mcp_servers.*` args, AFTER the Oracle entry.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let servers = [user_server_fixture()];
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let servers = [user_server_fixture()];
 
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &servers).unwrap();
-        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).unwrap().join(" ");
+            let claude =
+                mcp_client_config_json("python3", &root, &projects, None, &servers).unwrap();
+            let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers)
+                .unwrap()
+                .join(" ");
 
-        // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
-        let oracle_pos_claude = claude
-            .find("\"devboule\"")
-            .expect("oracle key present");
-        let user_pos_claude = claude.find("\"my-db\"").expect("user key present");
-        assert!(
-            oracle_pos_claude < user_pos_claude,
-            "Oracle must come before the user server"
-        );
-        // The user server carries its command, args, and env into the claude config.
-        assert!(claude.contains("\"my-db\""));
-        assert!(claude.contains("\"mydb_mcp\""));
-        assert!(claude.contains("\"DB_URL\""));
-        assert!(claude.contains("postgres://x"));
+            // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
+            let oracle_pos_claude = claude.find("\"devboule\"").expect("oracle key present");
+            let user_pos_claude = claude.find("\"my-db\"").expect("user key present");
+            assert!(
+                oracle_pos_claude < user_pos_claude,
+                "Oracle must come before the user server"
+            );
+            // The user server carries its command, args, and env into the claude config.
+            assert!(claude.contains("\"my-db\""));
+            assert!(claude.contains("\"mydb_mcp\""));
+            assert!(claude.contains("\"DB_URL\""));
+            assert!(claude.contains("postgres://x"));
 
-        // Codex: Oracle tokens come first, then the user-server tokens.
-        let oracle_pos_codex = codex
-            .find("mcp_servers.devboule.command")
-            .expect("oracle command");
-        let user_pos_codex = codex
-            .find("mcp_servers.my-db.command")
-            .expect("user command");
-        assert!(
-            oracle_pos_codex < user_pos_codex,
-            "Oracle tokens must precede the user server's"
-        );
-        assert!(codex.contains("mcp_servers.my-db.args="));
-        assert!(codex.contains("mydb_mcp"));
-        assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
-        assert!(codex.contains("postgres://x"));
+            // Codex: Oracle tokens come first, then the user-server tokens.
+            let oracle_pos_codex = codex
+                .find("mcp_servers.devboule.command")
+                .expect("oracle command");
+            let user_pos_codex = codex
+                .find("mcp_servers.my-db.command")
+                .expect("user command");
+            assert!(
+                oracle_pos_codex < user_pos_codex,
+                "Oracle tokens must precede the user server's"
+            );
+            assert!(codex.contains("mcp_servers.my-db.args="));
+            assert!(codex.contains("mydb_mcp"));
+            assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
+            assert!(codex.contains("postgres://x"));
+        });
     }
 
     #[test]
@@ -8191,57 +8215,74 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // byte-identical to passing an empty slice (the only call shape after A.2).
         // We assert the empty-slice output equals a hand-built Oracle-only expectation
         // by checking it contains exactly the Oracle key and no stray user keys.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
 
-        let claude_empty = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
-        let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[]).unwrap().join(" ");
+            let claude_empty =
+                mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
+            let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[])
+                .unwrap()
+                .join(" ");
 
-        // Exactly ONE server key in the claude config (the Oracle), no user-server noise.
-        assert_eq!(
-            claude_empty.matches("\"command\":").count(),
-            1,
-            "only the Oracle command"
-        );
-        assert!(claude_empty.contains("\"devboule\""));
-        // The codex args carry only `mcp_servers.devboule.*` tokens.
-        assert!(codex_empty.contains("mcp_servers.devboule.command"));
-        assert!(!codex_empty.contains("mcp_servers.my-db"));
-        // And the Oracle is unaffected: its standard env keys are all present.
-        assert!(claude_empty.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-        assert!(codex_empty.contains("mcp_servers.devboule.env.PYTHONPATH"));
+            // Exactly ONE server key in the claude config (the Oracle), no user-server noise.
+            assert_eq!(
+                claude_empty.matches("\"command\":").count(),
+                1,
+                "only the Oracle command"
+            );
+            assert!(claude_empty.contains("\"devboule\""));
+            // The codex args carry only `mcp_servers.devboule.*` tokens.
+            assert!(codex_empty.contains("mcp_servers.devboule.command"));
+            assert!(!codex_empty.contains("mcp_servers.my-db"));
+            // And the Oracle is unaffected: its standard env keys are all present.
+            assert!(claude_empty.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+            assert!(codex_empty.contains("mcp_servers.devboule.env.PYTHONPATH"));
+        });
     }
 
     #[test]
     fn user_server_with_empty_args_omits_the_args_token() {
         // FIX 5: a user server with NO args must NOT emit `mcp_servers.<name>.args=[]` (matches
         // the Oracle, which never emits an empty args token). `command` is always present.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let mut server = user_server_fixture();
-        server.args = Vec::new();
-        let servers = [server];
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let mut server = user_server_fixture();
+            server.args = Vec::new();
+            let servers = [server];
 
-        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).unwrap().join(" ");
-        assert!(
-            codex.contains("mcp_servers.my-db.command="),
-            "command token must still be present: {codex}"
-        );
-        assert!(
-            !codex.contains("mcp_servers.my-db.args="),
-            "empty args must NOT emit an args token: {codex}"
-        );
-        // env is unaffected (still emitted).
-        assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
+            let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers)
+                .unwrap()
+                .join(" ");
+            assert!(
+                codex.contains("mcp_servers.my-db.command="),
+                "command token must still be present: {codex}"
+            );
+            assert!(
+                !codex.contains("mcp_servers.my-db.args="),
+                "empty args must NOT emit an args token: {codex}"
+            );
+            // env is unaffected (still emitted).
+            assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
 
-        // And the same for the macOS launch line (it shares codex_user_server_config_settings).
-        let macos =
-            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers).unwrap();
-        assert!(macos.contains("mcp_servers.my-db.command="));
-        assert!(
-            !macos.contains("mcp_servers.my-db.args="),
-            "macOS line must omit empty args: {macos}"
-        );
+            // And the same for the macOS launch line (it shares codex_user_server_config_settings).
+            let macos = macos_codex_launch_line(
+                "python3",
+                &root,
+                &root,
+                &projects,
+                None,
+                None,
+                &servers,
+            )
+            .unwrap();
+            assert!(macos.contains("mcp_servers.my-db.command="));
+            assert!(
+                !macos.contains("mcp_servers.my-db.args="),
+                "macOS line must omit empty args: {macos}"
+            );
+        });
     }
 
     // --- Phase B: orchestrator DEVBOULE_USER_MCP_SERVERS wiring --------------
@@ -8398,10 +8439,12 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // enabled subset, injects exactly those — the merge filter is unit-tested in
         // user_mcp_config. Here: passing an empty slice (the disabled-only case) yields
         // no user keys.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
-        assert!(!claude.contains("\"my-db\""));
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
+            assert!(!claude.contains("\"my-db\""));
+        });
     }
 
     // --- L2.4 local Devboule orchestrator launch -----------------------------
@@ -8749,20 +8792,26 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // and it stalls in launch_pending. The interpreter is threaded in as a
         // parameter so the launch path resolves it ONCE via resolve_oracle_python().
         // These two builders are compiled on every platform.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let python = "/opt/venv/bin/python3.11";
+        // P7: pin Python — this test is about the soak/fallback interpreter path.
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let python = "/opt/venv/bin/python3.11";
 
-        let claude_json = mcp_client_config_json(python, &root, &projects, None, &[]).unwrap();
-        let codex_args = codex_mcp_config_args(python, &root, &projects, None, &[]).unwrap().join(" ");
+            let claude_json =
+                mcp_client_config_json(python, &root, &projects, None, &[]).unwrap();
+            let codex_args = codex_mcp_config_args(python, &root, &projects, None, &[])
+                .unwrap()
+                .join(" ");
 
-        // The resolved interpreter is what actually runs the MCP server.
-        assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
-        assert!(codex_args.contains("/opt/venv/bin/python3.11"));
+            // The resolved interpreter is what actually runs the MCP server.
+            assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
+            assert!(codex_args.contains("/opt/venv/bin/python3.11"));
 
-        // And the broken bare `python` command is gone everywhere.
-        assert!(!claude_json.contains("\"command\": \"python\""));
-        assert!(!codex_args.contains("command=\"python\""));
+            // And the broken bare `python` command is gone everywhere.
+            assert!(!claude_json.contains("\"command\": \"python\""));
+            assert!(!codex_args.contains("command=\"python\""));
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -8770,17 +8819,22 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn macos_launch_lines_use_resolved_interpreter_not_bare_python() {
         // BUG #14, macOS launch lines (cfg-gated, so this test is too — otherwise
         // the symbol is absent on Windows/Linux and the test module won't compile).
-        let root = PathBuf::from("/Users/me/Devboule");
-        let projects = root.join("projects");
-        let python = "/opt/venv/bin/python3.11";
+        with_python_mcp(|| {
+            let root = PathBuf::from("/Users/me/Devboule");
+            let projects = root.join("projects");
+            let python = "/opt/venv/bin/python3.11";
 
-        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None, &[]).unwrap();
-        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None, &[]).unwrap();
+            let macos_codex =
+                macos_codex_launch_line(python, &root, &root, &projects, None, None, &[])
+                    .unwrap();
+            let macos_claude =
+                macos_claude_launch_line(python, &root, &projects, None, None, &[]).unwrap();
 
-        assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
-        assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
-        assert!(!macos_codex.contains("command=\"python\""));
-        assert!(!macos_claude.contains("\"command\": \"python\""));
+            assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
+            assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
+            assert!(!macos_codex.contains("command=\"python\""));
+            assert!(!macos_claude.contains("\"command\": \"python\""));
+        });
     }
 
     #[test]
@@ -8790,77 +8844,111 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // (claude) / `-m <m>` (codex) when a model is selected, and emit NOTHING
         // model-related when None (so the CLI uses its own default). These two
         // builders are compiled on every platform.
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
-        let model = "test-model-xyz";
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
+            let model = "test-model-xyz";
 
-        let codex_with =
-            codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]).unwrap();
-        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None, &[]).unwrap();
-        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
-        let claude_none = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
+            let codex_with = codex_launch_script(
+                "python3",
+                &root,
+                &root,
+                &projects,
+                Some(model),
+                None,
+                &[],
+            )
+            .unwrap();
+            let claude_with =
+                claude_launch_script("python3", &root, &projects, Some(model), None, &[])
+                    .unwrap();
+            let codex_none =
+                codex_launch_script("python3", &root, &root, &projects, None, None, &[])
+                    .unwrap();
+            let claude_none =
+                claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
-        // Selected model reaches the CLI.
-        assert!(claude_with.contains("--model"));
-        assert!(claude_with.contains(model));
-        assert!(codex_with.contains(model));
-        assert!(codex_with.contains("'-m'")); // the codex flag itself (ps_single_quote'd)
-                                              // No model selected -> no model token injected (CLI default is used).
-        assert!(!claude_none.contains("--model"));
-        assert!(!claude_none.contains(model));
-        assert!(!codex_none.contains(model));
+            // Selected model reaches the CLI.
+            assert!(claude_with.contains("--model"));
+            assert!(claude_with.contains(model));
+            assert!(codex_with.contains(model));
+            assert!(codex_with.contains("'-m'")); // the codex flag itself (ps_single_quote'd)
+                                                  // No model selected -> no model token injected (CLI default is used).
+            assert!(!claude_none.contains("--model"));
+            assert!(!claude_none.contains(model));
+            assert!(!codex_none.contains(model));
+        });
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_launch_lines_pass_selected_model_to_the_cli() {
         // BUG #15 on the macOS launch lines (cfg-gated, so this test is too).
-        let root = PathBuf::from("/Users/me/Devboule");
-        let projects = root.join("projects");
-        let model = "test-model-xyz";
+        with_python_mcp(|| {
+            let root = PathBuf::from("/Users/me/Devboule");
+            let projects = root.join("projects");
+            let model = "test-model-xyz";
 
-        let codex_with =
-            macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]).unwrap();
-        let claude_with =
-            macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]).unwrap();
-        let codex_none =
-            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]).unwrap();
-        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None, &[]).unwrap();
+            let codex_with = macos_codex_launch_line(
+                "python3",
+                &root,
+                &root,
+                &projects,
+                Some(model),
+                None,
+                &[],
+            )
+            .unwrap();
+            let claude_with =
+                macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[])
+                    .unwrap();
+            let codex_none =
+                macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[])
+                    .unwrap();
+            let claude_none =
+                macos_claude_launch_line("python3", &root, &projects, None, None, &[]).unwrap();
 
-        assert!(claude_with.contains("--model"));
-        assert!(claude_with.contains(model));
-        assert!(codex_with.contains(model));
-        assert!(codex_with.contains(" -m ")); // the codex flag itself
-        assert!(!claude_none.contains("--model"));
-        assert!(!claude_none.contains(model));
-        assert!(!codex_none.contains(model));
+            assert!(claude_with.contains("--model"));
+            assert!(claude_with.contains(model));
+            assert!(codex_with.contains(model));
+            assert!(codex_with.contains(" -m ")); // the codex flag itself
+            assert!(!claude_none.contains("--model"));
+            assert!(!claude_none.contains(model));
+            assert!(!codex_none.contains(model));
+        });
     }
 
     #[test]
     fn codex_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+            let codex =
+                codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
 
-        // The prompt must be piped into codex via STDIN so PowerShell never
-        // word-splits it (which would mangle `<`/`>` and leak the launch token).
-        assert!(codex.contains("$prompt | & codex @codexArgs"));
-        // It must NOT be appended as a bare trailing native argv token.
-        assert!(!codex.contains("& codex @codexArgs $prompt"));
-        assert!(!codex.trim_end().ends_with("$prompt"));
+            // The prompt must be piped into codex via STDIN so PowerShell never
+            // word-splits it (which would mangle `<`/`>` and leak the launch token).
+            assert!(codex.contains("$prompt | & codex @codexArgs"));
+            // It must NOT be appended as a bare trailing native argv token.
+            assert!(!codex.contains("& codex @codexArgs $prompt"));
+            assert!(!codex.trim_end().ends_with("$prompt"));
+        });
     }
 
     #[test]
     fn claude_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
+        with_python_mcp(|| {
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
 
-        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
+            let claude =
+                claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
-        assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
-        assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
-        assert!(!claude.trim_end().ends_with("$prompt"));
+            assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
+            assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
+            assert!(!claude.trim_end().ends_with("$prompt"));
+        });
     }
 
     /// B2 F1: a cloud orchestrator (claude/codex) with a typed goal gets the goal
@@ -8921,22 +9009,26 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // argv. Because we pipe `$prompt` over STDIN, the rendered scripts must
         // reference the prompt only as a piped PowerShell variable, never inline
         // the prompt text onto the codex/claude command line.
-        let prompt = "model=\"<your model>\", message=\"starting <run>\"\nsecond line";
-        let root = PathBuf::from("C:\\Devboule");
-        let projects = root.join("projects");
+        with_python_mcp(|| {
+            let prompt = "model=\"<your model>\", message=\"starting <run>\"\nsecond line";
+            let root = PathBuf::from("C:\\Devboule");
+            let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
-        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
+            let codex =
+                codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
+            let claude =
+                claude_launch_script("python3", &root, &projects, None, None, &[]).unwrap();
 
-        // The literal prompt text is never embedded in either launch script: it
-        // is supplied at runtime through the `$prompt` variable piped over STDIN.
-        assert!(!codex.contains(prompt));
-        assert!(!claude.contains(prompt));
-        assert!(!codex.contains("<your model>"));
-        assert!(!claude.contains("<your model>"));
-        // And both pipe the prompt variable in rather than appending it as argv.
-        assert!(codex.contains("$prompt | & codex"));
-        assert!(claude.contains("$prompt | & claude"));
+            // The literal prompt text is never embedded in either launch script: it
+            // is supplied at runtime through the `$prompt` variable piped over STDIN.
+            assert!(!codex.contains(prompt));
+            assert!(!claude.contains(prompt));
+            assert!(!codex.contains("<your model>"));
+            assert!(!claude.contains("<your model>"));
+            // And both pipe the prompt variable in rather than appending it as argv.
+            assert!(codex.contains("$prompt | & codex"));
+            assert!(claude.contains("$prompt | & claude"));
+        });
     }
 
     // FIX 1: the launch-token-bearing prompt must NEVER be written to the PTY
