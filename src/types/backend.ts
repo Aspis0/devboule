@@ -671,6 +671,17 @@ export interface OracleRuntimeSetup {
 	 * as "not checking" and fall back to message-sniffing. Never assume present.
 	 */
 	checking?: boolean;
+	/**
+	 * ADDITIVE / OPTIONAL: this package ships the int8 ONNX embedder weights
+	 * (full build). Lite packages omit weights and download on first install.
+	 * Explicit `false` always wins. Absent → UI may fall back to `bundleKind`.
+	 */
+	embedderBundled?: boolean;
+	/**
+	 * ADDITIVE / OPTIONAL: `"full"` | `"lite"` | `"unknown"`. Older backends
+	 * omit it. Used only when `embedderBundled` is absent (not when false).
+	 */
+	bundleKind?: string;
 }
 
 export interface OracleLlmSettings {

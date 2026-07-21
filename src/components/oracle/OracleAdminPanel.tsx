@@ -1338,10 +1338,12 @@ function Stat({
   );
 }
 
-/** Approx. free disk the installed retrieval runtime needs (venv + torch +
- *  LanceDB + the embedder weights). Shown up front so first-run is no surprise.
+/** Approx. free disk when the int8 embedder must be downloaded (lite package).
+ *  Model ~600 MB + small MCP venv; shown up front so first-run is no surprise.
  */
-const ORACLE_RUNTIME_DISK_GB = 2;
+const ORACLE_RUNTIME_LITE_DISK_MB = 600;
+/** Approx. free disk when weights ship in the package (full) — MCP venv only. */
+const ORACLE_RUNTIME_FULL_DISK_MB = 100;
 
 export function OracleRuntimeSetupBanner({
   setup,
@@ -1360,6 +1362,24 @@ export function OracleRuntimeSetupBanner({
 }) {
   const stage = classifyRuntimeStage(setup);
   const checking = stage === "checking";
+  // Full package ships int8 weights; install only seeds + builds the MCP venv.
+  // Prefer the explicit flag; fall back to bundleKind only when the flag is
+  // absent (older payloads). Never treat embedderBundled:false + full as included.
+  const embedderBundled =
+    setup.embedderBundled === true ||
+    (setup.embedderBundled == null && setup.bundleKind === "full");
+  const needsModelDownload = !setup.embedderReady && !embedderBundled;
+  const installLabel = setup.embedderReady
+    ? "Install runtime"
+    : embedderBundled
+      ? "Install runtime (model included)"
+      : `Install runtime (~${ORACLE_RUNTIME_LITE_DISK_MB} MB model download)`;
+  const diskClaimMb = embedderBundled
+    ? ORACLE_RUNTIME_FULL_DISK_MB
+    : ORACLE_RUNTIME_LITE_DISK_MB;
+  const helpLines = embedderBundled
+    ? "Oracle retrieval runs in-app (Rust ONNX). This full package already includes the Qwen3 embedding model — install only seeds it into app data and sets up a small MCP helper venv.|This is separate from the answer model: retrieval is always local, answers prefer a remote API key.|No large model download is required on first install.|If Python is missing, install Python 3 first, then run setup."
+    : "Oracle retrieval runs in-app (Rust ONNX) and needs the Qwen3 embedding model (~600 MB), plus a small Python helper venv for the agent MCP server.|This is separate from the answer model: retrieval is always local, answers prefer a remote API key.|The lite package downloads the model on first install; the full package ships the weights in the app bundle.|If Python is missing, install Python 3 first, then run setup.";
   // While the probe is inconclusive we cannot trust the per-step verdicts (the
   // probe may simply not have answered yet), so the Python step renders as a
   // pending "checking" pill rather than a red ✗.
@@ -1377,7 +1397,7 @@ export function OracleRuntimeSetupBanner({
           : "border-amber/25 bg-amber/[0.07]"
       }`}
       data-help-title="This sets up the local retrieval runtime."
-      data-help-lines="Oracle retrieval runs in-app (Rust) and needs the Qwen3 embedding model, plus a small Python helper venv for the agent MCP server.|This is separate from the answer model: retrieval is always local, answers prefer a remote API key.|Installing downloads the embedding model (a few hundred MB) and can take a few minutes on first run.|If Python is missing, install Python 3 first, then run setup."
+      data-help-lines={helpLines}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
@@ -1393,25 +1413,35 @@ export function OracleRuntimeSetupBanner({
           <p className="mt-1 text-[11px] leading-5 text-cream-600">
             {checking ? (
               "First startup can be slow on a busy machine. We're still verifying the local Python runtime — no action needed yet."
+            ) : embedderBundled ? (
+              <>
+                Oracle search runs fully on your machine (in-app Rust ONNX
+                engine). This package already includes the{" "}
+                <span className="font-mono">{setup.embedModel}</span> embedding
+                model — one click seeds it into app data and sets up a small
+                Python helper venv for the agent MCP server. Needs about{" "}
+                <span className="font-semibold">{diskClaimMb} MB free disk</span>
+                .
+              </>
             ) : (
               <>
-                Oracle search runs fully on your machine (in-app Rust engine).
-                One click installs the{" "}
+                Oracle search runs fully on your machine (in-app Rust ONNX
+                engine). One click installs the{" "}
                 <span className="font-mono">{setup.embedModel}</span> embedding
                 model and a small Python helper venv for the agent MCP server —
                 separate from the answer model, retrieval is always local. First
-                install downloads a few hundred MB and needs about{" "}
-                <span className="font-semibold">
-                  {ORACLE_RUNTIME_DISK_GB} GB free disk
-                </span>
+                install downloads ~{ORACLE_RUNTIME_LITE_DISK_MB} MB and needs
+                about{" "}
+                <span className="font-semibold">{diskClaimMb} MB free disk</span>
                 .
               </>
             )}
           </p>
           {stage !== "checking" && (
             <p className="mt-1 text-[10px] leading-4 text-cream-500">
-              Nothing leaves your machine; you can keep working while it
-              downloads.
+              {needsModelDownload
+                ? "Nothing leaves your machine except the model download; you can keep working while it runs."
+                : "Nothing leaves your machine; setup stays local."}
             </p>
           )}
           <div className="mt-2 flex flex-wrap gap-2">
@@ -1450,7 +1480,11 @@ export function OracleRuntimeSetupBanner({
           {installing && (
             <p className="mt-2 flex items-center gap-2 text-[11px] text-amber-dark">
               <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber/30 border-t-amber-dark" />
-              Installing — downloading ~1-2 GB, this can take several minutes…
+              {needsModelDownload
+                ? `Installing — downloading ~${ORACLE_RUNTIME_LITE_DISK_MB} MB model, this can take several minutes…`
+                : embedderBundled && !setup.embedderReady
+                  ? "Installing — seeding bundled model and MCP venv…"
+                  : "Installing — setting up the MCP helper venv…"}
             </p>
           )}
           {error && (
@@ -1474,12 +1508,14 @@ export function OracleRuntimeSetupBanner({
             onClick={onInstall}
             disabled={installing || !setup.pythonFound}
             data-help-title="This installs the local Oracle retrieval runtime."
-            data-help-lines="It creates a Python virtual environment, installs LanceDB and the embedder, and downloads the Qwen3 model.|It does not touch your repository or send anything remote.|It needs internet for the first download and a few GB of disk.|Re-running it repairs a partial install."
+            data-help-lines={
+              embedderBundled
+                ? "It seeds the bundled Qwen3 ONNX model into app data and creates a small Python venv for the agent MCP server.|It does not touch your repository or send anything remote.|Re-running it repairs a partial install."
+                : "It creates a Python virtual environment for the agent MCP server and downloads the Qwen3 ONNX int8 model (~600 MB).|It does not touch your repository.|It needs internet for the first model download.|Re-running it repairs a partial install."
+            }
             className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {installing
-              ? "Installing…"
-              : `Install runtime (~${ORACLE_RUNTIME_DISK_GB} GB)`}
+            {installing ? "Installing…" : installLabel}
           </button>
         )}
       </div>

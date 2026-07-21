@@ -399,6 +399,9 @@ pub fn run() {
             // run Oracle Python only from there, never from a user "drop" dir.
             if let Ok(dir) = app.path().resource_dir() {
                 oracle::python_oracle::set_bundled_oracle_root(&dir);
+                // Full package: stage int8 embedder under resources/oracle-models;
+                // lite keeps only `.bundle-kind=lite`. Seed on first install.
+                oracle::oracle_setup::set_bundled_oracle_models_root(&dir);
                 // Record the same resource dir for the Censor's bundled, OFFLINE
                 // semgrep ruleset (`resources/censor/semgrep-rules.yml`), so the
                 // runner resolves an absolute local `--config` path instead of the

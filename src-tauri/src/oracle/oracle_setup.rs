@@ -81,10 +81,22 @@ pub struct OracleRuntimeSetup {
     pub ready: bool,
     pub embed_model: String,
     pub messages: Vec<String>,
+    /// True when this package ships the int8 ONNX weights (full bundle).
+    /// Additive + defaulted so older clients ignore it safely.
+    #[serde(default)]
+    pub embedder_bundled: bool,
+    /// Package kind: `"full"` | `"lite"` | `"unknown"`.
+    #[serde(default = "default_bundle_kind")]
+    pub bundle_kind: String,
+}
+
+fn default_bundle_kind() -> String {
+    "unknown".to_string()
 }
 
 impl OracleRuntimeSetup {
     fn unavailable(message: impl Into<String>) -> Self {
+        let (embedder_bundled, bundle_kind) = bundled_embedder_status();
         OracleRuntimeSetup {
             python_found: false,
             checking: false,
@@ -96,8 +108,113 @@ impl OracleRuntimeSetup {
             ready: false,
             embed_model: EMBED_MODEL.to_string(),
             messages: vec![message.into()],
+            embedder_bundled,
+            bundle_kind,
         }
     }
+}
+
+// --- bundled ONNX embedder (full vs lite package) ---------------------------
+
+/// Read-only root of the staged `oracle-models/` tree inside the Tauri resource
+/// dir. Recorded once at app setup via [`set_bundled_oracle_models_root`].
+static BUNDLED_ORACLE_MODELS_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the staged `oracle-models/` directory from the app resource dir.
+///
+/// Tauri stages `resources/oracle-models` path-preserving under the resource
+/// dir (`<resource_dir>/resources/oracle-models`). A flattened layout
+/// (`<resource_dir>/oracle-models`) is also accepted. Call once from setup.
+pub fn set_bundled_oracle_models_root(resource_dir: &Path) {
+    for candidate in [
+        resource_dir.join("resources").join("oracle-models"),
+        resource_dir.join("oracle-models"),
+    ] {
+        // Accept either a kind marker or a staged qwen3-onnx tree.
+        let kind = candidate.join(".bundle-kind");
+        let qwen = candidate.join("qwen3-onnx");
+        if kind.is_file() || qwen.is_dir() {
+            let _ = BUNDLED_ORACLE_MODELS_ROOT.set(candidate);
+            return;
+        }
+    }
+}
+
+fn bundled_oracle_models_root() -> Option<&'static Path> {
+    BUNDLED_ORACLE_MODELS_ROOT.get().map(|p| p.as_path())
+}
+
+/// Read `.bundle-kind` (`full` / `lite`) from a models root, or `"unknown"`.
+pub(crate) fn read_bundle_kind_at(root: &Path) -> String {
+    let path = root.join(".bundle-kind");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let kind = s.trim().to_ascii_lowercase();
+            if kind == "full" || kind == "lite" {
+                kind
+            } else {
+                "unknown".to_string()
+            }
+        }
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+/// Read `.bundle-kind` (`full` / `lite`) from the staged models root, or
+/// `"unknown"` when the marker is missing.
+pub fn read_bundle_kind() -> String {
+    match bundled_oracle_models_root() {
+        Some(root) => read_bundle_kind_at(root),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Bundled int8 model directory (`…/oracle-models/qwen3-onnx`), if recorded.
+pub fn bundled_qwen3_onnx_dir() -> Option<PathBuf> {
+    bundled_oracle_models_root().map(|r| r.join("qwen3-onnx"))
+}
+
+/// `(embedder_bundled, bundle_kind)` for status payloads.
+fn bundled_embedder_status() -> (bool, String) {
+    let kind = read_bundle_kind();
+    let bundled = bundled_qwen3_onnx_dir()
+        .map(|d| oracle_core::model_download::model_present_at(&d, true))
+        .unwrap_or(false);
+    (bundled, kind)
+}
+
+/// Seed the writable data dir from `src_model_dir` when the int8 model is
+/// missing. Pure helper (no global state) for unit tests.
+pub(crate) fn seed_embedder_from_dir(
+    data_dir: &Path,
+    src_model_dir: Option<&Path>,
+) -> Result<bool, String> {
+    if oracle_core::model_download::model_present(data_dir, true) {
+        return Ok(true);
+    }
+    let Some(src) = src_model_dir else {
+        return Ok(false);
+    };
+    if !oracle_core::model_download::model_present_at(src, true) {
+        return Ok(false);
+    }
+    let dest = oracle_core::model_download::model_dir(data_dir);
+    eprintln!(
+        "[oracle-setup] seeding bundled int8 embedder from {} → {}",
+        src.display(),
+        dest.display()
+    );
+    oracle_core::model_download::copy_int8_bundle(src, &dest)
+        .map_err(|e| format!("seeding bundled embedder failed: {e:#}"))?;
+    Ok(oracle_core::model_download::model_present(data_dir, true))
+}
+
+/// If the int8 model is missing from the writable data dir but present in the
+/// package bundle (full build), copy it into place. Returns `true` when the
+/// model is present afterwards (already there, or seeded).
+pub fn seed_bundled_embedder_if_needed(data_dir: &Path) -> Result<bool, String> {
+    let src = bundled_qwen3_onnx_dir();
+    seed_embedder_from_dir(data_dir, src.as_deref())
 }
 
 // --- path helpers -----------------------------------------------------------
@@ -465,9 +582,14 @@ fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
     let data_dir = rust_model_data_dir(root);
     let model_present = oracle_core::model_download::model_present(&data_dir, true); // int8
     let venv_ready = venv_complete(root);
+    let (embedder_bundled, bundle_kind) = bundled_embedder_status();
     let mut messages = Vec::new();
     if model_present {
         messages.push("Rust engine: ONNX embedding model is installed.".to_string());
+    } else if embedder_bundled {
+        messages.push(
+            "Rust engine: ONNX embedding model is bundled; will seed on install.".to_string(),
+        );
     } else {
         messages.push("Rust engine: ONNX embedding model not downloaded yet.".to_string());
     }
@@ -475,6 +597,11 @@ fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
         messages.push("Slim MCP venv: installed and ready.".to_string());
     } else {
         messages.push("Slim MCP venv: not yet installed.".to_string());
+    }
+    match bundle_kind.as_str() {
+        "full" => messages.push("Package: full (embedder weights included).".to_string()),
+        "lite" => messages.push("Package: lite (embedder downloads on first install).".to_string()),
+        _ => {}
     }
     let ready = model_present && venv_ready;
     OracleRuntimeSetup {
@@ -490,6 +617,8 @@ fn rust_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
         ready,
         embed_model: "Qwen/Qwen3-Embedding-0.6B (ONNX int8)".to_string(),
         messages,
+        embedder_bundled,
+        bundle_kind,
     }
 }
 
@@ -708,10 +837,22 @@ pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
     // Run the bootstrap (creates/reuses venv, installs requirements-mcp.txt,
     // handles fat→slim migration). The ONNX model install is separate and
     // triggered by the supervisor when the engine is Rust.
-    let status = run_oracle_runtime_bootstrap(&data_root, &package_root)?;
-    // If the model is not yet present, trigger the ONNX download now so the
-    // overall status reflects readiness.
+    let _status = run_oracle_runtime_bootstrap(&data_root, &package_root)?;
+    // Prefer seeding from the full-package bundle before any network download.
+    // Seed Err (corrupt/partial bundle, I/O) must not abort install — fall through
+    // to HuggingFace download when the model is still missing.
     let data_dir = rust_model_data_dir(&data_root);
+    match seed_bundled_embedder_if_needed(&data_dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            // No bundle (lite) or model already absent from bundle — download if needed.
+        }
+        Err(e) => {
+            eprintln!(
+                "[oracle-setup] seed failed: {e}; falling back to download if model missing"
+            );
+        }
+    }
     if !oracle_core::model_download::model_present(&data_dir, true) {
         eprintln!("[oracle-setup] ONNX model not present; downloading...");
         oracle_core::model_download::ensure_qwen3_onnx(&data_dir, true, |p| {
@@ -1099,5 +1240,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_bundle_kind_at_parses_full_and_lite() {
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-bundle-kind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_bundle_kind_at(&dir), "unknown");
+        std::fs::write(dir.join(".bundle-kind"), "lite\n").unwrap();
+        assert_eq!(read_bundle_kind_at(&dir), "lite");
+        std::fs::write(dir.join(".bundle-kind"), "FULL").unwrap();
+        assert_eq!(read_bundle_kind_at(&dir), "full");
+        std::fs::write(dir.join(".bundle-kind"), "weird").unwrap();
+        assert_eq!(read_bundle_kind_at(&dir), "unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_embedder_from_dir_copies_when_missing() {
+        let src_root = std::env::temp_dir().join(format!(
+            "devboule-seed-src-{}",
+            std::process::id()
+        ));
+        let data_root = std::env::temp_dir().join(format!(
+            "devboule-seed-dst-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&data_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+
+        let src_model = src_root.join("qwen3-onnx");
+        let payload = vec![0xEFu8; 2048];
+        for rel in ["onnx/model_int8.onnx", "tokenizer.json"] {
+            let p = src_model.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &payload).unwrap();
+        }
+
+        // No source → false (nothing to seed).
+        assert!(!seed_embedder_from_dir(&data_root, None).unwrap());
+        // Incomplete dest, complete source → seed succeeds.
+        assert!(seed_embedder_from_dir(&data_root, Some(&src_model)).unwrap());
+        assert!(oracle_core::model_download::model_present(&data_root, true));
+        // Already present → true without re-copy error.
+        assert!(seed_embedder_from_dir(&data_root, Some(&src_model)).unwrap());
+
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&data_root);
     }
 }

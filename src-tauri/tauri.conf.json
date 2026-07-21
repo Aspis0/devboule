@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "bash scripts/stage-devboule-mcp.sh && npm run build"
+    "beforeBuildCommand": "bash -c 'if [ \"${DEVBOULE_BUNDLE_ORACLE_EMBEDDER:-}\" = 1 ]; then bash scripts/stage-oracle-embedder.sh --full; else bash scripts/stage-oracle-embedder.sh --lite; fi' && bash scripts/stage-devboule-mcp.sh && npm run build"
   },
   "app": {
     "windows": [
@@ -44,7 +44,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../oracle", "resources/censor/semgrep-rules.yml", "../pi-sidecar/*"],
+    "resources": [
+      "../oracle",
+      "resources/censor/semgrep-rules.yml",
+      "resources/oracle-models",
+      "../pi-sidecar/*"
+    ],
     "externalBin": ["binaries/devboule-mcp"]
   }
 }

@@ -173,16 +173,12 @@ fn download_file(
     Ok(())
 }
 
-/// Ensure the requested ONNX bundle is present under `oracle_data_root`,
-/// downloading any missing/mismatched file. Returns the model directory to hand
-/// to `BackendChoice::Ort { model_dir, .. }`.
-///
-/// A file already at its full remote size is skipped, so re-running after a
-/// completed install is a cheap set of HEAD requests. `progress` is invoked per
-/// received chunk; pass a no-op closure to ignore it.
 /// Clear a broken model-dir symlink so downloads can create a real directory.
 /// Real directories and working symlinks are left alone.
-pub(crate) fn clear_broken_model_dir_symlink(dir: &Path) -> Result<()> {
+///
+/// Public so the app installer can clear a dangling link before seeding a
+/// bundled ONNX tree into the writable data dir.
+pub fn clear_broken_model_dir_symlink(dir: &Path) -> Result<()> {
     let meta = match dir.symlink_metadata() {
         Ok(m) => m,
         Err(_) => return Ok(()), // nothing there
@@ -194,6 +190,50 @@ pub(crate) fn clear_broken_model_dir_symlink(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Copy the int8 ONNX bundle files from `src_model_dir` into `dest_model_dir`.
+///
+/// Used by the full package installer to seed app-data from the read-only
+/// bundle without re-downloading. Destination parents are created; a broken
+/// dest-dir symlink is cleared first. Only the int8 file set is copied
+/// (`onnx/model_int8.onnx` + `tokenizer.json`).
+pub fn copy_int8_bundle(src_model_dir: &Path, dest_model_dir: &Path) -> Result<()> {
+    if !model_present_at(src_model_dir, true) {
+        bail!(
+            "source int8 bundle incomplete at {}",
+            src_model_dir.display()
+        );
+    }
+    clear_broken_model_dir_symlink(dest_model_dir)?;
+    for rel in INT8_FILES {
+        let src = src_model_dir.join(rel);
+        let dest = dest_model_dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // Copy via a sibling `.part` then rename so a crash never leaves a
+        // truncated file that `model_present` would treat as complete.
+        let part = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
+            Some(ext) => format!("{ext}.part"),
+            None => "part".to_string(),
+        });
+        std::fs::copy(&src, &part)
+            .with_context(|| format!("copying {} → {}", src.display(), part.display()))?;
+        std::fs::rename(&part, &dest)
+            .with_context(|| format!("finalizing {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Ensure the requested ONNX bundle is present under `oracle_data_root`,
+/// downloading any missing/mismatched file. Returns the model directory to hand
+/// to `BackendChoice::Ort { model_dir, .. }`.
+///
+/// A file already at its full remote size is skipped, so re-running after a
+/// completed install is a cheap set of HEAD requests. `progress` is invoked per
+/// received chunk; pass a no-op closure to ignore it.
+
 
 pub fn ensure_qwen3_onnx(
     oracle_data_root: &Path,
@@ -319,5 +359,42 @@ mod tests {
         // A zero-byte file must NOT count as present.
         std::fs::write(dir.join("tokenizer.json"), b"").unwrap();
         assert!(!model_present(tmp.path(), false));
+    }
+
+    #[test]
+    fn copy_int8_bundle_seeds_dest_from_complete_source() {
+        let src_root = tempfile::tempdir().unwrap();
+        let dest_root = tempfile::tempdir().unwrap();
+        let src = model_dir(src_root.path());
+        let dest = model_dir(dest_root.path());
+        let payload = vec![0xCDu8; 2048];
+        for rel in INT8_FILES {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &payload).unwrap();
+        }
+        assert!(!model_present_at(&dest, true));
+        copy_int8_bundle(&src, &dest).unwrap();
+        assert!(model_present_at(&dest, true));
+        for rel in INT8_FILES {
+            assert_eq!(
+                std::fs::read(dest.join(rel)).unwrap(),
+                payload,
+                "copied {rel} must match source bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_int8_bundle_rejects_incomplete_source() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        // Only tokenizer — missing model_int8.onnx.
+        std::fs::write(src.path().join("tokenizer.json"), vec![0u8; 2048]).unwrap();
+        let err = copy_int8_bundle(src.path(), dest.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete"),
+            "expected incomplete-source error, got: {err:#}"
+        );
     }
 }

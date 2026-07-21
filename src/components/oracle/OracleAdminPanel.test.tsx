@@ -514,6 +514,8 @@ describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
     ready: false,
     embedModel: "Qwen/Qwen3-Embedding-0.6B",
     messages: [],
+    embedderBundled: false,
+    bundleKind: "lite",
   };
 
   it("shows the required disk space and a one-click install for the embedding model + MCP venv", async () => {
@@ -534,21 +536,79 @@ describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
       );
     });
     const text = container.textContent ?? "";
-    // Required disk space must be stated up front (download + installed deps).
+    // Lite package: honest ~600 MB model download claim.
     expect(text).toMatch(/disk/i);
-    expect(text).toMatch(/GB/);
-    // The two installed pieces are named so the user knows what they get
-    // (M3: the in-app Rust engine owns retrieval — the install is the embedding
-    // model + the slim MCP helper venv, not LanceDB-via-Python).
+    expect(text).toMatch(/600\s*MB/i);
     expect(text).toMatch(/MCP/);
     expect(text).toMatch(/embedder|embedding/i);
-    // One-click install affordance.
     const button = container.querySelector("button");
     expect(button).not.toBeNull();
+    expect(button!.textContent ?? "").toMatch(/model download/i);
     act(() => {
       (button as HTMLButtonElement).click();
     });
     expect(onInstall).toHaveBeenCalledTimes(1);
+    act(() => root.unmount());
+  });
+
+  it("full package advertises model-included install without a large download claim", async () => {
+    const full: OracleRuntimeSetup = {
+      ...notReady,
+      embedderBundled: true,
+      bundleKind: "full",
+    };
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root!: Root;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        createElement(OracleRuntimeSetupBanner, {
+          setup: full,
+          installing: false,
+          error: null,
+          onInstall: vi.fn(),
+          onRetry: vi.fn(),
+        }),
+      );
+    });
+    const text = container.textContent ?? "";
+    expect(text).toMatch(/already includes/i);
+    expect(text).not.toMatch(/600\s*MB model download/i);
+    const button = container.querySelector("button");
+    expect(button).not.toBeNull();
+    expect(button!.textContent ?? "").toMatch(/model included/i);
+    act(() => root.unmount());
+  });
+
+  it("never treats embedderBundled:false as included even if bundleKind is full", async () => {
+    // Explicit false must win over a conflicting/stale bundleKind marker.
+    const conflicted: OracleRuntimeSetup = {
+      ...notReady,
+      embedderBundled: false,
+      bundleKind: "full",
+    };
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root!: Root;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        createElement(OracleRuntimeSetupBanner, {
+          setup: conflicted,
+          installing: false,
+          error: null,
+          onInstall: vi.fn(),
+          onRetry: vi.fn(),
+        }),
+      );
+    });
+    const text = container.textContent ?? "";
+    expect(text).not.toMatch(/already includes/i);
+    const button = container.querySelector("button");
+    expect(button).not.toBeNull();
+    expect(button!.textContent ?? "").toMatch(/model download/i);
+    expect(button!.textContent ?? "").not.toMatch(/model included/i);
     act(() => root.unmount());
   });
 });
