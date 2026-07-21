@@ -161,7 +161,7 @@ pub fn run_agentic_coder(
     working_set: Vec<PathBuf>,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
-    /// Optional Bearer token for Cloud/OpenRouter. None for local oMLX/Ollama.
+    // Optional Bearer token for Cloud/OpenRouter. None for local oMLX/Ollama.
     api_key: Option<String>,
 ) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String> {
     // A4 (§4c live wiring): hold a compute permit for the WHOLE local agentic decode so the
