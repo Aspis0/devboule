@@ -21,6 +21,9 @@ const AGENTS_STATE_FILE: &str = ".aspis-agents.json";
 // session's client on read.
 const AGENT_CLIENTS_FILE: &str = ".aspis-agent-clients.json";
 const MAX_EVENTS: usize = 300;
+/// e2e B12 / B08: cap closed session history returned to the UI so fleet rail +
+/// WebView re-renders stay lean (MCP normalize uses the same budget).
+const MAX_CLOSED_SESSIONS_UI: usize = 40;
 
 #[tauri::command]
 pub fn get_agent_live_state(
@@ -63,7 +66,50 @@ pub fn get_agent_live_state(
     if !live.is_empty() {
         super::pi_sidecar::overlay_pi_sessions(&mut live_state.sessions, &live, &now);
     }
+    // B08/B12: drop oldest closed rows so the WebView does not re-render a huge
+    // fleet of dead Aspis history every attention poll.
+    prune_closed_sessions_ui(&mut live_state.sessions, MAX_CLOSED_SESSIONS_UI);
+    // Cap events similarly — long transcripts inflate IPC + JSON parse cost.
+    if live_state.events.len() > MAX_EVENTS {
+        let drop_n = live_state.events.len() - MAX_EVENTS;
+        live_state.events.drain(0..drop_n);
+    }
     Ok(live_state)
+}
+
+/// Keep at most `max_closed` sessions with status=closed (oldest first).
+fn prune_closed_sessions_ui(sessions: &mut Vec<AgentSession>, max_closed: usize) {
+    let mut closed_idx: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.status.eq_ignore_ascii_case("closed"))
+        .map(|(i, _)| i)
+        .collect();
+    if closed_idx.len() <= max_closed {
+        return;
+    }
+    closed_idx.sort_by(|&a, &b| {
+        let ka = sessions[a]
+            .last_seen_at
+            .as_deref()
+            .or(sessions[a].first_seen_at.as_deref())
+            .unwrap_or("");
+        let kb = sessions[b]
+            .last_seen_at
+            .as_deref()
+            .or(sessions[b].first_seen_at.as_deref())
+            .unwrap_or("");
+        ka.cmp(kb)
+    });
+    let drop_count = closed_idx.len() - max_closed;
+    let to_drop: std::collections::HashSet<usize> =
+        closed_idx.into_iter().take(drop_count).collect();
+    let mut i = 0;
+    sessions.retain(|_| {
+        let keep = !to_drop.contains(&i);
+        i += 1;
+        keep
+    });
 }
 
 /// Read-time stamp: scrub the token-hash fields the UI must never see, then

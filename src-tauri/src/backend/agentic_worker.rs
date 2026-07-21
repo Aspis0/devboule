@@ -379,6 +379,16 @@ pub(crate) fn spawn_agentic_worker(
             // Write the result the finalize path reads, BEFORE the guard releases the in-flight
             // id (so run_pass never finalizes against a missing file). A write failure leaves no
             // result → read_result_outcome synthesizes a failed outcome on the next pass.
+            // Create parent dirs: MCP/default resultPath is often `mini/<id>.json` under
+            // `.aspis-mini` — without this, Cloud agentic reaches "running" then dies with
+            // "result file missing or unresolved" (B03 residual pilot 2026-07-21).
+            if let Some(parent) = result_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "agentic worker: failed to create result parent {parent:?}: {e}"
+                    );
+                }
+            }
             if let Err(e) = std::fs::write(&result_path, &json) {
                 eprintln!("agentic worker: failed to write result {result_path:?}: {e}");
             }

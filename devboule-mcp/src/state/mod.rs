@@ -24,6 +24,9 @@ use uuid::Uuid;
 pub const AGENTS_STATE_VERSION: u32 = 2;
 const MAX_EVENTS: usize = 300;
 const MAX_SESSIONS: usize = 200;
+/// e2e B12 / B08: closed history pollutes fleet UI and inflates get_agent_live_state
+/// payloads (WebView jank). Cap closed rows separately; live sessions still use MAX_SESSIONS.
+const MAX_CLOSED_SESSIONS: usize = 40;
 
 const VALID_ROLES: &[&str] = &["coder", "verifier", "mini", "orchestrator"];
 
@@ -596,7 +599,49 @@ fn normalize_agents_state(state: &mut Value) {
                 keep
             });
         }
+        // B12: even under MAX_SESSIONS, drop oldest closed so fleet UI stays lean.
+        prune_closed_sessions(sessions, MAX_CLOSED_SESSIONS);
     }
+}
+
+/// Keep at most `max_closed` sessions with status=closed (oldest lastSeen first).
+fn prune_closed_sessions(sessions: &mut Vec<Value>, max_closed: usize) {
+    let mut closed_idx: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.get("status")
+                .and_then(|v| v.as_str())
+                .map(|st| st.eq_ignore_ascii_case("closed"))
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if closed_idx.len() <= max_closed {
+        return;
+    }
+    closed_idx.sort_by(|&a, &b| {
+        let ka = sessions[a]
+            .get("lastSeenAt")
+            .or_else(|| sessions[a].get("firstSeenAt"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let kb = sessions[b]
+            .get("lastSeenAt")
+            .or_else(|| sessions[b].get("firstSeenAt"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        ka.cmp(kb)
+    });
+    let drop_count = closed_idx.len() - max_closed;
+    let to_drop: std::collections::HashSet<usize> =
+        closed_idx.into_iter().take(drop_count).collect();
+    let mut i = 0;
+    sessions.retain(|_| {
+        let keep = !to_drop.contains(&i);
+        i += 1;
+        keep
+    });
 }
 
 // ── secrets scrub / acks ────────────────────────────────────────────────────

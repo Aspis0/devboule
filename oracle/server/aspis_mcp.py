@@ -8280,6 +8280,12 @@ def handle_tool_call(
             name,
             args.get("session_token"),
         )
+        # B04: orchestrators plan + spawn Main; they must not claim implementation WIP.
+        if role == "orchestrator":
+            raise McpError(
+                "Orchestrators cannot claim implementation tasks. Create plan tasks and "
+                "spawn_main_coder (or let Main spawn mini) instead of claiming WIP yourself."
+            )
         project_id = normalize_project_id(args.get("project_id", ""))
         task_id = normalize_task_id(args.get("task_id", ""))
         with file_lock(state_lock):

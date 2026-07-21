@@ -365,6 +365,10 @@ export function PlannerChat({
 					}}
 				/>
 				<button
+					type="button"
+					data-testid="planner-send"
+					aria-label="Send message to Orchestrator"
+					title="Send message"
 					onClick={send}
 					style={{
 						width: 38,
@@ -382,7 +386,7 @@ export function PlannerChat({
 						transition: "opacity 0.15s",
 					}}
 				>
-					<Send size={16} />
+					<Send size={16} aria-hidden />
 				</button>
 			</div>
 		</div>

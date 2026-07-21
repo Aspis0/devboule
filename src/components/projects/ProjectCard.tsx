@@ -83,6 +83,8 @@ function ProjectCardComponent({
   return (
     <button
       type="button"
+      data-testid="project-card"
+      data-project-id={project.id}
       onClick={() => onSelect(project.id)}
       data-help-title="This opens a project from the stage board."
       data-help-lines="The stage board is the mini-Notion view of all projects.|Cards move stage based on tasks, agent claims, sessions, and verifier status.|Opening a card shows the detailed Kanban, notes, root, and agent controls.|The card itself does not modify the project."

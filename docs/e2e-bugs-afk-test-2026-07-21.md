@@ -1,7 +1,8 @@
 # E2E AFK test — Devboule agent stack (2026-07-21)
 
-**Mode:** observe-only (no product fixes). Owner AFK.  
-**App:** Tauri debug + `ui-pilot`, `DEVBOULE_DEV_UNLOCK=1`, Vite `:1420`.  
+**Original mode:** observe-only AFK session (no product fixes in that run).  
+**Post-fix (same day, `phase1/infra`):** product patches + pilot/unit verification — see **§ Status after product fixes**.  
+**App (original evidence):** Tauri debug + `ui-pilot`, `DEVBOULE_DEV_UNLOCK=1`, Vite `:1420`.  
 **Evidence root:** `{SCRATCH}` =  
 `/var/folders/7v/4dqj9qqs1q1fb3qllxbkqkbh0000gn/T/grok-goal-1f51c2fe4b41/implementer`  
 (see `00_evidence_index.txt` for file list).
@@ -17,18 +18,18 @@
 
 ## Matrix summary
 
-| Area | Live? | Outcome | Findings |
-|------|-------|---------|----------|
-| Tauri unlock | Yes | Pass (dev unlock) | B15 |
-| Project board / select | Yes | Partial | B10, B12, B13 |
-| Oracle index (`devboule` folder) | Yes | Fail | **B01, B02** |
-| Orch planning + questions | Partial | Blocked mid-session | B07, B08, B09 |
-| Bottom console chat | Yes | Compression OK; residual bad session | B14, B04 |
-| Main coder | Structural + residual | Skipped by orch | B04, B16 |
-| Mini coder | Residual live + code | Fail | **B03**, B05 |
-| Tools | Residual + role_rules | Mixed | B04–B06, B17 |
-| Async without Pigeon | Yes (default) | Confirmed | B11 (off side) |
-| Sync with Pigeon | Attempted | Blocked / incomplete | **B11** |
+| Area | AFK outcome | Post-fix | Findings |
+|------|-------------|------------|----------|
+| Tauri unlock | Pass (dev unlock) | WORKING + O1 bring-up | B15 |
+| Project board / select | Partial | B12/B13 fixed; B10 FEATURE | B10, B12, B13 |
+| Oracle index | Fail | B01 FIXED; B02 PARTIAL | **B01, B02** |
+| Orch planning + questions | Blocked mid-session | B07 FIXED; B08 PARTIAL; B09 FIXED | B07, B08, B09 |
+| Bottom console chat | Compression OK; bad session | B04 FIXED (no new orch claims) | B14, B04 |
+| Main coder | Skipped by orch | SSoT OK; live path INCONCLUSIVE | B04, B16 |
+| Mini coder | Fail (Cloud one-shot) | B03 FIXED (agentic + mkdir) | **B03**, B05 |
+| Tools / multi-root | Mixed | B06 FIXED in MCP; B17 WORKING | B04–B06, B17 |
+| Async without Pigeon | Confirmed | unchanged | B11 (off side) |
+| Sync with Pigeon | Incomplete | **OPEN** (deferred) | **B11** |
 
 ---
 
@@ -529,6 +530,65 @@ UI freeze (B08)
 
 ---
 
-## No fixes under this goal
+## No fixes under this goal (original charter)
 
-Deliverable is this document only (plus `{SCRATCH}` evidence). Product code was not patched in the AFK test session. Later commits on `phase1/infra` (roles/UI/dev-unlock) are separate from this report’s observe-only charter; RCA above uses **current tree** to explain residual risks (e.g. Cloud one-shot hard-fail still present).
+Deliverable for the AFK session was this document only (plus `{SCRATCH}` evidence). Product code was **not** patched in that observe-only run. RCA above uses the tree as of 2026-07-21 to explain residual risks.
+
+---
+
+## Status after product fixes (2026-07-21 post-fix)
+
+Tracked on `phase1/infra` (Oracle lifecycle + dense index + roles/SSoT + Metal).  
+Verdicts: **FIXED** | **PARTIAL** | **OPEN** | **WORKING** | **FEATURE** | **INCONCLUSIVE**.
+
+| ID | Title | Severity | Status | Notes |
+|----|-------|----------|--------|-------|
+| **B01** | Oracle does not index selected workspace | blocker | **FIXED** (core path) | DEV unlock → `on_unlock` (O1); Index now / watcher call `ensure_oracle_http_ready` (O4); dense path no longer “Ok + 0 vectors”; re-embed when Lance empty; Metal on macOS. Live e2e: tiny WS wipe + `force=false` via pilot → `vectorRecords>0`, Complete. Full monorepo `devboule` Index now **not** re-proven end-to-end. |
+| **B02** | Stale discovery / false “server running” | major | **PARTIAL** | Badge driven by live runtime/HTTP probe (O3), not “has workspace”. Supervisor rewrites discovery when healthy (O2). Residual: no dedicated boot purge if supervisor never starts; discovery `pid` is still app PID. |
+| **B03** | Cloud mini-coder one-shot hard-fail | blocker | **FIXED** | Executor forces agentic when Cloud + write + baseUrl; one-shot still hard-fails if misrouted. Residual: agentic resultPath `mini/<id>.json` needed `create_dir_all` parent (**fixed** `agentic_worker.rs`). **Pilot 2026-07-21:** inject app-user directive → `pending→running→done`, error **not** “does not support it yet”, result written, `index.html` has `<!-- b03-pilot-ok -->`. |
+| **B04** | Orch claimed T1 + spawned mini (Main skipped) | major | **FIXED** | SSoT blocks orch→mini (B17). **`project_claim_task` rejects `role=orchestrator`** (devboule-mcp + aspis_mcp.py). Unit: `orchestrator_cannot_claim_implementation_tasks`. Residual: historical WIP claims on mock project may still exist on disk. |
+| **B05** | Invalid `write_mode: "surgical"` | minor | **WORKING** (server) / **OPEN** (model) | Server correctly rejects; no schema soft-coerce. |
+| **B06** | `oracle_context` rejects project root outside approved workspaces | major | **FIXED** | Attached project `root_path`s (projects_dir frontmatter) are now approved parents in `devboule-mcp` `approved_work_root_parents` — attach project = approve root (no env required). Still fail-closed for unattached paths. **Verify:** unit `work_root_allows_attached_project_root` + `resolve_real_openrouter_mock_if_present` (real openrouter-mock). Agent MCP binary must be rebuilt for live orch; app UI uses different Oracle path. |
+| **B07** | “Awaiting your reply” without AskUser | major | **FIXED** | Pill only if `openQuestions` non-empty or session `needsUser` (not last-assistant). **Pilot UI 2026-07-21:** residual OpenRouter Mock chat has narrative assistant last + no ask → **no** “Awaiting your reply”. |
+| **B08** | WebView / pilot eval freezes | blocker | **PARTIAL** | Payload slim: `get_agent_live_state` prunes closed sessions (≤40) + caps events (≤300). **Pilot 2026-07-21:** 8× eval + 5× IPC burst all &lt;20ms, 0 timeouts. Root cause (main-thread React under heavy planner) not fully eliminated; still possible under load. |
+| **B09** | Composer “send” mis-clicks project card | minor | **FIXED** | `data-testid="planner-send"` + `aria-label="Send message to Orchestrator"`; project cards `data-testid="project-card"`. **Pilot:** planner-send present; weak `/send\|go/` still hits cards with “ago” in text — use testid, not regex. |
+| **B10** | Git policy blocks non-git mock roots | minor | **FEATURE** | By design. |
+| **B11** | Pigeon off OK; Pigeon on incomplete | major | **OPEN** | Default-off; sync path not proven. |
+| **B12** | Fleet pollution (35 sessions) | minor | **FIXED** (UI path) | `MAX_CLOSED_SESSIONS=40` on MCP normalize + UI `get_agent_live_state` prune. **Pilot:** closed=21 ≤40 after rebuild. Disk ledger may still hold more until next MCP write normalize. |
+| **B13** | Header “Orchestrator · claude” vs live session client/model | minor | **FIXED** | Header prefers live session by stable console agent id (not chip). **Pilot UI 2026-07-21:** chip Claude + `localStorage=claude` still shows `Orchestrator · orchestrator · gpt-5.2` from live session. |
+| **B14** | Milestone compression | nit | **WORKING** | Unchanged. |
+| **B15** | Dev unlock | nit | **WORKING** | Still correct; plus O1 bring-up fix so Oracle starts. |
+| **B16** | Main coder not exercised on OpenRouter | major | **INCONCLUSIVE** / depends B04+B08 | Path blocked in AFK smoke; not re-run after SSoT. |
+| **B17** | Role allowlist orch no mini | nit | **WORKING** | SSoT in `role_rules.json` + MCP. |
+
+### Open priority (fix queue)
+
+1. **B11** — Pigeon-on e2e + mailbox drain (deferred).  
+2. **B08 residual** — main-thread freeze under extreme planner load (payload slim done).  
+3. **B06 live orch** — rebuild/redeploy agent MCP so orch sessions pick up the gate.  
+4. **Stale WIP claims** on disk from pre-B04 orch claims (cleanup, not new claim path).
+
+### Pilot UI verification log (post-fix)
+
+| ID | How tested | Result |
+|----|------------|--------|
+| B07 | OpenRouter Mock residual chat: narrative assistant last, no `ask_user` / needsUser | `awaiting=false` ✓ |
+| B13 | Toggle Local/Claude chips; header vs live session `orchestrator` / `gpt-5.2` | chip≠header; stays live session ✓ |
+| B01 dense | wipe Lance + `start_oracle_index_job force=false` via pilot IPC | Complete, vectorRecords=2 ✓ |
+| B03 | inject Cloud mini (`app-user` + write+agentic, OpenRouter backend) into `.aspis-agents.json`; app unlocked + executor poll | `pending→running→done`; no pi-engine error; mkdir fix; comment in `index.html` ✓ |
+| B06 | MCP gate unit + `resolve_project_work_root` on real `openrouter-mock` | attached root OK; unattached still rejected ✓ (MCP binary rebuild for live orch) |
+| B08 | 8× `eval document.title` + 5× `get_auth_state` after closed-session prune | 0 timeouts; all &lt;20ms ✓ (PARTIAL under heavier UI still possible) |
+| B04 | unit `orchestrator_cannot_claim_implementation_tasks` | reject ✓ |
+| B09 | planner open: `[data-testid=planner-send]` + project-card | present ✓ |
+| B12 | `get_agent_live_state` after rebuild | closed≤40 ✓ |
+
+### Causal map (updated)
+
+```text
+Oracle dead (B02/O1)     → FIXED for DEV unlock + Index ensure-server
+Zero-vector dense path   → FIXED (memory floor + re-embed-all + job Error)
+Badge lie (O3)           → FIXED (runtime probe)
+Mini Cloud (B03)         → still OPEN
+UI freeze (B08)          → still OPEN → blocks Pigeon-on (B11) + clean Main (B16)
+Orch→mini shortcut (B04) → SSoT FIXED; residual sessions/claim OPEN
+```

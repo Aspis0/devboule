@@ -187,7 +187,43 @@ fn push_approved_parent(parents: &mut Vec<PathBuf>, path: PathBuf) {
     // omit the parent entirely — fail-closed rather than trust a raw path.
 }
 
-fn approved_work_root_parents(management_root: Option<&Path>) -> Vec<PathBuf> {
+/// Roots the user attached as Devboule projects (frontmatter `root_path`).
+/// Product bridge for multi-project work (e2e B06): security still fails closed
+/// for paths not in this set / env / management root; attaching a project is the
+/// in-app "approve this root for Oracle/Censor" action (no env var required).
+fn attached_project_roots(projects_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(projects_dir) else {
+        return out;
+    };
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.is_empty() || stem.starts_with('.') {
+            continue;
+        }
+        let Ok(doc) = load_project_locked(projects_dir, stem) else {
+            continue;
+        };
+        if let Some(rp) = doc.metadata.root_path() {
+            let t = rp.trim();
+            if !t.is_empty() {
+                out.push(PathBuf::from(t));
+            }
+        }
+    }
+    out
+}
+
+fn approved_work_root_parents(
+    management_root: Option<&Path>,
+    projects_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut parents = Vec::new();
     if let Some(mr) = management_root {
         push_approved_parent(&mut parents, mr.to_path_buf());
@@ -199,6 +235,12 @@ fn approved_work_root_parents(management_root: Option<&Path>) -> Vec<PathBuf> {
                 continue;
             }
             push_approved_parent(&mut parents, PathBuf::from(t));
+        }
+    }
+    if let Some(pd) = projects_dir {
+        for root in attached_project_roots(pd) {
+            // Exact project root is approved (not the whole parent tree).
+            push_approved_parent(&mut parents, root);
         }
     }
     let default_ws = dirs_home()
@@ -218,10 +260,14 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 /// Constrain `rootPath` to approved workspace parents (M2 / path confinement).
+///
+/// `projects_dir`: when set, every attached project's `root_path` is also approved
+/// (e2e B06 multi-project bridge). Omit only for pure env/management-root checks.
 pub fn validate_project_work_root(
     candidate: &Path,
     management_root: Option<&Path>,
     project_id: Option<&str>,
+    projects_dir: Option<&Path>,
 ) -> ToolResult<PathBuf> {
     // Fail-closed: never use the raw unnormalized candidate for containment.
     let root = resolve_for_confinement(candidate).ok_or_else(|| {
@@ -274,7 +320,7 @@ pub fn validate_project_work_root(
              use a folder under the Devboule workspace."
         )));
     }
-    let parents = approved_work_root_parents(management_root);
+    let parents = approved_work_root_parents(management_root, projects_dir);
     if !parents
         .iter()
         .any(|p| &root == p || path_is_within(&root, p))
@@ -294,7 +340,8 @@ pub fn validate_project_work_root(
         }
         return Err(ToolError::new(format!(
             "rootPath '{display}' is outside approved Devboule workspaces; \
-             set ASPIS_WORKSPACE_ROOT to its parent to approve."
+             attach the folder as a project in Devboule, or set \
+             ASPIS_WORKSPACE_ROOT / DEVBOULE_WORKSPACE_ROOT to its parent."
         )));
     }
     Ok(root)
@@ -322,6 +369,7 @@ pub fn resolve_project_work_root(projects_dir: &Path, project_id: &str) -> ToolR
         Path::new(&root_path),
         Some(&management_root),
         Some(project_id),
+        Some(projects_dir),
     )
 }
 
@@ -428,7 +476,12 @@ fn oracle_index_root_for_project(
     if root_path.is_empty() {
         return Ok(management_root);
     }
-    validate_project_work_root(Path::new(&root_path), Some(&management_root), Some(pid))
+    validate_project_work_root(
+        Path::new(&root_path),
+        Some(&management_root),
+        Some(pid),
+        Some(projects_dir),
+    )
 }
 
 /// Concrete allowed file_id set. Never returns "unscoped full corpus".
@@ -1288,6 +1341,7 @@ mod tests {
             Path::new("/tmp/ws/proj/../../etc"),
             Some(&ws),
             Some("p1"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1309,6 +1363,7 @@ mod tests {
             Path::new("/etc"),
             Some(Path::new("/tmp/devboule-mgmt")),
             Some("p1"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1397,9 +1452,56 @@ mod tests {
         let proj = ws.join("myproj");
         fs::create_dir_all(&proj).unwrap();
         std::env::set_var("ASPIS_WORKSPACE_ROOT", ws.to_str().unwrap());
-        let got = validate_project_work_root(&proj, None, Some("p1")).unwrap();
+        let got = validate_project_work_root(&proj, None, Some("p1"), None).unwrap();
         assert!(got.ends_with("myproj") || got == proj.canonicalize().unwrap());
         std::env::remove_var("ASPIS_WORKSPACE_ROOT");
+    }
+
+    /// B06 smoke against the real openrouter-mock project (host path may be missing in CI).
+    #[test]
+    fn resolve_real_openrouter_mock_if_present() {
+        let projects = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src-tauri/projects");
+        let projects = match projects.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if !projects.join("openrouter-mock.md").is_file() {
+            return;
+        }
+        let got = resolve_project_work_root(&projects, "openrouter-mock");
+        assert!(
+            got.is_ok(),
+            "attached openrouter-mock root must resolve (B06): {got:?}"
+        );
+    }
+
+    /// B06: an attached Devboule project root is approved without ASPIS_WORKSPACE_ROOT.
+    #[test]
+    fn work_root_allows_attached_project_root() {
+        let _g = env_lock();
+        std::env::remove_var("ASPIS_WORKSPACE_ROOT");
+        std::env::remove_var("DEVBOULE_WORKSPACE_ROOT");
+        let tmp = TempDir::new().unwrap();
+        let projects = tmp.path().join("projects");
+        let work = tmp.path().join("outside-mgmt").join("my-app");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        let md = format!(
+            "---\nid: my-app\ntitle: My App\nstatus: active\nroot_path: {}\nupdated_at: 2026-01-01T00:00:00Z\n---\n\n```aspis-project\n{{\"version\":1,\"tasks\":[],\"notes\":[]}}\n```\n",
+            work.display()
+        );
+        fs::write(projects.join("my-app.md"), md).unwrap();
+        // Without projects_dir → reject (still outside management root).
+        let err = validate_project_work_root(&work, None, Some("my-app"), None).unwrap_err();
+        assert!(
+            err.message.contains("outside approved"),
+            "unattached path must still fail: {}",
+            err.message
+        );
+        // With projects_dir → approve exact attached root.
+        let got =
+            validate_project_work_root(&work, None, Some("my-app"), Some(&projects)).unwrap();
+        assert_eq!(got, work.canonicalize().unwrap());
     }
 
     #[test]

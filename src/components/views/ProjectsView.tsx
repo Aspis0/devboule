@@ -1329,16 +1329,36 @@ export function ProjectsView() {
 		];
 	}, [plannerConvo, orchestratorConsole.streamingChat]);
 
-	// "Awaiting your reply": the orchestrator spoke last and is live → your turn. Drives the
-	// PlannerChat pill so the user knows to respond (esp. after an AskUser question).
+	// Live orchestrator session for needsUser + honest header labels.
+	// Prefer the STABLE console agent id (what the chat actually tails), not only the
+	// chip-bound launch liveness ids — chip can be "claude" while the residual
+	// project session is client/model something else (e2e B13).
+	const livePlannerSession = useMemo(() => {
+		if (plannerActivityAgentId) {
+			const byStable = currentProjectSessions.find(
+				(s) => s.agentId === plannerActivityAgentId,
+			);
+			if (byStable) return byStable;
+		}
+		const liveId = orchestratorAgentId || cloudOrchestratorAgentId;
+		if (!liveId) return null;
+		return (
+			currentProjectSessions.find((s) => s.agentId === liveId) ?? null
+		);
+	}, [
+		plannerActivityAgentId,
+		orchestratorAgentId,
+		cloudOrchestratorAgentId,
+		currentProjectSessions,
+	]);
+
+	// "Awaiting your reply" ONLY when the human is actually blocked:
+	// open ask_user / plan doubts (console question entries) OR session needsUser.
+	// Do NOT use "last bubble is assistant" — that lights the pill on mid-pipeline
+	// narrative ("Mini is implementing T1…") with no real ask (e2e B07).
 	const plannerAwaitingReply =
-		// plannerActivityAgentId covers BOTH backends (local orchestrator id OR the
-		// cloud duplex id). Gating on the local-only orchestratorAgentId kept this
-		// permanently false for Claude/Codex planners, so the "awaiting your reply"
-		// pill never showed there.
 		!!plannerActivityAgentId &&
-		plannerConvo.length > 0 &&
-		plannerConvo[plannerConvo.length - 1].role === "assistant";
+		(plannerQuestions.length > 0 || !!livePlannerSession?.needsUser);
 
 	// D3 GC: once the bridge echoes a pending send (by msgId, or an id-less text match
 	// from the local binary), remove it from state — mergePendingSends already hides it
@@ -3771,18 +3791,33 @@ export function ProjectsView() {
 								.pop() ?? ""
 						}
 						plannerModelLabel={
-							// Header = selected WHO + model. Placement (oMLX vs OpenRouter)
-							// is a badge next to the model — the Local chip stays Local.
-							plannerOrchestratorClient === "orchestrator"
+							// Prefer LIVE session client/model when a session is bound
+							// (e2e B13: chip localStorage said "claude" while ledger was pi/gpt).
+							// Fall back to chip + configured model only when no live session.
+							livePlannerSession
 								? (() => {
+										const client =
+											livePlannerSession.client?.trim() ||
+											plannerOrchestratorClient;
 										const model =
-											config.localCoderBackend?.model?.trim() || "local";
-										const place = enginePlacementBadge(
-											config.localCoderBackend,
-										);
-										return place ? `${model} · ${place}` : model;
+											livePlannerSession.model?.trim() ||
+											(client === "orchestrator"
+												? config.localCoderBackend?.model?.trim() ||
+													"local"
+												: null);
+										return model ? `${client} · ${model}` : client;
 									})()
-								: plannerOrchestratorClient
+								: plannerOrchestratorClient === "orchestrator"
+									? (() => {
+											const model =
+												config.localCoderBackend?.model?.trim() ||
+												"local";
+											const place = enginePlacementBadge(
+												config.localCoderBackend,
+											);
+											return place ? `${model} · ${place}` : model;
+										})()
+									: plannerOrchestratorClient
 						}
 						live={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
 						planCards={currentProject?.state.tasks && currentProject.state.tasks.length > 0 ? derivePlanCards(currentProject.state.tasks) : piPlan ? planCardsFromPiPlan(piPlan) : []}

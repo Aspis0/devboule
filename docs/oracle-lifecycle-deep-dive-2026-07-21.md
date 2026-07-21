@@ -277,14 +277,16 @@ AFK disk: `oracle-data/metadata.sqlite` exists (~36MB) but UI showed 0 files —
 
 ---
 
-## 10. Suggested fix directions (not implemented here)
+## 10. Suggested fix directions
 
-1. **O1:** On `BackendState::new` when `dev_unlock_enabled()`, call `oracle_service_on_unlock()` after setup has run `oracle_service::init` (order matters: projects dir must be set). Alternatively: FE on boot if already unlocked, invoke a dedicated `ensure_oracle_supervisor` command.  
-2. **O2:** On supervisor start / first reconcile, if discovery exists but `/health` fails, **delete or rewrite** discovery; never leave zombie agent tokens.  
-3. **O3:** Drive badge from `probe_oracle_live_server` (or equivalent), not from “workspace configured”.  
-4. **O4:** `start_oracle_index_job` / watcher should ensure resident server (or return explicit “server not running — starting…”).  
-5. **O5:** Log `ensure_rust_oracle_server` Err in `reconcile_once` (no secrets).  
-6. **Copy:** Align Install/Help text with Rust-only runtime.
+*Originally “not implemented”; status as of post-fix §16.*
+
+1. **O1:** DEV unlock → `on_unlock` after setup — **DONE**.  
+2. **O2:** Rewrite discovery when healthy; residual boot purge still open — **PARTIAL**.  
+3. **O3:** Badge from live/runtime probe — **DONE**.  
+4. **O4:** Index now / watcher ensure resident server — **DONE**.  
+5. **O5:** Log `ensure_rust_oracle_server` Err in `reconcile_once` — **DONE**.  
+6. **O6 / copy:** Align Install/Help text with Rust-only runtime — **OPEN**.
 
 ---
 
@@ -415,4 +417,50 @@ So: **slowness with manual unlock is expected** relative to old Python+MPS; **co
 
 ---
 
-*End of deep dive. No product fixes applied in this document’s charter.*
+*Original charter: observe-only deep dive. Product status below supersedes “no fixes” for O1–O7 and embed path.*
+
+---
+
+## 16. Status after product fixes (2026-07-21 post-fix)
+
+| ID | Issue | Status | What changed |
+|----|-------|--------|--------------|
+| **O1** | DEV unlock skips `oracle_service_on_unlock` | **FIXED** | After setup, if auth already unlocked → `oracle_service::on_unlock()` (`src-tauri/src/lib.rs`). |
+| **O2** | Stale `.oracle-server.json` | **PARTIAL** | Healthy supervisor rewrites discovery; Index path ensures server. Residual: no standalone boot purge if supervisor never starts; discovery `pid` = app pid. |
+| **O3** | Badge “running” without HTTP | **FIXED** | `OracleAdminPanel` `serverState` from runtime/live probe, not “has workspace”. |
+| **O4** | Index now does not spawn server | **FIXED** | `ensure_oracle_http_ready()` before `/index/run` and watch start (`oracle/commands.rs`). |
+| **O5** | Silent `ensure_rust` failure | **FIXED** | `reconcile_once` logs `ensure_rust_oracle_server failed: …`. |
+| **O6** | Python/venv copy residual | **OPEN** | Rust-only runtime; Install/Help copy still may mention venv in places. |
+| **O7** | Empty chunk index | **FIXED** (when server up) | Plus dense-index hardening: unreliable free-RAM floor, re-embed-all when Lance vectors=0 without force, job Error (no CKG) if 0 vectors after index. |
+| **§14 Metal** | App hard-coded ORT CPU on Mac | **FIXED** (macOS) | `rust_oracle` selects Candle Metal F16 when `oracle-core/metal`; non-macOS stays ORT int8 CPU. Re-index required after backend switch. |
+
+### Dense-index bugs found after AFK (not in original O1–O7)
+
+| Issue | Status |
+|-------|--------|
+| Free-RAM metric ~0 on large hosts → abort embed with Ok(0) | **FIXED** (`free_memory_gb` fallbacks + plausible floor + soft skip) |
+| Manifest current + Lance wiped → skip all files | **FIXED** (`re-embed-all reason=no_vectors`) |
+| Complete + CKG with 0 vectors | **FIXED** (job Error + clear message) |
+| AST regex recompile every file | **FIXED** (`LazyLock` patterns) |
+| Heavy `/health` under load | **FIXED** (light `{status, server_root, auth}`) |
+| Readiness timeout stops unrelated server | **FIXED** (only if `spawned_this_attempt`) |
+
+### §14 table correction
+
+| | Python era | Rust M3 app path (current) |
+|--|------------|----------------------------|
+| Embed device (Mac) | Often MPS via torch | **Candle Metal F16** (not ORT CPU) |
+| Embed device (Win/Linux) | — | ORT int8 + CPU EP |
+| Process | Separate Python child | In-process oracle-core |
+| Failure modes | venv/pip | Was O1/O2/O5 (mostly fixed); residual O2/O6 |
+
+### Operator checklist (still valid)
+
+1. Fresh discovery `updatedAt` + HTTP `/health` after unlock / DEV boot.  
+2. Index status: `vectorRecords > 0` after Complete, not only sqlite chunk counts.  
+3. Logs: `re-embed-all reason=no_vectors`, `metric-unreliable`, `Candle Metal F16`.  
+4. Full monorepo Index now still worth a manual smoke after long idle.
+
+### Still open (see e2e AFK B* for product stack)
+
+O6 copy debt; O2 residual boot purge; non-Oracle AFK items B03/B07/B08/B11/… remain outside this lifecycle doc’s primary scope.

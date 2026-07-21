@@ -19,7 +19,10 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
-const CODER_LIKE_ROLES: &[&str] = &["coder", "orchestrator"];
+/// Implementation roles that may claim Kanban tasks as WIP.
+/// Orchestrator is intentionally excluded (e2e B04): it plans / creates tasks /
+/// spawns Main coder — it must not short-circuit by claiming T* itself.
+const CODER_LIKE_ROLES: &[&str] = &["coder"];
 const CLAIM_LEASE_MINUTES: i64 = 45;
 const LEASELESS_CLAIM_WINDOW_MINUTES: i64 = 15;
 
@@ -425,6 +428,13 @@ pub fn project_claim_task(
         "project_claim_task",
         session_token,
     )?;
+    // B04: orch plans + delegates; claiming implementation tasks skipped Main/mini.
+    if role == "orchestrator" {
+        return Err(ToolError::new(
+            "Orchestrators cannot claim implementation tasks. Create plan tasks and \
+             spawn_main_coder (or let Main spawn mini) instead of claiming WIP yourself.",
+        ));
+    }
     let project_id = normalize_project_id(project_id)?;
     let task_id = normalize_task_id(task_id)?;
 
@@ -1116,6 +1126,38 @@ mod tests {
         )
         .unwrap();
         ack["sessionToken"].as_str().unwrap().to_string()
+    }
+
+
+    #[test]
+    fn orchestrator_cannot_claim_implementation_tasks() {
+        let _g = env_lock();
+        set_unmanaged(false);
+        let (_tmp, projects) = temp_projects();
+        write_test_project(
+            &projects,
+            "orch-claim",
+            "Orch",
+            "active",
+            json!([task("T1", "Work", "todo")]),
+            &[],
+        )
+        .unwrap();
+        let tok = register(&projects, "orchestrator-1", "orchestrator");
+        let err = project_claim_task(
+            &projects,
+            "orch-claim",
+            "T1",
+            "orchestrator-1",
+            "orchestrator",
+            Some(&tok),
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("cannot claim") || err.message.contains("Orchestrators cannot"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
