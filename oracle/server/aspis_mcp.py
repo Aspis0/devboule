@@ -90,14 +90,14 @@ VALID_TASK_STATUSES = {"todo", "wip", "review", "blocked", "done"}
 # coder PLANS and CODES (and may spawn subagents).
 # "mini" (P3) is the one-shot read-only sub-agent: oracle_context only, no
 # mutation tools — enforced by ROLE_ALLOWED_TOOLS via require_registered_role.
-# "orchestrator" (devboule-coder): the FIRST-CLASS planning+delegation main
-# coder. The new Rust `devboule-coder` binary self-registers under this role.
+# "orchestrator" (devboule-coder): the FIRST-CLASS planning tier. The new Rust
+# `devboule-coder` binary self-registers under this role.
 # BEHAVIOR CHANGE (deliberate): "orchestrator" was previously an ALIAS that
 # collapsed to "coder". It is now its OWN role and must NOT be normalized away —
-# otherwise its narrower allowlist (no direct file-write/mutation tool; it
-# delegates ALL writes to spawn_mini_coder) would never be reached. Its Kanban /
-# project semantics are IDENTICAL to coder's (see CODER_LIKE_ROLES) so it never
-# gains a verifier-only transition; it is strictly tighter-or-equal to coder.
+# otherwise its narrower allowlist (no file-write; no mini tools; hand-off only
+# via spawn_main_coder) would never be reached. Its Kanban / project semantics
+# remain coder-like (see CODER_LIKE_ROLES) so it never gains a verifier-only
+# transition; it is strictly tighter-or-equal to coder.
 VALID_ROLES = {"coder", "verifier", "mini", "orchestrator"}
 # "orchestrator" intentionally REMOVED from the aliases below: as a first-class
 # role it normalizes to itself, not to coder.
@@ -411,12 +411,13 @@ TOOLS = [
         # downgrading it to a one-shot mini.
         "name": "spawn_main_coder",
         "description": (
-            "Orchestrator only: dispatches a SUBSTANTIAL task to the local MAIN "
-            "CODER (the sandboxed agentic engine: multi-round read/edit/grep/run "
-            "loop against the deterministic gate). Unlike spawn_mini_coder it is "
-            "always agentic and meant for multi-file/heavyweight tasks; write and "
-            "write_mode are forced server-side. Same supervision as the mini: "
-            "wait=false + steer_mini_coder + mini_coder_result(directiveId)."
+            "Orchestrator only: hand off a SUBSTANTIAL task to the local MAIN "
+            "CODER (sandboxed agentic engine: multi-round read/edit/grep/run loop "
+            "against the deterministic gate). Always agentic; write and write_mode "
+            "are forced server-side. After dispatch, the orchestrator should "
+            "agent_heartbeat status=\"done\" (sleep until Change plan). Minis are "
+            "Main-coder-only — do NOT call spawn_mini_coder / steer_mini_coder / "
+            "mini_coder_result."
         ),
         "parameters": {
             "agent_id": {"type": "string"},
@@ -430,8 +431,8 @@ TOOLS = [
                 "default": True,
                 "description": (
                     "Whether to BLOCK until the main coder finishes (default true). "
-                    "Pass false to supervise: watch it, steer with steer_mini_coder, "
-                    "collect with mini_coder_result(directiveId)."
+                    "Pass false to fire-and-forget: the Main coder runs independently "
+                    "(it may spawn minis itself; orchestrator does not steer minis)."
                 ),
             },
             "session_token": {"type": "string"},
@@ -440,7 +441,7 @@ TOOLS = [
     {
         "name": "steer_mini_coder",
         "description": (
-            "Coder/orchestrator only: steer a RUNNING mini-coder you spawned by appending "
+            "Main coder only: steer a RUNNING mini-coder you spawned by appending "
             "a mid-flight correction to its steer queue. The app folds queued corrections "
             "into the mini's NEXT fix-pass round (it takes effect at a round boundary, not "
             "mid-token), reusing the same channel as the Stop button. Send the message "
@@ -465,7 +466,7 @@ TOOLS = [
     {
         "name": "mini_coder_result",
         "description": (
-            "Coder/orchestrator only: collect the outcome of a mini you delegated with "
+            "Main coder only: collect the outcome of a mini you delegated with "
             "spawn_mini_coder(wait=false). Pass the directiveId it returned. With "
             "wait=true (default) BLOCKS until the mini reaches a terminal outcome and "
             "returns {directiveId, result} (same poll/timeout semantics as the blocking "
@@ -6348,12 +6349,9 @@ def dispatch_spawn_main_coder(
     forced["write_mode"] = "agenticIterative"
     # F-F hardening (double-auth coupling): pass our ALREADY-VALIDATED identity
     # through so the shared dispatch below does NOT re-derive it against its OWN
-    # "spawn_mini_coder" grant. Before this, that internal re-derivation made a
-    # successful spawn_main_coder call SECRETLY DEPEND on the caller's role ALSO
-    # holding "spawn_mini_coder" — true only because today's sole
-    # "spawn_main_coder" holder (orchestrator) happens to hold both; a future role
-    # with spawn_main_coder but not spawn_mini_coder would otherwise fail here for
-    # no policy reason.
+    # "spawn_mini_coder" grant. Orchestrator holds spawn_main_coder only (not
+    # spawn_mini_coder); without _preauthorized the shared path would reject the
+    # hand-off for no policy reason.
     return dispatch_spawn_mini_coder(
         projects_dir,
         state_lock,
@@ -6686,7 +6684,7 @@ def dispatch_mini_coder_result(
 ) -> dict[str, Any]:
     """ASYNC (b): collect the outcome of a mini delegated with `spawn_mini_coder(wait=false)`.
 
-    A supervising coder/orchestrator that spawned a mini non-blocking holds its
+    A supervising Main coder that spawned a mini non-blocking holds its
     `directiveId`; it watches the mini's activity, sends corrections via
     `steer_mini_coder`, then calls this to fetch the terminal result.
 
@@ -6704,7 +6702,7 @@ def dispatch_mini_coder_result(
     retry chain's leaf outcome back onto the awaiting_retry root, so the terminal result
     lands on `directive_id` itself (same as the blocking `spawn_mini_coder` poll).
     """
-    # Authn/authz the CALLER (registered coder/orchestrator + valid session token).
+    # Authn/authz the CALLER (registered Main coder + valid session token).
     agent_id, role = require_agent_tool(projects_dir, args, "mini_coder_result")
     if "mini_coder_result" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use mini_coder_result.")
@@ -6759,7 +6757,7 @@ def dispatch_steer_mini_coder(
     state_lock: Path,
     args: dict[str, Any],
 ) -> dict[str, Any]:
-    """ASYNC STEERING (a): a supervising coder/orchestrator steers a RUNNING mini it
+    """ASYNC STEERING (a): a supervising Main coder steers a RUNNING mini it
     spawned, by APPENDING a mid-flight correction to the directive's `steerQueue` — the
     SAME external-signal-to-a-running-directive channel as the Stop button's
     `killRequested`, generalized from one bool to a bounded FIFO. The Rust executor
@@ -9515,17 +9513,11 @@ def create_mcp_server(
         wait: bool = True,
         session_token: str = "",
     ) -> dict:
-        """Orchestrator only: dispatch a SUBSTANTIAL task to the local MAIN CODER
-        (the sandboxed agentic engine: multi-round read/edit/grep/run loop against
-        the deterministic gate).
-
-        Unlike spawn_mini_coder it is always agentic and meant for
-        multi-file/heavyweight tasks; write and write_mode are forced server-side
-        (the Rust executor FAILS a main directive that cannot run agentic rather
-        than downgrading it to a one-shot mini). Same supervision contract as the
-        mini: pass wait=false to get {directiveId, status:'running'} immediately,
-        steer with steer_mini_coder(directiveId, message), collect with
-        mini_coder_result(directiveId).
+        """Orchestrator only: hand off a SUBSTANTIAL task to the local MAIN CODER
+        (sandboxed agentic engine). Always agentic; write/write_mode forced
+        server-side. After dispatch, heartbeat status=\"done\" (sleep until Change
+        plan). Minis are Main-coder-only — do not call spawn_mini_coder /
+        steer_mini_coder / mini_coder_result from the orchestrator.
         """
         # ROLE UNTANGLE Phase 3 completion: this wrapper was MISSING — the tool
         # had a TOOLS entry + dispatch + routing but no FastMCP surface, so no
@@ -9552,7 +9544,7 @@ def create_mcp_server(
         message: str,
         session_token: str = "",
     ) -> dict:
-        """Coder/orchestrator-only: steer a RUNNING mini-coder you spawned.
+        """Main coder only: steer a RUNNING mini-coder you spawned.
 
         Append a mid-flight correction to the mini's steer queue; the app folds queued
         corrections into the mini's NEXT fix-pass round (it takes effect at a round
@@ -9583,7 +9575,7 @@ def create_mcp_server(
         wait: bool = True,
         session_token: str = "",
     ) -> dict:
-        """Coder/orchestrator-only: collect the outcome of a mini you delegated with
+        """Main coder only: collect the outcome of a mini you delegated with
         spawn_mini_coder(wait=false). Pass the `directive_id` it returned.
 
         With `wait=true` (default) BLOCKS until the mini reaches a terminal outcome and

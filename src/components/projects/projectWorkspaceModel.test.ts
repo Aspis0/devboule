@@ -229,6 +229,18 @@ describe("isMiniSession", () => {
 		expect(isMiniSession(session({ parentAgentId: "" }))).toBe(false);
 		expect(isMiniSession(session({ parentAgentId: "   " }))).toBe(false);
 	});
+
+	it("is false for spawn_main_coder hand-off (parent set, Main coder message)", () => {
+		expect(
+			isMiniSession(
+				session({
+					parentAgentId: "orch-1",
+					role: "coder",
+					message: "Main coder running",
+				}),
+			),
+		).toBe(false);
+	});
 });
 
 describe("isMiniManagedSession", () => {

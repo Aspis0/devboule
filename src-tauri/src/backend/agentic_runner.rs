@@ -161,6 +161,8 @@ pub fn run_agentic_coder(
     working_set: Vec<PathBuf>,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
+    /// Optional Bearer token for Cloud/OpenRouter. None for local oMLX/Ollama.
+    api_key: Option<String>,
 ) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String> {
     // A4 (§4c live wiring): hold a compute permit for the WHOLE local agentic decode so the
     // coordinator's `active_local_decodes` reflects real GPU activity (what `admit_local_spawn`
@@ -179,7 +181,14 @@ pub fn run_agentic_coder(
     } else {
         format!("{system}\n{dir}")
     };
-    let mut llm = HttpAgentLlm::new(base_url, model, tools, params, enable_thinking)?;
+    let mut llm = HttpAgentLlm::with_api_key(
+        base_url,
+        model,
+        tools,
+        params,
+        enable_thinking,
+        api_key,
+    )?;
     // Reads are project-wide (for context); WRITES are confined to the directive's file
     // allowlist (empty = no extra restriction beyond the root).
     // A3: resolve the read-only Oracle scope (the project's indexed file_ids) BEFORE `root` is

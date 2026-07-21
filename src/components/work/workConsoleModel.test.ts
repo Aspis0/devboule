@@ -202,13 +202,37 @@ describe("buildWorkConsoleModel — hardening (reviewer findings)", () => {
     const tasks = [task({ id: "t1", scope: ["src/views/projects/card.tsx"] })];
     const sessions = [
       session({ agentId: "o1", client: "orchestrator", currentTaskId: null }),
-      session({ agentId: "m1", parentAgentId: "o1", currentTaskId: "t1" }),
+      // Non-oracle minis are still role=coder; distinguish from Main via message.
+      session({
+        agentId: "m1",
+        parentAgentId: "o1",
+        currentTaskId: "t1",
+        message: "Mini-coder running",
+      }),
     ];
     const m = buildWorkConsoleModel({ sessions, tasks, projectId: PROJECT });
     expect(m.orchestrator?.children.map((c) => c.agentId)).toEqual(["m1"]);
     const districtIds = m.districts.flatMap((d) => d.nodes.map((n) => n.agentId));
     expect(districtIds).not.toContain("m1");
     expect(m.unplaced.map((n) => n.agentId)).not.toContain("m1");
+  });
+
+  it("classifies spawn_main_coder hand-off as Main coder, not nested mini under orch", () => {
+    const tasks = [task({ id: "t1", scope: ["src/views/projects/card.tsx"] })];
+    const sessions = [
+      session({ agentId: "o1", role: "orchestrator", client: "pi", currentTaskId: null }),
+      session({
+        agentId: "mini-orch-abcd1234",
+        role: "coder",
+        parentAgentId: "o1",
+        currentTaskId: "t1",
+        message: "Main coder running",
+      }),
+    ];
+    const m = buildWorkConsoleModel({ sessions, tasks, projectId: PROJECT });
+    expect(m.orchestrator?.children.map((c) => c.agentId)).toEqual([]);
+    const main = m.districts.flatMap((d) => d.nodes).find((n) => n.agentId === "mini-orch-abcd1234");
+    expect(main?.type).toBe("coder");
   });
 
   it("normalizes a leading-slash absolute path into a real district (never empty name)", () => {

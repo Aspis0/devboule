@@ -4,7 +4,7 @@
 //! TIER DISTINCTION (read first): this is the ORCHESTRATOR / local-main-coder tier and is
 //! a SEPARATE, INDEPENDENT value from the MINI-coder backend
 //! (`backend::mini_coder::MiniCoderBackend`, config key `miniCoderBackend`). The mini is the
-//! SMALL delegated worker a coder spawns via `spawn_mini_coder`; the orchestrator is the
+//! SMALL delegated worker the Main coder spawns via `spawn_mini_coder`; the orchestrator is the
 //! local main coder itself. The two are DISTINCT tiers with DISTINCT models — they must
 //! NOT share a config value. (Historically the orchestrator launch wrongly reused the
 //! mini's backend; this module removes that conflation.)

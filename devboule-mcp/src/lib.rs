@@ -908,7 +908,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Coder/orchestrator: delegate a sub-task to a one-shot mini-coder hosted by the app (writes a pending directive the Tauri mini_coder_executor claims). Default wait=true blocks until terminal result (poll capped at 1800s, runs on a blocking pool); wait=false returns directiveId for steer_mini_coder / mini_coder_result. Fail-closed if the app executor is offline."
+        description = "Main coder only: delegate a sub-task to a one-shot mini-coder hosted by the app (writes a pending directive the Tauri mini_coder_executor claims). Default wait=true blocks until terminal result (poll capped at 1800s, runs on a blocking pool); wait=false returns directiveId for steer_mini_coder / mini_coder_result. Fail-closed if the app executor is offline."
     )]
     pub async fn spawn_mini_coder(
         &self,
@@ -940,7 +940,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Orchestrator only: dispatch a substantial task to the local MAIN coder (tier=main, always agentic write). Same supervision as spawn_mini_coder (wait=false + steer_mini_coder + mini_coder_result). wait=true poll is capped at 1800s and runs on a blocking pool."
+        description = "Orchestrator only: hand off a substantial task to the local MAIN coder (tier=main, always agentic write). After dispatch the orchestrator should sleep (status=done); minis are Main-coder-only. wait=true poll is capped at 1800s and runs on a blocking pool."
     )]
     pub async fn spawn_main_coder(
         &self,
@@ -969,7 +969,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Coder/orchestrator: steer a RUNNING mini you spawned (append mid-flight correction, or message 'stop' to abort via kill path). Pass directiveId from spawn_mini_coder / spawn_main_coder."
+        description = "Main coder only: steer a RUNNING mini you spawned (append mid-flight correction, or message 'stop' to abort via kill path). Pass directiveId from spawn_mini_coder."
     )]
     pub async fn steer_mini_coder(
         &self,
@@ -991,7 +991,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Coder/orchestrator: collect the outcome of a mini delegated with spawn_mini_coder(wait=false). wait=true (default) blocks until terminal (poll capped at 1800s, runs on a blocking pool); wait=false is a single non-blocking read returning the real directive status."
+        description = "Main coder only: collect the outcome of a mini delegated with spawn_mini_coder(wait=false). wait=true (default) blocks until terminal (poll capped at 1800s, runs on a blocking pool); wait=false is a single non-blocking read returning the real directive status."
     )]
     pub async fn mini_coder_result(
         &self,
@@ -1818,9 +1818,10 @@ mod tests {
             .filter_map(|t| t.as_str())
             .collect();
         assert!(tools.contains(&"spawn_main_coder"));
-        assert!(tools.contains(&"spawn_mini_coder"));
-        assert!(tools.contains(&"steer_mini_coder"));
-        assert!(tools.contains(&"mini_coder_result"));
+        // Minis are Main-coder-only; orchestrator must not hold these grants.
+        assert!(!tools.contains(&"spawn_mini_coder"));
+        assert!(!tools.contains(&"steer_mini_coder"));
+        assert!(!tools.contains(&"mini_coder_result"));
     }
 
     #[test]

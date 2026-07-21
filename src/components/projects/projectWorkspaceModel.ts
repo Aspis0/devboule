@@ -155,10 +155,15 @@ export interface RailAgentRow {
 	miniChildren: RailAgentRow[];
 }
 
-/** Whether a session is a mini-coder: a real app-hosted PTY session a coder
- *  delegated to, identified solely by a non-empty `parentAgentId`. The label-only
- *  heartbeat `AgentSubagent`s are a DIFFERENT thing (no PTY) and are not minis. */
+/** Whether a session is a mini-coder: an app-hosted PTY a Main coder delegated
+ *  to. Non-empty `parentAgentId` is the usual signal, BUT `spawn_main_coder`
+ *  also stamps parent=orch on the Main coder session (message "Main coder
+ *  running") — that is NOT a mini. Label-only heartbeat `AgentSubagent`s are a
+ *  different thing (no PTY) and are not minis. */
 export function isMiniSession(session: AgentSession): boolean {
+	const msg = (session.message ?? "").toLowerCase();
+	if (msg.includes("main coder")) return false;
+	if (session.role === "mini") return true;
 	return (
 		typeof session.parentAgentId === "string" &&
 		session.parentAgentId.trim().length > 0

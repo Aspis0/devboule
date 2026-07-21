@@ -1256,13 +1256,37 @@ fn resolve_sidecar_script(app: &AppHandle) -> Result<std::path::PathBuf, String>
     resolve_sidecar_candidates(&candidates, target)
 }
 
+/// Whether this sidecar session needs full outbound network (not just loopback).
+///
+/// Local oMLX/Ollama stay loopback-only. Cloud (OpenRouter) and any non-loopback
+/// HTTPS base URL need egress — otherwise the model can answer "I have no internet"
+/// even though OpenRouter is configured (tools/curl/web_search fail under Seatbelt).
+pub(crate) fn pi_session_needs_egress(provider: &str, base_url: Option<&str>) -> bool {
+    let p = provider.trim().to_ascii_lowercase();
+    if p == "openrouter" {
+        return true;
+    }
+    if let Some(raw) = base_url {
+        let u = raw.trim().to_ascii_lowercase();
+        if u.starts_with("https://")
+            && !u.contains("127.0.0.1")
+            && !u.contains("localhost")
+            && !u.contains("[::1]")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build the macOS Seatbelt sandbox policy for a pi sidecar session (decision #11).
 ///
 /// Confines pi's `edit`/`write`/`bash` tools to the project directory: the project
 /// root is both readable and (recursively) writable, plus temp dirs (Node scratch)
-/// and home (for pi's own config). Network is loopback-only — the Oracle MCP
-/// server, oMLX, and Pigeon are all local. rlimits bound a runaway coding agent
-/// (CPU 300s, 8GB address space, 4 procs).
+/// and home (for pi's own config). Network is loopback-only for local backends
+/// (Oracle MCP, oMLX, Pigeon); Cloud/OpenRouter sessions get full egress via
+/// [`NetPolicy::Enabled`]. rlimits bound a runaway coding agent (CPU 300s, 8GB
+/// address space, 4 procs).
 ///
 /// Security boundaries (enforced by `seatbelt::build_profile`):
 /// - `.git` writes are DENIED by a Seatbelt regex (RCE-via-planted-hooks guard)
@@ -1270,7 +1294,12 @@ fn resolve_sidecar_script(app: &AppHandle) -> Result<std::path::PathBuf, String>
 ///   `writable_paths`.
 /// - `~/.ssh`, `~/.aws`, `/etc`, and other system dirs are NOT writable (absent
 ///   from `writable_paths`) — only the project root, temp, and home are.
-fn pi_sandbox_policy(project_root: &Path, projects_dir: &Path, _management_root: &Path) -> SandboxPolicy {
+fn pi_sandbox_policy(
+    project_root: &Path,
+    projects_dir: &Path,
+    _management_root: &Path,
+    net: NetPolicy,
+) -> SandboxPolicy {
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1293,7 +1322,7 @@ fn pi_sandbox_policy(project_root: &Path, projects_dir: &Path, _management_root:
         // still a strict improvement over those paths. `.git` writes remain denied
         // by the Seatbelt regex regardless.
         .writable(projects_dir.to_path_buf())
-        .net(NetPolicy::Loopback)
+        .net(net)
         .rlimits(ResourceLimits {
             cpu_secs: 300,
             addr_space_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -1402,7 +1431,18 @@ fn spawn_pi_session_inner(
 
     // F3: pass projects_dir (writable for aspis_mcp) and management_root (readable
     // for python imports) to the sandbox policy.
-    let policy = pi_sandbox_policy(&effective_project_root, &projects_dir, &management_root);
+    // Cloud/OpenRouter needs full egress (LLM API + web tools). Local oMLX/Ollama
+    // stay loopback-only so a local session cannot call the public internet.
+    let net = if pi_session_needs_egress(
+        &env_vars.provider,
+        env_vars.base_url.as_deref(),
+    ) {
+        NetPolicy::Enabled
+    } else {
+        NetPolicy::Loopback
+    };
+    let policy =
+        pi_sandbox_policy(&effective_project_root, &projects_dir, &management_root, net);
     let script_arg = script.to_string_lossy().into_owned();
     // Audit F-04-012: never spawn bare `node` (GUI apps often lack Homebrew PATH).
     // Resolve an absolute path via the same augmented_path scan as provider_detect.
@@ -1417,7 +1457,10 @@ fn spawn_pi_session_inner(
             &[script_arg],
             &effective_project_root,
         );
-        eprintln!("[pi-sidecar] sandbox: enabled (macOS Seatbelt); node={node_s}");
+        eprintln!(
+            "[pi-sidecar] sandbox: enabled (macOS Seatbelt, net={:?}); node={node_s}",
+            policy.net
+        );
         (wrapped.program, wrapped.args)
     } else {
         eprintln!("[pi-sidecar] sandbox: disabled (non-macOS or env override); node={node_s}");
@@ -5005,6 +5048,33 @@ mod tests {
     // -- sandbox policy (decision #11) ----------------------------------------
 
     #[test]
+    fn pi_session_needs_egress_for_openrouter_and_public_https() {
+        assert!(pi_session_needs_egress("openrouter", None));
+        assert!(pi_session_needs_egress(
+            "openai",
+            Some("https://openrouter.ai/api/v1"),
+        ));
+        assert!(!pi_session_needs_egress(
+            "openai",
+            Some("http://127.0.0.1:8000/v1"),
+        ));
+        assert!(!pi_session_needs_egress(
+            "openai",
+            Some("http://localhost:11434/v1"),
+        ));
+        assert!(!pi_session_needs_egress("openai", None));
+    }
+
+    #[test]
+    fn pi_sandbox_policy_cloud_uses_enabled_net() {
+        let root = PathBuf::from("/tmp/aspis-project-root");
+        let projects = PathBuf::from("/tmp/aspis-project-root/projects");
+        let management = PathBuf::from("/tmp/devboule");
+        let policy = pi_sandbox_policy(&root, &projects, &management, NetPolicy::Enabled);
+        assert_eq!(policy.net, NetPolicy::Enabled);
+    }
+
+    #[test]
     fn pi_sandbox_policy_denies_git_write() {
         // `.git` must NOT be in the writable allowlist — writes are denied by the
         // Seatbelt regex (RCE-via-planted-hooks guard) even though the project
@@ -5012,7 +5082,7 @@ mod tests {
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
         let management = PathBuf::from("/tmp/devboule");
-        let policy = pi_sandbox_policy(&root, &projects, &management);
+        let policy = pi_sandbox_policy(&root, &projects, &management, NetPolicy::Loopback);
         assert!(
             !policy
                 .writable_paths
@@ -5029,7 +5099,7 @@ mod tests {
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
         let management = PathBuf::from("/tmp/devboule");
-        let policy = pi_sandbox_policy(&root, &projects, &management);
+        let policy = pi_sandbox_policy(&root, &projects, &management, NetPolicy::Loopback);
         assert!(
             policy.writable_paths.contains(&root),
             "project root must be in writable_paths: {:?}",
@@ -5044,7 +5114,7 @@ mod tests {
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
         let management = PathBuf::from("/tmp/devboule");
-        let policy = pi_sandbox_policy(&root, &projects, &management);
+        let policy = pi_sandbox_policy(&root, &projects, &management, NetPolicy::Loopback);
         assert!(
             policy.writable_paths.contains(&projects),
             "projects_dir must be writable: {:?}",
@@ -5058,7 +5128,7 @@ mod tests {
         let root = PathBuf::from("/tmp/aspis-project-root");
         let projects = PathBuf::from("/tmp/aspis-project-root/projects");
         let management = PathBuf::from("/tmp/devboule");
-        let policy = pi_sandbox_policy(&root, &projects, &management);
+        let policy = pi_sandbox_policy(&root, &projects, &management, NetPolicy::Loopback);
         assert_eq!(
             policy.rlimits.max_procs, 8,
             "max_procs must be 8 (was 4 before F3)"
@@ -5075,7 +5145,7 @@ mod tests {
         let explicit = PathBuf::from("/Users/user/Projects/MyApp");
         let projects = PathBuf::from("/Users/user/Projects/MyApp/projects");
         let management = PathBuf::from("/Users/user/Projects/Devboule");
-        let policy = pi_sandbox_policy(&explicit, &projects, &management);
+        let policy = pi_sandbox_policy(&explicit, &projects, &management, NetPolicy::Loopback);
         assert_eq!(
             policy.readonly_root, explicit,
             "readonly_root must be the explicit project_root"

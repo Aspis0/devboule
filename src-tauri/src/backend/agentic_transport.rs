@@ -142,15 +142,19 @@ pub fn parse_llm_turn(resp: &Value) -> Result<LlmTurn, String> {
     Ok(LlmTurn::Message(content.to_string()))
 }
 
-/// Blocking OpenAI-compatible `AgentLlm` (oMLX/Ollama loopback). `base_url` includes the
-/// `/v1` suffix (e.g. `http://127.0.0.1:8000/v1`). The blocking client is fine here: the
-/// agent loop runs on a dedicated worker, like the one-shot mini PTY path.
+/// Blocking OpenAI-compatible `AgentLlm` (oMLX/Ollama loopback **or** remote Cloud
+/// e.g. OpenRouter). `base_url` includes the `/v1` suffix. Optional `api_key` is
+/// sent as `Authorization: Bearer …` (required for public HTTPS providers; unused
+/// by local oMLX/Ollama which ignore the bearer). The blocking client is fine here:
+/// the agent loop runs on a dedicated worker, like the one-shot mini PTY path.
 pub struct HttpAgentLlm {
     pub base_url: String,
     pub model: String,
     pub tools: Value,
     pub params: SamplingParams,
     pub enable_thinking: bool,
+    /// When set, sent as Bearer on every chat/completions request (OpenRouter/cloud).
+    pub api_key: Option<String>,
     client: reqwest::blocking::Client,
 }
 
@@ -161,6 +165,17 @@ impl HttpAgentLlm {
         tools: Value,
         params: SamplingParams,
         enable_thinking: bool,
+    ) -> Result<Self, String> {
+        Self::with_api_key(base_url, model, tools, params, enable_thinking, None)
+    }
+
+    pub fn with_api_key(
+        base_url: String,
+        model: String,
+        tools: Value,
+        params: SamplingParams,
+        enable_thinking: bool,
+        api_key: Option<String>,
     ) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(600))
@@ -173,6 +188,7 @@ impl HttpAgentLlm {
             tools,
             params,
             enable_thinking,
+            api_key: api_key.filter(|k| !k.trim().is_empty()),
             client,
         })
     }
@@ -188,10 +204,11 @@ impl AgentLlm for HttpAgentLlm {
             self.enable_thinking,
         );
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(url)
-            .json(&body)
+        let mut req = self.client.post(url).json(&body);
+        if let Some(key) = self.api_key.as_deref() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .send()
             .map_err(|e| format!("agentic LLM request failed: {e}"))?
             .json::<Value>()

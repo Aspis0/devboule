@@ -4410,18 +4410,24 @@ class OrchestratorRoleTests(unittest.TestCase):
     # --- Allowlist shape (server-side gate is ROLE_ALLOWED_TOOLS) ---------------
 
     def test_orchestrator_and_coder_allowlists_differ_exactly_as_designed(self):
-        # ROLE UNTANGLE Phase 3: the orchestrator is no longer a strict subset of
-        # the coder — it holds exactly ONE tool the coder lacks (spawn_main_coder,
-        # the Main-coder dispatch: the coder CLIs write with their own tools and
-        # never need it). The coder keeps exactly the censor/visual adjudication
-        # surface the orchestrator must never hold. Pinning BOTH deltas keeps any
-        # future drift loud.
+        # Orchestrator: plan + spawn_main_coder only for implementation hand-off.
+        # Main coder: owns minis (spawn/steer/result) + censor/visual adjudication.
+        # Pinning BOTH deltas keeps any future privilege drift loud.
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         coder = ROLE_ALLOWED_TOOLS["coder"]
         self.assertEqual(sorted(orch - coder), ["spawn_main_coder"])
         self.assertEqual(
             sorted(coder - orch),
-            ["censor_dispose", "censor_findings", "visual_check"],
+            [
+                "censor_dispose",
+                "censor_findings",
+                "cloudflare_rotate_worker_secret",
+                "mini_coder_result",
+                "scaleway_resource_action",
+                "spawn_mini_coder",
+                "steer_mini_coder",
+                "visual_check",
+            ],
         )
 
     def test_orchestrator_allowlist_exact_contents(self):
@@ -4440,24 +4446,17 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_set_title",
                 "project_create_followup",
                 "project_create_plan_tasks",
-                # Owner decision (role untangle 2026-07): the orchestrator holds
-                # the full provider surface — it plans the infra, so it sees and
-                # manages it.
+                # Provider mutations (rotate / SCW action) are coder-only (F-04-020).
                 "provider_credentials_status",
                 "cloudflare_list_workers",
-                "cloudflare_rotate_worker_secret",
                 "scaleway_list_resources",
-                "scaleway_resource_action",
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
                 "get_neighborhood",
                 "find_imports",
-                "spawn_mini_coder",
-                # ROLE UNTANGLE Phase 3: the Main-coder dispatch, orchestrator-only.
+                # Main-coder dispatch only — minis are Main-coder-only.
                 "spawn_main_coder",
-                "steer_mini_coder",
-                "mini_coder_result",
                 "request_git_push",
                 "plan_submit",
                 "plan_status",
@@ -4523,23 +4522,26 @@ class OrchestratorRoleTests(unittest.TestCase):
                 )
             self.assertIn("at most 10", str(ctx.exception))
 
-    def test_orchestrator_has_no_write_or_censor_tool_but_full_provider_surface(self):
-        # It delegates ALL file writes to spawn_mini_coder and never adjudicates
-        # Censor findings — but it DOES hold the provider tools (owner decision:
-        # the planning tier manages the infra; mutations stay task-audited).
+    def test_orchestrator_has_no_write_censor_or_mini_tools(self):
+        # Plan + spawn_main_coder only for implementation. No minis, no censor
+        # adjudication, no provider mutations (rotate/SCW action are coder-only).
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         for forbidden in (
             "censor_findings",
             "censor_dispose",
             "visual_check",
+            "spawn_mini_coder",
+            "steer_mini_coder",
+            "mini_coder_result",
+            "cloudflare_rotate_worker_secret",
+            "scaleway_resource_action",
         ):
             self.assertNotIn(forbidden, orch)
         for allowed in (
             "provider_credentials_status",
             "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
             "scaleway_list_resources",
-            "scaleway_resource_action",
+            "spawn_main_coder",
         ):
             self.assertIn(allowed, orch)
 
@@ -4553,7 +4555,7 @@ class OrchestratorRoleTests(unittest.TestCase):
             for tool in (
                 "oracle_ask",
                 "oracle_context",
-                "spawn_mini_coder",
+                "spawn_main_coder",
                 "ask_user",
                 "request_git_push",
                 "project_get",
@@ -4566,12 +4568,9 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_create_followup",
                 "plan_submit",
                 "plan_status",
-                # Owner decision (role untangle 2026-07): full provider surface.
                 "provider_credentials_status",
                 "cloudflare_list_workers",
-                "cloudflare_rotate_worker_secret",
                 "scaleway_list_resources",
-                "scaleway_resource_action",
             ):
                 self.assertEqual(
                     require_registered_role(projects, "orch", "orchestrator", tool),
@@ -4590,6 +4589,11 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "censor_dispose",
                 "censor_findings",
                 "visual_check",
+                "spawn_mini_coder",
+                "steer_mini_coder",
+                "mini_coder_result",
+                "cloudflare_rotate_worker_secret",
+                "scaleway_resource_action",
             ):
                 with self.assertRaises(McpError, msg=tool):
                     require_registered_role(projects, "orch", "orchestrator", tool)
@@ -8659,6 +8663,10 @@ class SpawnMiniCoderTests(unittest.TestCase):
         self.assertIn("spawn_mini_coder", coder["allowedTools"])
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("spawn_mini_coder", verifier["allowedTools"])
+        orch = next(r for r in ROLE_RULES if r["role"] == "orchestrator")
+        self.assertNotIn("spawn_mini_coder", orch["allowedTools"])
+        self.assertNotIn("steer_mini_coder", orch["allowedTools"])
+        self.assertNotIn("mini_coder_result", orch["allowedTools"])
 
     def test_coder_role_rules_carry_aborted_by_human_escalation(self):
         # MC-P5: the coder's forbidden list must carry the aborted_by_human escalation
@@ -11409,29 +11417,28 @@ class SpawnMainCoderTests(unittest.TestCase):
     def test_spawn_main_coder_does_not_require_the_callers_role_to_also_hold_spawn_mini_coder(
         self,
     ):
-        # F-F hardening (double-auth coupling): dispatch_spawn_main_coder used to
-        # reuse dispatch_spawn_mini_coder's OWN internal re-authentication, which
-        # ALSO required the caller's role to separately hold "spawn_mini_coder" —
-        # true today only because the orchestrator role happens to hold BOTH
-        # grants. Strip "spawn_mini_coder" from the orchestrator's allowed tools
-        # (keeping only "spawn_main_coder") and prove spawn_main_coder still
-        # succeeds end-to-end — the two grants must be independent.
+        # F-F hardening (double-auth coupling): dispatch_spawn_main_coder must not
+        # require the caller's role to also hold "spawn_mini_coder". Orchestrator
+        # holds spawn_main_coder only (minis are Main-coder-only); prove
+        # spawn_main_coder succeeds end-to-end without the mini grant.
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
             token = self._register(root, "orchestrator", "orch")
-            with patch.dict(ROLE_ALLOWED_TOOLS, {"orchestrator": {"spawn_main_coder"}}):
-                out = handle_tool_call(
-                    "spawn_main_coder",
-                    {
-                        "agent_id": "orch",
-                        "role": "orchestrator",
-                        "task": "implement the feature end-to-end",
-                        "files": ["src/a.rs"],
-                        "wait": False,
-                        "session_token": token,
-                    },
-                    root=root,
-                )
+            self.assertNotIn(
+                "spawn_mini_coder", ROLE_ALLOWED_TOOLS["orchestrator"]
+            )
+            out = handle_tool_call(
+                "spawn_main_coder",
+                {
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "task": "implement the feature end-to-end",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
             self.assertIn("directiveId", out)
             self.assertEqual(out["status"], "running")
             d = self._read_state(root)["miniCoderDirectives"][0]
@@ -11910,12 +11917,12 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             self.assertIn("result", out)
             self.assertNotIn("status", out)
 
-    def test_result_is_coder_and_orchestrator_only(self):
+    def test_result_is_main_coder_only(self):
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         orch = next(r for r in ROLE_RULES if r["role"] == "orchestrator")
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertIn("mini_coder_result", coder["allowedTools"])
-        self.assertIn("mini_coder_result", orch["allowedTools"])
+        self.assertNotIn("mini_coder_result", orch["allowedTools"])
         self.assertNotIn("mini_coder_result", verifier["allowedTools"])
 
     def test_result_verifier_rejected_at_dispatch(self):

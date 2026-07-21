@@ -103,6 +103,10 @@ class RoleAllowedToolsDerivationTests(unittest.TestCase):
     def test_role_allowed_tools_derives_correctly(self):
         self.assertIn("spawn_main_coder", aspis_mcp.ROLE_ALLOWED_TOOLS["orchestrator"])
         self.assertNotIn("spawn_main_coder", aspis_mcp.ROLE_ALLOWED_TOOLS["coder"])
+        # Mini supervision is Main-coder-only (Work console); orch must not hold it.
+        for mini_tool in ("spawn_mini_coder", "steer_mini_coder", "mini_coder_result"):
+            self.assertNotIn(mini_tool, aspis_mcp.ROLE_ALLOWED_TOOLS["orchestrator"])
+            self.assertIn(mini_tool, aspis_mcp.ROLE_ALLOWED_TOOLS["coder"])
         self.assertIn("censor_findings", aspis_mcp.ROLE_ALLOWED_TOOLS["coder"])
         self.assertIn("censor_findings", aspis_mcp.ROLE_ALLOWED_TOOLS["verifier"])
         self.assertNotIn("censor_findings", aspis_mcp.ROLE_ALLOWED_TOOLS["orchestrator"])
@@ -173,8 +177,8 @@ class AllowedToolsOrderPinTests(unittest.TestCase):
             "scaleway_list_resources",
             "oracle_ask", "oracle_context", "project_structure",
             "get_neighborhood", "find_imports",
-            "spawn_mini_coder", "spawn_main_coder", "steer_mini_coder",
-            "mini_coder_result", "request_git_push", "plan_submit",
+            # Mini tools are Main-coder-only; orchestrator only spawn_main_coder.
+            "spawn_main_coder", "request_git_push", "plan_submit",
             "plan_status", "ask_user", "design_request",
         ],
         "verifier": [

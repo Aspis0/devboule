@@ -32,8 +32,8 @@ from rig.world import make_projects_dir, forge_agent_launch  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ID = "test-proj"
 AGENT_ID = "rig-spawn-agent"
-# "coder" holds spawn_mini_coder; "orchestrator" holds BOTH spawn_mini_coder
-# AND spawn_main_coder (role_rules.json:80-141).
+# "coder" holds spawn_mini_coder; "orchestrator" holds spawn_main_coder only
+# (minis are Main-coder-only — role_rules.json).
 AGENT_ROLE = "coder"
 
 

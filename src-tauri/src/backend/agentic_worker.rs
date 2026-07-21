@@ -268,6 +268,8 @@ pub(crate) fn spawn_agentic_worker(
     // Broker Slice 2: effective working set (persisted + transient, already resolved by
     // `claim_and_launch`).  Passed through to `run_agentic_coder` → `ScopedAgentTools`.
     working_set: Vec<std::path::PathBuf>,
+    /// Bearer token for Cloud/OpenRouter. None for local backends.
+    api_key: Option<String>,
 ) -> Result<(), String> {
     let state = app
         .try_state::<MiniCoderState>()
@@ -352,6 +354,7 @@ pub(crate) fn spawn_agentic_worker(
                 working_set,
                 max_rounds,
                 &cancel,
+                api_key,
             ) {
                 Ok((outcome, touched, net_blocked, out_of_scope_write)) => {
                     crate::backend::agentic_runner::agentic_result_json(

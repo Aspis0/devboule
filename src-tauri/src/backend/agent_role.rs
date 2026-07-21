@@ -5,11 +5,12 @@
 //! `CODER_LIKE_ROLES`) — the MCP server is the gate that actually enforces per-role
 //! tool grants, so this module follows it, never the other way around:
 //!
-//! - `orchestrator` — plans + delegates; NEVER writes (no write/mutation tool; every
-//!   code change goes through `spawn_mini_coder`). Locally this is the Devboule
-//!   binary (`client == "orchestrator"`).
-//! - `coder` — the MAIN CODER (UI display name "Main coder"): the primary writer.
-//!   Externally a claude/codex CLI writing with its own native tools.
+//! - `orchestrator` — plans + hands off; NEVER writes (no write/mutation tool; every
+//!   code change goes through `spawn_main_coder`). Never owns minis — minis are
+//!   Main-coder-only. Locally this is the Devboule binary (`client == "orchestrator"`).
+//! - `coder` — the MAIN CODER (UI display name "Main coder"): the primary writer;
+//!   alone may `spawn_mini_coder`. Externally a claude/codex CLI writing with its
+//!   own native tools.
 //! - `verifier` — review-only; the ONLY role that sets Kanban `done`.
 //! - `mini` — the delegated sub-task worker (a directive, not a launched client).
 //!

@@ -2173,10 +2173,9 @@ mod tests {
             .allowed_tools
             .iter()
             .any(|tool| tool == "project_create_followup"));
-        // The orchestrator is the frontier PLANNING tier: full provider surface
-        // (owner decision — it plans the infra, so it manages it), delegation
-        // tools, but it NEVER writes files and holds NO censor tools (Censor runs
-        // on the minis it delegates to).
+        // The orchestrator is the frontier PLANNING tier: read/list provider
+        // surface, plan tools, and spawn_main_coder only. It NEVER writes files,
+        // NEVER holds mini tools (Main coder owns minis), and holds NO censor tools.
         let orchestrator = rules
             .iter()
             .find(|rule| rule.role == "orchestrator")
@@ -2184,11 +2183,16 @@ mod tests {
         assert!(orchestrator
             .allowed_tools
             .iter()
-            .any(|tool| tool == "cloudflare_rotate_worker_secret"));
+            .any(|tool| tool == "cloudflare_list_workers"));
         assert!(orchestrator
             .allowed_tools
             .iter()
-            .any(|tool| tool == "scaleway_resource_action"));
+            .any(|tool| tool == "scaleway_list_resources"));
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .all(|tool| tool != "cloudflare_rotate_worker_secret"
+                && tool != "scaleway_resource_action"));
         assert!(orchestrator
             .allowed_tools
             .iter()
@@ -2196,30 +2200,46 @@ mod tests {
         assert!(orchestrator
             .allowed_tools
             .iter()
-            .any(|tool| tool == "spawn_mini_coder"));
+            .all(|tool| tool != "spawn_mini_coder"
+                && tool != "steer_mini_coder"
+                && tool != "mini_coder_result"));
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == "spawn_main_coder"));
         assert!(orchestrator
             .forbidden
             .iter()
             .any(|item| item.to_ascii_lowercase().contains("never writes")));
-        // ROLE UNTANGLE Phase 3: the orchestrator/coder allowlists differ by
-        // EXACTLY two pinned deltas (mirrors the Python test) — the orchestrator
-        // alone holds the Main-coder dispatch; the coder alone holds the
-        // censor/visual adjudication surface. No file-write tool exists on either
-        // side; writes never flow through MCP.
+        // Orchestrator alone holds spawn_main_coder. Main coder alone holds minis
+        // + censor/visual + provider mutations. No file-write tool on either side.
         let orch_only: Vec<&String> = orchestrator
             .allowed_tools
             .iter()
             .filter(|tool| !coder.allowed_tools.contains(*tool))
             .collect();
         assert_eq!(orch_only, vec!["spawn_main_coder"]);
-        let coder_only: Vec<&String> = coder
+        let mut coder_only: Vec<&String> = coder
             .allowed_tools
             .iter()
             .filter(|tool| !orchestrator.allowed_tools.contains(*tool))
             .collect();
+        coder_only.sort();
         assert_eq!(
-            coder_only,
-            vec!["censor_findings", "censor_dispose", "visual_check"]
+            coder_only
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "censor_dispose",
+                "censor_findings",
+                "cloudflare_rotate_worker_secret",
+                "mini_coder_result",
+                "scaleway_resource_action",
+                "spawn_mini_coder",
+                "steer_mini_coder",
+                "visual_check",
+            ]
         );
         assert!(rules
             .iter()

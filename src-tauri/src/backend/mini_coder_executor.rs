@@ -1351,20 +1351,13 @@ pub(crate) fn mini_model_sampling(
 // role-untangle Phase 2 pure move. Re-imported below so call sites are unchanged.)
 use super::agentic_worker::{should_run_agentic, spawn_agentic_worker};
 
-/// B2 (BLOCKER) pure gate: returns Ok(()) if `kind` can be dispatched by the
-/// directive executor, Err(reason) for kinds that must be routed elsewhere.
-/// Cloud is excluded — it is sidecar-capable only (pi engine); the agentic
-/// transport has no auth-header support, so a Cloud backend would silently
-/// 401-loop until timeout.
+/// Pure gate: returns Ok(()) if `kind` can be dispatched by the directive
+/// executor. Cloud is supported via the agentic HTTP loop + vault Bearer key
+/// (OpenRouter); one-shot PTY still rejects Cloud in mini_command_build.
 pub(crate) fn backend_supports_directive_dispatch(
     kind: MiniCoderBackendKind,
 ) -> Result<(), &'static str> {
-    if kind == MiniCoderBackendKind::Cloud {
-        return Err(
-            "cloud backend runs via the pi engine; the directive executor does not \
-             support it yet",
-        );
-    }
+    let _ = kind;
     Ok(())
 }
 
@@ -1506,22 +1499,32 @@ fn claim_and_launch(
             return;
         }
     };
-    // B2 (BLOCKER): gate Cloud OUT of the directive executor entirely.
-    // Cloud is sidecar-capable (pi_engine) but the agentic_transport::HttpAgentLlm
-    // has NO auth-header support; a Cloud backend with base_url would enter
-    // run_agentic_coder and POST to the remote provider with no Authorization →
-    // silent 401 loop until timeout. The one-shot path also rejects Cloud (see
-    // mini_command_build.rs Cloud arms). Fail fast with the same hard error,
-    // BEFORE any spawn.
-    if backend.kind == MiniCoderBackendKind::Cloud {
-        fail_launching(
-            app,
-            &directive_id,
-            "cloud backend runs via the pi engine; the directive executor does not \
-             support it yet",
-        );
-        return;
-    }
+    // Cloud (OpenRouter): agentic HTTP path with Bearer from the shared vault.
+    // Previously hard-failed ("pi engine only") even though agentic_transport now
+    // supports Authorization — that blocked mini on OpenRouter while orch worked.
+    let cloud_api_key: Option<String> = if backend.kind == MiniCoderBackendKind::Cloud {
+        match super::vault::read_cloud_llm_key() {
+            Ok(Some(k)) if !k.trim().is_empty() => Some(k),
+            Ok(_) => {
+                fail_launching(
+                    app,
+                    &directive_id,
+                    "cloud mini requires a saved Cloud API key (Settings → Roles → Cloud API key Save)",
+                );
+                return;
+            }
+            Err(e) => {
+                fail_launching(
+                    app,
+                    &directive_id,
+                    &format!("cloud mini could not read Cloud API key vault: {e}"),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let backend_kind_label = backend_client_label(&backend);
 
     // Resolve the MCP wiring (management root + projects dir) for the codex
@@ -1625,7 +1628,24 @@ fn claim_and_launch(
     // separate calls each re-read config.json, and a concurrent Safe flip between
     // them could pass the guard yet take the one-shot branch — the exact downgrade
     // the guard exists to prevent (hostile-review finding).
-    let run_agentic = should_run_agentic(app, &backend, directive);
+    // Cloud has no one-shot PTY path — always use the agentic HTTP loop when write+url.
+    let run_agentic = if backend.kind == MiniCoderBackendKind::Cloud {
+        directive.write
+            && backend
+                .base_url
+                .as_deref()
+                .is_some_and(|u| !u.trim().is_empty())
+    } else {
+        should_run_agentic(app, &backend, directive)
+    };
+    if backend.kind == MiniCoderBackendKind::Cloud && !run_agentic {
+        fail_launching(
+            app,
+            &directive_id,
+            "cloud mini requires write:true and a non-empty baseUrl (OpenRouter HTTPS)",
+        );
+        return;
+    }
     if directive.tier == mini_coder::DirectiveTier::Main && !run_agentic {
         fail_launching(
             app,
@@ -1676,11 +1696,14 @@ fn claim_and_launch(
         };
 
         // Net is enabled iff the pure resolver says so (pins the invariant table).
-        let net_enabled = crate::backend::broker::resolve_net_enabled(
-            persistent_net,
-            transient_net,
-            sandbox_mode,
-        );
+        // Cloud/OpenRouter always needs full egress (LLM API + tools), independent of
+        // the project net-toggle (otherwise mini says "no internet" with a valid key).
+        let net_enabled = backend.kind == MiniCoderBackendKind::Cloud
+            || crate::backend::broker::resolve_net_enabled(
+                persistent_net,
+                transient_net,
+                sandbox_mode,
+            );
         let agentic_net = if net_enabled {
             crate::backend::sandbox::NetPolicy::Enabled
         } else {
@@ -1714,6 +1737,7 @@ fn claim_and_launch(
             directive,
             agentic_net,
             working_set_paths,
+            cloud_api_key.clone(),
         );
         // Re-insert the transient grants atomically (single lock) ONLY in non-Unattended mode
         // if the spawn itself failed: the worker never launched, so the user never saw a

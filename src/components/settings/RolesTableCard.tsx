@@ -641,6 +641,7 @@ function LocalBackendFields(props: {
 	// Hoisted cloud key status.
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshCloudKey?: () => Promise<void>;
+	consentHighlight?: boolean;
 }) {
 	const {
 		idPrefix,
@@ -652,6 +653,7 @@ function LocalBackendFields(props: {
 		onKindPicked,
 		cloudKeyStatus,
 		onRefreshCloudKey,
+		consentHighlight,
 	} = props;
 	const validation = useMemo(
 		() =>
@@ -765,6 +767,7 @@ function LocalBackendFields(props: {
 					onConsentChange={onCloudConsentChange}
 					cloudKeyStatus={cloudKeyStatus}
 					onRefreshKey={onRefreshCloudKey}
+					consentHighlight={consentHighlight}
 				/>
 			) : null}
 
@@ -793,6 +796,7 @@ function LocalCloudKeyFields({
 	hideConsent,
 	cloudKeyStatus,
 	onRefreshKey,
+	consentHighlight,
 }: {
 	onConsentChange?: (consented: boolean) => void;
 	helperText?: string;
@@ -800,18 +804,24 @@ function LocalCloudKeyFields({
 	// M5: hoisted from inside this component to RolesTableCard — one fetch shared by all instances.
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshKey?: () => Promise<void>;
+	/** When true, ring the consent checkbox (top Save blocked without ack). */
+	consentHighlight?: boolean;
 }) {
 	const [cloudKeyDraft, setCloudKeyDraft] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [justSaved, setJustSaved] = useState(false);
 	const [cloudConsentAck, setCloudConsentAck] = useState(false);
 	const inflightRef = useRef(false);
 	const mountedRef = useRef(true);
+	const savedFlashRef = useRef<number | null>(null);
 
 	useEffect(() => {
 		mountedRef.current = true;
 		return () => {
 			mountedRef.current = false;
+			if (savedFlashRef.current !== null)
+				window.clearTimeout(savedFlashRef.current);
 		};
 	}, []);
 
@@ -821,28 +831,44 @@ function LocalCloudKeyFields({
 
 	const hasKey = cloudKeyStatus?.configured === true;
 
+	const errorMessage = (e: unknown, fallback: string) =>
+		typeof e === "string" && e.trim()
+			? e
+			: e instanceof Error
+				? e.message
+				: fallback;
+
 	const saveCloudKey = useCallback(async () => {
 		const key = cloudKeyDraft.trim();
 		if (!key || inflightRef.current) return;
 		inflightRef.current = true;
 		setBusy(true);
 		setError(null);
+		setJustSaved(false);
 		try {
 			const next = await invokeBackendCommand<AuxCredentialStatus>(
 				"save_cloud_llm_key",
 				{ key },
 			);
 			if (!mountedRef.current) return;
-			setCloudKeyDraft("");
-			if (!next.configured)
+			// ONLY clear the paste field after a confirmed vault write. Clearing on
+			// configured:false looked like "Save deleted my key" when validation rejected.
+			if (next.configured) {
+				setCloudKeyDraft("");
+				setJustSaved(true);
+				if (savedFlashRef.current !== null)
+					window.clearTimeout(savedFlashRef.current);
+				savedFlashRef.current = window.setTimeout(() => {
+					if (mountedRef.current) setJustSaved(false);
+				}, 2500);
+			} else {
 				setError(next.message ?? "The Cloud API key was not accepted.");
+			}
 			// M5: re-fetch shared status instead of updating local state.
 			await onRefreshKey?.();
 		} catch (e) {
 			if (mountedRef.current)
-				setError(
-					e instanceof Error ? e.message : "Saving the Cloud API key failed.",
-				);
+				setError(errorMessage(e, "Saving the Cloud API key failed."));
 		} finally {
 			inflightRef.current = false;
 			if (mountedRef.current) setBusy(false);
@@ -854,6 +880,7 @@ function LocalCloudKeyFields({
 		inflightRef.current = true;
 		setBusy(true);
 		setError(null);
+		setJustSaved(false);
 		try {
 			await invokeBackendCommand<AuxCredentialStatus>("delete_cloud_llm_key");
 			if (mountedRef.current) {
@@ -863,9 +890,7 @@ function LocalCloudKeyFields({
 			await onRefreshKey?.();
 		} catch (e) {
 			if (mountedRef.current)
-				setError(
-					e instanceof Error ? e.message : "Removing the Cloud API key failed.",
-				);
+				setError(errorMessage(e, "Removing the Cloud API key failed."));
 		} finally {
 			inflightRef.current = false;
 			if (mountedRef.current) setBusy(false);
@@ -890,7 +915,7 @@ function LocalCloudKeyFields({
 						}}
 						placeholder={
 							hasKey
-								? "Paste a new key to rotate"
+								? "Paste a new key to replace the saved one"
 								: "Paste your provider API key"
 						}
 						autoComplete="off"
@@ -904,7 +929,7 @@ function LocalCloudKeyFields({
 						className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
 					>
 						<CheckCircle2 className="h-3.5 w-3.5" />
-						{hasKey ? "Rotate key" : "Save key"}
+						Save
 					</button>
 					{hasKey ? (
 						<button
@@ -914,14 +939,22 @@ function LocalCloudKeyFields({
 							className="inline-flex items-center justify-center gap-1 rounded-md border border-cream-200 bg-white px-3 py-2 text-[11px] font-semibold normal-case tracking-normal text-cream-500 hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
 						>
 							<Trash2 className="h-3.5 w-3.5" />
-							Clear key
+							Clear
 						</button>
 					) : null}
 				</div>
-				<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
-					{hasKey
-						? "A key is saved (hidden). Required for Cloud mode."
-						: "No key saved — Cloud mode needs a key before the orchestrator can run."}
+				<span
+					className={`mt-1 block text-[11px] normal-case tracking-normal ${
+						justSaved || hasKey
+							? "font-semibold text-sage-dark"
+							: "text-cream-400"
+					}`}
+				>
+					{justSaved
+						? "Key saved in the OS vault (field cleared on purpose — the secret is not shown again)."
+						: hasKey
+							? "A key is already saved (hidden). Paste a new one + Save to replace it."
+							: "No key saved — paste a key and click Save next to this field."}
 				</span>
 			</label>
 			<p className="flex items-start gap-2 rounded-2xl border border-coral/40 bg-coral/[0.07] px-3 py-2 text-[11px] leading-4 text-coral-dark">
@@ -934,7 +967,13 @@ function LocalCloudKeyFields({
 				</span>
 			</p>
 			{!hideConsent && (
-				<label className="flex items-start gap-2 text-[11px] leading-4 normal-case tracking-normal text-cream-700">
+				<label
+					className={`flex items-start gap-2 rounded-xl px-2 py-1.5 text-[11px] leading-4 normal-case tracking-normal text-cream-700 ${
+						consentHighlight
+							? "border border-coral/50 bg-coral/[0.08] text-coral-dark"
+							: ""
+					}`}
+				>
 					<input
 						type="checkbox"
 						data-testid="cloud-consent-ack"
@@ -1009,6 +1048,7 @@ function CloudApiFields(props: {
 	// M5: hoisted cloud key status.
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshCloudKey?: () => Promise<void>;
+	consentHighlight?: boolean;
 }) {
 	const {
 		idPrefix,
@@ -1018,6 +1058,7 @@ function CloudApiFields(props: {
 		hideConsent,
 		cloudKeyStatus,
 		onRefreshCloudKey,
+		consentHighlight,
 	} = props;
 	const set = (patch: Partial<BackendDraft>) =>
 		onChange({ ...draft, ...patch });
@@ -1057,6 +1098,7 @@ function CloudApiFields(props: {
 				helperText="One key shared by every role's Cloud API placement (the same key the orchestrator editor manages)."
 				cloudKeyStatus={cloudKeyStatus}
 				onRefreshKey={onRefreshCloudKey}
+				consentHighlight={consentHighlight}
 			/>
 			{firstError ? (
 				<p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
@@ -1114,6 +1156,11 @@ export function RolesTableCard() {
 	const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
 	const [busyRole, setBusyRole] = useState<RoleKey | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	// Per-row error so a failed Orchestrator Save is visible next to that Save
+	// button (global error alone sat under Mini/Verifier and looked like "nothing happened").
+	const [roleError, setRoleError] = useState<Partial<Record<RoleKey, string>>>(
+		{},
+	);
 	const [savedRole, setSavedRole] = useState<RoleKey | null>(null);
 	const mountedRef = useRef(true);
 	const savedTimerRef = useRef<number | null>(null);
@@ -1323,6 +1370,11 @@ export function RolesTableCard() {
 		async (role: RoleKey) => {
 			setBusyRole(role);
 			setError(null);
+			setRoleError((prev) => {
+				const next = { ...prev };
+				delete next[role];
+				return next;
+			});
 			try {
 				if (role === "orchestrator") {
 					const client =
@@ -1337,7 +1389,12 @@ export function RolesTableCard() {
 					if (placement === "Cloud API") {
 						if (!orchestratorCloudConsent) {
 							throw new Error(
-								"Please acknowledge the Cloud consent checkbox before saving.",
+								"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
+							);
+						}
+						if (cloudKeyStatus?.configured !== true) {
+							throw new Error(
+								"Cloud API key is not saved yet. Paste the key and click Save next to the key field — the top Save only stores model + base URL.",
 							);
 						}
 						await saveLocalCoderBackend(orchestratorDraft);
@@ -1357,7 +1414,12 @@ export function RolesTableCard() {
 					if (placement === "Cloud API") {
 						if (!coderCloudConsent) {
 							throw new Error(
-								"Please acknowledge the Cloud consent checkbox before saving.",
+								"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
+							);
+						}
+						if (cloudKeyStatus?.configured !== true) {
+							throw new Error(
+								"Cloud API key is not saved yet. Paste the key and click Save next to the key field.",
 							);
 						}
 						await saveMiniBackend("set_main_coder_backend_cmd", mainDraft);
@@ -1404,7 +1466,12 @@ export function RolesTableCard() {
 						if (placement === "Cloud API") {
 							if (!verifierCloudConsent) {
 								throw new Error(
-									"Please acknowledge the Cloud consent checkbox before saving.",
+									"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
+								);
+							}
+							if (cloudKeyStatus?.configured !== true) {
+								throw new Error(
+									"Cloud API key is not saved yet. Paste the key and click Save next to the key field.",
 								);
 							}
 							await saveMiniBackend("set_verifier_backend_cmd", verifierDraft);
@@ -1421,8 +1488,16 @@ export function RolesTableCard() {
 				await refreshConfig();
 				if (mountedRef.current) flashSaved(role);
 			} catch (e) {
-				if (mountedRef.current)
-					setError(e instanceof Error ? e.message : "Could not save the role.");
+				const msg =
+					typeof e === "string" && e.trim()
+						? e
+						: e instanceof Error
+							? e.message
+							: "Could not save the role.";
+				if (mountedRef.current) {
+					setError(msg);
+					setRoleError((prev) => ({ ...prev, [role]: msg }));
+				}
 			} finally {
 				if (mountedRef.current) setBusyRole(null);
 			}
@@ -1437,6 +1512,7 @@ export function RolesTableCard() {
 			orchestratorCloudConsent,
 			coderCloudConsent,
 			verifierCloudConsent,
+			cloudKeyStatus,
 			verifierSameAsMain,
 			stagedPlacement,
 			saveClients,
@@ -1581,7 +1657,15 @@ export function RolesTableCard() {
 							onChange={setOrchestratorDraft}
 							statusMap={statusMap}
 							kinds={ORCHESTRATOR_LOCAL_KINDS}
-							onCloudConsentChange={setOrchestratorCloudConsent}
+							onCloudConsentChange={(ok) => {
+								setOrchestratorCloudConsent(ok);
+								if (ok)
+									setRoleError((prev) => {
+										const n = { ...prev };
+										delete n.orchestrator;
+										return n;
+									});
+							}}
 							onKindPicked={() => {
 								setStagedPlacement((prev) => {
 									const n = { ...prev };
@@ -1591,6 +1675,9 @@ export function RolesTableCard() {
 							}}
 							cloudKeyStatus={cloudKeyStatus}
 							onRefreshCloudKey={refreshCloudKeyStatus}
+							consentHighlight={Boolean(
+								roleError.orchestrator?.toLowerCase().includes("consent"),
+							)}
 						/>
 					) : (
 						<MiniBackendFields
@@ -1615,7 +1702,15 @@ export function RolesTableCard() {
 							onChange={setOrchestratorDraft}
 							statusMap={statusMap}
 							kinds={CLOUD_API_KIND}
-							onCloudConsentChange={setOrchestratorCloudConsent}
+							onCloudConsentChange={(ok) => {
+								setOrchestratorCloudConsent(ok);
+								if (ok)
+									setRoleError((prev) => {
+										const n = { ...prev };
+										delete n.orchestrator;
+										return n;
+									});
+							}}
 							onKindPicked={() => {
 								setStagedPlacement((prev) => {
 									const n = { ...prev };
@@ -1625,6 +1720,9 @@ export function RolesTableCard() {
 							}}
 							cloudKeyStatus={cloudKeyStatus}
 							onRefreshCloudKey={refreshCloudKeyStatus}
+							consentHighlight={Boolean(
+								roleError.orchestrator?.toLowerCase().includes("consent"),
+							)}
 						/>
 					) : (
 						// Coder / Verifier Cloud API: the shared MiniCoderBackend-shaped cloud editor
@@ -1633,13 +1731,21 @@ export function RolesTableCard() {
 							idPrefix={`roles-${role}`}
 							draft={draft}
 							onChange={setDraft}
-							onConsentChange={
-								role === "coder"
-									? setCoderCloudConsent
-									: setVerifierCloudConsent
-							}
+							onConsentChange={(ok) => {
+								if (role === "coder") setCoderCloudConsent(ok);
+								else setVerifierCloudConsent(ok);
+								if (ok)
+									setRoleError((prev) => {
+										const n = { ...prev };
+										delete n[role];
+										return n;
+									});
+							}}
 							cloudKeyStatus={cloudKeyStatus}
 							onRefreshCloudKey={refreshCloudKeyStatus}
+							consentHighlight={Boolean(
+								roleError[role]?.toLowerCase().includes("consent"),
+							)}
 						/>
 					)
 				) : (
@@ -1881,6 +1987,15 @@ export function RolesTableCard() {
 									{savedRole === meta.key ? "Saved" : busy ? "Saving…" : "Save"}
 								</button>
 							</div>
+							{roleError[meta.key] ? (
+								<p
+									data-testid={`role-save-error-${meta.key}`}
+									className="mt-2 flex items-start gap-2 rounded-2xl border border-coral/40 bg-coral/[0.08] px-3 py-2 text-[12px] leading-4 text-coral-dark"
+								>
+									<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+									<span>{roleError[meta.key]}</span>
+								</p>
+							) : null}
 							<p className="mt-1 flex items-start gap-1.5 text-[11px] leading-4 text-cream-400">
 								{meta.safety}
 							</p>
@@ -1914,17 +2029,20 @@ export function RolesTableCard() {
 							) : (
 								renderPlacement(meta.key, draft, setDraft)
 							)}
+							{/* Repeat near consent / fields so the warning is not only next to Save. */}
+							{roleError[meta.key] ? (
+								<p
+									data-testid={`role-save-error-footer-${meta.key}`}
+									className="mt-3 flex items-start gap-2 rounded-2xl border border-coral/40 bg-coral/[0.08] px-3 py-2 text-[12px] leading-4 text-coral-dark"
+								>
+									<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+									<span>{roleError[meta.key]}</span>
+								</p>
+							) : null}
 						</div>
 					);
 				})}
 			</div>
-
-			{error && (
-				<p className="mt-3 flex items-start gap-2 rounded-2xl border border-coral/30 bg-coral/[0.05] px-3 py-2 text-[11px] leading-4 text-coral-dark">
-					<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-					<span>{error}</span>
-				</p>
-			)}
 		</section>
 	);
 }

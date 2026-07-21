@@ -31,6 +31,19 @@ export interface WorkConsoleModel {
 
 const TERMINAL_STATUSES = new Set(["idle","done","exited","stopped","error","completed"]);
 
+/** True when the session is the Main-coder hand-off from spawn_main_coder
+ *  (role coder, optional parentAgentId=orch, message stamped by the executor). */
+function isMainCoderSession(session: AgentSession): boolean {
+  const msg = (session.message ?? "").toLowerCase();
+  if (msg.includes("main coder")) return true;
+  // Explicit role without parent is a top-level Main coder (cloud CLI / local).
+  if (session.role === "coder") {
+    const parent = (session.parentAgentId ?? "").trim();
+    if (!parent) return true;
+  }
+  return false;
+}
+
 function deriveDistrict(file: string | null): string {
   if (!file) return "unplaced";
   const normalized = file.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -96,7 +109,11 @@ export function buildWorkConsoleModel({
       type = "orchestrator";
     } else if (session.role === "censor" || session.client === "censor") {
       type = "censor";
-    } else if (session.parentAgentId) {
+    } else if (isMainCoderSession(session)) {
+      // spawn_main_coder stamps role=coder + parentAgentId=orch + "Main coder running".
+      // Must not be nested as a mini under the orchestrator.
+      type = "coder";
+    } else if (session.role === "mini" || session.parentAgentId) {
       type = "mini";
     } else {
       type = "coder";
