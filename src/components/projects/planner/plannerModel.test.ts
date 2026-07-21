@@ -182,6 +182,78 @@ describe("chatMessagesWithMilestones", () => {
       { role: "milestone", text: "Planning: 3 files" },
     ]);
   });
+
+  it("keeps short consecutive milestone runs fully expanded (≤4)", () => {
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "🔧 Calling `a`", time: "1" },
+      { type: "coder", text: "✅ `a` → ok", time: "2" },
+      { type: "coder", text: "🔧 Calling `b`", time: "3" },
+      { type: "coder", text: "✅ `b` → ok", time: "4" },
+    ];
+    const msgs = chatMessagesWithMilestones(entries);
+    expect(msgs).toHaveLength(4);
+    expect(msgs.every((m) => m.role === "milestone")).toBe(true);
+    expect(msgs.some((m) => m.text.startsWith("…"))).toBe(false);
+  });
+
+  it("compresses long tool-call spam: summary + last 3 milestones", () => {
+    // Live OpenRouter smoke flooded the chat with 15+ MCP call/result rows.
+    const tools = [
+      "agent_register",
+      "provider_credentials_status",
+      "project_get",
+      "oracle_context",
+      "project_next_task",
+      "project_claim_task",
+      "agent_heartbeat",
+      "spawn_mini_coder",
+    ];
+    const entries: ConsoleEntry[] = [];
+    for (const t of tools) {
+      entries.push({
+        type: "coder",
+        text: `🔧 Calling \`mcp_devboule_${t}\``,
+        time: String(entries.length),
+      });
+      entries.push({
+        type: "coder",
+        text: `✅ \`mcp_devboule_${t}\` → ok`,
+        time: String(entries.length),
+      });
+    }
+    // 16 milestones → 1 summary + last 3 = 4 rows
+    const msgs = chatMessagesWithMilestones(entries);
+    expect(msgs).toHaveLength(4);
+    expect(msgs[0].role).toBe("milestone");
+    expect(msgs[0].text).toMatch(/^… 13 earlier tool steps/);
+    expect(msgs[0].text).toContain("agent_register");
+    expect(msgs[0].title).toContain("agent_register");
+    expect(msgs.slice(1).map((m) => m.text)).toEqual([
+      "✅ `mcp_devboule_agent_heartbeat` → ok",
+      "🔧 Calling `mcp_devboule_spawn_mini_coder`",
+      "✅ `mcp_devboule_spawn_mini_coder` → ok",
+    ]);
+  });
+
+  it("does not compress across chat bubbles (only consecutive runs)", () => {
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "🔧 Calling `a`", time: "1" },
+      { type: "coder", text: "✅ `a`", time: "2" },
+      { type: "coder", text: "🔧 Calling `b`", time: "3" },
+      { type: "coder", text: "✅ `b`", time: "4" },
+      { type: "coder", text: "🔧 Calling `c`", time: "5" },
+      { type: "chat", role: "assistant", text: "mid reply", time: "6" },
+      { type: "coder", text: "🔧 Calling `d`", time: "7" },
+      { type: "coder", text: "✅ `d`", time: "8" },
+    ];
+    // First run is 5 (>4) → summary + 3; chat; last run is 2 → keep.
+    const msgs = chatMessagesWithMilestones(entries);
+    expect(msgs[0].text).toMatch(/^… 2 earlier tool steps/);
+    expect(msgs.some((m) => m.role === "assistant" && m.text === "mid reply")).toBe(
+      true,
+    );
+    expect(msgs.filter((m) => m.role === "milestone").length).toBe(1 + 3 + 2);
+  });
 });
 
 describe("pickProjectDesign", () => {

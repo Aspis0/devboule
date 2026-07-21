@@ -66,7 +66,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                 }}
-                title={msg.text}
+                title={msg.title ?? msg.text}
               >
                 <span
                   aria-hidden
@@ -74,7 +74,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
                     width: 5,
                     height: 5,
                     borderRadius: "50%",
-                    background: "#CFC6B6",
+                    background: msg.text.startsWith("…") ? "#C0894F" : "#CFC6B6",
                     flexShrink: 0,
                   }}
                 />

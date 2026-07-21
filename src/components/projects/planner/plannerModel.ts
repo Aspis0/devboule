@@ -39,7 +39,14 @@ export interface PlannerMessage {
   /** D3: the client-generated send id (user rows only) — the echo carries it back
    *  through the bridge and the pending copy drains by identity. */
   msgId?: string;
+  /** Optional hover detail (e.g. full list of steps folded into a compressed milestone). */
+  title?: string;
 }
+
+/** Compress a consecutive run of milestones when longer than this (inclusive tail kept). */
+export const MILESTONE_RUN_COMPRESS_AFTER = 4;
+/** How many of the newest milestones in a long run stay expanded. */
+export const MILESTONE_RUN_KEEP_TAIL = 3;
 
 /** D3: one optimistic user send awaiting its bridge echo. `msgId` is the
  *  client-generated identity the echo carries back. */
@@ -177,6 +184,60 @@ export function pickProjectDesign(
   return best;
 }
 
+/** Short tool name from a milestone line for compressed-run previews. */
+export function milestoneToolLabel(text: string): string {
+  const tick = text.match(/`([^`]+)`/);
+  if (tick?.[1]) {
+    return tick[1]
+      .replace(/^mcp_devboule_/, "")
+      .replace(/^mcp_/, "");
+  }
+  const cleaned = text.replace(/^[🔧✅❌⏳·\s]+/u, "").trim();
+  return cleaned.length > 48 ? `${cleaned.slice(0, 45)}…` : cleaned;
+}
+
+/**
+ * Collapse long consecutive milestone runs so tool spam does not fill the chat.
+ * Runs of length ≤ {@link MILESTONE_RUN_COMPRESS_AFTER} stay expanded. Longer runs
+ * keep the last {@link MILESTONE_RUN_KEEP_TAIL} rows and fold the rest into one
+ * summary row (full text in `title` for hover).
+ */
+export function compressMilestoneRuns(messages: PlannerMessage[]): PlannerMessage[] {
+  const out: PlannerMessage[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i];
+    if (msg.role !== "milestone") {
+      out.push(msg);
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < messages.length && messages[i].role === "milestone") i += 1;
+    const run = messages.slice(start, i);
+    if (run.length <= MILESTONE_RUN_COMPRESS_AFTER) {
+      out.push(...run);
+      continue;
+    }
+    const head = run.slice(0, run.length - MILESTONE_RUN_KEEP_TAIL);
+    const tail = run.slice(-MILESTONE_RUN_KEEP_TAIL);
+    const labels = head.map((m) => milestoneToolLabel(m.text)).filter(Boolean);
+    const unique: string[] = [];
+    for (const label of labels) {
+      if (!unique.includes(label)) unique.push(label);
+      if (unique.length >= 4) break;
+    }
+    const preview = unique.length > 0 ? ` · ${unique.join(", ")}` : "";
+    out.push({
+      role: "milestone",
+      text: `… ${head.length} earlier tool steps${preview}`,
+      title: head.map((m) => m.text).join("\n"),
+    });
+    out.push(...tail);
+  }
+  return out;
+}
+
 /** Map the orchestrator's console entries to planner chat bubbles, interleaving
  *  coder milestones (tool use: Bash, reads, spawns…) as tiny 'milestone' rows, in
  *  timeline order. The milestone rows are the planner chat's visibility into WHAT
@@ -184,7 +245,9 @@ export function pickProjectDesign(
  *  running tools looks identical to one that hung ("thinking" forever).
  *
  *  role:"plan" chat entries are skipped: they are structured data for the Plan stage
- *  (consumed via `latestPlan` / `planCardsFromPiPlan`), never a chat bubble. */
+ *  (consumed via `latestPlan` / `planCardsFromPiPlan`), never a chat bubble.
+ *
+ *  Long consecutive tool-call runs are compressed (see {@link compressMilestoneRuns}). */
 export function chatMessagesWithMilestones(
   entries: ConsoleEntry[] | undefined,
 ): PlannerMessage[] {
@@ -222,7 +285,7 @@ export function chatMessagesWithMilestones(
       out.push({ role: "milestone", text });
     }
   }
-  return out;
+  return compressMilestoneRuns(out);
 }
 
 /** Extract the orchestrator's OPEN Kairion doubts from a console timeline, upserted by
