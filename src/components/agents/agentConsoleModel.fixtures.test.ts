@@ -40,29 +40,25 @@ describe("agentConsoleModel against console-activity fixture", () => {
     ]);
   });
 
-  it("chatMessagesWithMilestones: 2 chat bubbles + 4 milestone rows, thinking/webSearch/banner dropped", () => {
+  it("chatMessagesWithMilestones: 2 chat bubbles + tool milestones; args folded; long runs compressed", () => {
     // chatMessagesWithMilestones keeps chat (user/assistant, NOT plan) + coder/spawn as
-    // milestones. thinking/webSearch/banner are dropped.
+    // milestones. thinking/webSearch/banner are dropped. `args:` lines fold into the
+    // preceding Calling row (not their own milestone).
     const messages = chatMessagesWithMilestones(activity.entries);
-    expect(messages).toHaveLength(6);
+    expect(messages).toHaveLength(5);
     expect(messages[0]).toEqual({ role: "user", text: "write a hello function" });
     expect(messages[1]).toEqual({
       role: "assistant",
       text: "I'll write a hello function",
     });
-    expect(messages[2]).toEqual({
-      role: "milestone",
-      text: "🔧 Calling `write`",
-    });
+    expect(messages[2].role).toBe("milestone");
+    expect(messages[2].text.startsWith("🔧 Calling `write`")).toBe(true);
+    expect(messages[2].text).toContain("src/hello.rs");
     expect(messages[3]).toEqual({
-      role: "milestone",
-      text: '  args: {"path":"src/hello.rs","content":"pub fn hello() -> &\'static str { \\"hello\\" }"}',
-    });
-    expect(messages[4]).toEqual({
       role: "milestone",
       text: "✅ `write` → wrote src/hello.rs",
     });
-    expect(messages[5]).toEqual({
+    expect(messages[4]).toEqual({
       role: "milestone",
       text: "⚑ Censor review started for: src/hello.rs",
     });
