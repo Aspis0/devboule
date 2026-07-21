@@ -242,6 +242,54 @@ fn test_run_once_complete_and_clusters() {
     );
 }
 
+/// After a successful index, wipe Lance vectors but leave SQLite+manifest.
+/// A non-force run must re-embed all (vector_count==0 path), not skip as "up to date".
+#[test]
+fn test_reembed_when_lance_wiped_without_force() {
+    let world = TestWorld::new();
+    let embedder = Arc::new(FakeEmbedder::new());
+    let mgr = OracleIndexJobManager::new();
+
+    let first = mgr
+        .run_once(Some(&world.root), false, None, false, embedder.as_ref())
+        .expect("first run_once");
+    assert_eq!(first.status, JobStatus::Complete);
+    mgr.wait_for_cluster_refresh();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let before = rt.block_on(world.chunk_vectors().count()).unwrap();
+    assert!(before > 0, "first run must write vectors");
+
+    // Wipe only Lance chunk vectors (manifest + sqlite stay).
+    std::fs::remove_dir_all(&world.paths.chunks).expect("wipe chunks.lancedb");
+    assert!(
+        !world.paths.chunks.exists(),
+        "chunks.lancedb must be gone"
+    );
+
+    let embedder2 = Arc::new(FakeEmbedder::new());
+    let second = mgr
+        .run_once(Some(&world.root), false, None, false, embedder2.as_ref())
+        .expect("second run_once after wipe");
+    assert_eq!(
+        second.status,
+        JobStatus::Complete,
+        "re-embed after wipe must complete, not skip or pause"
+    );
+    assert!(
+        embedder2.calls() > 0,
+        "embedder must be called when Lance is empty"
+    );
+
+    let after = rt
+        .block_on(LanceStore::new(&world.paths.chunks).count())
+        .unwrap();
+    assert!(
+        after > 0,
+        "vectors must be restored after non-force re-run (got {after})"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 2: start_background single-flight
 // ═══════════════════════════════════════════════════════════════════════════
