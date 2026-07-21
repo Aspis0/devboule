@@ -77,7 +77,9 @@ interface PlannerPlanModeProps {
 	onResetChat?: () => void;
 	// Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
 	// status strip (searching/planning/designing duplicated the view tabs). The active one
-	// pulses. Local = our Stage/TUI; Claude/Codex/OpenAI run their own CLI (their terminal is shown).
+	// pulses. Devboule engine (label Local or Cloud API from Settings); Claude/Codex/OpenAI
+	// run their own CLI (their terminal is shown). OpenRouter is Cloud API on the Devboule
+	// engine id — not the OpenAI CLI option.
 	orchestrators: { id: string; label: string; disabled?: boolean }[];
 	orchestratorId: string;
 	onOrchestratorChange: (id: string) => void;

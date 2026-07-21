@@ -95,6 +95,10 @@ import type {
 import type { EffectiveRolesConfig } from "../../types/config";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
 import { resolveOrchestratorClient } from "../../utils/orchestratorClient";
+import {
+	mainCoderDevbouleLabel,
+	orchestratorDevbouleLabel,
+} from "../../utils/devbouleEngineLabel";
 import { formatDateTime } from "../projects/projectFormat";
 import type { SpawnRole } from "../agents/roleDisplay";
 
@@ -3997,7 +4001,13 @@ export function ProjectsView() {
 							);
 						}}
 						orchestrators={[
-							{ id: "orchestrator", label: "Local" },
+							// id "orchestrator" = Devboule engine (Settings → Roles). Label is
+							// NOT always "Local": Cloud API (OpenRouter) still uses this id —
+							// only the placement/backend is cloud. OpenAI CLI is a different id.
+							{
+								id: "orchestrator",
+								label: orchestratorDevbouleLabel(config.localCoderBackend),
+							},
 							// A missing CLI is shown DISABLED (not hidden): the option stays
 							// discoverable, but an uninstalled backend can't be selected —
 							// it could only ever fail at launch.
@@ -4020,9 +4030,12 @@ export function ProjectsView() {
 						orchestratorId={plannerOrchestratorClient}
 						onOrchestratorChange={setPlannerOrchestratorClient}
 						coders={[
-							// Role untangle (P6b): the Main coder can run LOCAL — the sandboxed agentic
-							// engine on mainCoderBackend (Settings → Roles) — as well as a cloud CLI.
-							{ id: "local", label: "Local (Devboule)" },
+							// Role untangle (P6b): the Main coder can run the Devboule engine
+							// (mainCoderBackend) — Local or Cloud API — as well as a cloud CLI.
+							{
+								id: "local",
+								label: mainCoderDevbouleLabel(config.mainCoderBackend),
+							},
 							{ id: "claude", label: "Claude" },
 							{ id: "codex", label: "Codex" },
 							{ id: "openai", label: "OpenAI" },
