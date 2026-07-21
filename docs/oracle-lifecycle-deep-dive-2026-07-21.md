@@ -386,7 +386,12 @@ Overrides (if someone forces them):
 3. First embed loads the model lazily (multi-second / multi-minute cold).  
 4. UI “Indexed 0” during long first job + “not ready” messaging can look identical to **dead server** (O1/O2) until you check TCP `/health` and job progress.
 
-**We are not “sure Metal is used.” We are sure the current app wiring asks for ORT int8, and macOS ORT defaults to CPU.** Metal would require wiring Candle Metal (or another runtime) into `ensure_rust_oracle_server`, not hoping CoreML-ONNX works.
+**Status after 2026-07-21 wire (see git history):** macOS app path now selects **Candle Metal F16** when `oracle-core` is built with `features = ["metal"]` (enabled only under `[target.'cfg(target_os = "macos")'.dependencies]`). Windows/Linux stay **ORT int8 + `ORACLE_RS_EP=cpu`**.
+
+**Caveats still true:**
+- Candle loads **Qwen3 from the Hugging Face cache** (not the ONNX int8 bundle). First run may download weights.
+- Vectors are **not parity-compatible** with an existing ONNX-int8 Lance index — **re-index** after switching.
+- CoreML-ONNX remains unusable for this model; Metal is via Candle, not CoreML.
 
 ### Diff vs Python (felt performance)
 

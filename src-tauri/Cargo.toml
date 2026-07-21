@@ -149,15 +149,9 @@ similar = { version = "2", default-features = false, features = ["text"] }
 
 # M2: the Rust-native Oracle runtime (indexing, retrieval, answering). Wired as
 # a path dep so the app can host `oracle_core::server::serve` in-process on the
-# loopback port, replacing the `python -m oracle.server.main` subprocess when
-# `oracle.engine == "rust"` (the Python path stays untouched under
-# `oracle.engine == "python"`). DEFAULT features only: `default = []` in
-# oracle-core means NO `metal` — candle builds CPU-only and `ort` is target-gated
-# (CoreML on macOS, plain ONNX elsewhere), so this is cross-platform safe. The
-# server JSON is byte-compatible with the Python Oracle, so the app's existing
-# reqwest::blocking client + all Tauri commands call it unchanged.
-# BUILD REQUIREMENT: lancedb pulls a `protoc` build step — install protobuf
-# (`brew install protobuf` on macOS; the Windows toolchain needs it too).
+# loopback port. Base dep has no `metal` (Windows/Linux stay ORT CPU). On macOS
+# we re-declare with `features = ["metal"]` so Candle can use the Metal device
+# (see rust_oracle embed backend selection). BUILD: lancedb needs protoc.
 oracle-core = { path = "../oracle-core" }
 
 # Windows-only WinRT/Win32 bindings. All `use windows::` call sites in src/ are
@@ -178,9 +172,9 @@ windows = { version = "0.58", features = ["Foundation", "Security_Credentials_UI
 webview2-com = "=0.38.2"
 windows_capture = { package = "windows", version = "=0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
 
-# macOS Touch ID / device-owner authentication (LocalAuthentication). Target-gated
-# so it is never fetched or built on Windows. UNVERIFIED on real hardware — see
-# the macOS branch in backend/auth.rs.
+# macOS: Touch ID (LocalAuthentication) + Candle Metal for Oracle embeddings.
+# `oracle-core/metal` is compile-error on non-macOS — only enable here.
+# ORT CoreML cannot run the Qwen3 ONNX export; Metal via Candle is the GPU path.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
@@ -188,3 +182,4 @@ objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
 # API used by backend/auth.rs verify_user).
 objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError", "block2"] }
 block2 = "0.5"
+oracle-core = { path = "../oracle-core", features = ["metal"] }

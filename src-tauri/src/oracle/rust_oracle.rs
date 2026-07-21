@@ -6,7 +6,7 @@
 //! commands, readiness probe, discovery file) is unchanged — only the server
 //! behind the port differs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -66,6 +66,58 @@ fn apply_llm_env_in_process() {
                 std::env::remove_var(var);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embed backend selection
+// ---------------------------------------------------------------------------
+
+/// Pick the embed backend for the resident Oracle server.
+///
+/// - **macOS:** Candle Metal F16 (Cargo enables `oracle-core/metal` only on
+///   macOS). ORT CoreML cannot compile this Qwen3 ONNX export; Metal is the
+///   real Apple-GPU path (same family as the old Python MPS path).
+/// - **Windows/Linux:** ORT int8 on **CPU** only (`ORACLE_RS_EP=cpu`).
+fn select_embed_backend(
+    model_root: &Path,
+    ort_model_dir: PathBuf,
+) -> Result<BackendChoice, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = model_root;
+        let _ = ort_model_dir;
+        // Requires `[target.'cfg(target_os = "macos")'.dependencies] oracle-core
+        // features = ["metal"]` in src-tauri/Cargo.toml so candle Device::Metal
+        // symbols exist. First embed load pulls Qwen3 from the HF cache if missing.
+        eprintln!(
+            "[rust-oracle] embed backend: Candle Metal F16 \
+             (Qwen3 HF cache; re-index if you previously used ONNX int8)"
+        );
+        Ok(BackendChoice::Candle {
+            metal: true,
+            f16: true,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if !oracle_core::model_download::model_present(model_root, true) {
+            return Err(format!(
+                "Rust oracle: ONNX embedding model not installed at {} — run Oracle runtime Install first",
+                ort_model_dir.display()
+            ));
+        }
+        // Windows/Linux policy: CPU only (no DirectML/CUDA in the resident path).
+        std::env::set_var("ORACLE_RS_EP", "cpu");
+        eprintln!(
+            "[rust-oracle] embed backend: ORT int8 CPU ({})",
+            ort_model_dir.display()
+        );
+        Ok(BackendChoice::Ort {
+            model_dir: ort_model_dir,
+            int8: true,
+        })
     }
 }
 
@@ -137,16 +189,16 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
         // only 500 on the first real query, leaving Oracle "falsely ready". Bail
         // here instead so the supervisor keeps Oracle honestly not-ready until the
         // operator runs Install (which populates this exact `model_root`).
-        if !oracle_core::model_download::model_present(&model_root, true) {
-            return Err(format!(
-                "Rust oracle: ONNX embedding model not installed at {} — run Oracle runtime Install first",
-                model_dir.display()
-            ));
-        }
-        let pool = Arc::new(EmbedderPool::new(BackendChoice::Ort {
+        // Embed backend:
+        // - macOS + oracle-core `metal`: Candle Metal F16 (real Apple GPU path;
+        //   ORT CoreML cannot compile this Qwen3 ONNX export — dynamic dims).
+        // - everywhere else: ORT int8 on CPU (Windows stays CPU; DirectML not used).
+        // Candle loads Qwen3 from the HF cache (not the ONNX int8 bundle). Vectors
+        // are NOT parity-compatible with an int8 ONNX index — re-index after switching.
+        let pool = Arc::new(EmbedderPool::new(select_embed_backend(
+            &model_root,
             model_dir,
-            int8: true,
-        }));
+        )?));
         let (_base_url, port) = crate::oracle::python_oracle::oracle_session_endpoint();
 
         let state = Arc::new(AppState {

@@ -469,6 +469,15 @@ pub fn run() {
             backend::oracle_service::set_oracle_enabled_flag(
                 backend::oracle_service::read_oracle_enabled(app.handle()),
             );
+            // DEV unlock sets BackendState unlocked at construction without
+            // unlock_after_verification(), so Oracle's on_unlock never ran and
+            // the supervisor never started (empty index + stale discovery).
+            // If we are already unlocked after setup init, start Oracle now.
+            if let Ok(auth) = app.state::<backend::state::BackendState>().auth_state() {
+                if !auth.locked {
+                    backend::oracle_service::on_unlock();
+                }
+            }
             // M2 retired, M3 deleted: the runtime engine was always Rust after P13b
             // (the Python spawn machinery is gone). The persisted `oracle.engine`
             // config key is still read on the next launch via `read_oracle_engine`
