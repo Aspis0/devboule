@@ -11,223 +11,470 @@
 - `pigeon` key: **absent** (treated as disabled).
 - Launch log: `Pigeon disabled (config pigeon.enabled=false); not starting.`
 
-**Live tools used:** `tauri-pilot` ping/snapshot/eval/ipc/screenshot; MCP `devboule_pilot__pilot_ping`; disk reads of agents ledger, activity JSONL, Oracle discovery.
+**Live tools used:** `tauri-pilot` ping/snapshot/eval/ipc/screenshot; MCP `devboule_pilot__pilot_ping`; disk reads of agents ledger, activity JSONL, Oracle discovery; static code path tracing for RCA.
 
 ---
 
-## Matrix summary (criterion 2–4)
+## Matrix summary
 
-| Area | Attempted live? | Outcome | Key findings |
-|------|-----------------|---------|--------------|
-| Tauri unlock/session | Yes | Pass (dev unlock) | Unlocked without Touch ID (`04_auth_state.txt`) |
-| Project select (openrouter-mock, board) | Yes | Partial | Board + cards OK; mock root not git repo (`16_list_projects.txt`) |
-| Workspace **devboule** (Oracle index root) | Yes | Fail | Index 0; discovery stale; watcher fail |
-| Orchestrator planning + questions | Partial | Blocked | Prior session chat visible; new send stalled; then WebView eval freeze |
-| Bottom console chat | Yes | Pass (compression) + residual | Compression shows `… 17 earlier tool steps`; still shows old failed run |
-| Main coder | Structural + residual live | Fail path | Orch skipped Main; no live Main session for mock |
-| Mini coder | Residual live + static | Fail | Directive `failed`: cloud not supported on one-shot path |
-| Tools advertised / used | Residual activity + role_rules | Mixed | Orch used mini (old allowlist); `write_mode: surgical` invalid; oracle_context root blocked |
-| Async **without Pigeon** | Yes (default) | Confirmed | Startup + `get_pigeon_enabled` → false early |
-| Sync **with Pigeon** | Attempted | Blocked / incomplete product | IPC enable hung after UI freeze; static: no `mini-pool` in `pigeon_service.rs` |
-| Oracle indexing | Yes | **BUG confirmed** | See B01 |
+| Area | Live? | Outcome | Findings |
+|------|-------|---------|----------|
+| Tauri unlock | Yes | Pass (dev unlock) | B15 |
+| Project board / select | Yes | Partial | B10, B12, B13 |
+| Oracle index (`devboule` folder) | Yes | Fail | **B01, B02** |
+| Orch planning + questions | Partial | Blocked mid-session | B07, B08, B09 |
+| Bottom console chat | Yes | Compression OK; residual bad session | B14, B04 |
+| Main coder | Structural + residual | Skipped by orch | B04, B16 |
+| Mini coder | Residual live + code | Fail | **B03**, B05 |
+| Tools | Residual + role_rules | Mixed | B04–B06, B17 |
+| Async without Pigeon | Yes (default) | Confirmed | B11 (off side) |
+| Sync with Pigeon | Attempted | Blocked / incomplete | **B11** |
 
 ---
 
-## Findings
+## Findings (with investigation)
 
 ### B01 — Oracle does not index selected workspace (`devboule`)
+
 | Field | Value |
 |-------|--------|
 | **Area** | Oracle |
 | **Severity** | **blocker** |
 | **Verdict** | **BUG** |
-| **Repro / observed** | Open app → Oracle admin. Workspace shows `/Users/user/Projects/devboule`, "✓ Workspace is set". UI: Indexed 0 / Pending 0 / VECTORS 0, banners **"Oracle index watcher failed to start"** and later **"Oracle dense index job failed to start."** Click **Index now** → still 0. UI claims "Oracle server: running" but discovery file points at dead process. |
-| **Evidence** | `{SCRATCH}/03_oracle_body.txt`, `08_after_index_now.txt`, `09_oracle_discovery.json`, `10_projects_view.txt` (dense index banner). Live: `curl 127.0.0.1:31520` connection refused; discovery pid **891** not running; `updatedAt` stuck at prior session. |
-| **Notes** | Confirms owner half-bug. Additional lie: "server: running" with no listener + stale `.oracle-server.json`. |
 
-### B02 — Stale Oracle discovery file / false "server running"
+**What we saw**
+
+- Oracle admin: workspace `/Users/user/Projects/devboule`, badge “✓ Workspace is set”.
+- Counters: Indexed **0**, Pending **0**, Vectors **0**, Chunks **0**.
+- Banners: **“Oracle index watcher failed to start.”** and **“Oracle dense index job failed to start.”**
+- Click **Index now** → still 0 after wait; mixed lines “Oracle server: running” vs “Oracle is starting — the server is not ready yet.”
+- Evidence: `{SCRATCH}/03_oracle_body.txt`, `08_after_index_now.txt`, `10_projects_view.txt`.
+
+**Cause chain (investigated)**
+
+1. **UI is only an HTTP client to the resident Oracle server.**  
+   `startOracleIndexJob` / `startOracleIndexWatcher` in `AppContext.tsx` invoke Tauri commands that POST to the resident server (`oracle/commands.rs`):
+   - `start_oracle_index_job` → `POST /index/run?...&manual=...`
+   - `start_oracle_index_watcher` → `POST /index/watch/start?...`  
+   Failures surface as the exact banner strings when the invoke rejects (`AppContext.tsx` ~857–886).
+
+2. **Those POSTs need a live server process.**  
+   Discovery file `src-tauri/projects/.oracle-server.json` pointed at `http://127.0.0.1:31520` with **pid 891**.  
+   Live check: **curl connection refused**; **no listener on 31520**; pid 891 **not running**.  
+   So “Index now” cannot succeed: the client talks to a dead endpoint.
+
+3. **Lifecycle is supposed to (re)start the server on unlock.**  
+   `oracle_service::on_unlock()` calls `start_supervisor()` (best-effort; never blocks unlock).  
+   Dev unlock starts the app unlocked immediately — supervisor should run — but discovery was **stale from a previous session** (`updatedAt` stuck earlier) and was **not rewritten** with a live child for this process.  
+   So either: supervisor did not spawn a healthy server, or published/kept a dead discovery file (see B02).
+
+4. **“Index now” does not heal a dead server.**  
+   The command path assumes `oracle_http_post_blocking` can reach the resident server; it does not re-spawn the server first when the HTTP client fails. Result: permanent 0% index UI until something else brings Oracle up.
+
+**Confidence:** high that the user-visible failure is “no live Oracle HTTP server → index/watch commands fail”. Medium on *why* supervisor failed to replace the dead process this boot (needs server stderr / supervisor tick logs; not captured).
+
+**Owner half-bug:** **confirmed and refined** — not just “indexing slow”; the retrieval server endpoint is dead and jobs never start.
+
+---
+
+### B02 — Stale Oracle discovery / false “server running”
+
 | Field | Value |
 |-------|--------|
 | **Area** | Oracle / Tauri |
 | **Severity** | major |
 | **Verdict** | **BUG** |
-| **Observed** | `projects/.oracle-server.json` advertises `baseUrl http://127.0.0.1:31520` + old `pid` while nothing listens; UI HEALTH still says server running / "not ready yet" mixed messages. |
-| **Evidence** | `09_oracle_discovery.json`, curl fail in session notes. |
 
-### B03 — Cloud mini-coder fails: directive executor still rejects Cloud
+**What we saw**
+
+- Discovery JSON still advertising dead pid/port (`09_oracle_discovery.json`).
+- UI HEALTH: “Oracle server: running” while curl fails; also “not ready yet” from file browser.
+
+**Cause chain**
+
+1. Discovery is a **file contract** (`.oracle-server.json`) written when the supervisor publishes a live server (`oracle_service` DISCOVERY_FILENAME).
+2. **Vault lock no longer tears down Oracle** (`on_lock` intentionally empty) so discovery is process-scoped — but **app restart** must replace or delete stale discovery. Leaving an old file after a kill/crash makes every client (UI + MCP) believe a server exists.
+3. UI status aggregation likely treats “discovery file exists / last known good” or a partial status poll as “running” without verifying TCP liveness + matching pid.
+
+**Why it matters:** agents and “Index now” both fail closed or hang on a ghost server; operator thinks Oracle is up.
+
+**Confidence:** high on stale file + dead TCP; medium on exact UI status predicate (not fully reverse-engineered).
+
+---
+
+### B03 — Cloud mini-coder fails: “directive executor does not support it yet”
+
 | Field | Value |
 |-------|--------|
 | **Area** | mini-coder |
-| **Severity** | **blocker** (for OpenRouter mini path) |
+| **Severity** | **blocker** (OpenRouter mini) |
 | **Verdict** | **BUG** |
-| **Observed** | Directive `edbe87a2…` status **failed**, error: `cloud backend runs via the pi engine; the directive executor does not support it yet`. Config mini is `kind: cloud` OpenRouter. `index.html` **never** received T1 subtitle. |
-| **Evidence** | `{SCRATCH}/29_role_tools.txt` / agents state; `25_activity_tail.txt`; live `index.html` has no subtitle. Code still hard-fails Cloud in `mini_command_build.rs` (~1070–1081) even though `mini_coder_executor.rs` has a Cloud agentic + Bearer path (~1502+). Live failure message matches the **hard-fail** string → one-shot path still hit. |
-| **Notes** | Incomplete Cloud mini wiring / branch not taken for this directive (`write_mode` / agentic flag). |
 
-### B04 — Orchestrator claimed implementation task and spawned mini (Main skipped)
+**What we saw**
+
+- Directive `edbe87a2…`:
+  - `parentAgentId`: `orchestrator-openrouter-mock`
+  - `write: true`, `writeMode: "agenticIterative"`
+  - `status: failed`
+  - `result.error`: **`cloud backend runs via the pi engine; the directive executor does not support it yet`**
+- Project file `devboule-openrouter-mock/index.html` **never** got the T1 subtitle.
+- Config mini backend: `kind: cloud`, OpenRouter base URL.
+
+**Cause chain**
+
+1. **Error string is unique to `mini_command_build.rs`.**  
+   Cloud arm of `build_mini_command_impl` **hard-returns** that error (~1070–1081 macOS; same on Windows arm). One-shot PTY/`/bin/sh` path cannot drive HTTPS OpenRouter.
+
+2. **That function is only used by the one-shot spawn path** (`spawn_one_shot_mini` → `build_mini_command` in `mini_coder_executor.rs` ~3520).  
+   So at claim/launch time this directive took **`run_agentic == false`** (one-shot branch), not the agentic HTTP branch.
+
+3. **Contradiction with current Cloud agentic wiring.**  
+   In current tree, for `MiniCoderBackendKind::Cloud`:
+   ```text
+   run_agentic = directive.write && base_url non-empty
+   ```
+   This directive has `write: true` and config has baseUrl. **If** that code ran with a correctly resolved Cloud backend, it should **not** call `build_mini_command`.  
+   Therefore either:
+   - **(A) Temporal:** the smoke ran against a binary **before** Cloud agentic force-path was complete, or  
+   - **(B) Structural residual:** resolved backend at launch lacked baseUrl / was mis-classified so Cloud still fell through somewhere, or agentic spawn failed and a fallback still hit one-shot (less likely given exact hard-fail string).
+
+4. **Even with agentic path present, one-shot still hard-fails Cloud.**  
+   Any code path that still calls `spawn_one_shot_mini` for Cloud (mis-flagged write, empty baseUrl race, future regression) dies with the same message. Dual implementation is incomplete: agentic can do Cloud; one-shot cannot and is not auto-upgraded.
+
+5. **Cascade:** orch thought mini was “running” (MCP spawn returned `status: running` at enqueue) while executor later wrote **failed** — no successful file edit, orch never re-synced to failure in the UI narrative.
+
+**Confidence:** high that failure = Cloud + one-shot `build_mini_command`. Medium-high that current source *intends* agentic for Cloud write; live failure shows that intent was not effective for this run.
+
+---
+
+### B04 — Orchestrator claimed T1 and spawned mini (Main skipped)
+
 | Field | Value |
 |-------|--------|
-| **Area** | orchestrator / tools / product-model |
+| **Area** | orchestrator / product model / tools |
 | **Severity** | major |
-| **Verdict** | **BUG** (post role_rules fix: residual session + allowlist was wrong at run time) |
-| **Observed** | Session `orchestrator-openrouter-mock` role orchestrator, client `pi`, status **wip**, message still "Mini coder is implementing T1…" while mini **failed**. Activity: claim T1 → `spawn_mini_coder` (not `spawn_main_coder`). Product intent: Work console = Main; mini only from Main; orch only via Change plan. |
-| **Evidence** | `13_agent_live_summary.txt`, `25_activity_tail.txt`, openrouter-mock notes/claim. Current `role_rules.json` correctly **removes** mini tools from orch (static re-check in `29_role_tools.txt`). |
-| **Notes** | Stale **wip** session remains after failure — soft-lock / no finalize. |
+| **Verdict** | **BUG** |
 
-### B05 — Invalid `write_mode: "surgical"` then retry
+**What we saw**
+
+- Session `orchestrator-openrouter-mock`: role `orchestrator`, client `pi`, status still **`wip`**, message “Mini coder is implementing T1…” while mini **failed**.
+- Activity: `project_claim_task` T1 → `spawn_mini_coder` (not `spawn_main_coder`).
+- Product rule (owner + later role_rules): Work console = Main; mini only from Main; orch plans / `spawn_main_coder` then sleeps; Change plan recalls orch.
+
+**Cause chain**
+
+1. **At smoke time, role allowlist still permitted orch → mini** (pre-fix allowlist). Activity proves spawn succeeded after `surgical` reject.
+2. **Model policy followed tools, not product stages.** With mini available, the LLM short-circuited Main.
+3. **After allowlist fix** (`role_rules.json`: orch has `spawn_main_coder` only, no mini tools — verified in `29_role_tools.txt`), **new** orch sessions cannot spawn mini. **This session remains wip** — no automatic finalize when child directive fails; soft-lock / human not forced to clear.
+4. **Claim semantics:** `CODER_LIKE_ROLES` still treats orchestrator like coder for Kanban claim (`aspis_mcp.py`). So even with mini tools removed, orch can still claim WIP tasks unless further restricted — product gap residual.
+
+**Confidence:** high on wrong pipeline for this smoke; high that current SSoT blocks mini for orch; medium that claim-by-orch remains an open product hole.
+
+---
+
+### B05 — Invalid `write_mode: "surgical"`
+
 | Field | Value |
 |-------|--------|
-| **Area** | tools / orchestrator |
+| **Area** | tools / model behavior |
 | **Severity** | minor |
-| **Verdict** | **BUG** (model hallucinated mode; server correctly rejected) |
-| **Observed** | First spawn: `write_mode must be one of emitEdits, agenticIterative, (got "surgical")`. Second spawn accepted without surgical. |
-| **Evidence** | `25_activity_tail.txt`, earlier activity log. |
+| **Verdict** | **BUG** (model) / **working** (server gate) |
+
+**What we saw**
+
+- First `spawn_mini_coder`: MCP `-32602` — mode must be `emitEdits` | `agenticIterative`, got `"surgical"`.
+- Second call without surgical → accepted (`status: running`).
+
+**Cause**
+
+- Allowed modes are fixed in Python MCP + Rust `WriteMode` serde (camelCase).  
+- Model invented `"surgical"` (not in schema). Server **correctly** rejected.  
+- Not a host crash; wasted a turn and confuses logs.
+
+**Confidence:** high.
+
+---
 
 ### B06 — `oracle_context` rejects project root outside approved workspaces
+
 | Field | Value |
 |-------|--------|
-| **Area** | tools / Oracle |
+| **Area** | tools / Oracle / MCP |
 | **Severity** | major |
-| **Verdict** | **BUG** or **FEATURE?** — **LIKELY BUG** for multi-project roots |
-| **Observed** | MCP: `rootPath '…/devboule-openrouter-mock' is outside approved Devboule workspaces; set ASPIS_WORKSPACE_ROOT to its parent to approve.` Orchestrator continued without grounded context. |
-| **Evidence** | Activity log + assistant chat summary in UI (`10_projects_view.txt`). |
-| **Why not pure FEATURE** | Product lets you attach arbitrary project roots; fail-closed without UI path to approve parent is broken UX for smoke mocks. |
+| **Verdict** | **LIKELY BUG** (multi-root product) |
 
-### B07 — Planner stuck on "⏳ Awaiting your reply" with no clear ask_user card
+**What we saw**
+
+- MCP error: root `…/devboule-openrouter-mock` outside approved workspaces; set `ASPIS_WORKSPACE_ROOT` to parent.  
+- Orch continued planning/claiming without grounded code context.
+
+**Cause chain**
+
+1. Gate lives in `devboule-mcp/src/tools/oracle.rs` (~296–297): rootPath must be under an approved workspace set (management root / `ASPIS_WORKSPACE_ROOT`).
+2. **Intent:** prevent arbitrary filesystem RAG (security FEATURE).  
+3. **Product friction:** app allows project `root_path` anywhere the user attaches; MCP oracle tools do **not** auto-approve that root. No in-app “approve this project root for Oracle” surfaced during the smoke.  
+4. Env fix (`ASPIS_WORKSPACE_ROOT=/Users/user/Projects`) is operator-only and invisible in the planner chat failure (only tool error milestone).
+
+**Why LIKELY BUG not pure FEATURE:** security gate is right; missing product bridge for legitimate multi-project roots is the bug.
+
+**Confidence:** high on mechanism; product intent on multi-root is the open question.
+
+---
+
+### B07 — “⏳ Awaiting your reply” without a clear ask_user card
+
 | Field | Value |
 |-------|--------|
 | **Area** | planning-console |
 | **Severity** | major |
 | **Verdict** | **LIKELY BUG** |
-| **Observed** | Bottom chat shows **Awaiting your reply** after old assistant turn; no obvious question options / reply affordance beyond freeform composer. Status may be residual `needs_user` / plan gate without surface. |
-| **Evidence** | `10_projects_view.txt`. Fresh send attempt did not clear state. |
 
-### B08 — WebView / pilot eval freezes under load (IPC+DOM timeout)
+**What we saw**
+
+- Bottom chat: last assistant message about T1/mini; pill **Awaiting your reply**.  
+- No visible multi-option AskUser UI; only freeform “Message the Orchestrator…”.
+
+**Cause chain**
+
+1. Pill is **not** wired only to `needs_user` / open questions.  
+   In `ProjectsView.tsx` (~1332–1341):
+   ```ts
+   plannerAwaitingReply =
+     !!plannerActivityAgentId &&
+     plannerConvo.length > 0 &&
+     plannerConvo[plannerConvo.length - 1].role === "assistant";
+   ```
+   So: **any live activity agent + last chat row is assistant** → “your turn”, even if the assistant is mid-pipeline narrative (“next: collect evidence”) rather than a real blocking question.
+
+2. True `ask_user` / plan approval surfaces are separate (doubt panel / plan stage). If those are empty, the pill still shows from the heuristic above.
+
+3. Residual **stale session** (`wip` orch) keeps `plannerActivityAgentId` truthy → pill stuck across reloads of the same transcript.
+
+**Confidence:** high that the pill is over-broad relative to product copy “awaiting your reply (esp. after AskUser)”.
+
+---
+
+### B08 — WebView / pilot eval freezes (IPC + DOM timeout)
+
 | Field | Value |
 |-------|--------|
 | **Area** | Tauri / pilot |
-| **Severity** | **blocker** (for automation & sometimes UX) |
+| **Severity** | **blocker** (automation; possible UX jank) |
 | **Verdict** | **BUG** |
-| **Observed** | After Projects navigation + fill attempts, `tauri-pilot ping` still OK (socket) but **title/eval/ipc all timeout 10s** (`33_pilot_batch.txt`). Blocks further live planning, Settings, Pigeon toggle. |
-| **Evidence** | `22–28*.txt`, `33_pilot_batch.txt`. |
 
-### B09 — Composer send mis-clicks project card ("OpenRouter Mock…")
+**What we saw**
+
+- After Projects + fill attempts: `tauri-pilot ping` still OK (socket / plugin handshake).  
+- `title`, `eval`, `ipc get_pigeon_enabled`, `set_pigeon_enabled` → **Eval error: timed out after 10s** (`33_pilot_batch.txt`).  
+- Blocks Settings navigation, Pigeon toggle, further planning sends.
+
+**Cause chain (partial)**
+
+1. Pilot `eval`/`ipc` run **JavaScript in the WebView**. Ping does not need a responsive JS heap the same way. Pattern “ping works / eval dies” ⇒ **main WebView JS thread blocked or starved**, not total process death (Rust still up).
+2. Trigger correlated with: large agent state (35 sessions), rich Projects UI + planner, prior long transcript render, possibly concurrent IPC.  
+3. Not fully isolated: could be React re-render loop, long sync work on main thread, or pilot queue stuck behind a previous hung eval.  
+4. Once frozen, **cannot complete live Pigeon-on or fresh Local plan** in this session.
+
+**Confidence:** high on symptom; medium on root (needs Instruments / main-thread stack at freeze).
+
+---
+
+### B09 — Composer “send” mis-clicks project card
+
 | Field | Value |
 |-------|--------|
 | **Area** | planning-console / UI |
 | **Severity** | minor |
-| **Verdict** | **LIKELY BUG** (automation-sensitive; may also hit fat-finger users if buttons poorly scoped) |
-| **Observed** | Heuristic "send" button search clicked project card text `OpenRouter Mockdevboule-openrouter-mock…` (`19_send_goal.txt`). |
-| **Notes** | Pilot/automation issue first; still indicates overlapping interactive targets. |
+| **Verdict** | **LIKELY BUG** (automation-first; possible hit-target issue) |
 
-### B10 — Git policy: mock project root "not a git repo" / whole workspace blocked
+**What we saw**
+
+- Heuristic search for a send button clicked text matching **OpenRouter Mock…** project card (`19_send_goal.txt`).
+
+**Cause**
+
+- Automation used weak `button` text matching (`/send|plan it|go/i`). Project cards are buttons whose accessible name includes title/path.  
+- Product risk: large clickable cards near composer increase mis-click surface for humans; for agents, selectors must be specific.
+
+**Confidence:** high for automation cause; low-medium that human UI is broken without fat-finger evidence.
+
+---
+
+### B10 — Git policy blocks non-git mock roots
+
 | Field | Value |
 |-------|--------|
-| **Area** | Tauri / projects |
+| **Area** | projects / git policy |
 | **Severity** | minor |
-| **Verdict** | **FEATURE?** (policy by design) with **UX gap** |
-| **Observed** | `list_projects`: openrouter-mock `policyStatus: blocked`, warning "Use a specific code repo root, not the whole Devboule workspace" / not a git repo. |
-| **Evidence** | `16_list_projects.txt`. |
-| **Why FEATURE?** | Intentional safety. Still noisy for throwaway smoke projects. |
+| **Verdict** | **FEATURE?** (with UX noise) |
 
-### B11 — Pigeon-off works; Pigeon-on not verified (UI freeze + incomplete mini-pool wiring)
+**What we saw**
+
+- `list_projects`: openrouter-mock `policyStatus: "blocked"`, “not inside a Git repository”, requiredActions about feature branch / origin.
+
+**Cause**
+
+- Intentional policy for collaborator/PR workflows (`gitStatus` on summary).  
+- Throwaway smoke folders without git will always warn/block policy-sensitive actions.
+
+**Confidence:** high this is by design; not a crash.
+
+---
+
+### B11 — Pigeon off confirmed; Pigeon on not verified / incomplete
+
 | Field | Value |
 |-------|--------|
 | **Area** | Pigeon |
-| **Severity** | major (for "sync with Pigeon" claim) |
-| **Verdict** | **BUG** (incomplete path) + **INCONCLUSIVE** live sync |
-| **Observed** | **Without Pigeon:** confirmed. Launch: disabled; early IPC `get_pigeon_enabled` → `false` (`17_pigeon_enabled.txt`). Agents/directives used **file/MCP poll path**, not mailbox. **With Pigeon:** `set_pigeon_enabled` IPC hung after freeze; static `pigeon_service.rs` has start/get/set but **no `mini-pool` string** in that file (`30_pigeon_static.txt`). Config has no `pigeon` object. |
-| **Evidence** | Launch markers, `17`, `30`, `33`. |
+| **Severity** | major (for “sync with Pigeon” product claim) |
+| **Verdict** | **BUG** (incomplete product) + **INCONCLUSIVE** live sync |
 
-### B12 — Fleet pollution: 35 sessions, many closed Aspis leftovers
+**Without Pigeon (async / file+MCP)**
+
+- Launch: `Pigeon disabled (config pigeon.enabled=false); not starting.`  
+- Early IPC `get_pigeon_enabled` → `false` (`17_pigeon_enabled.txt`).  
+- Mini directive lifecycle used `.aspis-agents.json` + executor poll (classic path). **Confirmed working mode for coordination plumbing** (even though mini Cloud failed later).
+
+**With Pigeon (attempted)**
+
+- After UI freeze, `set_pigeon_enabled` / re-get timed out (`33_pilot_batch.txt`).  
+- Static: `pigeon_service.rs` has `start_if_enabled`, `get/set_pigeon_enabled`, default-off from config. **No `mini-pool` string in that file** — mailbox drain for minis is not obviously wired there (may live elsewhere, but smoke could not prove end-to-end mailbox dispatch).  
+- Config has **no `pigeon` object** — feature remains off until Settings/IPC succeeds.
+
+**Cause**
+
+- Default-off + incomplete operator path + freeze blocked toggle. Historical docs already suggested incomplete Pigeon; this session did not refute that.
+
+**Confidence:** high on off-mode; high that on-mode was not proven; medium on completeness of mini-pool wiring.
+
+---
+
+### B12 — Fleet pollution (35 sessions)
+
 | Field | Value |
 |-------|--------|
-| **Area** | Tauri / agents |
+| **Area** | agents ledger |
 | **Severity** | minor |
 | **Verdict** | **LIKELY BUG** (prune / isolation) |
-| **Observed** | `get_agent_live_state` returns **35** sessions including ancient `test`/`hola` closed Aspis entries; only one mock-related wip. |
-| **Evidence** | `13_agent_live_summary.txt`. |
 
-### B13 — Orchestrator chip UI showed "Orchestrator · claude" while live session is `client: pi`
+**What we saw**
+
+- `get_agent_live_state`: 35 sessions including ancient Aspis `test`/`hola` closed entries; only one mock-related wip.
+
+**Cause**
+
+- Ledger prune caps exist in MCP Python (`MAX_SESSIONS`) but closed sessions linger; multi-repo/history sharing same projects dir accumulates noise. UI/fleet counts (“active:9”) still mention large fleet.
+
+**Confidence:** medium (policy may intentionally keep history).
+
+---
+
+### B13 — Header “Orchestrator · claude” vs live session `client: pi`
+
 | Field | Value |
 |-------|--------|
 | **Area** | planning-console |
 | **Severity** | minor |
-| **Verdict** | **LIKELY BUG** (label/source mismatch) |
-| **Observed** | Header text "Orchestrator · claude" + chips Local/Claude/Codex/OpenAI idle; ledger session `orchestrator-openrouter-mock` client **pi** model gpt-5.2. |
-| **Evidence** | `10_projects_view.txt` vs `13_agent_live_summary.txt`. |
+| **Verdict** | **LIKELY BUG** |
 
-### B14 — Milestone compression works (regression check)
+**What we saw**
+
+- UI chrome: `Orchestrator · claude` while chips show Local/Claude/…  
+- Ledger: `orchestrator-openrouter-mock` **client `pi`**, model gpt-5.2.
+
+**Cause**
+
+- Header model/client label is driven by **planner chip selection / localStorage** (`plannerOrchestratorClient`), not the **live session** client field. Selecting Claude chip for a new launch does not rewrite the running pi session label; residual transcript stays attached to project.
+
+**Confidence:** high on dual-source mismatch.
+
+---
+
+### B14 — Milestone compression works
+
 | Field | Value |
 |-------|--------|
 | **Area** | planning-console |
 | **Severity** | nit (positive) |
-| **Verdict** | **FEATURE?** / working |
-| **Observed** | Chat shows `… 17 earlier tool steps · agent_register, provider_credentials_status…` then tail of spawn/heartbeat. |
-| **Evidence** | `10_projects_view.txt`. |
+| **Verdict** | working |
 
-### B15 — Dev unlock OK in debug
+Chat showed `… 17 earlier tool steps · agent_register, …` then last tool lines — `compressMilestoneRuns` in `plannerModel.ts` doing its job (`10_projects_view.txt`).
+
+---
+
+### B15 — Dev unlock works
+
 | Field | Value |
 |-------|--------|
-| **Area** | Tauri |
+| **Area** | Tauri auth |
 | **Severity** | nit (positive) |
 | **Verdict** | working |
-| **Observed** | `locked:false`, launch log DEV unlock active. |
-| **Evidence** | `04_auth_state.txt`, launch log. |
 
-### B16 — Main coder not exercised on live OpenRouter path this session
+`get_auth_state`: `locked: false`, launch log DEV unlock active (`04_auth_state.txt`).
+
+---
+
+### B16 — Main coder not exercised on the live OpenRouter path
+
 | Field | Value |
 |-------|--------|
 | **Area** | main-coder |
-| **Severity** | major (coverage gap caused by product path failure) |
-| **Verdict** | **INCONCLUSIVE** live Main success; **BUG** that Main was skipped in the only live work path |
-| **Observed** | No `spawn_main_coder` / coder session for openrouter-mock; only orch + failed mini. UI freeze blocked fresh hand-off test. Static: Main owns mini tools; orch owns `spawn_main_coder` only (`29_role_tools.txt`). |
+| **Severity** | major (coverage + product path) |
+| **Verdict** | **INCONCLUSIVE** for “Main works on OpenRouter”; **BUG** that the only live work path skipped Main |
 
-### B17 — Role allowlist now correct (orch no mini) — good; live session predates/enforces poorly
+**Cause**
+
+- No `spawn_main_coder` in activity; no `role: coder` session for openrouter-mock.  
+- Dependent on B04 (orch mini shortcut) + B08 (could not force a clean hand-off after freeze).  
+- Static: Main owns mini tools; orch owns `spawn_main_coder` only — correct **if** models comply.
+
+---
+
+### B17 — Role allowlist SSoT now correct (orch no mini)
+
 | Field | Value |
 |-------|--------|
 | **Area** | tools |
 | **Severity** | nit |
-| **Verdict** | working (SSoT) / **BUG** (stale session still wip) |
-| **Evidence** | `role_rules.json` via `29_role_tools.txt`. |
+| **Verdict** | working (SSoT) |
+
+`role_rules.json` / MCP load: orch **no** `spawn_mini_coder` / steer / result; **yes** `spawn_main_coder`. Coder has mini tools. Aligns with product after the role fix; does **not** rewrite stale sessions (B04).
 
 ---
 
-## Coordination modes
+## Coordination modes (detail)
 
 ### Async without Pigeon
-- **Status:** Exercised by default.
-- Agents register/heartbeat/spawn via MCP + `.aspis-agents.json` (not mailbox).
-- Mini executor poll/file path used; result written as failed.
+- Default. Confirmed at process start and early IPC.  
+- Directives and MCP poll/file co-write used. Mini enqueue returned `running` then executor failed (B03).
 
 ### Sync with Pigeon
-- **Status:** Not fully entered.
-- Blockers: (1) config default off; (2) after ~minutes UI eval freeze → cannot toggle Settings/IPC; (3) static code review shows incomplete mini-pool integration in `pigeon_service.rs`.
-- Finding **B11**.
+- Not fully entered (B08 + B11).  
+- Finding stands: cannot claim Pigeon sync works for mini/orch until enable + mailbox drain is live-tested.
 
 ---
 
 ## Planning / questions / bottom chat
 
-| Check | Result |
-|-------|--------|
-| Bottom chat shows tool milestones | Yes (compressed) |
-| Assistant narrative visible | Yes (old turn) |
-| Clarifying questions UI | **Not observed** for a fresh ask_user turn; stuck "Awaiting your reply" |
-| Create plan / auto-create controls | Visible (`Create plan`, auto-create off) |
-| New Local plan send | Fill OK earlier; after freeze, eval fails — **not completed** |
+| Check | Result | Cause note |
+|-------|--------|------------|
+| Tool milestones in chat | Yes | Compressed (B14) |
+| Assistant narrative | Yes | Residual failed pipeline (B03/B04) |
+| Clarifying questions UI | Not observed fresh | B08 blocked new plan; B07 pill ≠ ask_user |
+| Create plan controls | Visible | Not driven to completion |
+| New Local plan send | Incomplete | B08 / B09 |
 
 ---
 
-## What was *not* reached (honest gaps)
+## What was not reached
 
-1. Full **Main coder** OpenRouter write cycle (hand-off → claim → mini → review).
-2. Live **ask_user** multi-option question cards + reply round-trip.
-3. **plan_submit** → human approve UI → `project_create_plan_tasks` on a fresh goal.
-4. **Pigeon-on** mini dispatch latency / mailbox drain.
-5. Local oMLX path (config is all Cloud OpenRouter).
-6. Verifier / done transition.
-7. Settings Roles consent Save (UI freeze).
+1. Full Main OpenRouter write cycle.  
+2. Live multi-option `ask_user` + reply.  
+3. `plan_submit` → approve → `project_create_plan_tasks` on a clean goal.  
+4. Pigeon-on mailbox mini dispatch.  
+5. Local oMLX backends (config all Cloud).  
+6. Verifier / done.  
+7. Settings Roles consent (UI freeze).
 
 ---
 
@@ -242,26 +489,46 @@
 
 ---
 
+## Causal dependency map (how bugs stack)
+
+```text
+Oracle server dead (B02)
+    → index/watch HTTP fail (B01)
+    → weak/no oracle_context for in-workspace roots too
+
+Orch claims T1 + spawn_mini (B04)  [allowlist/history]
+    → mini Cloud one-shot hard-fail (B03)
+    → index.html unchanged
+    → orch stuck wip + chat “awaiting reply” heuristic (B07)
+    → tool spam then compression (B14)
+
+UI freeze (B08)
+    → cannot toggle Pigeon (B11 on-path)
+    → cannot re-drive planning / Main hand-off (B16)
+```
+
+---
+
 ## Appendix — evidence map
 
 | File | Content |
 |------|---------|
-| `01_app_state.txt` | title, state, interactive snapshot |
-| `03_oracle_body.txt` | Oracle admin text (0 index, watcher fail) |
-| `04_auth_state.txt` | unlocked session |
+| `01_app_state.txt` | title, state, snapshot |
+| `03_oracle_body.txt` | Oracle admin 0-index / banners |
+| `04_auth_state.txt` | unlocked |
 | `09_oracle_discovery.json` | stale discovery |
 | `10_projects_view.txt` | board + chat + awaiting |
-| `13_agent_live_*` | sessions + failed mini directive parent |
-| `16_list_projects.txt` | git policy warnings |
+| `13_agent_live_*` | sessions + failed mini parent |
+| `16_list_projects.txt` | git policy |
 | `17_pigeon_enabled.txt` | false |
-| `25_activity_tail.txt` | tool trace surgical/spawn |
-| `29_role_tools.txt` | allowlists + failed directive result |
-| `30_pigeon_static.txt` | pigeon service surface |
+| `25_activity_tail.txt` | surgical + spawn trace |
+| `29_role_tools.txt` | allowlists + directive result |
+| `30_pigeon_static.txt` | pigeon surface |
 | `33_pilot_batch.txt` | freeze: ping OK, eval/ipc timeout |
-| `02_screenshot_raw.json` | full-page PNG data URL (large) |
+| `02_screenshot_raw.json` | full-page PNG data URL |
 
 ---
 
 ## No fixes under this goal
 
-`git status` shows only pre-existing untracked assets; **no product fix commits** from this AFK test session. This file is the sole intentional deliverable.
+Deliverable is this document only (plus `{SCRATCH}` evidence). Product code was not patched in the AFK test session. Later commits on `phase1/infra` (roles/UI/dev-unlock) are separate from this report’s observe-only charter; RCA above uses **current tree** to explain residual risks (e.g. Cloud one-shot hard-fail still present).
