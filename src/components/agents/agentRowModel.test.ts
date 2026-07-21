@@ -384,6 +384,26 @@ describe("buildLaunchInput", () => {
       buildLaunchInput({ ...sel, client: "orchestrator" }, "app").cloudDuplex,
     ).toBeUndefined();
   });
+
+  it("orchestrator client forces role=orchestrator (no silent coder/verifier)", () => {
+    // Local (Devboule) is orchestrator-only; a panel radio left on coder/verifier
+    // must not leak into the launch payload (backend fails closed on mismatch).
+    expect(
+      buildLaunchInput({ ...sel, client: "orchestrator", role: "coder" }, "app")
+        .role,
+    ).toBe("orchestrator");
+    expect(
+      buildLaunchInput(
+        { ...sel, client: "orchestrator", role: "verifier" },
+        "app",
+      ).role,
+    ).toBe("orchestrator");
+    // Non-local clients keep the selected role.
+    expect(
+      buildLaunchInput({ ...sel, client: "claude", role: "verifier" }, "app")
+        .role,
+    ).toBe("verifier");
+  });
 });
 
 describe("canRoleLaunchTask / spawnDisabledReason", () => {
@@ -435,6 +455,47 @@ describe("canRoleLaunchTask / spawnDisabledReason", () => {
         task: task({ status: "wip" }),
       }),
     ).toBeNull();
+  });
+
+  it("skips coder/verifier task-role rules for the Local orchestrator client", () => {
+    // A review task would block a coder, but Local only needs an active project.
+    expect(
+      spawnDisabledReason({
+        projectId: "p-1",
+        projectActive: true,
+        role: "coder",
+        task: task({ status: "review" }),
+        client: "orchestrator",
+      }),
+    ).toBeNull();
+    expect(
+      spawnDisabledReason({
+        projectId: "p-1",
+        projectActive: true,
+        role: "orchestrator",
+        task: task({ status: "todo" }),
+        client: "orchestrator",
+      }),
+    ).toBeNull();
+    // Project gates still apply for Local.
+    expect(
+      spawnDisabledReason({
+        projectId: "all",
+        projectActive: true,
+        role: "orchestrator",
+        task: null,
+        client: "orchestrator",
+      }),
+    ).toMatch(/Select a project/);
+    expect(
+      spawnDisabledReason({
+        projectId: "p-1",
+        projectActive: false,
+        role: "orchestrator",
+        task: null,
+        client: "orchestrator",
+      }),
+    ).toMatch(/active projects/);
   });
 });
 

@@ -67,11 +67,18 @@ export function PlansPanel({ plans }: PlansPanelProps) {
         setExpanded({ requestId: request.id, markdown: md ?? "", loading: false, error: null });
       } catch (e) {
         if (!mountedRef.current || pendingRequestIdRef.current !== request.id) return;
+        // Tauri rejections are often plain strings, not Error.
+        const message =
+          typeof e === "string"
+            ? e
+            : e instanceof Error
+              ? e.message
+              : "Failed to load plan.";
         setExpanded({
           requestId: request.id,
           markdown: null,
           loading: false,
-          error: e instanceof Error ? e.message : "Failed to load plan.",
+          error: message,
         });
       }
     },
@@ -212,7 +219,14 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
         setPlans(data ?? []);
       } catch (e) {
         if (mountedRef.current) {
-          setError(e instanceof Error ? e.message : "Failed to load plans.");
+          // Tauri rejections are often plain strings, not Error.
+          const message =
+            typeof e === "string"
+              ? e
+              : e instanceof Error
+                ? e.message
+                : "Failed to load plans.";
+          setError(message);
         }
       } finally {
         if (showSpinner && mountedRef.current) setLoading(false);

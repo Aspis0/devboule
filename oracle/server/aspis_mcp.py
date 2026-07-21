@@ -7601,13 +7601,20 @@ def dispatch_plan_submit(
     #    is single-line cleaned + capped; the markdown is prose (newlines PRESERVED, so
     #    NOT run through clean_text which collapses whitespace) — non-empty + hard cap.
     project_id = normalize_project_id(args.get("project_id", ""))
+    # Resolve the project so a missing id fails closed. Draft projects MUST accept
+    # plan_submit: the approval gate is what promotes draft→active. Rejecting here
+    # deadlocks the planner (UI creates drafts, launch is allowed on draft, but
+    # submit was blocked). Other mutations (spawn_mini_coder, project_append_note,
+    # project_set_title, task claims) keep their draft rejection elsewhere.
+    # Defense-in-depth: only active|draft may receive a plan; paused/done/archived
+    # are terminal/idle and must not queue a new approval bell.
     project = load_project_locked(
         projects_dir, project_id
     )  # raises McpError("Project not found.")
-    # T4 — Ticket A: draft projects are read-only; reject plan_submit on draft.
-    if project["metadata"].get("status") == "draft":
+    pstatus = str(project.get("metadata", {}).get("status") or "active").strip().lower()
+    if pstatus not in ("active", "draft"):
         raise McpError(
-            "plan_submit: draft projects are read-only — activate the project first."
+            f"plan_submit: project status must be active or draft (got '{pstatus}')."
         )
     title = clean_text(args.get("title"), "Plan title", 200)
     plan_markdown = str(args.get("plan_markdown") or "")

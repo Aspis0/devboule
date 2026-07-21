@@ -110,7 +110,9 @@ export function SpawnPanel({
 	onLaunch,
 	onCopyPrompt,
 }: SpawnPanelProps) {
-	const [role, setRole] = useState<SpawnRole>("coder");
+	// Spawn radio is coder|verifier; Local (orchestrator client) forces
+	// role:"orchestrator" so Launch/Copy/gating never see a stale radio value.
+	const [role, setRole] = useState<SpawnRole | "orchestrator">("coder");
 	// Free-text advisory model hint (the source of truth). Empty = let the agent
 	// self-report. Quick-fill suggestion chips (per CLI) write into this field.
 	const [model, setModel] = useState<string>("");
@@ -247,6 +249,14 @@ export function SpawnPanel({
 			nextModel = localModel;
 		}
 		if (nextModel !== model) setModel(nextModel);
+		// Local is orchestrator-only: force role so selection.role is never a stale
+		// coder/verifier value for Launch/Copy/task gating. Leaving Local restores
+		// coder when the radio was hidden (no prior coder|verifier choice visible).
+		if (client === "orchestrator") {
+			if (role !== "orchestrator") setRole("orchestrator");
+		} else if (role === "orchestrator") {
+			setRole("coder");
+		}
 		// Reset the PTY opt-out on client switch: the flag is only meaningful for
 		// client "claude" + host "app" (duplex default), so a stale toggle must never
 		// ride into a different client's launch.
@@ -268,12 +278,23 @@ export function SpawnPanel({
 		projectActive,
 		role,
 		task: selectedTask,
+		client,
 	});
 	const disabled = isBusy || Boolean(disabledReason);
+	// Local launches the orchestrator binary only — the composed prompt is unused.
+	const copyDisabled = disabled || client === "orchestrator";
+	// Prefer the project/role gate reason when present; only then explain Local.
+	const copyDisabledReason =
+		disabledReason ??
+		(client === "orchestrator"
+			? "Local (Devboule) launches the orchestrator binary only; the prompt is unused."
+			: undefined);
 
 	const selection: SpawnSelection = {
 		projectId: lockedProjectId ?? selectedProjectId,
-		role,
+		// Force orchestrator when Local is selected so a stale radio value never
+		// rides into Launch/Copy (mirrors buildLaunchInput's client gate).
+		role: client === "orchestrator" ? "orchestrator" : role === "orchestrator" ? "coder" : role,
 		model,
 		taskId,
 		client,
@@ -332,37 +353,65 @@ export function SpawnPanel({
 				</div>
 			)}
 
-			{/* Role. */}
+			{/* Role. Local (Devboule) is orchestrator-only — hide Coder/Verifier so the
+			    UI cannot send a mismatched role (backend fails closed on that combo). */}
 			<p className="mb-1.5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
 				Role
 			</p>
-			<div
-				className="mb-1.5 inline-flex rounded-lg border border-cream-200 bg-white p-0.5"
-				role="radiogroup"
-				aria-label="Agent role"
-			>
-				{ROLE_OPTIONS.map((option) => {
-					const active = role === option.id;
-					return (
-						<button
-							key={option.id}
-							type="button"
+			{client === "orchestrator" ? (
+				<>
+					<div
+						className="mb-1.5 inline-flex rounded-lg border border-cream-200 bg-white p-0.5"
+						role="radiogroup"
+						aria-label="Agent role"
+					>
+						<span
 							role="radio"
-							aria-checked={active}
-							onClick={() => setRole(option.id)}
-							title={option.summary}
-							className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
-								active
-									? "bg-terracotta/10 text-terracotta"
-									: "text-cream-500 hover:text-cream-800"
-							}`}
+							aria-checked={true}
+							title="Plans and delegates via the local Devboule binary; never writes code itself."
+							className="rounded-md bg-terracotta/10 px-2.5 py-1 text-[11px] font-semibold text-terracotta"
 						>
-							{option.label}
-						</button>
-					);
-				})}
-			</div>
-			<p className="mb-3 text-[10px] leading-4 text-cream-400">{roleSummary}</p>
+							Orchestrator
+						</span>
+					</div>
+					<p className="mb-3 text-[10px] leading-4 text-cream-400">
+						Local (Devboule) launches the planner only. Pick Claude/Codex for
+						coder or verifier.
+					</p>
+				</>
+			) : (
+				<>
+					<div
+						className="mb-1.5 inline-flex rounded-lg border border-cream-200 bg-white p-0.5"
+						role="radiogroup"
+						aria-label="Agent role"
+					>
+						{ROLE_OPTIONS.map((option) => {
+							const active = role === option.id;
+							return (
+								<button
+									key={option.id}
+									type="button"
+									role="radio"
+									aria-checked={active}
+									onClick={() => setRole(option.id)}
+									title={option.summary}
+									className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+										active
+											? "bg-terracotta/10 text-terracotta"
+											: "text-cream-500 hover:text-cream-800"
+									}`}
+								>
+									{option.label}
+								</button>
+							);
+						})}
+					</div>
+					<p className="mb-3 text-[10px] leading-4 text-cream-400">
+						{roleSummary}
+					</p>
+				</>
+			)}
 
 			{/* Model (advisory) — free text is the source of truth; the chips below
           are per-CLI quick-fills. */}
@@ -560,9 +609,11 @@ export function SpawnPanel({
 									))}
 								</select>
 							</label>
-							<p className="mt-1.5 text-[10px] leading-4 text-cream-400">
-								Use “Copy prompt” to see the full prompt with this persona.
-							</p>
+							{client !== "orchestrator" && (
+								<p className="mt-1.5 text-[10px] leading-4 text-cream-400">
+									Use “Copy prompt” to see the full prompt with this persona.
+								</p>
+							)}
 						</div>
 					)}
 				</div>
@@ -607,13 +658,13 @@ export function SpawnPanel({
 				<button
 					type="button"
 					onClick={() => onCopyPrompt(selection)}
-					disabled={disabled}
+					disabled={copyDisabled}
 					title={
-						disabledReason ??
+						copyDisabledReason ??
 						"Copy the role/task prompt for a terminal you already have open."
 					}
 					data-help-title="This copies a manual prompt for the selected role and task."
-					data-help-lines="Manual prompt copy is for terminals you open yourself.|The role/task prompt tells the agent how to read the project and report through MCP.|It does not start a process or inject token profiles by itself.|Prefer app/external launch when provider tokens or root setup matter."
+					data-help-lines="Manual prompt copy is for terminals you open yourself.|The role/task prompt tells the agent how to read the project and report through MCP.|It does not start a process or inject token profiles by itself.|Prefer app/external launch when provider tokens or root setup matter.|Local (Devboule) does not use a copied prompt — launch the binary instead."
 					className="inline-flex items-center gap-1.5 rounded-md border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:text-terracotta disabled:opacity-60"
 				>
 					<Copy className="h-3.5 w-3.5" aria-hidden />

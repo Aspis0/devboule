@@ -1471,6 +1471,13 @@ pub fn lock_app(state: State<'_, BackendState>) -> Result<AuthState, String> {
     state.lock("manual")
 }
 
+/// Refresh soft-lock idle TTL after genuine user activity (frontend-throttled).
+/// Background pollers must NOT call this — only pointer/key handlers.
+#[tauri::command]
+pub fn touch_idle_activity(state: State<'_, BackendState>) -> Result<(), String> {
+    state.touch_idle_activity()
+}
+
 #[tauri::command]
 pub fn get_secret_status(state: State<'_, BackendState>) -> Result<Vec<SecretStatus>, String> {
     state.ensure_unlocked()?;

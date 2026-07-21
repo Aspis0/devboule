@@ -936,8 +936,24 @@ pub fn run_review_now(
         Some(rel) => run_fine_batch(app, project_id, root, &[rel.to_string()], gemma, running),
         // The whole-project sweep is COARSE-only (Gemma is per-file fine, see the
         // module doc); the Gemma ctx is intentionally not threaded here.
-        None => run_coarse_pass(app, project_id, root, running),
+        None => {
+            run_coarse_pass(app, project_id, root, running);
+            // Stamp last_coarse_run the same way the auto coarse path does so the
+            // UI's lastCoarseRun is not stuck at null after a manual whole-project
+            // review. Single-file rechecks intentionally leave the stamp alone.
+            stamp_last_coarse_run(root);
+        }
     }
+}
+
+/// Write `<root>/.aspis/last_coarse_run` with the current UTC RFC3339 stamp.
+/// Best-effort (IO errors ignored) — matches the auto coarse path in
+/// `mini_coder_executor`. Schema is a single RFC3339 line; do not invent a
+/// second format.
+pub(crate) fn stamp_last_coarse_run(root: &Path) {
+    let dir = root.join(".aspis");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("last_coarse_run"), chrono::Utc::now().to_rfc3339());
 }
 
 // ---------------------------------------------------------------------------

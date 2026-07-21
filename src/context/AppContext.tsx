@@ -79,6 +79,9 @@ const LIVE_SYNC_INTERVAL_MS = 60_000;
 // feel "minimized + frozen". Security intent kept: a genuine walk-away (staying
 // hidden) still locks after 2 minutes.
 const VISIBILITY_LOCK_GRACE_MS = 120_000;
+// Soft-lock idle TTL is refreshed only on genuine user input (not pollers).
+// Throttle IPC so pointer/key spam does not flood the backend.
+const IDLE_ACTIVITY_TOUCH_THROTTLE_MS = 60_000;
 const SCALEWAY_ACTION_FOLLOWUP_DELAYS_MS = [5_000, 15_000, 30_000];
 
 const EMPTY_CONFIG: AppConfig = {
@@ -2498,6 +2501,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (!unlockInFlightRef.current) void lock();
     }, VISIBILITY_LOCK_GRACE_MS);
   }, [isDesktopRuntime, isLocked, lock]);
+
+  // Soft-lock idle TTL tracks USER activity only. Background pollers call
+  // ensure_unlocked and must not refresh the clock (that was the security hole).
+  // pointerdown/keydown are genuine interaction; throttle to at most one IPC/min.
+  useEffect(() => {
+    if (isLocked || !isDesktopRuntime) return;
+    let lastTouchMs = 0;
+    const touch = () => {
+      const now = Date.now();
+      if (now - lastTouchMs < IDLE_ACTIVITY_TOUCH_THROTTLE_MS) return;
+      lastTouchMs = now;
+      void invokeBackendCommand("touch_idle_activity").catch((e) => {
+        // If the backend already expired idle, surface lock immediately instead
+        // of waiting for the next LIVE_SYNC poll (~60s UI desync).
+        const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "";
+        if (msg.toLowerCase().includes("app is locked")) {
+          void refreshAuthState();
+        }
+      });
+    };
+    // Immediate touch on unlock / effect mount so the idle window starts from
+    // the moment the user is actively in the app (not only first key/click).
+    touch();
+    window.addEventListener("pointerdown", touch, true);
+    window.addEventListener("keydown", touch, true);
+    return () => {
+      window.removeEventListener("pointerdown", touch, true);
+      window.removeEventListener("keydown", touch, true);
+    };
+  }, [isDesktopRuntime, isLocked, refreshAuthState]);
 
   useEffect(
     () => () => {

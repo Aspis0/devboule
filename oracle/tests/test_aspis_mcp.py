@@ -3564,10 +3564,12 @@ class T4DraftReadableTests(unittest.TestCase):
     """T4 — Ticket A: `draft` is a READABLE project status.
 
     The planner needs read-only introspection of pre-approval projects
-    (project_get) and Oracle queries against them (oracle_context). Every
-    mutation path (claim, update_status, follow-up create, plan-tasks
-    create, provider mutations) MUST keep rejecting `draft` exactly as it
-    rejects `paused | done | archived`.
+    (project_get) and Oracle queries against them (oracle_context). Most
+    mutation paths (claim, update_status, follow-up create, plan-tasks
+    create, notes/title, spawn_mini_coder) MUST keep rejecting `draft`
+    exactly as they reject `paused | done | archived`. Exception:
+    plan_submit MUST succeed on draft so the approval gate can promote
+    draft→active (rejecting it deadlocks the planner).
 
     Draft projects are authored via a direct markdown write (bypassing
     MCP `project_create`, which enforces `VALID_PROJECT_STATUSES` and
@@ -3882,13 +3884,106 @@ updated_at: 2026-05-28T00:00:00Z
             self.assertIn("draft projects are read-only", str(ctx.exception))
             self.assertIn("project_set_title", str(ctx.exception))
 
-    def test_draft_plan_submit_rejected(self):
-        # MUTATION: plan_submit must reject draft projects.
+    def test_draft_plan_submit_allowed(self):
+        # plan_submit MUST succeed on draft: the approval gate promotes draft→active.
+        # Rejecting it deadlocks the planner (UI creates drafts; launch is allowed).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
             projects.mkdir()
             self._write_draft_project(projects)
+            token = "test-launch-token"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "updatedAt": "2026-06-09T00:00:00+00:00",
+                        "sessions": [
+                            {
+                                "agentId": "codex",
+                                "role": "coder",
+                                "status": "launch_pending",
+                                "lastSeenAt": "2026-06-09T00:00:00+00:00",
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            reg = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "model": "codex",
+                    "message": "coding",
+                    "launch_token": token,
+                },
+                root=root,
+            )
+            session_token = reg["sessionToken"]
+            with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "plan_submit",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "project_id": "draft-proj",
+                        "title": "Test plan",
+                        "plan_markdown": "# Plan\n\n- step one\n",
+                        "session_token": session_token,
+                    },
+                    root=root,
+                )
+            self.assertIn("planId", out)
+            self.assertRegex(out["planId"], r"^[0-9a-f]{32}$")
+            # Zero poll timeout → synthesized timeout (no human verdict); still a
+            # successful submit path — draft was NOT rejected.
+            self.assertEqual(out["status"], "timeout")
+            plan_id = out["planId"]
+            md_path = (
+                projects / ".aspis-plans" / "draft-proj" / f"{plan_id}.md"
+            )
+            self.assertTrue(
+                md_path.exists(), "plan markdown must be written for draft projects"
+            )
+
+    def test_paused_plan_submit_rejected(self):
+        # Defense-in-depth: plan_submit only allows active|draft. paused/done/
+        # archived must fail closed with a clear status message.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            prepare_management_root(root)
+            path = projects / "paused-proj.md"
+            path.write_text(
+                """---
+id: paused-proj
+title: Paused project
+status: paused
+updated_at: 2026-05-28T00:00:00Z
+---
+
+# Goal
+- Idle project.
+
+```aspis-project
+{
+  "version": 1,
+  "tasks": [],
+  "notes": []
+}
+```
+""",
+                encoding="utf-8",
+            )
             token = "test-launch-token"
             (projects / ".aspis-agents.json").write_text(
                 json.dumps(
@@ -3931,15 +4026,16 @@ updated_at: 2026-05-28T00:00:00Z
                     {
                         "agent_id": "codex",
                         "role": "coder",
-                        "project_id": "draft-proj",
+                        "project_id": "paused-proj",
                         "title": "Test plan",
                         "plan_markdown": "# Plan\n\n- step one\n",
                         "session_token": session_token,
                     },
                     root=root,
                 )
-            self.assertIn("draft projects are read-only", str(ctx.exception))
-            self.assertIn("plan_submit", str(ctx.exception))
+            self.assertIn("active or draft", str(ctx.exception))
+            self.assertIn("paused", str(ctx.exception))
+            self.assertFalse((projects / ".aspis-plans").exists())
 
     def test_draft_spawn_mini_coder_rejected(self):
         # MUTATION: spawn_mini_coder must reject when parent session is on a

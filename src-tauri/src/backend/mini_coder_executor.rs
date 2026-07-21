@@ -1130,11 +1130,8 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                         crate::backend::censor::orchestrator::run_coarse_pass(
                             &app, &pid, &root, &running,
                         );
-                        let _ = std::fs::create_dir_all(root.join(".aspis"));
-                        let _ = std::fs::write(
-                            root.join(".aspis").join("last_coarse_run"),
-                            chrono::Utc::now().to_rfc3339(),
-                        );
+                        // Same stamp as manual whole-project review (censor_review_now).
+                        crate::backend::censor::orchestrator::stamp_last_coarse_run(&root);
                         // B3: clear dirty only AFTER successful completion.
                         dirty_ref.lock().unwrap().remove(&pid);
                     });

@@ -57,9 +57,10 @@ describe("SpawnPanel CLI options", () => {
 
 // Type-level contract: SpawnSelection.client / SpawnLaunchInput.client are plain
 // strings, so "orchestrator" threads through the launch pipeline without widening.
+// Local (Devboule) launches carry role:"orchestrator" (not coder/verifier).
 // (Compile-time check; the assignment fails tsc if either field were narrowed.)
 describe("SpawnPanel launch contract", () => {
-  it("accepts orchestrator as a client value in the selection/launch shape", () => {
+  it("accepts orchestrator as a client value with matching orchestrator role", () => {
     const selection: SpawnSelection = {
       projectId: "p1",
       role: "coder",
@@ -69,7 +70,7 @@ describe("SpawnPanel launch contract", () => {
     };
     const input: SpawnLaunchInput = {
       projectId: "p1",
-      role: "coder",
+      role: "orchestrator",
       client: "orchestrator",
       taskId: null,
       host: "app",
@@ -77,5 +78,6 @@ describe("SpawnPanel launch contract", () => {
     };
     expect(selection.client).toBe("orchestrator");
     expect(input.client).toBe("orchestrator");
+    expect(input.role).toBe("orchestrator");
   });
 });

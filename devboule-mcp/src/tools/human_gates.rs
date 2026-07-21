@@ -916,11 +916,19 @@ pub fn plan_submit(
     let (agent_id, role) =
         require_agent_tool(projects_dir, agent_id, role, "plan_submit", session_token)?;
     let project_id = normalize_project_id(project_id)?;
+    // Draft projects MUST accept plan_submit: the approval gate is what promotes
+    // draft→active. Rejecting here deadlocks the planner (UI creates drafts, launch
+    // is allowed on draft, but submit was blocked). Other mutations (mini, notes,
+    // title, task claims) keep their draft rejection elsewhere.
+    // Still resolve the project so a missing id fails closed.
+    // Defense-in-depth: only active|draft may receive a plan; paused/done/archived
+    // are terminal/idle and must not queue a new approval bell.
     let project = load_project_locked(projects_dir, &project_id)?;
-    if project.metadata.status() == "draft" {
-        return Err(ToolError::new(
-            "plan_submit: draft projects are read-only — activate the project first.",
-        ));
+    let pstatus = project.metadata.status();
+    if !matches!(pstatus, "active" | "draft") {
+        return Err(ToolError::new(format!(
+            "plan_submit: project status must be active or draft (got '{pstatus}')."
+        )));
     }
     let title = clean_text(title, "Plan title", 200)?;
     if strip_invisible_and_bidi(plan_markdown).trim().is_empty() {
@@ -1959,6 +1967,75 @@ mod tests {
         let err = plan_status(&projects, "codex", "coder", "../etc/passwd", Some(&tok))
             .unwrap_err();
         assert!(err.message.contains("32 lowercase"), "{}", err.message);
+    }
+
+    #[test]
+    fn plan_submit_rejects_paused_done_archived_allows_draft() {
+        let _g = env_lock();
+        set_unmanaged(false);
+        let _to = set_poll_timeout_zero();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "codex", "coder");
+
+        for status in ["paused", "done", "archived"] {
+            write_test_project(
+                &projects,
+                "scrna-seq",
+                "scRNA",
+                status,
+                json!([{
+                    "id": "T1",
+                    "title": "Manual",
+                    "status": "todo",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                }]),
+                &[],
+            )
+            .unwrap();
+            let err = plan_submit(
+                &projects,
+                "codex",
+                "coder",
+                "scrna-seq",
+                "Nope",
+                "# Plan\n\n- step\n",
+                Some(&tok),
+            )
+            .unwrap_err();
+            assert!(
+                err.message.contains("active or draft") && err.message.contains(status),
+                "status={status}: {}",
+                err.message
+            );
+        }
+
+        // Draft remains allowed (approval gate promotes draft→active).
+        write_test_project(
+            &projects,
+            "scrna-seq",
+            "scRNA",
+            "draft",
+            json!([{
+                "id": "T1",
+                "title": "Manual",
+                "status": "todo",
+                "updatedAt": "2026-01-01T00:00:00Z",
+            }]),
+            &[],
+        )
+        .unwrap();
+        let out = plan_submit(
+            &projects,
+            "codex",
+            "coder",
+            "scrna-seq",
+            "Draft plan",
+            "# Plan\n\n- step\n",
+            Some(&tok),
+        )
+        .unwrap();
+        assert_eq!(out["status"], "timeout");
+        assert!(out["planId"].as_str().unwrap().len() == 32);
     }
 
     #[test]

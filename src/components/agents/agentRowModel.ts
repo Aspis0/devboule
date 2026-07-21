@@ -314,7 +314,10 @@ export type SpawnHost = "app" | "external" | "copy";
 
 export interface SpawnSelection {
 	projectId: string;
-	role: SpawnRole;
+	// ROLE UNTANGLE: normally a SpawnRole (coder/verifier radio). When client is
+	// "orchestrator" (Local Devboule) the panel forces role:"orchestrator" so
+	// Launch/Copy/gating never see a stale coder|verifier value.
+	role: SpawnRole | "orchestrator";
 	// Advisory model hint threaded into the launch prompt. "" / "custom-with-no-
 	// value" means "let the agent self-report" and no hint is sent.
 	model: string;
@@ -469,7 +472,10 @@ export function buildLaunchInput(
 	}
 	return {
 		projectId: selection.projectId,
-		role: selection.role,
+		// Local (Devboule) is orchestrator-only: never send role=coder|verifier with
+		// client=orchestrator (backend fails closed). Force the matching role here so
+		// the panel's coder/verifier radio cannot leak a mismatched launch.
+		role: selection.client === "orchestrator" ? "orchestrator" : selection.role,
 		client: selection.client,
 		taskId: selection.taskId.trim().length > 0 ? selection.taskId : null,
 		host,
@@ -530,11 +536,16 @@ export function canRoleLaunchTask(
 // The reason a spawn is blocked, or null when it is allowed. Order of precedence:
 // no project selected -> project not active -> role/task rule. Returned as a
 // human string so the panel can show it as a disabled-button title + inline note.
+//
+// Local (client === "orchestrator") skips coder/verifier task-role rules: the
+// orchestrator plans/delegates and does not need a matching task status.
 export function spawnDisabledReason(args: {
 	projectId: string;
 	projectActive: boolean | null;
-	role: SpawnRole;
+	role: SpawnRole | "orchestrator";
 	task: ProjectTask | null;
+	// Optional: when "orchestrator", only project gates apply (no task-role match).
+	client?: string;
 }): string | null {
 	if (!args.projectId || args.projectId === "all") {
 		return "Select a project before launching an agent.";
@@ -547,6 +558,16 @@ export function spawnDisabledReason(args: {
 	}
 	if (args.projectActive === false) {
 		return "Only active projects can launch agents.";
+	}
+	// Local orchestrator: project gates only. It does not claim coder/verifier
+	// task columns, so a Review/Todo mismatch must not block Launch.
+	if (args.client === "orchestrator") {
+		return null;
+	}
+	// Orchestrator role without the Local client should not hit task-role rules
+	// either (defensive — the panel only emits role:orchestrator with that client).
+	if (args.role === "orchestrator") {
+		return null;
 	}
 	if (!canRoleLaunchTask(args.role, args.task)) {
 		// canRoleLaunchTask only ever returns false for a non-null task (a null task

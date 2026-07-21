@@ -572,6 +572,7 @@ pub fn run() {
             backend::workspace::get_workspace_hygiene_snapshot,
             backend::workspace::get_workspace_package_snapshot,
             backend::commands::lock_app,
+            backend::commands::touch_idle_activity,
             backend::projects::add_project_milestone,
             backend::projects::append_project_note,
             backend::projects::create_project,

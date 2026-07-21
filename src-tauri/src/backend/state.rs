@@ -17,8 +17,11 @@ struct AuthSession {
     locked: bool,
     /// User-facing unlock timestamp (wall clock). NOT used for expiry math.
     last_unlocked_at: Option<DateTime<Utc>>,
-    /// D2: monotonic unlock instant used for the idle-TTL comparison so a
-    /// backward wall-clock change cannot extend the unlocked window.
+    /// D2: monotonic instant of the last genuine user activity while unlocked
+    /// (set on unlock; refreshed only via `touch_idle_activity`, never by
+    /// background IPC / `ensure_unlocked` pollers). Used for the idle-TTL
+    /// comparison so a backward wall-clock change cannot extend the unlocked
+    /// window, and only real user interaction keeps the session open.
     unlocked_instant: Option<Instant>,
     lock_reason: Option<String>,
     session_id: u64,
@@ -186,12 +189,34 @@ impl BackendState {
         let mut auth = self.auth.write().map_err(|e| e.to_string())?;
         let expired = Self::expire_if_needed(&mut auth);
         let locked = auth.locked;
+        // Idle TTL tracks genuine user activity only (`touch_idle_activity`).
+        // Background pollers that gate via ensure_unlocked must NOT refresh
+        // the clock — that would defeat soft-lock while the window is visible.
         drop(auth);
         if expired {
             self.clear_sensitive_runtime_data()?;
         }
         if locked {
-            return Err("App is locked. Unlock with Windows Hello first.".into());
+            return Err("App is locked. Unlock to continue.".into());
+        }
+        Ok(())
+    }
+
+    /// Refresh the idle-TTL clock after genuine user activity (pointer/key).
+    /// Does not extend the window when already locked or when expire fires.
+    pub fn touch_idle_activity(&self) -> Result<(), String> {
+        let mut auth = self.auth.write().map_err(|e| e.to_string())?;
+        let expired = Self::expire_if_needed(&mut auth);
+        let locked = auth.locked;
+        if !locked {
+            auth.unlocked_instant = Some(Instant::now());
+        }
+        drop(auth);
+        if expired {
+            self.clear_sensitive_runtime_data()?;
+        }
+        if locked {
+            return Err("App is locked. Unlock to continue.".into());
         }
         Ok(())
     }
@@ -206,7 +231,7 @@ impl BackendState {
             self.clear_sensitive_runtime_data()?;
         }
         if locked {
-            return Err("App is locked. Unlock with Windows Hello first.".into());
+            return Err("App is locked. Unlock to continue.".into());
         }
         Ok(session_id)
     }
@@ -221,7 +246,7 @@ impl BackendState {
             self.clear_sensitive_runtime_data()?;
         }
         if locked {
-            return Err("App is locked. Unlock with Windows Hello first.".into());
+            return Err("App is locked. Unlock to continue.".into());
         }
         if changed {
             return Err("App lock state changed. Retry after unlocking.".into());
@@ -447,9 +472,11 @@ impl BackendState {
         if auth.locked {
             return false;
         }
-        // D2: the idle TTL is measured against the MONOTONIC unlock instant, so a
-        // backward wall-clock change cannot extend the unlocked window. A missing
-        // monotonic instant is treated as unavailable and locks immediately.
+        // D2: the idle TTL is measured against the MONOTONIC last-activity instant
+        // (refreshed only by genuine user activity via touch_idle_activity), so a
+        // backward wall-clock change cannot extend the unlocked window and real
+        // interactive use stays open without background IPC defeating the lock.
+        // A missing monotonic instant is treated as unavailable and locks immediately.
         let Some(unlocked_instant) = auth.unlocked_instant else {
             auth.locked = true;
             auth.lock_reason = Some("unavailable".into());
@@ -526,11 +553,76 @@ mod tests {
             auth.lock_reason = None;
         }
 
-        assert!(state.ensure_unlocked().is_err());
+        let err = state.ensure_unlocked().unwrap_err();
+        assert!(err.contains("App is locked"), "{err}");
         assert_eq!(
             state.auth_state().unwrap().lock_reason.as_deref(),
             Some("idle")
         );
+    }
+
+    #[test]
+    fn ensure_unlocked_does_not_refresh_idle_ttl() {
+        // ensure_unlocked is a pure gate: background pollers must not reset idle.
+        let state = BackendState::new();
+        let almost_expired = Instant::now()
+            - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30);
+        {
+            let mut auth = state.auth.write().unwrap();
+            auth.locked = false;
+            auth.last_unlocked_at = Some(Utc::now());
+            auth.unlocked_instant = Some(almost_expired);
+            auth.lock_reason = None;
+        }
+
+        assert!(state.ensure_unlocked().is_ok());
+        let elapsed = {
+            let auth = state.auth.read().unwrap();
+            auth.unlocked_instant.expect("unchanged").elapsed()
+        };
+        // Still near TTL (≈30s remaining), not refreshed to "now".
+        assert!(
+            elapsed > StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 60),
+            "ensure_unlocked must not refresh idle clock, elapsed={elapsed:?}"
+        );
+        assert!(!state.auth_state().unwrap().locked);
+    }
+
+    #[test]
+    fn touch_idle_activity_refreshes_idle_ttl_when_unlocked() {
+        // Genuine user activity extends the expire window.
+        let state = BackendState::new();
+        {
+            let mut auth = state.auth.write().unwrap();
+            auth.locked = false;
+            auth.last_unlocked_at = Some(Utc::now());
+            // Almost expired (TTL - 30s). Without touch, waiting would expire.
+            auth.unlocked_instant = Some(
+                Instant::now()
+                    - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30),
+            );
+            auth.lock_reason = None;
+        }
+
+        assert!(state.touch_idle_activity().is_ok());
+        let elapsed = {
+            let auth = state.auth.read().unwrap();
+            auth.unlocked_instant.expect("refreshed").elapsed()
+        };
+        assert!(
+            elapsed < StdDuration::from_secs(5),
+            "expected touch to Instant::now(), elapsed={elapsed:?}"
+        );
+        // Expire window extended: ensure_unlocked still succeeds after the touch.
+        assert!(state.ensure_unlocked().is_ok());
+        assert!(!state.auth_state().unwrap().locked);
+    }
+
+    #[test]
+    fn touch_idle_activity_errors_when_locked() {
+        let state = BackendState::new();
+        let err = state.touch_idle_activity().unwrap_err();
+        assert!(err.contains("App is locked"), "{err}");
     }
 
     #[test]

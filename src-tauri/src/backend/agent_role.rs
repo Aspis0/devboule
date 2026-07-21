@@ -46,17 +46,34 @@ pub fn canonicalize_launch_role(value: &str) -> Result<String, String> {
     }
 }
 
-/// The EFFECTIVE role for a launch, from the launch intent: selecting the Devboule
-/// binary (`client == "orchestrator"`) IS asking for the orchestrator role, whatever
-/// the (legacy) role field said — the binary hardcodes
-/// `agent_register(role="orchestrator")` and the MCP server matches the stored
-/// session role against it. Every other client keeps the canonical role verbatim.
-pub fn effective_launch_role(client: &str, canonical_role: &str) -> String {
+/// The EFFECTIVE role for a launch, from the launch intent.
+///
+/// Selecting the Devboule binary (`client == "orchestrator"`) is an orchestrator
+/// launch ONLY. Sending `role=coder` or `role=verifier` with that client used to
+/// silently coerce to orchestrator (so "Launch Verifier" with Local CLI produced
+/// no verifier session). Fail closed with a clear error instead; the UI must not
+/// offer coder/verifier when Local is selected. Role already `orchestrator` (or
+/// empty, treated as default orchestrator) succeeds. Every other client keeps the
+/// canonical role verbatim.
+pub fn effective_launch_role(client: &str, canonical_role: &str) -> Result<String, String> {
     if client == ROLE_ORCHESTRATOR {
-        ROLE_ORCHESTRATOR.to_string()
-    } else {
-        canonical_role.to_string()
+        let role = canonical_role.trim();
+        if role.is_empty() || role == ROLE_ORCHESTRATOR {
+            return Ok(ROLE_ORCHESTRATOR.to_string());
+        }
+        if role == ROLE_CODER || role == ROLE_VERIFIER {
+            return Err(
+                "Local (Devboule) launches the orchestrator only. Pick Claude/Codex/Gemini for coder or verifier."
+                    .into(),
+            );
+        }
+        // Unknown role strings should already have been rejected by canonicalize;
+        // still refuse rather than silently coerce.
+        return Err(format!(
+            "Local (Devboule) launches the orchestrator only (got role '{role}')."
+        ));
     }
+    Ok(canonical_role.to_string())
 }
 
 /// Roles sharing the coder's Kanban transition + claim semantics (mirrors Python
@@ -111,17 +128,30 @@ mod tests {
 
     #[test]
     fn effective_role_follows_launch_intent() {
-        // Devboule-binary client ⇒ orchestrator role, even from a legacy "coder"
-        // role field (old frontend payloads keep working).
-        assert_eq!(effective_launch_role("orchestrator", "coder"), "orchestrator");
+        // Devboule-binary client ⇒ orchestrator role when role matches intent.
         assert_eq!(
-            effective_launch_role("orchestrator", "orchestrator"),
+            effective_launch_role("orchestrator", "orchestrator").unwrap(),
             "orchestrator"
         );
+        assert_eq!(
+            effective_launch_role("orchestrator", "").unwrap(),
+            "orchestrator"
+        );
+        // Mismatched coder/verifier with Local client fails closed (no silent coerce).
+        let err = effective_launch_role("orchestrator", "coder").unwrap_err();
+        assert!(err.contains("orchestrator only"), "{err}");
+        let err = effective_launch_role("orchestrator", "verifier").unwrap_err();
+        assert!(err.contains("orchestrator only"), "{err}");
         // Every other client keeps the canonical role verbatim.
-        assert_eq!(effective_launch_role("codex", "coder"), "coder");
-        assert_eq!(effective_launch_role("claude", "verifier"), "verifier");
-        assert_eq!(effective_launch_role("custom-cli", "coder"), "coder");
+        assert_eq!(effective_launch_role("codex", "coder").unwrap(), "coder");
+        assert_eq!(
+            effective_launch_role("claude", "verifier").unwrap(),
+            "verifier"
+        );
+        assert_eq!(
+            effective_launch_role("custom-cli", "coder").unwrap(),
+            "coder"
+        );
     }
 
     #[test]

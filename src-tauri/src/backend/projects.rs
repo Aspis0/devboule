@@ -1616,13 +1616,14 @@ fn prepare_or_launch_project_agent(
     let (client, custom_command) = resolve_launch_client(&app, &input.client)?;
     // ROLE UNTANGLE (2026-07): ONE effective role, derived from the launch intent.
     // Selecting the Devboule binary (`client == "orchestrator"`) IS an orchestrator
-    // launch, whatever the legacy role field said; every other client keeps its
-    // canonical role. This single value now drives the prompt, the Kanban launch
-    // gate, the vault/provider env (orchestrator ⇒ none) AND the persisted session
-    // role — replacing the former stored_role/canonical-role split, so the stored
-    // role always equals what the binary registers as (`agent_register`, config.rs).
-    let role =
-        super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
+    // launch ONLY — mismatched role=coder|verifier fails closed (no silent coerce).
+    // Every other client keeps its canonical role. This single value drives the
+    // prompt, the Kanban launch gate, the vault/provider env AND the persisted
+    // session role — so the stored role always equals what the binary registers as.
+    let role = super::agent_role::effective_launch_role(
+        &client,
+        &normalize_agent_role(&input.role)?,
+    )?;
     // "app" -> hosted PTY inside Devboule; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
@@ -7870,11 +7871,9 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     }
 
     // ROLE UNTANGLE — the PERSISTED session role equals the EFFECTIVE launch role,
-    // which is first-class "orchestrator" for a Devboule-binary launch (the binary
-    // hardcodes `agent_register(role="orchestrator")`, config.rs, and the server
-    // matches the stored role against it — a mismatch silently degrades the
-    // orchestrator to the StubExecutor). Legacy frontend payloads that still send
-    // role:"coder" with client:"orchestrator" keep working via the intent fold.
+    // which is first-class "orchestrator" for a matching Devboule-binary launch
+    // (the binary hardcodes `agent_register(role="orchestrator")`). Mismatched
+    // role=coder|verifier with client=orchestrator fails closed (no silent coerce).
     #[test]
     fn orchestrator_launch_role_is_first_class() {
         // The role string canonicalizes to ITSELF now (no more fold to coder)...
@@ -7882,23 +7881,30 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             normalize_agent_role("orchestrator").unwrap(),
             "orchestrator"
         );
-        // ...and the launch INTENT decides: Devboule client ⇒ orchestrator role,
-        // even from a legacy "coder" role field.
+        // Matching intent: Devboule client + orchestrator role.
         assert_eq!(
-            super::super::agent_role::effective_launch_role("orchestrator", "coder"),
+            super::super::agent_role::effective_launch_role("orchestrator", "orchestrator")
+                .unwrap(),
             "orchestrator"
+        );
+        // Mismatched role with Local client fails closed.
+        assert!(
+            super::super::agent_role::effective_launch_role("orchestrator", "coder").is_err()
+        );
+        assert!(
+            super::super::agent_role::effective_launch_role("orchestrator", "verifier").is_err()
         );
         // Every other client persists the canonical role verbatim.
         assert_eq!(
-            super::super::agent_role::effective_launch_role("codex", "coder"),
+            super::super::agent_role::effective_launch_role("codex", "coder").unwrap(),
             "coder"
         );
         assert_eq!(
-            super::super::agent_role::effective_launch_role("claude", "verifier"),
+            super::super::agent_role::effective_launch_role("claude", "verifier").unwrap(),
             "verifier"
         );
         assert_eq!(
-            super::super::agent_role::effective_launch_role("custom-cli", "coder"),
+            super::super::agent_role::effective_launch_role("custom-cli", "coder").unwrap(),
             "coder"
         );
     }
@@ -8033,18 +8039,24 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     }
 
     // ROLE UNTANGLE — a workflow_run is rejected for an orchestrator launch by BOTH
-    // guards now: the client-specific message AND the role gate (the effective role
-    // is "orchestrator", which is != "coder").
+    // guards: the client-specific message AND the role gate (effective role is
+    // "orchestrator", which is != "coder"). Matching role is required; mismatched
+    // coder+Local fails closed before the workflow guard.
     #[test]
     fn workflow_run_rejected_for_orchestrator_client() {
         let client = "orchestrator";
         let role = super::super::agent_role::effective_launch_role(
             client,
-            &normalize_agent_role("coder").unwrap(),
-        );
+            &normalize_agent_role("orchestrator").unwrap(),
+        )
+        .unwrap();
         assert_eq!(role, "orchestrator");
         assert!(client == "orchestrator", "client-keyed guard rejects this");
         assert!(role != "coder", "role-keyed guard rejects it too");
+        // Fail-closed: coder role with Local client never reaches workflow_run.
+        assert!(
+            super::super::agent_role::effective_launch_role(client, "coder").is_err()
+        );
     }
 
     #[test]
