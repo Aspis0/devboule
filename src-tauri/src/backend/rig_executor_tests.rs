@@ -738,6 +738,7 @@ fn test_agentic_full_chain_vs_mock_llm() {
         vec![],
         4,
         &std::sync::atomic::AtomicBool::new(false),
+        None,
     );
 
     // ── Assert outcome ───────────────────────────────────────────────────
@@ -862,6 +863,7 @@ fn test_agentic_allowlist_blocks_out_of_scope_write() {
         vec![],
         4,
         &std::sync::atomic::AtomicBool::new(false),
+        None,
     );
 
     // ── Outcome: Done (loop continues after a tool error; agentic_loop.rs) ─

@@ -12,6 +12,37 @@ use std::time::{Duration as StdDuration, Instant};
 const UNLOCK_TTL_MINUTES: i64 = 15;
 const ACTIVITY_HISTORY_LIMIT: usize = 80;
 
+/// DEV ONLY: skip Touch ID / Hello and idle soft-lock so agents can drive the
+/// app overnight without a human at the keyboard.
+///
+/// - **Release builds:** always off.
+/// - **Unit tests (`cfg(test)`):** off by default (real lock semantics), unless
+///   `DEVBOULE_DEV_UNLOCK=1` is set for a deliberate test.
+/// - **Debug app runs:** on by default; set `DEVBOULE_DEV_UNLOCK=0` to exercise
+///   the real lock screen.
+pub fn dev_unlock_enabled() -> bool {
+    #[cfg(not(debug_assertions))]
+    {
+        return false;
+    }
+    #[cfg(debug_assertions)]
+    {
+        match std::env::var("DEVBOULE_DEV_UNLOCK")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") | Some("false") | Some("no") | Some("off") => false,
+            Some("1") | Some("true") | Some("yes") | Some("on") => true,
+            // cfg(test): keep lock tests honest unless the env opts in.
+            None | Some("") if cfg!(test) => false,
+            // Debug cargo run / tauri dev / pilot: stay unlocked.
+            None | Some("") => true,
+            Some(_) => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AuthSession {
     locked: bool,
@@ -64,12 +95,19 @@ impl BackendState {
             .build()
             .expect("failed to build reqwest client");
 
+        let dev = dev_unlock_enabled();
+        if dev {
+            eprintln!(
+                "[devboule] DEV unlock active — no Touch ID / Hello, no idle soft-lock \
+                 (set DEVBOULE_DEV_UNLOCK=0 to restore real lock)"
+            );
+        }
         Self {
             auth: RwLock::new(AuthSession {
-                locked: true,
-                last_unlocked_at: None,
-                unlocked_instant: None,
-                lock_reason: Some("startup".into()),
+                locked: !dev,
+                last_unlocked_at: if dev { Some(Utc::now()) } else { None },
+                unlocked_instant: if dev { Some(Instant::now()) } else { None },
+                lock_reason: if dev { None } else { Some("startup".into()) },
                 session_id: 0,
             }),
             auth_prompt: Mutex::new(()),
@@ -136,6 +174,11 @@ impl BackendState {
     }
 
     pub fn verify_unlock(&self, message: &str) -> Result<AuthState, String> {
+        // Debug / pilot overnight: no biometric prompt.
+        if dev_unlock_enabled() {
+            return self.unlock_after_verification();
+        }
+
         self.ensure_auth_retry_allowed()?;
 
         let _prompt_guard = self
@@ -472,6 +515,10 @@ impl BackendState {
         if auth.locked {
             return false;
         }
+        // Debug overnight: never soft-lock on idle (Touch ID would block agents).
+        if dev_unlock_enabled() {
+            return false;
+        }
         // D2: the idle TTL is measured against the MONOTONIC last-activity instant
         // (refreshed only by genuine user activity via touch_idle_activity), so a
         // backward wall-clock change cannot extend the unlocked window and real
@@ -538,6 +585,33 @@ mod tests {
     fn sensitive_gate_blocks_when_locked() {
         let state = BackendState::new();
         assert!(state.ensure_unlocked().is_err());
+    }
+
+    #[test]
+    fn dev_unlock_skips_biometric_and_idle_ttl() {
+        // Opt in explicitly — unit tests default DEV unlock off.
+        std::env::set_var("DEVBOULE_DEV_UNLOCK", "1");
+        let state = BackendState::new();
+        assert!(
+            !state.auth_state().unwrap().locked,
+            "debug + DEVBOULE_DEV_UNLOCK=1 starts unlocked"
+        );
+        assert!(state.ensure_unlocked().is_ok());
+        // Far past idle TTL — still open.
+        {
+            let mut auth = state.auth.write().unwrap();
+            auth.unlocked_instant = Some(
+                Instant::now()
+                    - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 10) * 60),
+            );
+        }
+        assert!(
+            state.ensure_unlocked().is_ok(),
+            "dev unlock must not idle-expire"
+        );
+        // No biometric path required.
+        assert!(state.verify_unlock("dev").is_ok());
+        std::env::remove_var("DEVBOULE_DEV_UNLOCK");
     }
 
     #[test]

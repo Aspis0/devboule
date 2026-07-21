@@ -25,6 +25,9 @@ trap cleanup EXIT
 
 export TAURI_CONFIG
 TAURI_CONFIG="$(cat "$TAURI/tauri.pilot.conf.json")"
-echo "launching: cargo run --features ui-pilot (capability pilot.json staged)"
+# Stay unlocked overnight for agent drive (no Touch ID / idle soft-lock).
+# Set DEVBOULE_DEV_UNLOCK=0 to exercise the real lock screen.
+export DEVBOULE_DEV_UNLOCK="${DEVBOULE_DEV_UNLOCK:-1}"
+echo "launching: cargo run --features ui-pilot (capability pilot.json staged, DEVBOULE_DEV_UNLOCK=$DEVBOULE_DEV_UNLOCK)"
 cd "$TAURI"
 exec cargo run --features ui-pilot
