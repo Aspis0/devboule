@@ -505,12 +505,26 @@ export function OracleAdminPanel() {
     ? doctor.checks.filter((c) => c.ok).length
     : DOCTOR_CHECK_ORDER.filter((id) => doctorOkById.get(id) === true).length;
 
-  // server badge: no-workspace (coral) > indexing (amber) > running (sage).
-  const serverState: "running" | "indexing" | "no-workspace" = !hasWorkspace
+  // server badge: honest liveness — not "has workspace ⇒ running".
+  //   no-workspace → coral
+  //   indexing     → amber (job active)
+  //   running      → sage (runtime probe true = live HTTP)
+  //   down         → coral (probe false after grace)
+  //   starting     → neutral (probe null / still checking)
+  const serverState:
+    | "running"
+    | "indexing"
+    | "no-workspace"
+    | "down"
+    | "starting" = !hasWorkspace
     ? "no-workspace"
     : jobActive
       ? "indexing"
-      : "running";
+      : runtimeReadyStable === true
+        ? "running"
+        : runtimeReadyStable === false
+          ? "down"
+          : "starting";
 
   return (
     <div className="space-y-5">
@@ -933,7 +947,7 @@ function HealthStrip({
   backend,
   onRunDoctor,
 }: {
-  serverState: "running" | "indexing" | "no-workspace";
+  serverState: "running" | "indexing" | "no-workspace" | "down" | "starting";
   checkOk: Map<string, boolean>;
   passCount: number;
   totalChecks: number;
@@ -947,21 +961,31 @@ function HealthStrip({
       ? "no workspace"
       : serverState === "indexing"
         ? "indexing"
-        : "running";
+        : serverState === "down"
+          ? "down"
+          : serverState === "starting"
+            ? "starting…"
+            : "running";
   const coreColor =
-    serverState === "no-workspace"
+    serverState === "no-workspace" || serverState === "down"
       ? "bg-coral"
-      : serverState === "indexing"
+      : serverState === "indexing" || serverState === "starting"
         ? "bg-amber"
         : "bg-sage";
   const labelColor =
-    serverState === "no-workspace"
+    serverState === "no-workspace" || serverState === "down"
       ? "text-coral-dark"
-      : serverState === "indexing"
+      : serverState === "indexing" || serverState === "starting"
         ? "text-amber-dark"
         : "text-sage-dark";
-  const showPing = serverState !== "no-workspace";
-  const pingColor = serverState === "indexing" ? "bg-amber/60" : "bg-sage/60";
+  const showPing =
+    serverState === "running" ||
+    serverState === "indexing" ||
+    serverState === "starting";
+  const pingColor =
+    serverState === "indexing" || serverState === "starting"
+      ? "bg-amber/60"
+      : "bg-sage/60";
 
   return (
     <section

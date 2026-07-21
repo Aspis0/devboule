@@ -337,6 +337,33 @@ pub fn on_unlock() {
     start_supervisor();
 }
 
+/// Ensure the resident Oracle HTTP server is up (for operator actions like
+/// "Index now" / start watcher). Starts the supervisor if needed, then blocks
+/// (on a worker thread / blocking context) until `ensure_rust_oracle_server`
+/// succeeds or fails. Publishes a fresh discovery file on success.
+///
+/// Safe to call from Tauri commands that already run off the UI thread via
+/// async + `spawn_blocking`. Does NOT replace the supervisor tick — it only
+/// accelerates first-use when the operator clicks before the ~10s reconcile.
+pub fn ensure_resident_server_now() -> Result<(), String> {
+    if !oracle_is_enabled() {
+        return Err("Oracle is disabled (config oracle.enabled=false).".into());
+    }
+    let _ = ensure_projects_dir_resolved();
+    start_supervisor();
+    let root = index_root().ok_or_else(|| {
+        "No Oracle workspace root configured. Set the indexed folder in Settings → Oracle."
+            .to_string()
+    })?;
+    if !oracle_server_ready(&root) && discovery_file_present() {
+        delete_discovery();
+    }
+    let stop = AtomicBool::new(false);
+    crate::oracle::rust_oracle::ensure_rust_oracle_server(&root, &stop)?;
+    publish_discovery(&root)?;
+    Ok(())
+}
+
 /// React to a vault LOCK / idle-expiry.
 ///
 /// LIFECYCLE CHANGE (always-on agent MCP): a vault lock NO LONGER tears down the
@@ -649,23 +676,37 @@ fn reconcile_once(stop: &AtomicBool) {
     }
 
     let mut server_ready = oracle_server_ready(&root);
+    // Stale discovery after crash: file exists but HTTP is dead. Drop the ghost
+    // file so MCP clients don't trust a dead pid/port until we republish.
+    if !server_ready && discovery_file_present() {
+        delete_discovery();
+    }
     if should_restart(true, true, mid_install, server_ready) {
         // Cold/dead server: (re)start it. `ensure_rust_oracle_server` waits for ready
         // and honors `stop` — a superseded/stopping supervisor aborts the (re)spawn
         // and releases the start lock promptly (returns the Aborted error) so two
         // supervisors never spawn two servers (the double-spawn root cause).
-        if crate::oracle::rust_oracle::ensure_rust_oracle_server(&root, stop).is_ok()
-            && !stop.load(Ordering::SeqCst)
-        {
-            server_ready = true;
-            let _ = publish_discovery(&root);
+        match crate::oracle::rust_oracle::ensure_rust_oracle_server(&root, stop) {
+            Ok(()) if !stop.load(Ordering::SeqCst) => {
+                server_ready = true;
+                if let Err(e) = publish_discovery(&root) {
+                    eprintln!("oracle supervisor: publish_discovery failed: {e}");
+                }
+            }
+            Ok(()) => {}
+            Err(e) => {
+                // No secrets/paths with tokens — message only (model missing, timeout, abort).
+                eprintln!("oracle supervisor: ensure_rust_oracle_server failed: {e}");
+            }
         }
     } else if server_ready && !stop.load(Ordering::SeqCst) && !discovery_file_present() {
         // Warm server but no discovery file (e.g. the server was started by the
         // operator path, or the file was removed out-of-band): recreate it. Gated
         // on absence so the steady-state tick does not rewrite the file (and churn
         // its `updatedAt`) every interval.
-        let _ = publish_discovery(&root);
+        if let Err(e) = publish_discovery(&root) {
+            eprintln!("oracle supervisor: publish_discovery failed: {e}");
+        }
     }
 
     // Auto-watch + warm the index, once per app process, while the server is

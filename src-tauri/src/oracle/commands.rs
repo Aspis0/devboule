@@ -1462,6 +1462,17 @@ pub async fn sync_oracle_text_chunks(
     .await
 }
 
+/// Bring up the resident Oracle HTTP server (if needed) before operator index
+/// actions. Runs on a blocking pool so a cold Metal/CPU model load does not
+/// stall the async runtime. Surfaces a clear error instead of a dead POST.
+async fn ensure_oracle_http_ready() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::backend::oracle_service::ensure_resident_server_now()
+    })
+    .await
+    .map_err(|e| format!("Oracle ensure task join: {e}"))?
+}
+
 #[tauri::command]
 pub async fn start_oracle_index_job(
     auth_state: tauri::State<'_, BackendState>,
@@ -1474,6 +1485,8 @@ pub async fn start_oracle_index_job(
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
+    // Do not POST into a dead ghost server — start (or restart) first.
+    ensure_oracle_http_ready().await?;
     // FIX 2: when the user clicks "Index now" (manual=true) the server forces
     // idle=false + unbounded batches so the whole workspace indexes immediately
     // instead of being deferred by the idle RAM floor or capped to one batch
@@ -1498,6 +1511,7 @@ pub async fn start_oracle_index_watcher(
     // FIX: address the workspace-root resident server (supervisor/`ask_oracle`),
     // not the package/code root, to avoid the wrong-root kill/respawn loop.
     let index_root = oracle_index_root().map_err(|e| e.message)?;
+    ensure_oracle_http_ready().await?;
     oracle_http_post_blocking(
         index_root.clone(),
         format!("/index/watch/start?{}", oracle_root_query(&index_root)),
