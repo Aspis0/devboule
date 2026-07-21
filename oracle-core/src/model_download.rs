@@ -180,12 +180,31 @@ fn download_file(
 /// A file already at its full remote size is skipped, so re-running after a
 /// completed install is a cheap set of HEAD requests. `progress` is invoked per
 /// received chunk; pass a no-op closure to ignore it.
+/// Clear a broken model-dir symlink so downloads can create a real directory.
+/// Real directories and working symlinks are left alone.
+pub(crate) fn clear_broken_model_dir_symlink(dir: &Path) -> Result<()> {
+    let meta = match dir.symlink_metadata() {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // nothing there
+    };
+    if meta.file_type().is_symlink() && !dir.exists() {
+        std::fs::remove_file(dir).with_context(|| {
+            format!("removing broken model-dir symlink {}", dir.display())
+        })?;
+    }
+    Ok(())
+}
+
 pub fn ensure_qwen3_onnx(
     oracle_data_root: &Path,
     int8: bool,
     mut progress: impl FnMut(FileProgress),
 ) -> Result<PathBuf> {
     let dir = model_dir(oracle_data_root);
+    // A broken symlink at the model dir (common after Aspis→Devboule renames
+    // that left `qwen3-onnx -> …/aspis-management/…`) makes create_dir_all fail
+    // with "File exists" and the whole install never downloads. Clear it.
+    clear_broken_model_dir_symlink(&dir)?;
     let files = bundle_files(int8);
     let client = http_client()?;
 
@@ -264,6 +283,24 @@ mod tests {
     fn model_present_false_on_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!model_present(tmp.path(), false));
+    }
+
+    #[test]
+    fn clear_broken_model_dir_symlink_removes_dangling_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = model_dir(tmp.path());
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/nonexistent/oracle-qwen3-target", &dir).unwrap();
+            assert!(dir.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(!dir.exists());
+            clear_broken_model_dir_symlink(&dir).unwrap();
+            assert!(!dir.symlink_metadata().is_ok() || !dir.symlink_metadata().unwrap().file_type().is_symlink());
+            // After clear, a real dir can be created.
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(dir.is_dir());
+        }
     }
 
     #[test]
