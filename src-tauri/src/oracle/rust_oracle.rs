@@ -157,8 +157,14 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
         }
     }
 
+    // Track whether we spawn on this call. Readiness-timeout teardown must
+    // only clear a just-spawned dead entry — never a previously-healthy server
+    // that may be mid-index and briefly unresponsive to health probes.
+    let mut spawned_this_attempt = false;
+
     // If the slot is `None` (either empty or just cleared), build state and spawn.
     if guard.is_none() {
+        spawned_this_attempt = true;
         // Inject the vault-resolved LLM settings into the PROCESS env before the
         // server spawns. The in-process answerer reads ORACLE_LLM_* per request
         // (`LlmAnswerer::from_env`) — this is the in-process mirror of the deleted
@@ -327,10 +333,17 @@ pub(crate) fn ensure_rust_oracle_server(root: &Path, stop: &AtomicBool) -> Resul
             return Err("oracle server start aborted".into());
         }
         if std::time::Instant::now() >= deadline {
-            // The server never came up (bind failure, crashed task, etc.). Clear the
-            // slot so the next supervisor tick respawns instead of being wedged forever
-            // by a dead entry.
-            stop_rust_oracle_server();
+            eprintln!(
+                "[rust-oracle] readiness deadline exceeded root={} spawned_this_attempt={}",
+                root.display(),
+                spawned_this_attempt
+            );
+            // Only tear down if we just spawned this attempt and it never
+            // answered. Do NOT kill a previously-healthy server that may be
+            // mid-index / briefly unresponsive — leave it for the next tick.
+            if spawned_this_attempt {
+                stop_rust_oracle_server();
+            }
             return Err("rust oracle server did not become ready".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(200));

@@ -15,13 +15,11 @@
 //!
 //! 1. **`on_phase` callback**: the Python `index_file_chunks` accepts a
 //!    structured `on_phase(phase, detail)` callback for live sub-state
-//!    (GPU cooling, memory waiting). The Rust `index_file_chunks` only has a
-//!    `progress: Option<&dyn Fn(&str)>` string callback. Live phase updates
-//!    are not available without modifying `indexer.rs` (read-only constraint).
-//!    The job status shows "running" without detailed sub-state.
-//! 2. **Embed device detection**: `resolve_min_free_gb` in Python calls
-//!    `embedding_device()` to detect CUDA/MPS/CPU. The Rust version uses a
-//!    simple env-var heuristic since the device is resolved at pool load time.
+//!    (GPU cooling, memory waiting). The Rust path maps string progress lines
+//!    (`chunk-index start` / `batch begin` / `paused_low_memory` / …) onto
+//!    job `phase` + `phase_message` instead.
+//! 2. **Embed device detection**: `resolve_min_free_gb` uses `ORACLE_EMBED_DEVICE`
+//!    or macOS→`"mps"`. CUDA and MPS share the low accelerator host floor.
 //! 3. **CKG refresh**: ported — the Rust job manager now calls `_refresh_ckg_best_effort`
 //!    which spawns a named thread running an injectable hook (`set_ckg_refresh_hook`).
 //!    The app wires the closure to `crate::backend::ckg::build_ckg_graph` →
@@ -47,8 +45,9 @@ use crate::watch::{self, WatcherHandle};
 // Configuration constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// GPU min free RAM floor (GB). Used on CUDA where the embedding model lives
-/// in VRAM. Matches `oracle/config.py::CHUNK_GPU_MIN_FREE_GB`.
+/// Accelerator min free *host* RAM floor (GB). Used on CUDA and MPS/Metal
+/// where the embedding model lives on the GPU, not as a large host ORT
+/// allocation. Matches `oracle/config.py::CHUNK_GPU_MIN_FREE_GB`.
 const GPU_MIN_FREE_GB: f64 = 1.5;
 
 /// CPU min free RAM floor (GB). Matches `oracle/config.py::CHUNK_MIN_FREE_GB`.
@@ -157,9 +156,15 @@ pub fn resolve_index_run_params(
 
 /// Pick the between-batch free-system-RAM floor.
 /// Port of `index_jobs.py::resolve_min_free_gb`.
+///
+/// - CUDA / MPS (Metal): model weights live on the accelerator, so the host
+///   RAM floor matches `GPU_MIN_FREE_GB` (1.5). On macOS, sysinfo's
+///   `available_memory` often under-reports (compressor / inactive pages), and
+///   a 5 GB CPU floor falsely pauses with zero embeddings.
+/// - CPU / unknown: 5 GB active, 8 GB idle.
 pub fn resolve_min_free_gb(device: Option<&str>, idle: bool) -> f64 {
     match device {
-        Some("cuda") => GPU_MIN_FREE_GB,
+        Some("cuda") | Some("mps") | Some("metal") => GPU_MIN_FREE_GB,
         _ => {
             if idle {
                 CPU_MIN_FREE_GB.max(IDLE_FLOOR_GB)
@@ -168,6 +173,25 @@ pub fn resolve_min_free_gb(device: Option<&str>, idle: bool) -> f64 {
             }
         }
     }
+}
+
+/// Env override for the free-RAM floor. Takes precedence over
+/// [`resolve_min_free_gb`] when set and parseable.
+fn env_min_free_gb_override() -> Option<f64> {
+    for key in ["ORACLE_CHUNK_MIN_FREE_GB", "ORACLE_CHUNK_MIN_FREE_RAM_GB"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(v) = trimmed.parse::<f64>() {
+                if v.is_finite() && v >= 0.0 {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Short, human, PATH-FREE label for a live index sub-state.
@@ -338,10 +362,69 @@ impl OracleIndexJobManager {
         self._set_job(JobStatus::Running, &index_root, force, max_batches, idle);
 
         let result = (|| -> Result<JobState, anyhow::Error> {
-            let min_free_gb = resolve_min_free_gb(detect_device(), idle);
+            // Env override wins over device-based floor so operators can tune
+            // Metal/CPU hosts without a rebuild (IndexerConfig::default already
+            // reads the same keys; jobs must not clobber that with resolve_*).
+            let min_free_gb = env_min_free_gb_override()
+                .unwrap_or_else(|| resolve_min_free_gb(detect_device(), idle));
 
-            let sync_result =
-                indexer::sync_text_chunks(&index_root, &sqlite, &paths.manifest, 100, force, None)?;
+            let inner_for_progress = std::sync::Arc::clone(&self.inner);
+            let progress = move |line: &str| {
+                // Map the indexer's progress lines to a live job phase. Pause lines
+                // (memory / GPU cooldown) must override "embedding" so the UI stops
+                // claiming it is embedding while it is actually waiting.
+                let update: Option<(&'static str, Option<String>)> =
+                    if line.starts_with("chunk-text-sync") {
+                        Some(("scanning", Some(line.to_string())))
+                    } else if line.starts_with("chunk-index low-memory retry")
+                        || line.starts_with("chunk-index paused_low_memory")
+                    {
+                        // Prefer a concrete free_gb when the line carries it.
+                        let free_gb = line
+                            .split_whitespace()
+                            .find_map(|tok| tok.strip_prefix("free_gb="))
+                            .and_then(|v| v.parse::<f64>().ok());
+                        let msg = match free_gb {
+                            Some(g) => Some(format!(
+                                "Waiting for memory ({g:.1} GB free), resuming…"
+                            )),
+                            None => Some("Waiting for memory, resuming…".to_string()),
+                        };
+                        Some(("waiting_memory", msg))
+                    } else if line.starts_with("chunk-index gpu cooldown") {
+                        Some(("cooling_gpu", None))
+                    } else if line.starts_with("chunk-index start")
+                        || line.starts_with("chunk-index low-memory proceeding")
+                    {
+                        // Start / soft pre-scan lines carry counts or free_gb —
+                        // surface them so the UI is not stuck on a blank phase.
+                        Some(("scanning", Some(line.to_string())))
+                    } else if line.starts_with("chunk-index batch begin") {
+                        Some(("embedding", Some(line.to_string())))
+                    } else if let Some(rest) =
+                        line.strip_prefix("chunk-index progress embedded_chunks=")
+                    {
+                        rest.trim().parse::<usize>().ok().map(|n| {
+                            ("embedding", Some(format!("Embedding\u{2026} {n} chunks")))
+                        })
+                    } else {
+                        None
+                    };
+                if let Some((phase, msg)) = update {
+                    let mut inner = inner_for_progress.lock().unwrap_or_else(|e| e.into_inner());
+                    inner.job.phase = Some(phase.to_string());
+                    inner.job.phase_message = msg;
+                }
+            };
+
+            let sync_result = indexer::sync_text_chunks(
+                &index_root,
+                &sqlite,
+                &paths.manifest,
+                100,
+                force,
+                Some(&progress),
+            )?;
             eprintln!(
                 "[jobs] sync complete: files={} chunks={} skipped={}",
                 sync_result.files, sync_result.chunks, sync_result.skipped
@@ -358,31 +441,6 @@ impl OracleIndexJobManager {
                     None,
                 ))?;
             }
-
-            let inner_for_progress = std::sync::Arc::clone(&self.inner);
-            let progress = move |line: &str| {
-                // Map the indexer's progress lines to a live job phase. Pause lines
-                // (memory / GPU cooldown) must override "embedding" so the UI stops
-                // claiming it is embedding while it is actually waiting. phase_message
-                // None lets the frontend show its own fallback label for the pause phases.
-                let update: Option<(&'static str, Option<String>)> =
-                    if line.starts_with("chunk-index low-memory retry") {
-                        Some(("waiting_memory", None))
-                    } else if line.starts_with("chunk-index gpu cooldown") {
-                        Some(("cooling_gpu", None))
-                    } else if let Some(rest) = line.strip_prefix("chunk-index progress embedded_chunks=") {
-                        rest.trim().parse::<usize>().ok().map(|n| {
-                            ("embedding", Some(format!("Embedding\u{2026} {n} chunks")))
-                        })
-                    } else {
-                        None
-                    };
-                if let Some((phase, msg)) = update {
-                    let mut inner = inner_for_progress.lock().unwrap_or_else(|e| e.into_inner());
-                    inner.job.phase = Some(phase.to_string());
-                    inner.job.phase_message = msg;
-                }
-            };
 
             let index_result = if max_batches == Some(0) {
                 indexer::IndexResult {
@@ -422,6 +480,59 @@ impl OracleIndexJobManager {
                 ))?
             };
 
+            // Count actual Lance vectors before cluster/CKG. A "success" with
+            // 0 vectors (e.g. pre-scan abort, embed never wrote) must not
+            // rebuild CKG or refresh clusters as if the dense index exists.
+            let vector_count = {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(chunk_vectors.count()).unwrap_or(0)
+            };
+
+            let zero_vectors_failure = max_batches != Some(0)
+                && vector_count == 0
+                && (index_result.processed == 0
+                    || matches!(
+                        index_result.status,
+                        IndexStatus::Complete
+                            | IndexStatus::PausedLowMemory
+                            | IndexStatus::PausedGpuTemperature
+                            | IndexStatus::PausedBatchLimit
+                    ));
+
+            if zero_vectors_failure {
+                let zero_msg = "Dense index produced 0 vectors. Text sync may have run, \
+                    but embeddings did not write. Retry Index now."
+                    .to_string();
+                // Keep pause statuses so the UI can show pause; Complete→Error.
+                let status = match index_result.status {
+                    IndexStatus::PausedLowMemory => JobStatus::PausedLowMemory,
+                    IndexStatus::PausedGpuTemperature => JobStatus::PausedGpuTemperature,
+                    IndexStatus::PausedBatchLimit => JobStatus::PausedBatchLimit,
+                    IndexStatus::Complete => JobStatus::Error,
+                };
+                eprintln!(
+                    "[jobs] dense index produced 0 vectors status={:?} processed={} free_gb={:?}",
+                    index_result.status, index_result.processed, index_result.free_gb
+                );
+                let result_job = JobState {
+                    status,
+                    root: index_root.to_string_lossy().to_string(),
+                    message: Some(zero_msg),
+                    started_at: None,
+                    finished_at: Some(utc_now()),
+                    force: Some(force),
+                    max_batches,
+                    idle: Some(idle),
+                    phase: None,
+                    phase_message: None,
+                    gpu_temp_c: index_result.gpu_temp_c,
+                    free_gb: index_result.free_gb,
+                };
+                self._finish_job(result_job.clone());
+                // No cluster refresh, no CKG rebuild — dense index is empty.
+                return Ok(result_job);
+            }
+
             let status = match index_result.status {
                 IndexStatus::Complete => JobStatus::Complete,
                 IndexStatus::PausedLowMemory => JobStatus::PausedLowMemory,
@@ -447,6 +558,7 @@ impl OracleIndexJobManager {
             self._finish_job(result_job.clone());
 
             // Best-effort cluster refresh on a daemon thread.
+            // Only when vectors exist (or text-only max_batches==0, handled above).
             self._refresh_clusters_best_effort(&index_root, &sqlite, &chunk_vectors, &file_vectors);
 
             // Best-effort CKG full-rebuild on a named thread. No-op when no hook

@@ -442,16 +442,64 @@ fn output_paths_set(
 
 /// Free system RAM in GB (mirrors Python's `free_memory_gb`).
 ///
-/// Uses the `sysinfo` crate for a cross-platform, allocation-free reading.
-/// Returns 0.0 on failure (matches Python's catch-all fallback).
+/// Prefers `available_memory`, then `free_memory`, then `total - used` when
+/// total > used. Never treats a single metric failure as 0.0 free (that always
+/// trips the RAM floor). Returns 0.0 only when no usable metric is available.
+/// Rounded to 2 decimal places.
 pub fn free_memory_gb() -> f64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
-    let available = sys.available_memory();
-    let gb = (available as f64) / (1024.0_f64.powi(3));
+    let mut bytes = sys.available_memory();
+    if bytes == 0 {
+        bytes = sys.free_memory();
+    }
+    if bytes == 0 {
+        let total = sys.total_memory();
+        let used = sys.used_memory();
+        if total > used {
+            bytes = total - used;
+        }
+    }
+    let gb = (bytes as f64) / (1024.0_f64.powi(3));
     (gb * 100.0).round() / 100.0
-    // ^ round to 2 decimal places like Python
+}
+
+/// Total installed RAM in GB (2 decimal places). 0.0 if unknown.
+fn total_memory_gb() -> f64 {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let gb = (sys.total_memory() as f64) / (1024.0_f64.powi(3));
+    (gb * 100.0).round() / 100.0
+}
+
+/// Whether `free_gb` is a plausible free-RAM reading for this host.
+///
+/// macOS/sysinfo sometimes under-reports free (or returns near-zero) while the
+/// machine still has tens of GB total. Treating that as "low memory" aborts
+/// dense indexing with 0 vectors. Reject readings under 2% of total (capped at
+/// 1 GB) on hosts with ≥8 GB — those are treated as unreliable metrics.
+fn free_memory_reading_is_plausible(free_gb: f64) -> bool {
+    if !free_gb.is_finite() || free_gb < 0.0 {
+        return false;
+    }
+    let total = total_memory_gb();
+    if total >= 8.0 {
+        let floor = (total * 0.02).min(1.0);
+        if free_gb < floor {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when the memory floor should hard-pause indexing.
+/// Unreliable free-RAM readings never trip the floor (log+proceed instead).
+fn should_enforce_memory_floor(free_gb: f64, min_free_gb: f64) -> bool {
+    min_free_gb > 0.0
+        && free_gb < min_free_gb
+        && free_memory_reading_is_plausible(free_gb)
 }
 
 /// GPU temperature in °C via `nvidia-smi` (macOS/CPU-only → `None`).
@@ -477,14 +525,28 @@ pub fn gpu_temperature_c() -> Option<i32> {
 
 /// Sleep-and-retry while free RAM is below `min_free_gb`.
 /// Returns the final observed free-RAM reading.
+///
+/// If the free-RAM reading is implausible (host metric garbage), returns a
+/// value ≥ `min_free_gb` so callers proceed instead of hard-pausing.
 fn wait_for_memory_recovery(min_free_gb: f64, progress: Option<&dyn Fn(&str)>) -> f64 {
-    if LOW_MEMORY_RETRY_SECONDS == 0 {
-        return free_memory_gb();
-    }
     let mut free_gb = free_memory_gb();
+    if !free_memory_reading_is_plausible(free_gb) {
+        log_progress(
+            progress,
+            &format!(
+                "chunk-index low-memory metric-unreliable free_gb={free_gb} \
+                 total_gb={} — not enforcing floor",
+                total_memory_gb(),
+            ),
+        );
+        return min_free_gb.max(free_gb);
+    }
+    if LOW_MEMORY_RETRY_SECONDS == 0 {
+        return free_gb;
+    }
     for cycle in 0..LOW_MEMORY_RETRY_CYCLES {
-        if free_gb >= min_free_gb {
-            return free_gb;
+        if free_gb >= min_free_gb || !should_enforce_memory_floor(free_gb, min_free_gb) {
+            return free_gb.max(min_free_gb);
         }
         log_progress(
             progress,
@@ -497,6 +559,9 @@ fn wait_for_memory_recovery(min_free_gb: f64, progress: Option<&dyn Fn(&str)>) -
         );
         std::thread::sleep(Duration::from_secs(LOW_MEMORY_RETRY_SECONDS));
         free_gb = free_memory_gb();
+        if !free_memory_reading_is_plausible(free_gb) {
+            return min_free_gb.max(free_gb);
+        }
     }
     free_gb
 }
@@ -525,8 +590,10 @@ fn wait_for_gpu_cooldown(max_gpu_temp_c: i32, progress: Option<&dyn Fn(&str)>) -
     temp_c
 }
 
-/// Emit a progress message if the callback is present.
+/// Emit a progress message to the callback (if any) and always to stderr so
+/// app logs show indexing phases even when the UI does not map a given line.
 fn log_progress(progress: Option<&dyn Fn(&str)>, message: &str) {
+    eprintln!("[oracle-index] {message}");
     if let Some(cb) = progress {
         cb(message);
     }
@@ -824,32 +891,36 @@ pub async fn index_file_chunks(
     let vector_path = chunk_vectors.path().to_path_buf();
     let sqlite_path = sqlite.path().to_path_buf();
 
-    // ── Pre-scan RAM guard ──────────────────────────────────────────────
-    if config.min_free_gb > 0.0 && free_memory_gb() < config.min_free_gb {
-        log_progress(
-            progress,
-            &format!(
-                "chunk-index paused_low_memory before scan root={}",
-                root.display()
-            ),
-        );
-        return Ok(make_index_result(
-            IndexStatus::PausedLowMemory,
-            &root,
-            &sqlite_path,
-            &vector_path,
-            &manifest_path,
-            0,
-            None,
-            0,
-            0,
-            None,
-            None,
-            None,
-            free_memory_gb(),
-            None,
-            None,
-        ));
+    // ── Pre-scan RAM guard (soft) ───────────────────────────────────────
+    // Wait once for recovery; if still below the floor, proceed into
+    // collect/embed rather than aborting with processed=0 (which used to
+    // finish the job as "success" and trigger CKG with no Lance writes).
+    // Between-batch guards still hard-pause under real pressure.
+    if config.min_free_gb > 0.0 {
+        let free_gb = free_memory_gb();
+        if should_enforce_memory_floor(free_gb, config.min_free_gb) {
+            let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
+            if should_enforce_memory_floor(recovered, config.min_free_gb) {
+                log_progress(
+                    progress,
+                    &format!(
+                        "chunk-index low-memory proceeding free_gb={recovered} \
+                         min_free_gb={} (pre-scan floor soft; between-batch guards still apply)",
+                        config.min_free_gb,
+                    ),
+                );
+            }
+        } else if free_gb < config.min_free_gb {
+            // Metric unusable — do not hard-pause.
+            log_progress(
+                progress,
+                &format!(
+                    "chunk-index low-memory metric-unreliable free_gb={free_gb} \
+                     total_gb={} — pre-scan floor skipped",
+                    total_memory_gb(),
+                ),
+            );
+        }
     }
 
     let out_paths = output_paths_set(&sqlite_path, &vector_path, &manifest_path);
@@ -858,18 +929,32 @@ pub async fn index_file_chunks(
         .filter(|p| !is_output_path(p, &out_paths))
         .collect();
 
+    // file_needs_index is vector-unaware (manifest+sqlite text only). When Lance
+    // is empty (failed/paused dense run, wiped chunks.lancedb) every file would
+    // otherwise be skipped forever without Force. Re-embed the whole collect set.
+    let vector_count = chunk_vectors.count().await.unwrap_or(0);
     let pending: Vec<PathBuf> = {
         let manifest_files = manifest_files_for_root(&mut manifest, &root, true).unwrap();
         files
             .iter()
             .filter(|path| {
                 config.force
+                    || vector_count == 0
                     || manifest::file_needs_index(path, &root, manifest_files, sqlite)
                         .unwrap_or(true)
             })
             .cloned()
             .collect()
     };
+    if vector_count == 0 && !config.force {
+        log_progress(
+            progress,
+            &format!(
+                "chunk-index re-embed-all reason=no_vectors scanned={}",
+                files.len()
+            ),
+        );
+    }
 
     log_progress(
         progress,
@@ -927,7 +1012,8 @@ pub async fn index_file_chunks(
         }
 
         // ── Pre-batch RAM guard (wait-and-resume) ───────────────────────
-        if config.min_free_gb > 0.0 && free_gb < config.min_free_gb {
+        // Hard-pause only when free-RAM reading is plausible AND below floor.
+        if should_enforce_memory_floor(free_gb, config.min_free_gb) {
             {
                 let mf = manifest_files_for_root(&mut manifest, &root, true).unwrap();
                 // Touch to ensure legacy mirror is up to date before save
@@ -936,7 +1022,7 @@ pub async fn index_file_chunks(
             sync_legacy_manifest_root(&mut manifest, &root);
             save_manifest(&manifest_path, &manifest)?;
             let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
-            if recovered < config.min_free_gb {
+            if should_enforce_memory_floor(recovered, config.min_free_gb) {
                 log_progress(
                     progress,
                     &format!("chunk-index paused_low_memory free_gb={recovered}"),
@@ -1045,13 +1131,13 @@ pub async fn index_file_chunks(
                 }
             }
 
-            // In-sub-batch RAM guard
+            // In-sub-batch RAM guard (hard pause only on plausible free-RAM)
             let free_gb = free_memory_gb();
-            if config.min_free_gb > 0.0 && free_gb < config.min_free_gb {
+            if should_enforce_memory_floor(free_gb, config.min_free_gb) {
                 sync_legacy_manifest_root(&mut manifest, &root);
                 save_manifest(&manifest_path, &manifest)?;
                 let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
-                if recovered < config.min_free_gb {
+                if should_enforce_memory_floor(recovered, config.min_free_gb) {
                     log_progress(
                         progress,
                         &format!(

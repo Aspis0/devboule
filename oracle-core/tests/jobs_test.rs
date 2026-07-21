@@ -648,11 +648,24 @@ fn test_resolve_min_free_gb() {
     // CPU + not idle: 5.0
     assert_eq!(jobs::resolve_min_free_gb(Some("cpu"), false), 5.0);
 
-    // MPS: same as CPU (unified memory)
-    assert_eq!(jobs::resolve_min_free_gb(Some("mps"), true), 8.0);
-    assert_eq!(jobs::resolve_min_free_gb(Some("mps"), false), 5.0);
+    // MPS/Metal: weights on GPU — same low host floor as CUDA (idle ignored).
+    assert_eq!(jobs::resolve_min_free_gb(Some("mps"), true), 1.5);
+    assert_eq!(jobs::resolve_min_free_gb(Some("mps"), false), 1.5);
+    assert_eq!(jobs::resolve_min_free_gb(Some("metal"), false), 1.5);
 
     // None (unknown device): same as CPU
     assert_eq!(jobs::resolve_min_free_gb(None, true), 8.0);
     assert_eq!(jobs::resolve_min_free_gb(None, false), 5.0);
+}
+
+#[test]
+fn test_free_memory_gb_nonzero_on_real_host() {
+    // free_memory_gb must not collapse metric failure to 0.0 when the host
+    // has RAM (available → free → total-used fallbacks). A real machine always
+    // reports some free/available memory.
+    let gb = oracle_core::ingest::indexer::free_memory_gb();
+    assert!(
+        gb > 0.0,
+        "free_memory_gb returned {gb}; expected > 0 on a host with RAM"
+    );
 }

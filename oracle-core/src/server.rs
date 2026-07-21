@@ -450,31 +450,19 @@ async fn health_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Response> {
+    // Lightweight liveness only — do NOT open SQLite/Lance via state.engine().
+    // Under heavy index write that open can hang and trip readiness timeouts.
+    // Probes (probe_oracle_server_ready) need HTTP 200 + server_root string.
     require_operator(&headers, &state).map_err(auth_error)?;
-    let engine = state.engine().map_err(internal_error)?;
-    let health = engine.health().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("engine error: {e:#}")})),
-        )
-            .into_response()
-    })?;
-    let mut payload = serde_json::to_value(&health).unwrap_or_default();
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert(
-            "server_root".to_string(),
-            serde_json::Value::String(state.server_root.clone()),
-        );
-        obj.insert(
-            "auth".to_string(),
-            serde_json::Value::String(if state.operator_token.is_empty() {
-                "disabled".to_string()
-            } else {
-                "enabled".to_string()
-            }),
-        );
-    }
-    Ok(Json(payload))
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "server_root": state.server_root,
+        "auth": if state.operator_token.is_empty() {
+            "disabled"
+        } else {
+            "enabled"
+        },
+    })))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

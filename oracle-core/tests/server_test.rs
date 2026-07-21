@@ -334,8 +334,9 @@ async fn test_health_shape() {
         .unwrap();
     assert_eq!(body["auth"], "enabled");
     assert!(body["server_root"].is_string());
-    assert!(body["status"].is_string());
-    assert!(body["nodes"].is_number());
+    assert_eq!(body["status"], "ok");
+    // Lightweight /health must not open the engine — no engine fields.
+    assert!(body.get("nodes").is_none());
 }
 
 #[tokio::test]

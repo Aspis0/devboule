@@ -3,7 +3,9 @@
 //! Port of `oracle/ingestion/ast_chunker.py` (bug-for-bug, no improvements).
 
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 // ── Language detection ───────────────────────────────────────────────────────
 
@@ -49,75 +51,156 @@ struct DefPattern {
     kind: &'static str,
 }
 
-fn definition_patterns_for(language: &str) -> Vec<DefPattern> {
-    match language {
-        "rust" => vec![
-            DefPattern { re: Regex::new(r"^\s*(pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+([A-Za-z_]\w*)").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?(unsafe\s+)?(async\s+)?fn\s+([A-Za-z_]\w*)").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?struct\s+([A-Za-z_]\w*)").unwrap(), kind: "struct" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?enum\s+([A-Za-z_]\w*)").unwrap(), kind: "enum" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?trait\s+([A-Za-z_]\w*)").unwrap(), kind: "trait" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?(unsafe\s+)?impl\b").unwrap(), kind: "impl" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?mod\s+([A-Za-z_]\w*)").unwrap(), kind: "module" },
-            DefPattern { re: Regex::new(r"^\s*(pub\s+)?type\s+([A-Za-z_]\w*)").unwrap(), kind: "type" },
-            DefPattern { re: Regex::new(r"^\s*macro_rules!\s+([A-Za-z_]\w*)").unwrap(), kind: "macro" },
-        ],
-        "python" => vec![
-            DefPattern { re: Regex::new(r"^\s*def\s+([A-Za-z_]\w*)\s*\(").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*async\s+def\s+([A-Za-z_]\w*)\s*\(").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*class\s+([A-Za-z_]\w*)\s*[:(]").unwrap(), kind: "class" },
-        ],
-        "typescript" => vec![
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(async\s+)?function\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?class\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "class" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(interface|type)\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "type" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(enum|namespace)\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "type" },
-        ],
-        "javascript" => vec![
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(async\s+)?function\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*(export\s+)?class\s+([A-Za-z_$][\w$]*)").unwrap(), kind: "class" },
-        ],
-        "java" => vec![
-            DefPattern { re: Regex::new(r"^\s*(public|private|protected)?\s*(static\s+)?(class|interface|enum)\s+([A-Za-z_]\w*)").unwrap(), kind: "class" },
-            DefPattern { re: Regex::new(r"^\s*(public|private|protected)?\s*(static\s+)?[\w<>\[\],\s]+\s+([A-Za-z_]\w*)\s*\(").unwrap(), kind: "function" },
-        ],
-        "kotlin" => vec![
-            DefPattern { re: Regex::new(r"^\s*fun\s+([A-Za-z_]\w*)").unwrap(), kind: "function" },
-            DefPattern { re: Regex::new(r"^\s*class\s+([A-Za-z_]\w*)").unwrap(), kind: "class" },
-            DefPattern { re: Regex::new(r"^\s*interface\s+([A-Za-z_]\w*)").unwrap(), kind: "interface" },
-            DefPattern { re: Regex::new(r"^\s*object\s+([A-Za-z_]\w*)").unwrap(), kind: "object" },
-            DefPattern { re: Regex::new(r"^\s*(data\s+)?class\s+([A-Za-z_]\w*)").unwrap(), kind: "class" },
-            DefPattern { re: Regex::new(r"^\s*(sealed\s+)?(class|interface)\s+([A-Za-z_]\w*)").unwrap(), kind: "class" },
-            DefPattern { re: Regex::new(r"^\s*enum\s+class\s+([A-Za-z_]\w*)").unwrap(), kind: "enum" },
-        ],
-        _ => vec![],
+fn def(re: &str, kind: &'static str) -> DefPattern {
+    DefPattern {
+        re: Regex::new(re).unwrap(),
+        kind,
     }
+}
+
+/// Compiled once per language — callers hit these on every chunk.
+static DEFINITION_PATTERNS: LazyLock<HashMap<&'static str, Vec<DefPattern>>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert(
+            "rust",
+            vec![
+                def(
+                    r"^\s*(pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+([A-Za-z_]\w*)",
+                    "function",
+                ),
+                def(
+                    r"^\s*(pub\s+)?(unsafe\s+)?(async\s+)?fn\s+([A-Za-z_]\w*)",
+                    "function",
+                ),
+                def(r"^\s*(pub\s+)?struct\s+([A-Za-z_]\w*)", "struct"),
+                def(r"^\s*(pub\s+)?enum\s+([A-Za-z_]\w*)", "enum"),
+                def(r"^\s*(pub\s+)?trait\s+([A-Za-z_]\w*)", "trait"),
+                def(r"^\s*(pub\s+)?(unsafe\s+)?impl\b", "impl"),
+                def(r"^\s*(pub\s+)?mod\s+([A-Za-z_]\w*)", "module"),
+                def(r"^\s*(pub\s+)?type\s+([A-Za-z_]\w*)", "type"),
+                def(r"^\s*macro_rules!\s+([A-Za-z_]\w*)", "macro"),
+            ],
+        );
+        m.insert(
+            "python",
+            vec![
+                def(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", "function"),
+                def(r"^\s*async\s+def\s+([A-Za-z_]\w*)\s*\(", "function"),
+                def(r"^\s*class\s+([A-Za-z_]\w*)\s*[:(]", "class"),
+            ],
+        );
+        m.insert(
+            "typescript",
+            vec![
+                def(
+                    r"^\s*(export\s+)?(async\s+)?function\s+([A-Za-z_$][\w$]*)",
+                    "function",
+                ),
+                def(
+                    r"^\s*(export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(",
+                    "function",
+                ),
+                def(r"^\s*(export\s+)?class\s+([A-Za-z_$][\w$]*)", "class"),
+                def(
+                    r"^\s*(export\s+)?(interface|type)\s+([A-Za-z_$][\w$]*)",
+                    "type",
+                ),
+                def(
+                    r"^\s*(export\s+)?(enum|namespace)\s+([A-Za-z_$][\w$]*)",
+                    "type",
+                ),
+            ],
+        );
+        m.insert(
+            "javascript",
+            vec![
+                def(
+                    r"^\s*(export\s+)?(async\s+)?function\s+([A-Za-z_$][\w$]*)",
+                    "function",
+                ),
+                def(
+                    r"^\s*(export\s+)?(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(",
+                    "function",
+                ),
+                def(r"^\s*(export\s+)?class\s+([A-Za-z_$][\w$]*)", "class"),
+            ],
+        );
+        m.insert(
+            "java",
+            vec![
+                def(
+                    r"^\s*(public|private|protected)?\s*(static\s+)?(class|interface|enum)\s+([A-Za-z_]\w*)",
+                    "class",
+                ),
+                def(
+                    r"^\s*(public|private|protected)?\s*(static\s+)?[\w<>\[\],\s]+\s+([A-Za-z_]\w*)\s*\(",
+                    "function",
+                ),
+            ],
+        );
+        m.insert(
+            "kotlin",
+            vec![
+                def(r"^\s*fun\s+([A-Za-z_]\w*)", "function"),
+                def(r"^\s*class\s+([A-Za-z_]\w*)", "class"),
+                def(r"^\s*interface\s+([A-Za-z_]\w*)", "interface"),
+                def(r"^\s*object\s+([A-Za-z_]\w*)", "object"),
+                def(r"^\s*(data\s+)?class\s+([A-Za-z_]\w*)", "class"),
+                def(r"^\s*(sealed\s+)?(class|interface)\s+([A-Za-z_]\w*)", "class"),
+                def(r"^\s*enum\s+class\s+([A-Za-z_]\w*)", "enum"),
+            ],
+        );
+        m
+    });
+
+fn definition_patterns_for(language: &str) -> &'static [DefPattern] {
+    DEFINITION_PATTERNS
+        .get(language)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
 }
 
 // ── Import/reference patterns for symbols_used ──────────────────────────────
 
-fn import_patterns_for(language: &str) -> Vec<Regex> {
-    match language {
-        "rust" => vec![
+static IMPORT_PATTERNS: LazyLock<HashMap<&'static str, Vec<Regex>>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert(
+        "rust",
+        vec![
             Regex::new(r"use\s+([\w:]+(?:::\w+)*)").unwrap(),
             Regex::new(r"\b([\w]+)::([\w]+)").unwrap(),
             Regex::new(r"\b([A-Z][\w]*)\b").unwrap(),
         ],
-        "python" => vec![
+    );
+    m.insert(
+        "python",
+        vec![
             Regex::new(r"(?:from|import)\s+([\w.]+)").unwrap(),
             Regex::new(r"\b([a-z_][\w_]*)\.([a-zA-Z_]\w*)\s*\(").unwrap(),
         ],
-        "typescript" | "javascript" => vec![
-            Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap(),
-            Regex::new(r#"import\s+(\w+)\s+from\s*['"]([^'"]+)['"]"#).unwrap(),
-            Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap(),
-        ],
-        "java" => vec![Regex::new(r"import\s+([\w.]+)").unwrap()],
-        "kotlin" => vec![Regex::new(r"import\s+([\w.]+)").unwrap()],
-        _ => vec![],
+    );
+    // typescript and javascript share the same pattern strings (compiled once each).
+    for lang in ["typescript", "javascript"] {
+        m.insert(
+            lang,
+            vec![
+                Regex::new(r#"import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).unwrap(),
+                Regex::new(r#"import\s+(\w+)\s+from\s*['"]([^'"]+)['"]"#).unwrap(),
+                Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap(),
+            ],
+        );
     }
+    m.insert("java", vec![Regex::new(r"import\s+([\w.]+)").unwrap()]);
+    m.insert("kotlin", vec![Regex::new(r"import\s+([\w.]+)").unwrap()]);
+    m
+});
+
+fn import_patterns_for(language: &str) -> &'static [Regex] {
+    IMPORT_PATTERNS
+        .get(language)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────────
@@ -137,6 +220,9 @@ const KEYWORDS: &[&str] = &[
     "function",
 ];
 
+static IDENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_$][\w$]*$").unwrap());
+
 fn symbol_name_from_match(captures: &regex::Captures, _kind: &str) -> String {
     let mut groups: Vec<&str> = Vec::new();
     for i in 1..captures.len() {
@@ -147,10 +233,9 @@ fn symbol_name_from_match(captures: &regex::Captures, _kind: &str) -> String {
     if groups.is_empty() {
         return String::new();
     }
-    let ident_re = Regex::new(r"^[A-Za-z_$][\w$]*$").unwrap();
     for g in groups.iter().rev() {
         let g = g.trim();
-        if !g.is_empty() && !g.starts_with("pub") && !KEYWORDS.contains(&g) && ident_re.is_match(g)
+        if !g.is_empty() && !g.starts_with("pub") && !KEYWORDS.contains(&g) && IDENT_RE.is_match(g)
         {
             return g.to_string();
         }
@@ -174,7 +259,7 @@ fn extract_signature(text: &str, symbol_name: &str) -> String {
 fn extract_symbols_used(text: &str, language: &str) -> Vec<String> {
     let patterns = import_patterns_for(language);
     let mut symbols = std::collections::HashSet::new();
-    for pattern in &patterns {
+    for pattern in patterns {
         for caps in pattern.captures_iter(text) {
             if caps.len() == 1 {
                 // No capturing groups: Python's findall returns the FULL match.
@@ -267,7 +352,7 @@ pub fn split_semantic(text: &str, language: &str, max_chars: usize) -> Vec<Seman
             continue;
         }
         let indent = line.len() - line.trim_start().len();
-        for pat in &patterns {
+        for pat in patterns {
             if let Some(m) = pat.re.captures(line) {
                 let name = symbol_name_from_match(&m, pat.kind);
                 boundaries.push(Boundary {

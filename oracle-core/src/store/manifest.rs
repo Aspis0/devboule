@@ -237,6 +237,13 @@ fn relative_posix(path: &Path, root: &Path) -> Result<String> {
 }
 
 /// Whether a file needs re-indexing. Mirrors `chunk_index.py::file_needs_index`.
+///
+/// **Vector-unaware**: when the signature and chunk profile match and SQLite
+/// already has text chunks for the file, this returns `false` even if Lance
+/// vectors are missing (e.g. after a backend switch that wiped `chunks.lancedb`,
+/// or a prior run that paused before embed). Callers that need vectors must
+/// pass `force=true` on the index job (UI "Force re-index") so the pipeline
+/// re-embeds regardless of this check.
 pub fn file_needs_index(
     path: &Path,
     root: &Path,
@@ -258,6 +265,8 @@ pub fn file_needs_index(
     if previous.chunks == Some(0) {
         return Ok(false);
     }
+    // Text-only freshness: empty SQLite chunks → needs index; present chunks
+    // → skip (does NOT inspect Lance vectors).
     Ok(sqlite.chunks_for_file(&file_id)?.is_empty())
 }
 
