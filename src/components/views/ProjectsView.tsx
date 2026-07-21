@@ -96,6 +96,7 @@ import type { EffectiveRolesConfig } from "../../types/config";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
 import { resolveOrchestratorClient } from "../../utils/orchestratorClient";
 import {
+	enginePlacementBadge,
 	mainCoderDevbouleLabel,
 	orchestratorDevbouleLabel,
 } from "../../utils/devbouleEngineLabel";
@@ -3770,11 +3771,17 @@ export function ProjectsView() {
 								.pop() ?? ""
 						}
 						plannerModelLabel={
-							// The header names the SELECTED orchestrator backend. It used to
-							// read mainCoderClient (the task-card coder default, "codex") —
-							// wrong store, so the label sat on "codex" whatever was chosen.
+							// Header = selected WHO + model. Placement (oMLX vs OpenRouter)
+							// is a badge next to the model — the Local chip stays Local.
 							plannerOrchestratorClient === "orchestrator"
-								? (config.localCoderBackend?.model ?? "local")
+								? (() => {
+										const model =
+											config.localCoderBackend?.model?.trim() || "local";
+										const place = enginePlacementBadge(
+											config.localCoderBackend,
+										);
+										return place ? `${model} · ${place}` : model;
+									})()
 								: plannerOrchestratorClient
 						}
 						live={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
@@ -4001,9 +4008,9 @@ export function ProjectsView() {
 							);
 						}}
 						orchestrators={[
-							// id "orchestrator" = Devboule engine (Settings → Roles). Label is
-							// NOT always "Local": Cloud API (OpenRouter) still uses this id —
-							// only the placement/backend is cloud. OpenAI CLI is a different id.
+							// id "orchestrator" = Devboule engine (WHO), always labeled Local.
+							// On-device oMLX vs Cloud API OpenRouter is Settings → Roles placement
+							// — do not rename this chip or Local disappears from the planner.
 							{
 								id: "orchestrator",
 								label: orchestratorDevbouleLabel(config.localCoderBackend),
@@ -4030,8 +4037,8 @@ export function ProjectsView() {
 						orchestratorId={plannerOrchestratorClient}
 						onOrchestratorChange={setPlannerOrchestratorClient}
 						coders={[
-							// Role untangle (P6b): the Main coder can run the Devboule engine
-							// (mainCoderBackend) — Local or Cloud API — as well as a cloud CLI.
+							// Main coder Devboule engine (WHO), always Local (Devboule).
+							// Placement Local vs Cloud API is Settings → Roles.
 							{
 								id: "local",
 								label: mainCoderDevbouleLabel(config.mainCoderBackend),
