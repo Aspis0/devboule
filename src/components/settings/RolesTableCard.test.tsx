@@ -475,7 +475,7 @@ describe("RolesTableCard — B1/M1/M4/M8: no silent kind coercion", () => {
 		return btn as HTMLButtonElement;
 	}
 
-	it("renders persisted codex coder backend without coercion and disables Save until offered kind is picked", async () => {
+	it("Local click from Cloud CLI coerces codex backend to omlx and enables Save", async () => {
 		effectiveRoles = {
 			orchestratorClient: "orchestrator",
 			coderClient: "claude",
@@ -487,56 +487,28 @@ describe("RolesTableCard — B1/M1/M4/M8: no silent kind coercion", () => {
 		await mount();
 		const row = rowFor("coder");
 
-		// Coder starts on Cloud CLI (client='claude'). Click Local to reveal the kind select.
+		// Coder starts on Cloud CLI (client='claude'). Click Local → on-device kind.
 		const localBtn = clickButton(row, "Local");
 		await act(async () => {
 			localBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 		});
 		await flush();
 
-		// Now on Local placement: kind select should show codex as the foreign option.
-		// Re-query — the DOM changed after switching placement.
 		const select = row.querySelector("select") as HTMLSelectElement;
 		expect(select).toBeTruthy();
-		expect(select.value).toBe("codex");
+		expect(select.value).toBe("omlx");
 
-		// The foreign option should be disabled.
-		const foreignOption = select.querySelector(
-			'option[value="codex"]',
-		) as HTMLOptionElement;
-		expect(foreignOption).toBeTruthy();
-		expect(foreignOption.disabled).toBe(true);
-
-		// Foreign-kind note should be visible.
+		// No foreign-kind trap — Save is usable.
 		expect(
 			row.querySelector('[data-testid="roles-coder-foreign-kind-note"]'),
-		).toBeTruthy();
-
-		// Save button should be disabled.
+		).toBeNull();
 		const saveBtn = Array.from(row.querySelectorAll("button")).find((b) =>
 			b.textContent?.includes("Save"),
 		)!;
-		expect(saveBtn.disabled).toBe(true);
-
-		// Kind is still codex — NOT coerced to ollama.
-		expect(select.value).toBe("codex");
-
-		// Pick an offered kind (ollama).
-		const nativeSelectSetter = Object.getOwnPropertyDescriptor(
-			window.HTMLSelectElement.prototype,
-			"value",
-		)!.set!;
-		await act(async () => {
-			nativeSelectSetter.call(select, "ollama");
-			select.dispatchEvent(new Event("change", { bubbles: true }));
-		});
-		await flush();
-
-		// Save should now be enabled.
 		expect(saveBtn.disabled).toBe(false);
 	});
 
-	it("Local click does NOT mutate kind; Cloud API click DOES set kind=cloud", async () => {
+	it("Local click coerces cloud kinds to omlx; Cloud API click sets kind=cloud", async () => {
 		effectiveRoles = {
 			orchestratorClient: "orchestrator",
 			coderClient: "claude",
@@ -548,17 +520,17 @@ describe("RolesTableCard — B1/M1/M4/M8: no silent kind coercion", () => {
 		await mount();
 		const row = rowFor("coder");
 
-		// Click Local — should NOT change kind from codex (destination ambiguous).
+		// Click Local — cloud kinds (codex/cloud/openai/api) must become on-device
+		// so Save is not stuck on "current — not offered".
 		const localBtn = clickButton(row, "Local");
 		await act(async () => {
 			localBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 		});
 		await flush();
 		const select = row.querySelector("select") as HTMLSelectElement;
-		expect(select.value).toBe("codex"); // NOT coerced to ollama
+		expect(select.value).toBe("omlx");
 
-		// Click Cloud API — IS an explicit action into single-kind placement; sets kind=cloud.
-		// CloudApiFields renders model + base URL inputs (no kind select), proving kind=cloud.
+		// Click Cloud API — sets kind=cloud (model + https base URL fields, no kind select).
 		const cloudApiBtn = clickButton(row, "Cloud API");
 		await act(async () => {
 			cloudApiBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));

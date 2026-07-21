@@ -1193,11 +1193,15 @@ export function RolesTableCard() {
 	);
 
 	// Reflect external config changes into the local-model drafts (e.g. after a save).
+	// Also drop staged placement: a config refresh (or concurrent save elsewhere) can
+	// rewrite drafts while `stagedPlacement` still says "Cloud API", leaving kind=omlx
+	// under a Cloud API segment — Save permanently disabled ("current — not offered").
 	useEffect(() => {
 		setMainDraft(draftFromBackend(config.mainCoderBackend));
 		setMiniDraft(draftFromBackend(config.miniCoderBackend));
 		setVerifierDraft(draftFromBackend(config.verifierBackend));
 		setOrchestratorDraft(localDraftFromBackend(config.localCoderBackend));
+		setStagedPlacement({});
 	}, [
 		config.mainCoderBackend,
 		config.miniCoderBackend,
@@ -1471,19 +1475,61 @@ export function RolesTableCard() {
 		// B1/M1/M4/M8: use stagedPlacement for display when set; derive otherwise.
 		const displayPlacement =
 			stagedPlacement[role] ?? placementFor(role, client, draftKind);
-		// B1/M1/M4/M8: do NOT mutate draft.kind when switching to Local (destination
-		// ambiguous — show foreign-kind note + disabled Save if kind doesn't fit).
+		// Switching to Local from Cloud API must leave a saveable on-device kind.
+		// Leaving kind="cloud" under Local (old B1 behavior) permanently disabled Save
+		// ("current — not offered") until the user hunted the kind select.
+		const DEFAULT_LOCAL_BASE = "http://127.0.0.1:8000/v1";
 		const setLocal = () => {
 			setRoleClient(role, localMarker(role));
+			if (role === "orchestrator") {
+				if (orchestratorDraft.kind === "cloud") {
+					setOrchestratorDraft({
+						...orchestratorDraft,
+						kind: "omlx",
+						baseUrl:
+							orchestratorDraft.baseUrl &&
+							!/^https:\/\//i.test(orchestratorDraft.baseUrl)
+								? orchestratorDraft.baseUrl
+								: DEFAULT_LOCAL_BASE,
+					});
+				}
+			} else if (isCloudKind(draft.kind)) {
+				setDraft({
+					...draft,
+					kind: "omlx",
+					baseUrl:
+						draft.baseUrl && !/^https:\/\//i.test(draft.baseUrl)
+							? draft.baseUrl
+							: DEFAULT_LOCAL_BASE,
+					command: "",
+				});
+			}
 			setStagedPlacement((prev) => ({ ...prev, [role]: "Local" }));
 		};
 		// Clicking Cloud API IS an explicit user action into a single-kind placement —
-		// stage kind='cloud' (other draft fields stay intact until save).
+		// stage kind='cloud'. Drop loopback/http baseUrls carried over from omlx/Local —
+		// those fail Cloud https-public validation and left Save permanently disabled.
+		const cloudSafeBaseUrl = (raw: string): string => {
+			const u = raw.trim();
+			if (!u) return "";
+			if (/^https:\/\//i.test(u) && !/localhost|127\.0\.0\.1/i.test(u)) return u;
+			return "";
+		};
 		const setCloudApi = () => {
 			setRoleClient(role, localMarker(role));
 			if (role === "orchestrator")
-				setOrchestratorDraft({ ...orchestratorDraft, kind: "cloud" });
-			else setDraft({ ...draft, kind: "cloud" });
+				setOrchestratorDraft({
+					...orchestratorDraft,
+					kind: "cloud",
+					baseUrl: cloudSafeBaseUrl(orchestratorDraft.baseUrl),
+				});
+			else
+				setDraft({
+					...draft,
+					kind: "cloud",
+					baseUrl: cloudSafeBaseUrl(draft.baseUrl),
+					command: "",
+				});
 			setStagedPlacement((prev) => ({ ...prev, [role]: "Cloud API" }));
 		};
 		const setCloudCli = () => {
@@ -1772,13 +1818,22 @@ export function RolesTableCard() {
 					const busy = busyRole === meta.key;
 					// B1/M1/M4/M8: compute whether the current kind is foreign to the
 					// effective placement — used to disable Save and show the inline note.
+					// Mini has NO client: placement is kind-based (Local vs Cloud), same as
+					// renderMiniPlacement. Using placementFor(mini, verifierClient, …) was
+					// wrong — when verifier was a cloud CLI, Mini Save stayed permanently
+					// disabled even for a valid local ollama backend.
 					const effectivePlacement =
-						stagedPlacement[meta.key] ??
-						placementFor(
-							meta.key,
-							clientFor(meta.key),
-							meta.key === "orchestrator" ? orchestratorDraft.kind : draft.kind,
-						);
+						meta.key === "mini"
+							? (stagedPlacement.mini ??
+								(isCloudKind(draft.kind) ? "Cloud" : "Local"))
+							: (stagedPlacement[meta.key] ??
+								placementFor(
+									meta.key,
+									clientFor(meta.key),
+									meta.key === "orchestrator"
+										? orchestratorDraft.kind
+										: draft.kind,
+								));
 					const foreignKindsForRole =
 						meta.key === "mini"
 							? effectivePlacement === "Local"
