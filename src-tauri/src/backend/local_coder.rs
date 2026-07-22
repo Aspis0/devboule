@@ -508,6 +508,158 @@ pub fn preflight_local_orchestrator_backend(backend: &LocalCoderBackend) -> Resu
     local_model_preflight_verdict(&base_url, &model, listed.as_deref())
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Config-save Cloud model-id preflight (fail-open on network; hard-reject only
+// when /models was fetched successfully and the configured id is absent).
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// PURE: true if `wanted` (after trim) is an exact member of `ids`.
+/// Comparison is case-sensitive (OpenRouter / OpenAI model slugs are).
+pub(crate) fn model_id_present(ids: &[String], wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    if wanted.is_empty() {
+        return false;
+    }
+    ids.iter().any(|id| id.as_str() == wanted)
+}
+
+/// Parse an OpenAI-compatible `/models` body into the full list of model ids.
+/// Returns None when the body is not JSON, has no `data` array, or yields ZERO ids
+/// (so the caller fail-opens on an empty/unusable list). No count cap.
+pub(crate) fn parse_cloud_models_body(body: &str) -> Option<Vec<String>> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = json.get("data")?.as_array()?;
+    let ids: Vec<String> = data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+/// Max bytes buffered from a Cloud `/models` response. Must exceed real provider
+/// catalog sizes (OpenRouter ~0.5 MiB today); 8 MiB gives headroom while bounding RAM.
+const MAX_CLOUD_MODELS_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Blocking GET `{baseUrl}/models` with bearer auth. Returns `None` on ANY failure
+/// (timeout, connect, non-2xx, oversized body, unparseable) so the config-save path
+/// can fail-open. Never logs the key.
+fn fetch_cloud_models_blocking(base_url: &str, api_key: &str) -> Option<Vec<String>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Devboule/0.1")
+        .connect_timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let resp = client.get(&url).bearer_auth(api_key).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_CLOUD_MODELS_BODY_BYTES {
+            return None;
+        }
+    }
+    use std::io::Read;
+    let mut body = String::new();
+    resp.take(MAX_CLOUD_MODELS_BODY_BYTES)
+        .read_to_string(&mut body)
+        .ok()?;
+    parse_cloud_models_body(&body)
+}
+
+/// Shared Cloud model-id check used by MiniCoderBackend and LocalCoderBackend saves.
+///
+/// Fail-open conditions (return `Ok(())` without blocking the save):
+/// - missing / empty vault key (`Ok(None)` or blank)
+/// - vault read error
+/// - network / timeout / connection error
+/// - non-2xx on `/models`
+/// - unparseable or wrong-shape body
+/// - empty base_url / model (shape validation should have caught these)
+///
+/// Hard-reject only when `/models` was fetched + parsed successfully and the
+/// configured model id is NOT in the list.
+fn preflight_cloud_model_id_fields(
+    role: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<(), String> {
+    let model = model.trim();
+    let base_url = base_url.trim();
+    if model.is_empty() || base_url.is_empty() {
+        return Ok(());
+    }
+    let api_key = match super::vault::read_cloud_llm_key_for_role(role) {
+        Ok(Some(k)) => {
+            let trimmed = k.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            // Own a copy so the vault secret is not held longer than the request;
+            // never interpolate `api_key` into error messages.
+            trimmed.to_string()
+        }
+        // No key at all, or vault error → cannot auth; do not block the save.
+        Ok(None) | Err(_) => return Ok(()),
+    };
+    let Some(ids) = fetch_cloud_models_blocking(base_url, &api_key) else {
+        return Ok(());
+    };
+    // `api_key` drops here (end of scope after last use); never include it below.
+    drop(api_key);
+    if model_id_present(&ids, model) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cloud model id \"{model}\" was not found on the provider. \
+             Check the model id (provider slugs are case-sensitive) and pick a model \
+             listed by the provider, e.g. via Settings → Providers."
+        ))
+    }
+}
+
+/// Config-save preflight for a Cloud-kind [`super::mini_coder::MiniCoderBackend`].
+/// No-op for non-Cloud kinds. Call AFTER shape-validation (`validate_mini_coder_backend`).
+///
+/// `role` selects the vault key via [`super::vault::read_cloud_llm_key_for_role`]
+/// (`"main"` | `"mini"` | `"verifier"` | `"coder"` …).
+pub(crate) fn preflight_cloud_model_id(
+    role: &str,
+    backend: &super::mini_coder::MiniCoderBackend,
+) -> Result<(), String> {
+    use super::mini_coder::MiniCoderBackendKind;
+    if backend.kind != MiniCoderBackendKind::Cloud {
+        return Ok(());
+    }
+    preflight_cloud_model_id_fields(
+        role,
+        backend.base_url.as_deref().unwrap_or(""),
+        backend.model.as_deref().unwrap_or(""),
+    )
+}
+
+/// Config-save preflight for a Cloud-kind [`LocalCoderBackend`].
+/// No-op for non-Cloud kinds. Call AFTER shape-validation (`validate_local_coder_backend`).
+pub(crate) fn preflight_local_cloud_model_id(
+    role: &str,
+    backend: &LocalCoderBackend,
+) -> Result<(), String> {
+    if backend.kind != LocalCoderBackendKind::Cloud {
+        return Ok(());
+    }
+    preflight_cloud_model_id_fields(
+        role,
+        backend.base_url.as_deref().unwrap_or(""),
+        backend.model.as_deref().unwrap_or(""),
+    )
+}
+
 /// FAIL-LOUD launch gate (bug B2): an orchestrator launch with NEITHER a local (oMLX/
 /// Ollama) model NOR a cloud model configured must be REJECTED before the binary spawns —
 /// without this gate, `build_model` (devboule-coder/src/config.rs) silently selects its
@@ -581,6 +733,90 @@ mod tests {
             local_model_preflight_verdict("http://x/v1", "qwen", Some(&ids(&["other", "qwen"])))
                 .is_ok()
         );
+    }
+
+    // -- config-save Cloud model-id preflight (pure helpers only; no network) --
+
+    #[test]
+    fn model_id_present_exact_match() {
+        let ids = ids(&["openai/gpt-4o-mini", "anthropic/claude-sonnet-4"]);
+        assert!(model_id_present(&ids, "openai/gpt-4o-mini"));
+        assert!(model_id_present(&ids, "anthropic/claude-sonnet-4"));
+    }
+
+    #[test]
+    fn model_id_present_absent_is_false() {
+        let ids = ids(&["openai/gpt-4o-mini"]);
+        assert!(!model_id_present(
+            &ids,
+            "mistralai/mistral-7b-instruct"
+        ));
+    }
+
+    #[test]
+    fn model_id_present_case_mismatch_is_false() {
+        let ids = ids(&["openai/gpt-4o-mini"]);
+        // Provider slugs are case-sensitive — do not case-fold.
+        assert!(!model_id_present(&ids, "openai/GPT-4o-mini"));
+        assert!(!model_id_present(&ids, "OpenAI/gpt-4o-mini"));
+    }
+
+    #[test]
+    fn model_id_present_trims_wanted() {
+        let ids = ids(&["openai/gpt-4o-mini"]);
+        assert!(model_id_present(&ids, "  openai/gpt-4o-mini  "));
+        assert!(model_id_present(&ids, "\topenai/gpt-4o-mini\n"));
+        assert!(!model_id_present(&ids, "   "));
+    }
+
+    #[test]
+    fn parse_cloud_models_body_openai_shape() {
+        let body = r#"{"data":[{"id":"openai/gpt-4o-mini"},{"id":"anthropic/claude-sonnet-4"}]}"#;
+        let parsed = parse_cloud_models_body(body).expect("should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "openai/gpt-4o-mini".to_string(),
+                "anthropic/claude-sonnet-4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cloud_models_body_garbage_is_none() {
+        // Unparseable / wrong shape must be None (fail-open), NOT empty Vec (hard-reject).
+        assert!(parse_cloud_models_body("not json").is_none());
+        assert!(parse_cloud_models_body(r#"{"models":[]}"#).is_none());
+        assert!(parse_cloud_models_body(r#"{"data":"nope"}"#).is_none());
+        assert!(parse_cloud_models_body("").is_none());
+    }
+
+    #[test]
+    fn parse_cloud_models_body_extracts_all_ids_no_cap() {
+        // Prove the old parse_omlx_models MAX_MODELS=200 cap is gone: 250 ids all returned.
+        let entries: Vec<String> = (0..250)
+            .map(|i| format!(r#"{{"id":"model-{:03}"}}"#, i))
+            .collect();
+        let body = format!(r#"{{"data":[{}]}}"#, entries.join(","));
+        let parsed = parse_cloud_models_body(&body).expect("should parse full catalog");
+        assert_eq!(parsed.len(), 250);
+        assert!(parsed.contains(&"model-249".to_string()));
+    }
+
+    #[test]
+    fn parse_cloud_models_body_empty_data_is_none() {
+        // Empty list → None (fail-open), NOT Some([]) (which would hard-reject every save).
+        assert!(parse_cloud_models_body(r#"{"data":[]}"#).is_none());
+    }
+
+    #[test]
+    fn parse_cloud_models_body_no_id_strings_is_none() {
+        assert!(parse_cloud_models_body(r#"{"data":[{"object":"model"}]}"#).is_none());
+    }
+
+    #[test]
+    fn parse_cloud_models_body_missing_data_is_none() {
+        assert!(parse_cloud_models_body(r#"{"foo":1}"#).is_none());
     }
 
     #[test]

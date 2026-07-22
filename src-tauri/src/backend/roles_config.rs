@@ -485,6 +485,20 @@ fn set_role_backend_key(
         Some(b) => Some(super::mini_coder::validate_mini_coder_backend(b)?),
         None => None,
     };
+    // Cloud model-id preflight (fail-open on network; hard-reject only when /models
+    // succeeded and the id is absent). Role → vault key: mainCoderBackend→main,
+    // verifierBackend→verifier.
+    if let Some(ref b) = normalized {
+        let vault_role = match key {
+            "mainCoderBackend" => "main",
+            "verifierBackend" => "verifier",
+            // Unknown keys: skip preflight (no silent wrong-role vault read).
+            _ => "",
+        };
+        if !vault_role.is_empty() {
+            super::local_coder::preflight_cloud_model_id(vault_role, b)?;
+        }
+    }
     let path = locate_config_path(app)
         .ok_or_else(|| format!("config.json could not be located to save the {key} backend."))?;
     // Serialize the read-modify-write against the other config.json savers (mini / local /

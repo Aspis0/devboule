@@ -1190,6 +1190,11 @@ pub fn set_mini_coder_backend(
         Some(b) => Some(super::mini_coder::validate_mini_coder_backend(b)?),
         None => None,
     };
+    // Cloud model-id preflight (vault role "mini"). Fail-open on network; hard-reject
+    // only when GET {baseUrl}/models succeeded and the configured id is absent.
+    if let Some(ref b) = normalized {
+        super::local_coder::preflight_cloud_model_id("mini", b)?;
+    }
     let path = locate_config_path(&app).ok_or_else(|| {
         "config.json could not be located to save the mini-coder backend.".to_string()
     })?;
@@ -1335,6 +1340,11 @@ pub fn set_local_coder_backend(
         Some(b) => Some(super::local_coder::validate_local_coder_backend(b)?),
         None => None,
     };
+    // Cloud model-id preflight (vault role "coder" / "local"). Fail-open on network;
+    // hard-reject only when GET {baseUrl}/models succeeded and the id is absent.
+    if let Some(ref b) = normalized {
+        super::local_coder::preflight_local_cloud_model_id("coder", b)?;
+    }
     let path = locate_config_path(&app).ok_or_else(|| {
         "config.json could not be located to save the local-coder backend.".to_string()
     })?;
