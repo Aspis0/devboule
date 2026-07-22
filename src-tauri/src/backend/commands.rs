@@ -1718,6 +1718,29 @@ pub async fn delete_claude_oauth_token(
         .map_err(|e| format!("task join error: {e}"))?
 }
 
+// F51: in-app Login with Claude (PTY + vault). F47: never on the main thread.
+
+#[tauri::command]
+pub async fn claude_login_start(
+    state: State<'_, BackendState>,
+) -> Result<crate::backend::claude_login::ClaudeLoginResult, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(crate::backend::claude_login::run_claude_setup_token)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+pub async fn claude_login_cancel(
+    state: State<'_, BackendState>,
+) -> Result<crate::backend::claude_login::ClaudeLoginResult, String> {
+    state.ensure_unlocked()?;
+    // Cancel is a quick mutex/AtomicBool poke — still off main for consistency.
+    tauri::async_runtime::spawn_blocking(crate::backend::claude_login::cancel_claude_login)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
 // F50: per-role Cloud LLM keys (fallback to shared). F47: keyring off the main thread.
 
 #[tauri::command]

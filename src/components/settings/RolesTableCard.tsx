@@ -1350,12 +1350,15 @@ export function RolesTableCard() {
 		void refreshAllCloudKeyStatus();
 	}, [refreshAllCloudKeyStatus]);
 
-	// F46-close: shared Claude setup-token (orchestrator Agent CLI section only).
+	// F46-close / F51: shared Claude setup-token (orchestrator Agent CLI section only).
 	const [claudeOauthStatus, setClaudeOauthStatus] =
 		useState<AuxCredentialStatus | null>(null);
 	const [claudeOauthDraft, setClaudeOauthDraft] = useState("");
 	const [claudeOauthBusy, setClaudeOauthBusy] = useState(false);
 	const [claudeOauthError, setClaudeOauthError] = useState<string | null>(null);
+	const [claudeLoginBusy, setClaudeLoginBusy] = useState(false);
+	const [claudeLoginMsg, setClaudeLoginMsg] = useState<string | null>(null);
+	const [claudeLoginOk, setClaudeLoginOk] = useState(false);
 	const refreshClaudeOauthStatus = useCallback(async () => {
 		try {
 			const next = await invokeBackendCommand<AuxCredentialStatus>(
@@ -1409,6 +1412,47 @@ export function RolesTableCard() {
 			if (mountedRef.current) setClaudeOauthBusy(false);
 		}
 	}, [claudeOauthBusy, refreshClaudeOauthStatus]);
+	const startClaudeLogin = useCallback(async () => {
+		if (claudeLoginBusy) return;
+		setClaudeLoginBusy(true);
+		setClaudeLoginMsg(null);
+		setClaudeLoginOk(false);
+		setClaudeOauthError(null);
+		try {
+			const result = await invokeBackendCommand<{
+				ok: boolean;
+				reason?: string;
+				stderrTail?: string;
+			}>("claude_login_start");
+			if (!mountedRef.current) return;
+			if (result.ok) {
+				setClaudeLoginOk(true);
+				setClaudeLoginMsg("Logged in — token saved");
+				await refreshClaudeOauthStatus();
+			} else {
+				setClaudeLoginOk(false);
+				const r = result.reason ?? "Login failed";
+				const tail = result.stderrTail?.trim();
+				setClaudeLoginMsg(tail ? `${r}${tail ? ` — ${tail}` : ""}` : r);
+			}
+		} catch (e) {
+			if (mountedRef.current) {
+				setClaudeLoginOk(false);
+				setClaudeLoginMsg(
+					typeof e === "string" ? e : "Login with Claude failed.",
+				);
+			}
+		} finally {
+			if (mountedRef.current) setClaudeLoginBusy(false);
+		}
+	}, [claudeLoginBusy, refreshClaudeOauthStatus]);
+	const cancelClaudeLogin = useCallback(async () => {
+		try {
+			await invokeBackendCommand("claude_login_cancel");
+		} catch {
+			// best-effort
+		}
+	}, []);
 	useEffect(() => {
 		mountedRef.current = true;
 		return () => {
@@ -2038,20 +2082,42 @@ export function RolesTableCard() {
 								);
 							})()}
 						</label>
-						{/* F46-close: shared setup-token — only on orchestrator Agent CLI. */}
+						{/* F46/F51: Login with Claude + manual paste fallback — orchestrator only. */}
 						{role === "orchestrator" ? (
 							<div
-								className="space-y-2 rounded-lg border border-cream-200 bg-cream-50/50 p-3"
+								className="space-y-3 rounded-lg border border-cream-200 bg-cream-50/50 p-3"
 								data-testid="claude-setup-token-field"
 							>
 								<p className="text-[11px] leading-4 text-cream-400">
 									Shared by every role using the Claude CLI. Generate with:{" "}
-									<code className="font-mono text-[10px]">claude setup-token</code>
+									<code className="font-mono text-[10px]">
+										claude setup-token
+									</code>
 								</p>
-								<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-									Claude setup-token (optional)
+								<div className="flex flex-wrap items-center gap-2">
+									<button
+										type="button"
+										onClick={() => void startClaudeLogin()}
+										disabled={claudeLoginBusy}
+										className="inline-flex items-center justify-center rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-70"
+										data-testid="claude-login-start"
+									>
+										{claudeLoginBusy
+											? "Waiting for browser authorization…"
+											: "Login with Claude"}
+									</button>
+									{claudeLoginBusy ? (
+										<button
+											type="button"
+											onClick={() => void cancelClaudeLogin()}
+											className="text-[11px] font-semibold text-cream-500 underline hover:text-coral-dark"
+											data-testid="claude-login-cancel"
+										>
+											Cancel
+										</button>
+									) : null}
 									<span
-										className={`ml-2 text-[9px] font-semibold normal-case tracking-normal ${
+										className={`text-[9px] font-semibold uppercase tracking-wider ${
 											claudeOauthStatus?.configured
 												? "text-emerald-700"
 												: "text-cream-400"
@@ -2061,6 +2127,21 @@ export function RolesTableCard() {
 											? "configured"
 											: "missing"}
 									</span>
+								</div>
+								{claudeLoginMsg ? (
+									<p
+										className={`text-[11px] leading-4 ${
+											claudeLoginOk
+												? "text-emerald-700"
+												: "text-coral-dark"
+										}`}
+										data-testid="claude-login-msg"
+									>
+										{claudeLoginMsg}
+									</p>
+								) : null}
+								<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+									or paste a token manually
 									<div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
 										<input
 											type="password"
@@ -2082,9 +2163,10 @@ export function RolesTableCard() {
 											type="button"
 											onClick={() => void saveClaudeOauth()}
 											disabled={
-												claudeOauthBusy || claudeOauthDraft.trim().length === 0
+												claudeOauthBusy ||
+												claudeOauthDraft.trim().length === 0
 											}
-											className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
+											className="inline-flex items-center justify-center gap-1.5 rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-cream-600 hover:bg-cream-50 disabled:cursor-not-allowed disabled:opacity-60"
 										>
 											Save
 										</button>
@@ -2101,7 +2183,9 @@ export function RolesTableCard() {
 									</div>
 								</label>
 								{claudeOauthError ? (
-									<p className="text-[10px] text-coral-dark">{claudeOauthError}</p>
+									<p className="text-[10px] text-coral-dark">
+										{claudeOauthError}
+									</p>
 								) : null}
 							</div>
 						) : null}

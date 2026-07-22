@@ -22,6 +22,7 @@ pub mod censor;
 pub mod censor_review;
 pub mod changes;
 pub mod cli_agents;
+pub mod claude_login;
 pub mod cloud_claude;
 pub mod cloud_claude_config;
 pub mod cloud_codex;
