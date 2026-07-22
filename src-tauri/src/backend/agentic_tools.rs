@@ -577,6 +577,7 @@ impl ScopedAgentTools {
                 return Err("refusing to write to a hardlinked file".to_string());
             }
         }
+        sanity_check_written(target, content)?;
         std::fs::write(target, content).map_err(|e| e.to_string())?;
         // FIX 2: record the write so the Censor audit (files_touched / verdict_fn) sees it.
         // Use the relative path for in-root writes (consistent with the relative branch);
@@ -680,6 +681,111 @@ impl ScopedAgentTools {
 
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 
+/// Detect content that is a single logical line stuffed with uninterpreted `\n` escape
+/// sequences instead of real newlines (LLM double-escape corruption). Safe against normal
+/// multi-line files and one-liners that contain the two-char string `\n` inside literals:
+/// only fires when there are zero real newlines AND at least two literal `\n` sequences.
+/// Intentionally narrow: a single literal `\n`, or corruption plus a trailing real newline,
+/// is left to the per-language syntax gate.
+fn has_unescaped_literal_newlines(content: &str) -> bool {
+    let real_nl = content.bytes().filter(|&b| b == b'\n').count();
+    let lit_nl = content.matches("\\n").count();
+    real_nl == 0 && lit_nl >= 2
+}
+
+/// Source-code extensions where the language-agnostic escape guard may fire.
+/// Data/minified formats (json, css, map, txt, md, …) legitimately embed `\\n` on one line.
+/// Caller should pass a lowercased extension (no leading dot).
+fn is_code_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "py" | "rs" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "cjs" | "go" | "java"
+            | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "rb" | "php" | "swift" | "kt"
+            | "kts" | "scala" | "sh" | "bash" | "zsh" | "lua" | "pl" | "pm" | "r" | "dart"
+    )
+}
+
+/// Pre-write sanity gate. Called on the FINAL bytes about to hit the disk, before `fs::write`.
+/// Rejects (1) double-escaped newline corruption on source-code extensions only, and
+/// (2) invalid Python syntax for `.py`/`.pyi`/`.pyw` (best-effort via system `python3`;
+/// skipped if unavailable or if the checker hangs past a short deadline).
+fn sanity_check_written(path: &Path, content: &str) -> Result<(), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // Escape guard: code extensions only (skip json/css/map/txt/md/… and unknown).
+    if is_code_ext(&ext) && has_unescaped_literal_newlines(content) {
+        let lit_nl = content.matches("\\n").count();
+        return Err(format!(
+            "refused: content has {lit_nl} literal \\n escape sequences and no real newlines — emit real newlines, not escaped ones"
+        ));
+    }
+
+    // Best-effort Python syntax gate. Skip if python3 is missing or hangs (~3s budget).
+    if matches!(ext.as_str(), "py" | "pyi" | "pyw") {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let mut child = match std::process::Command::new("python3")
+            .args(["-c", "import ast,sys; ast.parse(sys.stdin.read())"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+
+        // Feed content, then drop stdin so python's sys.stdin.read() gets EOF.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(content.as_bytes());
+        }
+        // Take stderr before waiting; read only after the child has exited.
+        let mut stderr_pipe = match child.stderr.take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Hung/slow checker must not block writes — skip like python-missing.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return Ok(()),
+            }
+        };
+
+        let mut stderr_buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut stderr_buf);
+
+        if !status.success() {
+            let trimmed = stderr_buf.trim();
+            let mut end = trimmed.len().min(400);
+            while end > 0 && !trimmed.is_char_boundary(end) {
+                end -= 1;
+            }
+            return Err(format!(
+                "refused: Python syntax error in {}: {}",
+                path.display(),
+                &trimmed[..end]
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ScopedAgentTools {
     /// WRITE-safe resolver (stricter than `resolve`): the parent dir MUST exist and
     /// canonicalize UNDER the root (blocks writing through a symlinked-out ancestor), and
@@ -738,6 +844,7 @@ impl ScopedAgentTools {
             return Err(format!("'{safe}' is outside this task's write scope"));
         }
         let p = self.write_resolve(path)?;
+        sanity_check_written(&p, content)?;
         fs::write(&p, content).map_err(|e| e.to_string())?;
         self.record_touched(safe);
         Ok(format!("wrote {} bytes to {}", content.len(), p.display()))
@@ -771,7 +878,9 @@ impl ScopedAgentTools {
         if n > 1 {
             return Err(format!("old_string is not unique ({n} matches)"));
         }
-        fs::write(&p, content.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        let final_content = content.replacen(old, new, 1);
+        sanity_check_written(&p, &final_content)?;
+        fs::write(&p, &final_content).map_err(|e| e.to_string())?;
         self.record_touched(safe);
         Ok(format!("edited {}", p.display()))
     }
@@ -854,7 +963,9 @@ impl ScopedAgentTools {
         if n > 1 {
             return Err(format!("old_string is not unique ({n} matches)"));
         }
-        fs::write(target, content.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        let final_content = content.replacen(old, new, 1);
+        sanity_check_written(target, &final_content)?;
+        fs::write(target, &final_content).map_err(|e| e.to_string())?;
         // FIX 2: record the edit so the Censor audit (files_touched / verdict_fn) sees it.
         // Use the same canon_parent-based relative path derivation as FIX 1 above.
         let touch_key = if in_root && !in_working_set {
@@ -1200,6 +1311,82 @@ mod tests {
         assert!(super::looks_network_blocked("curl: (7) Connection refused"));
         assert!(!super::looks_network_blocked("test result: ok. 5 passed"));
         assert!(!super::looks_network_blocked("compile error: missing semicolon"));
+    }
+
+    #[test]
+    fn has_unescaped_literal_newlines_blocks_corrupted_one_liner() {
+        // Model double-escaped: literal backslash-n, no real newlines. Mirrors the real
+        // llama-3.1-8b corruption (three defs collapsed onto one line = two literal `\n`).
+        // The guard requires >= 2 literal `\n` with zero real newlines to avoid tripping on
+        // a legit no-trailing-newline one-liner like `x = "a\nb"` (a single literal `\n`).
+        assert!(has_unescaped_literal_newlines(
+            "def a():pass\\ndef b():pass\\ndef c():pass"
+        ));
+    }
+
+    #[test]
+    fn has_unescaped_literal_newlines_allows_legit_multiline() {
+        assert!(!has_unescaped_literal_newlines("def a():\n    pass\n"));
+    }
+
+    #[test]
+    fn has_unescaped_literal_newlines_allows_string_literal_escape() {
+        // One literal `\n` inside a string plus a real trailing newline — not the corruption pattern.
+        assert!(!has_unescaped_literal_newlines("x = \"a\\nb\"\n"));
+    }
+
+    #[test]
+    fn has_unescaped_literal_newlines_allows_empty() {
+        assert!(!has_unescaped_literal_newlines(""));
+    }
+
+    #[test]
+    fn has_unescaped_literal_newlines_allows_js_regex_with_real_newline() {
+        assert!(!has_unescaped_literal_newlines("const re = /\\n/g;\n"));
+    }
+
+    #[test]
+    fn is_code_ext_accepts_source() {
+        assert!(is_code_ext("py"));
+        assert!(is_code_ext("rs"));
+        assert!(is_code_ext("js"));
+    }
+
+    #[test]
+    fn is_code_ext_rejects_data_and_empty() {
+        assert!(!is_code_ext("json"));
+        assert!(!is_code_ext("css"));
+        assert!(!is_code_ext("txt"));
+        assert!(!is_code_ext(""));
+    }
+
+    #[test]
+    fn sanity_check_written_blocks_corrupted_py_via_escape_guard() {
+        // Corrupted one-liner trips the escape guard before python3 is spawned.
+        let content = "def a():pass\\ndef b():pass\\ndef c():pass";
+        let err = sanity_check_written(Path::new("x.py"), content).unwrap_err();
+        assert!(err.contains("literal \\n"), "{err}");
+    }
+
+    #[test]
+    fn sanity_check_written_allows_json_minified_escapes() {
+        // Legitimate minified JSON with literal `\n` inside strings — escape guard skipped.
+        let content = "{\"a\":\"x\\ny\",\"b\":\"u\\nv\"}";
+        assert!(sanity_check_written(Path::new("x.json"), content).is_ok());
+    }
+
+    #[test]
+    fn sanity_check_written_skips_escape_guard_for_txt() {
+        let content = "def a():pass\\ndef b():pass\\ndef c():pass";
+        assert!(sanity_check_written(Path::new("x.txt"), content).is_ok());
+    }
+
+    #[test]
+    fn sanity_check_written_code_ext_case_insensitive() {
+        // Extension lowercased before is_code_ext / python gate matching.
+        let content = "def a():pass\\ndef b():pass\\ndef c():pass";
+        let err = sanity_check_written(Path::new("x.PY"), content).unwrap_err();
+        assert!(err.contains("literal \\n"), "{err}");
     }
 
     #[test]
