@@ -658,10 +658,37 @@ async function main() {
 			!event.isError
 		) {
 			const args = pendingDevbouleArgs.get(event.toolCallId) || {};
+			// F44: details alone is often meta-only ({queries, totalResults}) while
+			// the model-visible hits live in result.content text. Ship both so Rust
+			// extract_pages can recover pages for the rail.
+			const raw = event.result || {};
+			const details =
+				raw.details && typeof raw.details === "object" ? raw.details : {};
+			let contentText = "";
+			if (typeof raw.content === "string") {
+				contentText = raw.content;
+			} else if (Array.isArray(raw.content)) {
+				contentText = raw.content
+					.map((c) =>
+						typeof c === "string"
+							? c
+							: c && typeof c.text === "string"
+								? c.text
+								: "",
+					)
+					.filter(Boolean)
+					.join("\n");
+			} else if (typeof raw.text === "string") {
+				contentText = raw.text;
+			}
+			const results =
+				contentText.trim().length > 0
+					? { ...details, _content: contentText }
+					: details;
 			emit({
 				type: "devboule_websearch",
-				query: args.query || "",
-				results: event.result?.details || {},
+				query: args.query || args.q || "",
+				results,
 				timestamp: Date.now(),
 			});
 			pendingDevbouleArgs.delete(event.toolCallId);

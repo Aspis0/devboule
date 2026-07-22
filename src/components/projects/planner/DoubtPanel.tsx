@@ -1,8 +1,15 @@
-import type { CSSProperties } from "react";
+import { useRef, useState, type CSSProperties } from "react";
 import type { QuestionEntry } from "../../agents/agentConsoleModel";
 import { steerPickOption, steerYouDecide } from "./plannerModel";
 import { leanIsSoft } from "./leanFieldMath";
 import { LeanField } from "./LeanField";
+import {
+  acceptDoubtAnswerOnce,
+  DOUBT_OPTION_FONT_PX,
+  DOUBT_QUESTION_FONT_PX,
+  DOUBT_QUESTION_LINE_HEIGHT,
+  openDoubts,
+} from "./doubtPanelModel";
 
 // DoubtPanel — the LEFT half of the reused Plan view. It renders the orchestrator's
 // OPEN Kairion doubts as cards: the question, the lean-field graphic (insecurity =
@@ -12,6 +19,10 @@ import { LeanField } from "./LeanField";
 // "you decide", or — handled by the shared chat composer below — type a plain reply.
 // Each routes to orchestrator_steer (local) / project_cloud_orchestrator_send (cloud)
 // exactly as PlannerChat's onSend already does.
+//
+// F38: first pick/decide dismisses the card and fires onSend at most once per question
+// (ref-guard + settled set — multi-tap must not re-steer / re-submit plans).
+// F37: question/option type is sized for long Italian copy at typical planner width.
 //
 // Degrades calmly: no doubts => a quiet "no open doubts" resting state (Kairion is
 // always-on for the orchestrator but silent when it isn't split on anything).
@@ -42,6 +53,21 @@ export function DoubtPanel({
   highlightedDoubtIds,
   onHoverDoubt,
 }: DoubtPanelProps) {
+  // F38: session-local settled ids (optimistic collapse). Ref is the sync guard so
+  // double-clicks in the same tick cannot both pass the Set check before re-render.
+  const settledRef = useRef<Set<string>>(new Set());
+  const [settled, setSettled] = useState<Set<string>>(() => new Set());
+
+  const open = openDoubts(questions, settled);
+
+  const answerOnce = (questionId: string, text: string) => {
+    const { accepted, next } = acceptDoubtAnswerOnce(settledRef.current, questionId);
+    if (!accepted) return;
+    settledRef.current = next;
+    setSettled(next);
+    onSend(text);
+  };
+
   return (
     <div
       className="pp-scroll"
@@ -55,19 +81,19 @@ export function DoubtPanel({
     >
       <div className="pp-mono" style={COL_HEADER}>
         <span>open doubts</span>
-        <span>{questions.length}</span>
+        <span>{open.length}</span>
       </div>
 
-      {questions.length === 0 ? (
+      {open.length === 0 ? (
         <div style={{ color: "#9c9488", fontSize: 12, padding: "18px 4px" }}>
           no open doubts — the plan is firming up.
         </div>
       ) : (
-        questions.map((q) => (
+        open.map((q) => (
           <DoubtCard
             key={q.id}
             q={q}
-            onSend={onSend}
+            onAnswer={(text) => answerOnce(q.id, text)}
             linked={highlightedDoubtIds.has(q.id)}
             onHover={onHoverDoubt}
           />
@@ -79,12 +105,12 @@ export function DoubtPanel({
 
 function DoubtCard({
   q,
-  onSend,
+  onAnswer,
   linked,
   onHover,
 }: {
   q: QuestionEntry;
-  onSend: (text: string) => void;
+  onAnswer: (text: string) => void;
   linked: boolean;
   onHover: (id: string | null) => void;
 }) {
@@ -109,11 +135,20 @@ function DoubtCard({
   return (
     <div
       style={cardStyle}
+      data-testid={`doubt-card-${q.id}`}
       onMouseEnter={() => onHover(q.id)}
       onMouseLeave={() => onHover(null)}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 7 }}>
-        <div style={{ flex: 1, fontSize: 12.5, fontWeight: 600, color: "#2A2621", lineHeight: 1.3 }}>
+        <div
+          style={{
+            flex: 1,
+            fontSize: DOUBT_QUESTION_FONT_PX,
+            fontWeight: 600,
+            color: "#2A2621",
+            lineHeight: DOUBT_QUESTION_LINE_HEIGHT,
+          }}
+        >
           {q.text}
         </div>
         {reopened && (
@@ -144,7 +179,7 @@ function DoubtCard({
       />
 
       {/* HONEST lean line — never a percentage. */}
-      <div style={{ fontSize: 10.5, color: "#9c9488", margin: "5px 1px 8px", lineHeight: 1.4 }}>
+      <div style={{ fontSize: 12, color: "#9c9488", margin: "5px 1px 8px", lineHeight: 1.45 }}>
         {q.lean === null ? (
           <span style={{ color: "#9a6a33", fontWeight: 600 }}>genuinely split</span>
         ) : soft ? (
@@ -168,27 +203,32 @@ function DoubtCard({
         </div>
       )}
 
-      {/* MOVE 1: pick an option. */}
-      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 8 }}>
-        {q.options.map((o) => (
-          <button
-            key={o.id}
-            type="button"
-            onClick={() => onSend(steerPickOption(q, o))}
-            style={{
-              fontSize: 11.5,
-              color: "#2A2621",
-              background: "#FCFAF6",
-              border: "1px solid #E4DDD0",
-              borderRadius: 7,
-              padding: "5px 9px",
-              cursor: "pointer",
-            }}
-          >
-            {o.label}
-          </button>
-        ))}
-      </div>
+      {/* MOVE 1: pick an option (F38: single-fire via parent answerOnce).
+          Free-form doubts omit options — legal store contract; skip the whole row. */}
+      {(q.options ?? []).length > 0 && (
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 8 }}>
+          {(q.options ?? []).map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              data-testid={`doubt-option-${q.id}-${o.id}`}
+              onClick={() => onAnswer(steerPickOption(q, o))}
+              style={{
+                fontSize: DOUBT_OPTION_FONT_PX,
+                color: "#2A2621",
+                background: "#FCFAF6",
+                border: "1px solid #E4DDD0",
+                borderRadius: 7,
+                padding: "6px 11px",
+                cursor: "pointer",
+                lineHeight: 1.35,
+              }}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* MOVE 2: you decide. (MOVE 3 = a plain reply via the shared chat composer below.) */}
       <div
@@ -205,9 +245,10 @@ function DoubtCard({
         <button
           type="button"
           className="pp-mono"
-          onClick={() => onSend(steerYouDecide(q))}
+          data-testid={`doubt-you-decide-${q.id}`}
+          onClick={() => onAnswer(steerYouDecide(q))}
           style={{
-            fontSize: 10,
+            fontSize: 11,
             color: "#C0894F",
             background: "none",
             border: "none",

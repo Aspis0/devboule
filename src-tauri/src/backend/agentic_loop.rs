@@ -48,8 +48,22 @@ pub trait AgentTools {
     fn call(&mut self, name: &str, arguments: &str) -> Result<String, String>;
 }
 
+/// F08: progress signal from the agentic multi-turn loop so the host can append
+/// live activity (JSONL bridge / console). Pure data — no I/O here.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgenticProgress {
+    /// Model emitted one or more tool calls this round.
+    ToolRound {
+        round: u32,
+        tool_names: Vec<String>,
+    },
+}
+
 /// Drive the agentic loop until the model finishes, errors, or hits `max_rounds`
 /// (the runaway guard — replaces the one-shot token cap). Never panics.
+///
+/// `on_progress` (F08): optional observer invoked after each tool-call round so
+/// the host can append live activity. Pure loop control stays free of I/O.
 pub fn run_agent_loop(
     llm: &mut dyn AgentLlm,
     tools: &mut dyn AgentTools,
@@ -57,6 +71,7 @@ pub fn run_agent_loop(
     task: &str,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
+    mut on_progress: Option<&mut dyn FnMut(AgenticProgress)>,
 ) -> LoopOutcome {
     let mut messages = vec![
         ChatMsg {
@@ -114,6 +129,14 @@ pub fn run_agent_loop(
                         reason: "model returned an empty turn before doing any work".to_string(),
                         rounds,
                     };
+                }
+                // F08: notify host before executing tools so the activity feed is live.
+                if let Some(cb) = on_progress.as_mut() {
+                    let tool_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+                    cb(AgenticProgress::ToolRound {
+                        round: rounds,
+                        tool_names,
+                    });
                 }
                 // Record the assistant's tool-call turn, then each tool result, so the next
                 // turn sees the full transcript.
@@ -186,7 +209,7 @@ mod tests {
             ]),
         };
         let mut tools = MockTools { calls: vec![], response: "file content".to_string() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false), None);
         assert_eq!(outcome, LoopOutcome::Done { output: "done".to_string(), rounds: 2 });
         assert_eq!(tools.calls.len(), 1);
         assert_eq!(tools.calls[0].0, "read_file");
@@ -204,7 +227,7 @@ mod tests {
             ]),
         };
         let mut tools = MockTools { calls: vec![], response: "ok".to_string() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 3, &std::sync::atomic::AtomicBool::new(false));
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 3, &std::sync::atomic::AtomicBool::new(false), None);
         assert_eq!(
             outcome,
             LoopOutcome::Aborted { reason: "max rounds (3) exceeded".to_string(), rounds: 3 }
@@ -216,7 +239,7 @@ mod tests {
     fn llm_error_aborts() {
         let mut llm = MockLlm { turns: VecDeque::from(vec![Err("api down".to_string())]) };
         let mut tools = MockTools { calls: vec![], response: String::new() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false), None);
         assert_eq!(
             outcome,
             LoopOutcome::Aborted { reason: "llm error: api down".to_string(), rounds: 1 }
@@ -239,7 +262,7 @@ mod tests {
             ]),
         };
         let mut tools = FailingTools;
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false), None);
         assert_eq!(outcome, LoopOutcome::Done { output: "recovered".to_string(), rounds: 2 });
     }
 
@@ -250,7 +273,7 @@ mod tests {
         };
         let mut tools = MockTools { calls: vec![], response: "x".to_string() };
         let cancel = std::sync::atomic::AtomicBool::new(true); // already cancelled
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &cancel);
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &cancel, None);
         assert_eq!(outcome, LoopOutcome::Aborted { reason: "cancelled".to_string(), rounds: 0 });
         assert_eq!(tools.calls.len(), 0); // never executed a tool
     }
@@ -267,10 +290,44 @@ mod tests {
             "task",
             5,
             &std::sync::atomic::AtomicBool::new(false),
+            None,
         );
         match outcome {
             LoopOutcome::Aborted { reason, .. } => assert!(reason.contains("no content")),
             other => panic!("expected Aborted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_progress_fires_for_tool_rounds() {
+        let mut llm = MockLlm {
+            turns: VecDeque::from(vec![
+                Ok(LlmTurn::ToolCalls(vec![call("read_file"), call("edit_file")])),
+                Ok(LlmTurn::Message("done".to_string())),
+            ]),
+        };
+        let mut tools = MockTools {
+            calls: vec![],
+            response: "ok".to_string(),
+        };
+        let mut seen: Vec<AgenticProgress> = Vec::new();
+        let mut cb = |p: AgenticProgress| seen.push(p);
+        let outcome = run_agent_loop(
+            &mut llm,
+            &mut tools,
+            "sys",
+            "task",
+            5,
+            &std::sync::atomic::AtomicBool::new(false),
+            Some(&mut cb),
+        );
+        assert!(matches!(outcome, LoopOutcome::Done { .. }));
+        assert_eq!(seen.len(), 1, "one tool round → one progress event");
+        match &seen[0] {
+            AgenticProgress::ToolRound { round, tool_names } => {
+                assert_eq!(*round, 1);
+                assert_eq!(tool_names, &["read_file".to_string(), "edit_file".to_string()]);
+            }
         }
     }
 }

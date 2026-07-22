@@ -435,6 +435,13 @@ TOOLS = [
                     "(it may spawn minis itself; orchestrator does not steer minis)."
                 ),
             },
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "Optional Kanban task id this Main coder implements. When set, "
+                    "successful write finalize promotes the task to review."
+                ),
+            },
             "session_token": {"type": "string"},
         },
     },
@@ -6491,6 +6498,11 @@ def dispatch_spawn_mini_coder(
     # "main" (matches the Rust serde skip — a mini directive stays byte-identical).
     if tier == "main":
         directive["tier"] = "main"
+    # F07: optional Kanban task for Main write finalize → review promotion.
+    # NO-CHURN: only emit when a non-empty valid-shaped id is provided.
+    raw_task_id = str(args.get("task_id") or "").strip()
+    if raw_task_id and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", raw_task_id):
+        directive["taskId"] = raw_task_id
     # NO-CHURN: only emit allowOracle when true (matches the Rust serde skip).
     if allow_oracle:
         directive["allowOracle"] = True
@@ -9518,6 +9530,7 @@ def create_mcp_server(
         allow_oracle: bool = False,
         wait: bool = True,
         session_token: str = "",
+        task_id: str = "",
     ) -> dict:
         """Orchestrator only: hand off a SUBSTANTIAL task to the local MAIN CODER
         (sandboxed agentic engine). Always agentic; write/write_mode forced
@@ -9539,6 +9552,7 @@ def create_mcp_server(
                 "allow_oracle": allow_oracle,
                 "wait": wait,
                 "session_token": session_token,
+                "task_id": task_id,
             },
         )
 

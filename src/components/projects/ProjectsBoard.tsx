@@ -90,17 +90,19 @@ function ProjectsBoardComponent({
                     const workingClaim = projectClaims.find((claim) =>
                       isWorkingClaim(claim),
                     );
+                    // F43: sessionsByProject is already live-only; agentActive must
+                    // not light on a claim alone while no live session exists.
                     const sessions = sessionsByProject[item.id] ?? [];
-                    const agentActive =
-                      Boolean(workingClaim) || sessions.length > 0;
-                    // WHO line: prefer the working claim's agent/role, else the
-                    // freshest recent session. Uses the SAME freshestSession
-                    // helper as the header/panel so the card never shows a
-                    // different agent than the detail header for one project
-                    // (#4).
+                    const agentActive = sessions.length > 0;
+                    // WHO line: prefer a live session that matches a working claim,
+                    // else the freshest live session. Same freshestSession helper
+                    // as the header/panel (#4).
                     const workingSession = freshestSession(sessions);
-                    const agentLabel = workingClaim
-                      ? `${workingClaim.agentId} · ${workingClaim.role}`
+                    const claimMatched = workingClaim
+                      ? sessions.find((s) => s.agentId === workingClaim.agentId)
+                      : undefined;
+                    const agentLabel = claimMatched
+                      ? `${claimMatched.agentId} · ${claimMatched.role}`
                       : workingSession
                         ? `${workingSession.agentId} · ${workingSession.role}`
                         : null;

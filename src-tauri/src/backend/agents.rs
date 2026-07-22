@@ -25,6 +25,11 @@ const MAX_EVENTS: usize = 300;
 /// WebView re-renders stay lean (MCP normalize uses the same budget).
 const MAX_CLOSED_SESSIONS_UI: usize = 40;
 
+/// F43: heartbeat window for live workers (must match FE `LIVE_HEARTBEAT_STALE_MS`).
+const LIVE_HEARTBEAT_STALE: ChronoDuration = ChronoDuration::minutes(3);
+/// F43: launch_pending never-registered window (must match FE `LAUNCH_PENDING_STALE_MS`).
+const LAUNCH_PENDING_STALE: ChronoDuration = ChronoDuration::minutes(2);
+
 #[tauri::command]
 pub fn get_agent_live_state(
     app: tauri::AppHandle,
@@ -66,6 +71,15 @@ pub fn get_agent_live_state(
     if !live.is_empty() {
         super::pi_sidecar::overlay_pi_sessions(&mut live_state.sessions, &live, &now);
     }
+    // F43: close ghost active/launch_pending rows that fail the same liveness
+    // windows as the FE (`isLiveWorkingSession`). Persist when anything changed
+    // so the ledger stops claiming "agent active" after a hang/crash (stale-on-boot
+    // + every poll; not a 24h-only age rule).
+    let reaped = reap_stale_ghost_sessions(&mut live_state.sessions, Utc::now());
+    if reaped > 0 {
+        live_state.updated_at = now.clone();
+        let _ = write_agent_live_state(&state_path, &live_state);
+    }
     // B08/B12: drop oldest closed rows so the WebView does not re-render a huge
     // fleet of dead Aspis history every attention poll.
     prune_closed_sessions_ui(&mut live_state.sessions, MAX_CLOSED_SESSIONS_UI);
@@ -75,6 +89,62 @@ pub fn get_agent_live_state(
         live_state.events.drain(0..drop_n);
     }
     Ok(live_state)
+}
+
+/// F43 pure: mark non-live ghost sessions as `closed`.
+///
+/// * `launch_pending` older than [`LAUNCH_PENDING_STALE`] → closed
+/// * other non-terminal statuses older than [`LIVE_HEARTBEAT_STALE`] → closed
+/// * terminal statuses (`closed`/`done`/…) left untouched
+///
+/// Returns the number of sessions closed. Age is measured from `last_seen_at`
+/// falling back to `first_seen_at` (same as FE `isLiveWorkingSession`).
+pub(crate) fn reap_stale_ghost_sessions(
+    sessions: &mut [AgentSession],
+    now: DateTime<Utc>,
+) -> usize {
+    let mut n = 0;
+    for session in sessions.iter_mut() {
+        let status = session.status.to_ascii_lowercase();
+        if matches!(
+            status.as_str(),
+            "done" | "archived" | "idle" | "stopped" | "closed" | "review" | "blocked"
+        ) {
+            continue;
+        }
+        let ref_ts = session
+            .last_seen_at
+            .as_deref()
+            .or(session.first_seen_at.as_deref());
+        let Some(raw) = ref_ts else {
+            // No timestamp at all on a non-terminal row → treat as ghost.
+            session.status = "closed".into();
+            session.message = Some("Reaped ghost session (no heartbeat)".into());
+            session.last_seen_at = Some(now.to_rfc3339());
+            n += 1;
+            continue;
+        };
+        let Ok(seen) = DateTime::parse_from_rfc3339(raw) else {
+            session.status = "closed".into();
+            session.message = Some("Reaped ghost session (bad heartbeat timestamp)".into());
+            session.last_seen_at = Some(now.to_rfc3339());
+            n += 1;
+            continue;
+        };
+        let age = now.signed_duration_since(seen.with_timezone(&Utc));
+        let limit = if status == "launch_pending" {
+            LAUNCH_PENDING_STALE
+        } else {
+            LIVE_HEARTBEAT_STALE
+        };
+        if age > limit {
+            session.status = "closed".into();
+            session.message = Some("Reaped stale ghost session (no live heartbeat)".into());
+            session.last_seen_at = Some(now.to_rfc3339());
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Keep at most `max_closed` sessions with status=closed (oldest first).
@@ -3123,13 +3193,11 @@ mod tests {
 
     #[test]
     fn role_rules_contract_matches_ssot_json_per_role() {
-        // The SSoT (oracle/server/role_rules.json) is now parsed identically by
-        // Rust and Python, so cross-language drift is structurally impossible —
-        // this just pins the per-role contract shape (shared 3-liner for
-        // coder/verifier, the "(mini-coders)" orchestrator variant, and the
-        // mini's own 2-line contract) so an accidental JSON edit still fails
-        // loudly here.
-        let expected = [
+        // The SSoT (oracle/server/role_rules.json) is parsed identically by
+        // Rust and Python. Pin per-role `contract` lines so a JSON edit fails
+        // loudly. F40: orchestrator no longer has a mini-coders subagent line
+        // (orch cannot spawn minis); it has needs_user + planning-done heartbeats.
+        let expected_coder_verifier = [
             "Declare your model (`model`) at agent_register.",
             "Whenever you spawn or close subagents, send agent_heartbeat with an updated `subagents=[{label, model, count, role?}]`.",
             "When waiting on the human (question, allow/deny permission, blocker) send agent_heartbeat with status=\"needs_user\" and a clear message.",
@@ -3138,10 +3206,11 @@ mod tests {
             "Declare your model (`model`) at agent_register.",
             "Register with agent_register (role=\"mini\") before calling oracle_context / project_structure.",
         ];
+        // Mirrors oracle/server/role_rules.json roles[orchestrator].contract exactly.
         let expected_orchestrator = [
             "Declare your model (`model`) at agent_register.",
-            "Whenever you spawn or close subagents (mini-coders), send agent_heartbeat with an updated `subagents=[{label, model, count, role?}]`.",
             "When waiting on the human (question, allow/deny permission, blocker) send agent_heartbeat with status=\"needs_user\" and a clear message.",
+            "When planning is finished (plan approved, tasks created, Main coder spawned), send agent_heartbeat with status=\"done\" so you leave the Work console.",
         ];
         for rule in default_role_rules() {
             let want: &[&str] = if rule.role == "mini" {
@@ -3149,7 +3218,7 @@ mod tests {
             } else if rule.role == "orchestrator" {
                 &expected_orchestrator
             } else {
-                &expected
+                &expected_coder_verifier
             };
             assert_eq!(
                 rule.contract, want,
@@ -3549,6 +3618,71 @@ mod tests {
         // Must match AGENTS_STATE_VERSION in oracle/server/aspis_mcp.py (=2) so a
         // fresh file the Rust side writes is not seen as a stale v1 by Python.
         assert_eq!(default_agent_live_state().version, 2);
+    }
+
+    /// F43: ghosts with stale heartbeats are closed; fresh workers kept.
+    #[test]
+    fn reap_stale_ghost_sessions_closes_stale_active_and_pending() {
+        let now = DateTime::parse_from_rfc3339("2026-07-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mk = |id: &str, status: &str, last_seen_mins_ago: Option<i64>| {
+            let last = last_seen_mins_ago.map(|m| {
+                (now - ChronoDuration::minutes(m)).to_rfc3339()
+            });
+            let mut s: AgentSession = serde_json::from_value(serde_json::json!({
+                "agentId": id,
+                "role": "coder",
+                "status": status,
+                "currentProjectId": "p1",
+                "firstSeenAt": (now - ChronoDuration::hours(1)).to_rfc3339(),
+                "lastSeenAt": last,
+            }))
+            .unwrap();
+            if last_seen_mins_ago.is_none() {
+                s.last_seen_at = None;
+            }
+            s
+        };
+        let mut sessions = vec![
+            mk("fresh", "active", Some(1)),            // 1 min ago → keep
+            mk("ghost-active", "active", Some(10)),    // 10 min > 3 → close
+            mk("ghost-pending", "launch_pending", Some(5)), // 5 > 2 → close
+            mk("fresh-pending", "launch_pending", Some(1)),
+            mk("already-closed", "closed", Some(60)),
+            mk("no-ts", "active", None),
+        ];
+        // no-ts: use first_seen only — set last to None and first old
+        sessions[5].first_seen_at = Some((now - ChronoDuration::hours(2)).to_rfc3339());
+        sessions[5].last_seen_at = None;
+
+        let n = reap_stale_ghost_sessions(&mut sessions, now);
+        assert!(n >= 3, "expected at least ghost-active, ghost-pending, no-ts; n={n}");
+        assert_eq!(sessions[0].status, "active");
+        assert_eq!(sessions[1].status, "closed");
+        assert_eq!(sessions[2].status, "closed");
+        assert_eq!(sessions[3].status, "launch_pending");
+        assert_eq!(sessions[4].status, "closed"); // already closed stays closed
+        assert_eq!(sessions[5].status, "closed");
+    }
+
+    #[test]
+    fn reap_stale_ghost_sessions_leaves_fresh_alone() {
+        let now = Utc::now();
+        let mut sessions = vec![{
+            let mut s: AgentSession = serde_json::from_value(serde_json::json!({
+                "agentId": "live",
+                "role": "coder",
+                "status": "active",
+                "currentProjectId": "p1",
+                "firstSeenAt": now.to_rfc3339(),
+                "lastSeenAt": now.to_rfc3339(),
+            }))
+            .unwrap();
+            s
+        }];
+        assert_eq!(reap_stale_ghost_sessions(&mut sessions, now), 0);
+        assert_eq!(sessions[0].status, "active");
     }
 
     // FIX 4 helpers/tests: exercise the pure in-memory close logic without a real

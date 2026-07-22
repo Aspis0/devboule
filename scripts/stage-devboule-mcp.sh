@@ -42,10 +42,29 @@ echo "stage-devboule-mcp: building ${NAME} (${PROFILE}) for ${TARGET}…"
   if [[ "$SRC" == *.exe ]]; then
     STAGED="${STAGED}.exe"
   fi
-  cp -f "$SRC" "$STAGED"
-  if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
-    chmod +x "$STAGED"
-  fi
+  # F22: macOS kills an in-place overwrite of a running/mapped signed binary
+  # (SIGKILL / invalidated code signature). Always replace via new inode:
+  # write to a temp path, then rm destination + mv (never `cp -f` over existing).
+  install_new_inode() {
+    local src="$1" dest="$2"
+    local tmp="${dest}.new.$$"
+    # Fail closed: never rm the live dest if the staging copy failed (audit F22).
+    if ! cp "$src" "$tmp"; then
+      rm -f "$tmp"
+      echo "stage-devboule-mcp: cp failed: $src → $tmp" >&2
+      return 1
+    fi
+    if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+      chmod +x "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    rm -f "$dest"
+    mv "$tmp" "$dest" || {
+      echo "stage-devboule-mcp: mv failed: $tmp → $dest" >&2
+      rm -f "$tmp"
+      return 1
+    }
+  }
+  install_new_inode "$SRC" "$STAGED"
   if [[ ! -x "$STAGED" && "$(uname -s)" != MINGW* ]]; then
     echo "stage-devboule-mcp: staged binary is not executable: $STAGED" >&2
     exit 1
@@ -56,13 +75,22 @@ echo "stage-devboule-mcp: building ${NAME} (${PROFILE}) for ${TARGET}…"
   if [[ "$SRC" == *.exe ]]; then
     LOCAL="${LOCAL}.exe"
   fi
-  cp -f "$SRC" "$LOCAL"
-  if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
-    chmod +x "$LOCAL"
-  fi
+  install_new_inode "$SRC" "$LOCAL"
   if [[ ! -x "$LOCAL" && "$(uname -s)" != MINGW* ]]; then
     echo "stage-devboule-mcp: local binary is not executable: $LOCAL" >&2
     exit 1
+  fi
+
+  # Optional: refresh src-tauri/target/debug sibling for tools that hardcode it
+  # (still prefer crate target via resolve_devboule_mcp_bin — F02).
+  if [[ "${DEVBOULE_MCP_SYNC_APP_TARGET:-0}" == "1" ]]; then
+    APP_DBG="$ROOT/src-tauri/target/debug/${NAME}"
+    if [[ "$SRC" == *.exe ]]; then
+      APP_DBG="${APP_DBG}.exe"
+    fi
+    mkdir -p "$(dirname "$APP_DBG")"
+    install_new_inode "$SRC" "$APP_DBG"
+    echo "stage-devboule-mcp: also synced → $APP_DBG"
   fi
 
   echo "stage-devboule-mcp: staged → $STAGED"

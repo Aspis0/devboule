@@ -94,7 +94,9 @@ export function workspaceGitLine(
 	const aheadCount = safeCount(gitStatus?.aheadCount);
 	const behindCount = safeCount(gitStatus?.behindCount);
 	const committed = dirtyCount === 0;
-	const pushed = aheadCount === 0;
+	// F27: without an upstream, aheadCount stays 0 and must NOT mean "pushed".
+	const hasUpstream = Boolean(gitStatus?.upstream?.trim());
+	const pushed = hasUpstream && aheadCount === 0;
 
 	// Only show "N modified" when there is something modified — a "0 modified"
 	// segment is noise (the `committed?: yes` segment already conveys a clean tree),
@@ -104,7 +106,11 @@ export function workspaceGitLine(
 	if (aheadCount > 0) segments.push(`↑${aheadCount}`);
 	if (behindCount > 0) segments.push(`↓${behindCount}`);
 	segments.push(`committed?: ${committed ? "yes" : "no"}`);
-	segments.push(`pushed?: ${pushed ? "yes" : "no"}`);
+	segments.push(
+		hasUpstream
+			? `pushed?: ${pushed ? "yes" : "no"}`
+			: "pushed?: no upstream",
+	);
 
 	return {
 		branch,

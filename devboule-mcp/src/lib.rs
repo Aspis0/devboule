@@ -282,6 +282,10 @@ pub struct SpawnMainCoderArgs {
     pub wait: Option<bool>,
     #[serde(default)]
     pub session_token: Option<String>,
+    /// F07: optional Kanban task this Main coder implements. When set, successful
+    /// write finalize promotes the task to `review`.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -426,6 +430,10 @@ pub struct OracleContextArgs {
     pub imports: Option<Vec<String>>,
     #[serde(default)]
     pub module: Option<String>,
+    /// Optional extra **already-registered** index roots for multi-root union
+    /// query (P3). Unregistered paths are rejected (no query-time indexing).
+    #[serde(default)]
+    pub extra_roots: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -958,6 +966,7 @@ impl DevbouleMcp {
                 args.allow_oracle.unwrap_or(false),
                 args.wait,
                 args.session_token.as_deref(),
+                args.task_id.as_deref(),
             )
         })
         .await
@@ -1197,20 +1206,45 @@ impl DevbouleMcp {
     ) -> Result<CallToolResult, McpError> {
         let body = tokio::task::spawn_blocking(move || {
             let projects = resolve_projects_dir();
-            oracle::oracle_context(
-                &projects,
-                &args.agent_id,
-                &args.role,
-                args.session_token.as_deref(),
-                &args.query,
-                args.limit,
-                args.project_id.as_deref(),
-                args.kind.as_deref(),
-                args.language.as_deref(),
-                args.symbols.as_deref(),
-                args.imports.as_deref(),
-                args.module.as_deref(),
-            )
+            let extra: Vec<std::path::PathBuf> = args
+                .extra_roots
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            if extra.is_empty() {
+                oracle::oracle_context(
+                    &projects,
+                    &args.agent_id,
+                    &args.role,
+                    args.session_token.as_deref(),
+                    &args.query,
+                    args.limit,
+                    args.project_id.as_deref(),
+                    args.kind.as_deref(),
+                    args.language.as_deref(),
+                    args.symbols.as_deref(),
+                    args.imports.as_deref(),
+                    args.module.as_deref(),
+                )
+            } else {
+                oracle::oracle_context_with_extra_roots(
+                    &projects,
+                    &args.agent_id,
+                    &args.role,
+                    args.session_token.as_deref(),
+                    &args.query,
+                    args.limit,
+                    args.project_id.as_deref(),
+                    args.kind.as_deref(),
+                    args.language.as_deref(),
+                    args.symbols.as_deref(),
+                    args.imports.as_deref(),
+                    args.module.as_deref(),
+                    &extra,
+                )
+            }
         })
         .await
         .map_err(|e| internal(format!("oracle_context join: {e}")))?

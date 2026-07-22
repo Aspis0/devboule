@@ -585,6 +585,8 @@ fn dispatch_spawn_mini_coder(
     wait: Option<bool>,
     tier: &str,
     preauthorized: Option<(String, String)>,
+    // F07: optional Kanban task (Main path). NO-CHURN: omitted from directive when None.
+    task_id: Option<&str>,
 ) -> ToolResult<Value> {
     let (agent_id, role) = if let Some((aid, r)) = preauthorized {
         (aid, r)
@@ -643,6 +645,23 @@ fn dispatch_spawn_mini_coder(
     // NO-CHURN: only emit tier when non-default "main".
     if tier == "main" {
         directive.insert("tier".into(), json!("main"));
+    }
+    // F07: stamp taskId when the Main caller named a Kanban task.
+    if let Some(tid) = task_id.map(str::trim).filter(|t| !t.is_empty()) {
+        // Soft validate: keep the same shape as project_file::normalize_task_id
+        // without hard-failing the whole spawn on a weird id (the finalize
+        // promote is a no-op when the task is missing).
+        if tid.len() <= 40
+            && tid
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            && tid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            directive.insert("taskId".into(), json!(tid));
+        }
     }
     if allow_oracle {
         directive.insert("allowOracle".into(), json!(true));
@@ -799,6 +818,7 @@ pub fn spawn_mini_coder(
         wait,
         "mini",
         None,
+        None, // task_id is Main-path only
     )
 }
 
@@ -812,6 +832,7 @@ pub fn spawn_main_coder(
     allow_oracle: bool,
     wait: Option<bool>,
     session_token: Option<&str>,
+    task_id: Option<&str>,
 ) -> ToolResult<Value> {
     let (agent_id, role) = require_agent_tool(
         projects_dir,
@@ -842,6 +863,7 @@ pub fn spawn_main_coder(
         wait,
         "main",
         Some((agent_id, role)),
+        task_id,
     )
 }
 
@@ -1330,6 +1352,7 @@ mod tests {
             false,
             Some(false),
             Some(&tok_c),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1436,6 +1459,7 @@ mod tests {
             false,
             Some(false),
             Some(&tok),
+            None,
         )
         .unwrap();
         let did = out["directiveId"].as_str().unwrap();
@@ -1462,6 +1486,7 @@ mod tests {
             false,
             Some(false),
             Some(&tok),
+            None,
         )
         .unwrap_err();
         assert!(

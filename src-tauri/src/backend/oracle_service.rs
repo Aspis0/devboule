@@ -1008,12 +1008,16 @@ fn publish_discovery(root: &Path) -> Result<(), String> {
     }
 
     let (base_url, _port) = oracle_session_endpoint();
+    let auth_token = oracle_agent_token().to_string();
+    let index_root_str = root.to_string_lossy().to_string();
+    let pid = discovery_pid();
+    let updated_at = chrono::Utc::now().to_rfc3339();
     let payload = DiscoveryFile {
-        base_url,
-        auth_token: oracle_agent_token().to_string(),
-        index_root: root.to_string_lossy().to_string(),
-        pid: discovery_pid(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        base_url: base_url.clone(),
+        auth_token: auth_token.clone(),
+        index_root: index_root_str.clone(),
+        pid,
+        updated_at: updated_at.clone(),
     };
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Could not serialize discovery file: {e}"))?;
@@ -1025,6 +1029,91 @@ fn publish_discovery(root: &Path) -> Result<(), String> {
         &target,
         &backup,
         "Oracle discovery file",
+    )?;
+
+    // Layer 2: registry under management only (never write agent tokens into
+    // external/untrusted project trees — P2 audit #4).
+    if let Err(e) =
+        upsert_oracle_roots_registry_entry(root, &base_url, &auth_token, pid, &updated_at)
+    {
+        eprintln!("[oracle] roots registry upsert failed: {e}");
+    }
+    Ok(())
+}
+
+/// Upsert this root into `<management>/oracle-data/.oracle-roots.json`.
+/// Management root = parent of the projects dir when available.
+fn upsert_oracle_roots_registry_entry(
+    root: &Path,
+    base_url: &str,
+    auth_token: &str,
+    pid: u32,
+    updated_at: &str,
+) -> Result<(), String> {
+    let Some(projects) = discovery_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) else {
+        return Ok(());
+    };
+    // Management root is typically parent of projects/.
+    let management = projects
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| projects.clone());
+    let reg_dir = management.join("oracle-data");
+    std::fs::create_dir_all(&reg_dir)
+        .map_err(|e| format!("Could not create oracle-data for registry: {e}"))?;
+    let reg_path = reg_dir.join(".oracle-roots.json");
+    let mut roots: Vec<serde_json::Value> = if reg_path.is_file() {
+        std::fs::read_to_string(&reg_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.get("roots").cloned())
+            .and_then(|r| r.as_array().cloned())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Canonicalize when possible so /var and /private/var collapse (audit #6).
+    let root_key = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let entry = serde_json::json!({
+        "path": root_key,
+        "manifestPath": root.join("oracle-data").join("chunk-index-manifest.json").to_string_lossy(),
+        "discovery": {
+            "baseUrl": base_url,
+            "authToken": auth_token,
+            "pid": pid,
+            "indexRoot": root_key,
+        },
+        "lastIndexedAt": updated_at,
+        "status": "indexed",
+    });
+    // Replace existing entry with same path (canonical or lexical equivalent).
+    let fold = |s: &str| -> String {
+        s.strip_prefix("/private/var/")
+            .map(|r| format!("/var/{r}"))
+            .unwrap_or_else(|| s.to_string())
+    };
+    let root_fold = fold(&root_key);
+    roots.retain(|e| {
+        let Some(p) = e.get("path").and_then(|p| p.as_str()) else {
+            return true;
+        };
+        fold(p) != root_fold && Path::new(p) != root
+    });
+    roots.push(entry);
+    let body = serde_json::json!({ "roots": roots });
+    let json = serde_json::to_string_pretty(&body)
+        .map_err(|e| format!("Could not serialize roots registry: {e}"))?;
+    let temp = write_restricted_temp(Some(&reg_dir), &json)?;
+    let backup = sibling_with_suffix(&reg_path, ".bak");
+    crate::backend::fs_replace::replace_file_with_backup(
+        &temp,
+        &reg_path,
+        &backup,
+        "Oracle roots registry",
     )
 }
 
@@ -1421,6 +1510,77 @@ mod tests {
     }
 
     #[test]
+    /// Layer 2: registry upsert writes `.oracle-roots.json` under management
+    /// oracle-data and can be re-read with the root path.
+    #[test]
+    fn roots_registry_upsert_round_trips_entry() {
+        // Serialize: publish_discovery / init share process-global projects_dir.
+        static REG_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _g = REG_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let base = std::env::temp_dir().join(format!(
+            "devboule-reg-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = base.join("projects");
+        let root = base.join("indexed-root");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        // discovery_path uses projects_dir_slot — seed it.
+        init(projects.clone());
+        upsert_oracle_roots_registry_entry(
+            &root,
+            "http://127.0.0.1:7788",
+            "tok-test",
+            99,
+            "2026-07-21T00:00:00Z",
+        )
+        .expect("upsert");
+        let reg_path = base.join("oracle-data").join(".oracle-roots.json");
+        assert!(
+            reg_path.is_file(),
+            "registry must exist at {}",
+            reg_path.display()
+        );
+        let raw = std::fs::read_to_string(&reg_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let roots = v["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0]["discovery"]["authToken"].as_str(),
+            Some("tok-test")
+        );
+        assert_eq!(
+            roots[0]["discovery"]["baseUrl"].as_str(),
+            Some("http://127.0.0.1:7788")
+        );
+        // Second upsert same path replaces, does not duplicate.
+        upsert_oracle_roots_registry_entry(
+            &root,
+            "http://127.0.0.1:7789",
+            "tok-2",
+            100,
+            "2026-07-21T01:00:00Z",
+        )
+        .unwrap();
+        let raw2 = std::fs::read_to_string(&reg_path).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["roots"].as_array().unwrap().len(), 1, "raw={raw2}");
+        assert_eq!(
+            v2["roots"][0]["discovery"]["authToken"].as_str(),
+            Some("tok-2"),
+            "raw={raw2}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn discovery_file_serializes_exact_contract_keys_with_agent_token_and_loopback() {
         let (base_url, _port) = oracle_session_endpoint();
         let payload = DiscoveryFile {

@@ -93,7 +93,12 @@ import type {
 	SavedWorkflow,
 } from "../../types/backend";
 import type { EffectiveRolesConfig } from "../../types/config";
-import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
+import {
+	clearVerifierKeysOnLeaveReview,
+	isLiveWorkingSession,
+	isOpenClaim,
+	isRecentProjectSession,
+} from "../../utils/agentClaims";
 import { resolveOrchestratorClient } from "../../utils/orchestratorClient";
 import {
 	enginePlacementBadge,
@@ -682,9 +687,14 @@ export function ProjectsView() {
 		if (engine && engine !== "local") return engine;
 		return mainCoderDefault !== "local" ? mainCoderDefault : "codex";
 	}, [mainCoderOverride, mainCoderDefault]);
-	// The Verifier's own client for CLI launches (same "local" → cloud fallback rationale).
+	// F35: never map verifier "local" to external CLI client "codex" — that opened
+	// Terminal.app / pi idle and stamped launch_pending forever. Keep "local" so
+	// prepare_or_launch can take the in-app path; cloud clients pass through.
 	const effectiveVerifierClient = useMemo(
-		() => (verifierClientDefault !== "local" ? verifierClientDefault : "codex"),
+		() =>
+			verifierClientDefault && verifierClientDefault.trim().length > 0
+				? verifierClientDefault
+				: "local",
 		[verifierClientDefault],
 	);
 
@@ -1010,8 +1020,11 @@ export function ProjectsView() {
 
 	const sessionsByProject = useMemo(() => {
 		const grouped: Record<string, AgentSession[]> = {};
+		// F43: only LIVE workers (fresh heartbeat / fresh launch_pending). Ghost
+		// ledger rows (status=active, no process) must not light the board WHO
+		// chip while the Work console says "No agent working this project".
 		for (const session of agentState?.sessions ?? []) {
-			if (!session.currentProjectId || !isRecentProjectSession(session))
+			if (!session.currentProjectId || !isLiveWorkingSession(session))
 				continue;
 			grouped[session.currentProjectId] = [
 				...(grouped[session.currentProjectId] ?? []),
@@ -2010,8 +2023,32 @@ export function ProjectsView() {
 	// Phase 4: verifier work-ethic (opt-in). Refs use PROJECT-SCOPED keys (task ids repeat across
 	// projects) and track fan-out vs nudge SEPARATELY, so the watcher survives the frequent re-renders
 	// without double-spawning or wedging — and still retries a failed launch.
-	const verifiedTaskKeysRef = useRef<Set<string>>(new Set());
-	const maxRecallFiredRef = useRef<Set<string>>(new Set());
+	// F35: seed from sessionStorage so a ProjectsView remount does not double-fire.
+	const loadVerifierKeySet = (storageKey: string): Set<string> => {
+		try {
+			const raw = sessionStorage.getItem(storageKey);
+			if (!raw) return new Set();
+			const arr = JSON.parse(raw) as unknown;
+			return Array.isArray(arr)
+				? new Set(arr.filter((x): x is string => typeof x === "string"))
+				: new Set();
+		} catch {
+			return new Set();
+		}
+	};
+	const persistVerifierKeySet = (storageKey: string, set: Set<string>) => {
+		try {
+			sessionStorage.setItem(storageKey, JSON.stringify([...set]));
+		} catch {
+			/* quota / private mode — in-memory only */
+		}
+	};
+	const verifiedTaskKeysRef = useRef<Set<string>>(
+		loadVerifierKeySet("devboule.verifier.fired"),
+	);
+	const maxRecallFiredRef = useRef<Set<string>>(
+		loadVerifierKeySet("devboule.verifier.maxRecall"),
+	);
 	const nudgedRef = useRef<Set<string>>(new Set());
 	// Verifier launches that already FAILED (per-task auto-spawn). Tracked so a
 	// key that just failed is NOT immediately retried on the next task reload
@@ -2032,11 +2069,8 @@ export function ProjectsView() {
 			invokeBackendCommand("launch_project_agent_terminal", {
 				input: {
 					projectId: pid,
-					// Role untangle (P6b): the verifier runs on its OWN client (Settings → Roles),
-					// no longer silently reusing the Main coder's. NOTE: a "local" verifier (the
-					// in-process agentic engine) launches via a different path; the CLI terminal
-					// spawn here covers the cloud clients (claude/codex/custom) — effectiveVerifierClient
-					// maps a "local" selection to a cloud default.
+					// F35: client is the configured verifier client including "local"
+					// (in-app). Do not force external CLI.
 					role: "verifier",
 					client: effectiveVerifierClient,
 					agentId: `verifier-${taskId ?? "recall"}-${Date.now()}-${idx}`,
@@ -2050,10 +2084,22 @@ export function ProjectsView() {
 		if (controls.verifierPerTask) {
 			for (const t of tasks) {
 				const key = `${pid}:${t.id}`;
-				// A task that left the review state may legitimately retry later —
-				// drop any prior failure so a re-entry into review re-arms the spawn.
+				// F35: a task that left review may re-enter later and must re-verify.
+				// Clear BOTH failure and fired keys (sessionStorage-persisted) or the
+				// second pass is silently skipped forever after the first success.
 				if (t.status !== "review") {
-					verifierFailedKeysRef.current.delete(key);
+					if (
+						clearVerifierKeysOnLeaveReview(
+							verifiedTaskKeysRef.current,
+							verifierFailedKeysRef.current,
+							key,
+						)
+					) {
+						persistVerifierKeySet(
+							"devboule.verifier.fired",
+							verifiedTaskKeysRef.current,
+						);
+					}
 					continue;
 				}
 				if (
@@ -2063,8 +2109,16 @@ export function ProjectsView() {
 					continue;
 				}
 				verifiedTaskKeysRef.current.add(key);
+				persistVerifierKeySet(
+					"devboule.verifier.fired",
+					verifiedTaskKeysRef.current,
+				);
 				void spawnVerifier(t.id, 0).catch((e) => {
 					verifiedTaskKeysRef.current.delete(key);
+					persistVerifierKeySet(
+						"devboule.verifier.fired",
+						verifiedTaskKeysRef.current,
+					);
 					// Record the failure so we don't retry + re-error every reload;
 					// the error is surfaced ONCE here.
 					verifierFailedKeysRef.current.add(key);
@@ -2086,6 +2140,10 @@ export function ProjectsView() {
 			if (controls.maxRecallPerProject) {
 				if (!maxRecallFiredRef.current.has(pid)) {
 					maxRecallFiredRef.current.add(pid);
+					persistVerifierKeySet(
+						"devboule.verifier.maxRecall",
+						maxRecallFiredRef.current,
+					);
 					for (let i = 0; i < 3; i++)
 						void spawnVerifier(null, i).catch((e) =>
 							// Make the fan-out failure visible rather than swallowed.
@@ -2859,6 +2917,13 @@ export function ProjectsView() {
 					e instanceof Error ? e.message : "git commit failed.",
 				);
 				setGitActionError(true);
+				// F27: failure must still refresh gitStatus so STAGED counters
+				// are not left looking "clean" after a rejected commit.
+				try {
+					await reloadSelectedProjectSafe();
+				} catch {
+					/* best-effort; message already set */
+				}
 			} finally {
 				busyRef.current = false;
 				setGitActionBusy(false);
@@ -2869,8 +2934,8 @@ export function ProjectsView() {
 		// gitStatus) stay stale because the 10s reload was suppressed for the op. After
 		// a SUCCESSFUL commit, reload the selected project ONCE so board + Work mode
 		// reflect real post-commit disk state. Runs after the guard released busyRef so
-		// the reload's own loadProject is not self-suppressed. Skipped on failure (the
-		// tree is unchanged) to avoid a needless fetch.
+		// the reload's own loadProject is not self-suppressed. Failure path reloads
+		// above (F27).
 		if (succeeded) await reloadSelectedProjectSafe();
 	};
 

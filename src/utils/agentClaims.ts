@@ -53,3 +53,58 @@ export function isActiveProjectSession(session: AgentSession, now = Date.now()):
   const status = session.status.toLowerCase();
   return status !== "review" && status !== "blocked" && status !== "launch_pending";
 }
+
+/** Heartbeat window for live workers (must match Rust `reap_stale_ghost_sessions`). */
+export const LIVE_HEARTBEAT_STALE_MS = 3 * 60 * 1000;
+/** launch_pending never-registered window (must match Rust). */
+export const LAUNCH_PENDING_STALE_MS = 2 * 60 * 1000;
+
+/**
+ * F43: "agent is working this project" for board WHO + Work console must agree.
+ * A ledger row with status=active but no recent heartbeat (ghost from a pre-fix
+ * hang) is NOT working. Aligns with sessionHealth: only online / fresh pending.
+ */
+export function isLiveWorkingSession(
+  session: AgentSession,
+  now = Date.now(),
+): boolean {
+  if (!session.currentProjectId) return false;
+  const status = session.status.toLowerCase();
+  if (
+    status === "done" ||
+    status === "archived" ||
+    status === "idle" ||
+    status === "stopped" ||
+    status === "closed" ||
+    status === "review" ||
+    status === "blocked"
+  ) {
+    return false;
+  }
+  const lastSeen = sessionLastSeenTime(session);
+  const firstSeen = session.firstSeenAt ? Date.parse(session.firstSeenAt) : NaN;
+  const ref =
+    lastSeen ??
+    (Number.isNaN(firstSeen) ? null : firstSeen);
+  if (ref === null) return false;
+  const age = now - ref;
+  if (status === "launch_pending") {
+    return age <= LAUNCH_PENDING_STALE_MS;
+  }
+  // Heartbeat must be fresh — ghosts drop out of "working" UI.
+  return age <= LIVE_HEARTBEAT_STALE_MS;
+}
+
+/**
+ * F35 pure helper: when a task leaves "review", clear both fired and failed
+ * verifier keys so a later re-entry can spawn again. Returns whether `fired`
+ * changed (caller should persist sessionStorage).
+ */
+export function clearVerifierKeysOnLeaveReview(
+  fired: Set<string>,
+  failed: Set<string>,
+  key: string,
+): boolean {
+  failed.delete(key);
+  return fired.delete(key);
+}

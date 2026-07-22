@@ -10,7 +10,7 @@ import type {
 	StageFinding,
 	PlannerMessage,
 } from "./plannerModel";
-import { doubtTouchesCard } from "./plannerModel";
+import { doubtTouchesCard, stageViewOnDoubts } from "./plannerModel";
 import type { QuestionEntry } from "../../agents/agentConsoleModel";
 import { StageWebsearch } from "./StageWebsearch";
 import { StagePlan } from "./StagePlan";
@@ -212,15 +212,26 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 	// Auto-expand the drawer when something worth showing appears. Doubts are the HARD
 	// exception: an incoming doubt MUST always surface — even if the user collapsed the
 	// drawer by hand — unanswered doubts are never hidden by a collapsed drawer.
+	// F48: also force view → "plan" via pick (pauses rotation); DoubtPanel only mounts
+	// under the plan branch. prevQuestionsLen starts at 0 so remount-with-open-doubts
+	// is treated as an arrival (not skipped by len===prevLen).
 	// Same convention for plan-content: a fresh pi plan (or any stage content) arriving
 	// mid-session forces the drawer open, unless the user has manually toggled (userToggled).
 	const prevLive = useRef(live);
 	const prevArtifact = useRef(artifactActive);
-	const prevQuestionsLen = useRef(questions.length);
+	const prevQuestionsLen = useRef(0);
 	const prevHasContent = useRef(stageHasContent);
 	useEffect(() => {
-		if (questions.length > prevQuestionsLen.current) {
+		const forcePlan = stageViewOnDoubts(
+			prevQuestionsLen.current,
+			questions.length,
+			view,
+		);
+		if (forcePlan === "plan") {
 			setStageExpanded(true);
+			// pick pauses auto-rotation so the stage does not drift off plan while
+			// unanswered doubts are open (user can still manually change tabs after).
+			pick("plan");
 		} else if (!userToggled.current) {
 			if (live && !prevLive.current) setStageExpanded(true);
 			if (artifactActive && !prevArtifact.current) setStageExpanded(true);
@@ -230,7 +241,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 		prevArtifact.current = artifactActive;
 		prevQuestionsLen.current = questions.length;
 		prevHasContent.current = stageHasContent;
-	}, [live, artifactActive, questions.length, stageHasContent]);
+	}, [live, artifactActive, questions.length, stageHasContent, pick, view]);
 
 	// Kairion doubt<->task link: hovering a doubt highlights its task card(s) and vice-versa.
 	// One source of hover at a time; the derived Sets feed both panels.

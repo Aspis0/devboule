@@ -5,7 +5,7 @@ use super::model::{
 use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const SERVICE: &str = "Devboule";
 
@@ -912,9 +912,11 @@ pub fn default_oracle_llm_settings() -> OracleLlmSettings {
 }
 
 pub fn default_oracle_index_preferences() -> OracleIndexPreferences {
+    let root = default_oracle_index_root().map(|path| path.to_string_lossy().to_string());
     OracleIndexPreferences {
         auto_watch_on_unlock: true,
-        index_root: default_oracle_index_root().map(|path| path.to_string_lossy().to_string()),
+        index_root: root.clone(),
+        index_roots: root.into_iter().collect(),
         index_mode: None,
     }
 }
@@ -925,6 +927,12 @@ pub fn save_oracle_index_preferences(
     let cleaned = sanitize_oracle_index_preferences(preferences)?;
     let raw = serde_json::to_string(&cleaned)
         .map_err(|_| "Oracle index preferences could not be serialized.".to_string())?;
+    // F31: debug/DEV unlock never writes the ad-hoc-signed keychain ACL path
+    // (every relink invalidates "Always Allow"). File store survives rebuilds.
+    if super::state::dev_unlock_enabled() {
+        write_oracle_index_preferences_dev_file(&raw)?;
+        return Ok(cleaned);
+    }
     oracle_index_preferences_entry()?
         .set_password(&raw)
         .map_err(|_| vault_error("save"))?;
@@ -967,8 +975,153 @@ pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String>
         .unwrap_or_else(default_oracle_index_preferences))
 }
 
-#[cfg(not(test))]
-pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
+/// Max wall-clock wait for a keychain round-trip (F31). Beyond this we return
+/// defaults so the Tauri main thread / UI never freezes on an invisible ACL prompt
+/// after an ad-hoc-signed debug relink.
+const ORACLE_INDEX_PREFS_KEYCHAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// File-backed prefs used under debug DEV unlock (F31). Survives rebuilds because
+/// it is not bound to the binary's codesign ACL.
+fn oracle_index_preferences_dev_file_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DEVBOULE_ORACLE_INDEX_PREFS_PATH") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(dir) = std::env::var("ASPIS_PROJECTS_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join(".oracle-index-preferences.json"));
+        }
+    }
+    // Prefer absolute checkout paths (CARGO_MANIFEST_DIR = src-tauri) so CWD
+    // does not decide whether prefs load (audit: relative CWD trap).
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest.join("projects/.oracle-index-preferences.json"),
+        manifest.join("../projects/.oracle-index-preferences.json"),
+        PathBuf::from("src-tauri/projects/.oracle-index-preferences.json"),
+        PathBuf::from("projects/.oracle-index-preferences.json"),
+    ];
+    for c in candidates {
+        if let Some(parent) = c.parent() {
+            if parent.exists() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn write_oracle_index_preferences_dev_file(raw: &str) -> Result<(), String> {
+    let path = oracle_index_preferences_dev_file_path().ok_or_else(|| {
+        "DEV unlock Oracle index prefs path unavailable (set DEVBOULE_ORACLE_INDEX_PREFS_PATH or ASPIS_PROJECTS_DIR)."
+            .to_string()
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Could not create Oracle index prefs directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&path, raw).map_err(|e| {
+        format!(
+            "Could not write Oracle index prefs file {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// F39: true when prefs look like a real operator choice (workspace path set),
+/// not the empty/default "No indexed workspace folder" state.
+pub(crate) fn oracle_index_prefs_have_workspace(prefs: &OracleIndexPreferences) -> bool {
+    prefs.primary_index_root().is_some()
+}
+
+pub(crate) fn read_oracle_index_preferences_dev_file() -> Result<OracleIndexPreferences, String> {
+    let Some(path) = oracle_index_preferences_dev_file_path() else {
+        return Ok(default_oracle_index_preferences());
+    };
+    if path.is_file() {
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "Could not read Oracle index prefs file {}: {e}",
+                path.display()
+            )
+        })?;
+        let parsed: OracleIndexPreferences = serde_json::from_str(&raw)
+            .map_err(|_| "Oracle index preferences are invalid.".to_string())?;
+        return sanitize_oracle_index_preferences(&parsed);
+    }
+    // F39: one-shot migrate from keychain when the DEV file does not exist yet
+    // (post-F31 upgrade). Bounded so a keychain ACL prompt cannot freeze DEV boot.
+    migrate_oracle_index_prefs_keychain_to_dev_file(&path)
+}
+
+/// F39 pure decision: when the DEV prefs file is missing, should we copy
+/// keychain prefs into it? Only if keychain has a real workspace root.
+/// Unit-tested without OS keychain I/O.
+pub(crate) fn f39_should_migrate_keychain_to_dev(
+    dev_file_exists: bool,
+    from_keychain: &OracleIndexPreferences,
+) -> bool {
+    !dev_file_exists && oracle_index_prefs_have_workspace(from_keychain)
+}
+
+/// F39 pure apply: if migrate decision is true, write `from_keychain` JSON to
+/// `dev_path` and return those prefs; otherwise return defaults (caller may
+/// still read an existing file separately).
+pub(crate) fn f39_apply_migrate_keychain_to_dev_file(
+    dev_path: &Path,
+    from_keychain: &OracleIndexPreferences,
+) -> Result<OracleIndexPreferences, String> {
+    let exists = dev_path.is_file();
+    if !f39_should_migrate_keychain_to_dev(exists, from_keychain) {
+        return Ok(default_oracle_index_preferences());
+    }
+    let raw = serde_json::to_string_pretty(from_keychain)
+        .map_err(|e| format!("Could not serialize Oracle index prefs for migrate: {e}"))?;
+    if let Some(parent) = dev_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Could not create Oracle index prefs parent {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(dev_path, &raw).map_err(|e| {
+        format!(
+            "Could not write migrated Oracle index prefs {}: {e}",
+            dev_path.display()
+        )
+    })?;
+    Ok(from_keychain.clone())
+}
+
+/// F39: if keychain still holds a real workspace preference, copy it into the
+/// DEV file store and return it. Best-effort; on timeout/missing → defaults.
+fn migrate_oracle_index_prefs_keychain_to_dev_file(
+    dev_path: &Path,
+) -> Result<OracleIndexPreferences, String> {
+    // Production: bounded keychain read. Unit tests never call this path with a
+    // live keychain — they drive `f39_apply_migrate_keychain_to_dev_file` with
+    // injected prefs (see f39_* tests).
+    let from_keychain = if cfg!(test) {
+        // In-test: do not touch OS keychain. Production path always takes the
+        // bounded read below (cfg!(test) is compile-time false for non-test builds).
+        return Ok(default_oracle_index_preferences());
+    } else {
+        read_oracle_index_preferences_keychain_bounded(ORACLE_INDEX_PREFS_KEYCHAIN_TIMEOUT)
+            .unwrap_or_else(|_| default_oracle_index_preferences())
+    };
+    f39_apply_migrate_keychain_to_dev_file(dev_path, &from_keychain)
+}
+
+fn read_oracle_index_preferences_keychain_inner() -> Result<OracleIndexPreferences, String> {
     match oracle_index_preferences_entry()?.get_password() {
         Ok(raw) => {
             let parsed: OracleIndexPreferences = serde_json::from_str(&raw)
@@ -980,31 +1133,94 @@ pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String>
     }
 }
 
+/// Keychain read on a helper thread with a hard timeout (F31). If the OS ACL
+/// dialog would block forever, return defaults so pilot/UI stay live.
+fn read_oracle_index_preferences_keychain_bounded(
+    timeout: std::time::Duration,
+) -> Result<OracleIndexPreferences, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("oracle-index-prefs-keychain".into())
+        .spawn(move || {
+            let _ = tx.send(read_oracle_index_preferences_keychain_inner());
+        })
+        .map_err(|e| format!("Could not spawn keychain reader: {e}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Fail open to defaults: better a one-time reconfigure than a frozen app.
+            Ok(default_oracle_index_preferences())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(vault_error("read"))
+        }
+    }
+}
+
+#[cfg(not(test))]
+pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
+    // F31: debug DEV unlock never touches keychain (ad-hoc codesign ACL prompt
+    // freezes the main thread / supervisor after every relink).
+    if super::state::dev_unlock_enabled() {
+        return read_oracle_index_preferences_dev_file();
+    }
+    read_oracle_index_preferences_keychain_bounded(ORACLE_INDEX_PREFS_KEYCHAIN_TIMEOUT)
+}
+
 fn sanitize_oracle_index_preferences(
     preferences: &OracleIndexPreferences,
 ) -> Result<OracleIndexPreferences, String> {
     let default = default_oracle_index_preferences();
-    let raw_root = preferences
+    // Collect candidate roots: multi-root list first, then single alias, then default.
+    let mut candidates: Vec<String> = preferences
+        .index_roots
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if candidates.is_empty() {
+        if let Some(r) = preferences
+            .index_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            candidates.push(r.to_string());
+        } else if let Some(r) = default.index_root.as_deref() {
+            candidates.push(r.to_string());
+        }
+    } else if let Some(primary) = preferences
         .index_root
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| default.index_root.as_deref().map(PathBuf::from));
-    let index_root = match raw_root {
-        Some(path) => {
-            if !path.exists() || !path.is_dir() {
-                return Err("Oracle index root must be an existing folder.".into());
-            }
-            Some(
-                path.canonicalize()
-                    .map_err(|_| "Oracle index root could not be resolved.".to_string())?
-                    .to_string_lossy()
-                    .to_string(),
-            )
+        .filter(|s| !s.is_empty())
+    {
+        // Ensure primary alias is present as first entry when provided.
+        if !candidates.iter().any(|c| c == primary) {
+            candidates.insert(0, primary.to_string());
+        } else {
+            // Move primary to front.
+            candidates.retain(|c| c != primary);
+            candidates.insert(0, primary.to_string());
         }
-        None => None,
-    };
+    }
+
+    let mut index_roots: Vec<String> = Vec::new();
+    for raw in candidates {
+        let path = PathBuf::from(&raw);
+        if !path.exists() || !path.is_dir() {
+            return Err("Oracle index root must be an existing folder.".into());
+        }
+        let canon = path
+            .canonicalize()
+            .map_err(|_| "Oracle index root could not be resolved.".to_string())?
+            .to_string_lossy()
+            .to_string();
+        if !index_roots.iter().any(|e| e == &canon) {
+            index_roots.push(canon);
+        }
+    }
+    let index_root = index_roots.first().cloned();
     // Coerce any value that is not "watch" or "commit" to None (don't store
     // garbage). Absent (None) is valid and means the default (watch).
     let index_mode = preferences
@@ -1015,6 +1231,7 @@ fn sanitize_oracle_index_preferences(
     Ok(OracleIndexPreferences {
         auto_watch_on_unlock: preferences.auto_watch_on_unlock,
         index_root,
+        index_roots,
         index_mode,
     })
 }
@@ -1629,6 +1846,128 @@ mod tests {
         set_oracle_index_preferences_override_for_test(None);
         let restored = read_oracle_index_preferences().expect("defaults again");
         assert_eq!(restored.auto_watch_on_unlock, true);
+    }
+
+    /// F40: share the crate-wide DEV unlock / env test lock with `state::DEV_UNLOCK_ENV_TEST_LOCK`
+    /// so vault prefs env mutations never race with unlock-env tests.
+    fn f31_prefs_env_lock() -> &'static std::sync::Mutex<()> {
+        // Same mutex instance as state::DEV_UNLOCK_ENV_TEST_LOCK (process-wide).
+        &crate::backend::state::DEV_UNLOCK_ENV_TEST_LOCK
+    }
+
+    /// F31: DEV file store round-trips without keychain (the path used under
+    /// `dev_unlock_enabled()` so ad-hoc-signed rebuilds never freeze UI).
+    #[test]
+    fn f31_oracle_index_prefs_dev_file_roundtrip() {
+        let _guard = f31_prefs_env_lock().lock().expect("f31 prefs env lock");
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-f31-prefs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefs.json");
+        let prev = std::env::var_os("DEVBOULE_ORACLE_INDEX_PREFS_PATH");
+        std::env::set_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH", &path);
+
+        let mut prefs = default_oracle_index_preferences();
+        prefs.auto_watch_on_unlock = false;
+        prefs.index_mode = Some("commit".into());
+        prefs.index_root = None;
+        let raw = serde_json::to_string(&prefs).unwrap();
+        write_oracle_index_preferences_dev_file(&raw).expect("write dev prefs");
+        assert!(path.is_file(), "prefs file must exist at {}", path.display());
+
+        let loaded = read_oracle_index_preferences_dev_file().expect("read dev prefs");
+        assert_eq!(loaded.auto_watch_on_unlock, false);
+        assert_eq!(loaded.index_mode.as_deref(), Some("commit"));
+
+        match prev {
+            Some(v) => std::env::set_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH", v),
+            None => std::env::remove_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f39_oracle_index_prefs_have_workspace_detects_root() {
+        let mut empty = default_oracle_index_preferences();
+        empty.index_root = None;
+        assert!(!oracle_index_prefs_have_workspace(&empty));
+        empty.index_root = Some("".into());
+        assert!(!oracle_index_prefs_have_workspace(&empty));
+        empty.index_root = Some("   ".into());
+        assert!(!oracle_index_prefs_have_workspace(&empty));
+        empty.index_root = Some("/Users/user/Projects/sandbox".into());
+        assert!(oracle_index_prefs_have_workspace(&empty));
+    }
+
+    #[test]
+    fn f39_should_migrate_only_when_file_missing_and_workspace_set() {
+        let mut with_ws = default_oracle_index_preferences();
+        with_ws.index_root = Some("/Users/user/Projects/sandbox".into());
+        let mut empty = default_oracle_index_preferences();
+        empty.index_root = None;
+        assert!(f39_should_migrate_keychain_to_dev(false, &with_ws));
+        assert!(
+            !f39_should_migrate_keychain_to_dev(true, &with_ws),
+            "must not overwrite existing DEV file"
+        );
+        assert!(
+            !f39_should_migrate_keychain_to_dev(false, &empty),
+            "empty keychain prefs → no migrate"
+        );
+    }
+
+    #[test]
+    fn f39_apply_migrate_writes_dev_file_from_injected_keychain_prefs() {
+        // Real path: inject keychain-shaped prefs (no OS keychain) → file appears.
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-f39-migrate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".oracle-index-preferences.json");
+        assert!(!path.exists());
+
+        let mut from_keychain = default_oracle_index_preferences();
+        from_keychain.index_root = Some("/Users/user/Projects/devboule-website".into());
+
+        let out = f39_apply_migrate_keychain_to_dev_file(&path, &from_keychain)
+            .expect("migrate write");
+        assert_eq!(
+            out.index_root.as_deref(),
+            Some("/Users/user/Projects/devboule-website")
+        );
+        assert!(path.is_file(), "DEV prefs file must be created");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("devboule-website"));
+
+        // Second call with file present must not require rewrite (decision false).
+        assert!(!f39_should_migrate_keychain_to_dev(true, &from_keychain));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F31: missing DEV prefs file falls back to defaults (never keychain).
+    #[test]
+    fn f31_oracle_index_prefs_dev_file_missing_returns_defaults() {
+        let _guard = f31_prefs_env_lock().lock().expect("f31 prefs env lock");
+        let path = std::env::temp_dir().join(format!(
+            "devboule-f31-missing-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let prev = std::env::var_os("DEVBOULE_ORACLE_INDEX_PREFS_PATH");
+        std::env::set_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH", &path);
+        let loaded = read_oracle_index_preferences_dev_file().expect("defaults");
+        assert!(loaded.auto_watch_on_unlock);
+        match prev {
+            Some(v) => std::env::set_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH", v),
+            None => std::env::remove_var("DEVBOULE_ORACLE_INDEX_PREFS_PATH"),
+        }
     }
 
     /// RAII guard that snapshots EVERY Oracle LLM credential slot the mutating
@@ -2300,6 +2639,7 @@ mod tests {
         OracleIndexPreferences {
             auto_watch_on_unlock: true,
             index_root: None,
+            index_roots: vec![],
             index_mode: mode.map(str::to_owned),
         }
     }
@@ -2340,6 +2680,47 @@ mod tests {
         let out =
             sanitize_oracle_index_preferences(&prefs_with_mode(None)).expect("None mode is valid");
         assert_eq!(out.index_mode, None);
+    }
+
+    /// Layer 2: multi-root sanitize canonicalizes and keeps both roots; primary
+    /// is first. Legacy single-root still works.
+    #[test]
+    fn sanitize_oracle_index_preferences_multi_root_and_legacy() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-prefs-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let a = base.join("root-a");
+        let b = base.join("root-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let multi = OracleIndexPreferences {
+            auto_watch_on_unlock: true,
+            index_root: Some(a.to_string_lossy().to_string()),
+            index_roots: vec![
+                a.to_string_lossy().to_string(),
+                b.to_string_lossy().to_string(),
+            ],
+            index_mode: Some("watch".into()),
+        };
+        let out = sanitize_oracle_index_preferences(&multi).expect("multi-root ok");
+        assert_eq!(out.index_roots.len(), 2, "{:?}", out.index_roots);
+        assert_eq!(out.primary_index_root().as_deref(), out.index_root.as_deref());
+        assert!(out.index_roots[0].contains("root-a") || out.index_roots[0].ends_with("root-a"));
+        // Legacy single indexRoot only.
+        let legacy = OracleIndexPreferences {
+            auto_watch_on_unlock: true,
+            index_root: Some(a.to_string_lossy().to_string()),
+            index_roots: vec![],
+            index_mode: None,
+        };
+        let out2 = sanitize_oracle_index_preferences(&legacy).expect("legacy ok");
+        assert_eq!(out2.index_roots.len(), 1);
+        assert!(out2.index_root.is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- L2.4 Exa key ---------------------------------------------------------

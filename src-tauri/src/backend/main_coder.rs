@@ -97,12 +97,16 @@ fn validate_main_coder_request(
 /// The caller is responsible for the
 /// unlocked-vault check — this helper does NOT call `ensure_unlocked`.
 ///
+/// `task_id` (F07): optional Kanban task this Main coder implements. When set,
+/// successful write finalize promotes that task to `review`.
+///
 /// Returns the generated directive id on success.
 pub(crate) fn append_main_coder_directive(
     app: &tauri::AppHandle,
     project_id: &str,
     task: String,
     files: Vec<String>,
+    task_id: Option<String>,
 ) -> Result<String, String> {
     // 1. Pure validation (see module doc comment).
     let (task, files) = validate_main_coder_request(&task, &files)?;
@@ -112,10 +116,12 @@ pub(crate) fn append_main_coder_directive(
 
     // 3. Build the directive.
     //
-    // MiniCoderDirective does NOT implement Default. Every field must be
-    // filled explicitly — the pattern is copied from the `directive(...)`
-    // test fixture in mini_coder.rs.
+    // MiniCoderDirective implements Default; we fill the meaningful fields and
+    // leave the rest at zero-values (None / empty / false).
     let id = generate_id();
+    let cleaned_task_id = task_id
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     let directive = MiniCoderDirective {
         id: id.clone(),
         parent_agent_id: "app-user".into(),
@@ -130,6 +136,7 @@ pub(crate) fn append_main_coder_directive(
         // Explicit scope: app-authored directives carry their project directly
         // (there is no live parent session to derive it from).
         project_id: Some(project_id.to_string()),
+        task_id: cleaned_task_id,
         backend: None,
         allow_oracle: false,
         kill_requested: false,

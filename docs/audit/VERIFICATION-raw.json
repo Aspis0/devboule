@@ -1,0 +1,262 @@
+[
+  {
+    "id": "F-00-001",
+    "verdict": "WEAKENED",
+    "note": "doc said 293, now 303"
+  },
+  {
+    "id": "F-LCK-001",
+    "verdict": "CONFIRMED",
+    "note": "all 16 still NO_GATE: ['list_pending_design_requests', 'design_request_claim', 'design_request_complete']..."
+  },
+  {
+    "id": "F-02-020",
+    "verdict": "CONFIRMED",
+    "note": "same list"
+  },
+  {
+    "id": "F-02-001",
+    "verdict": "CONFIRMED",
+    "note": "send has no session gate in body"
+  },
+  {
+    "id": "F-02-014",
+    "verdict": "CONFIRMED",
+    "note": "same"
+  },
+  {
+    "id": "F-02-003",
+    "verdict": "CONFIRMED",
+    "note": "no ensure_unlocked"
+  },
+  {
+    "id": "F-02-003-related",
+    "verdict": "CONFIRMED",
+    "note": "mini_coder_kill has ensure_unlocked (asymmetry real)"
+  },
+  {
+    "id": "F-02-005",
+    "verdict": "CONFIRMED",
+    "note": "install no unlock"
+  },
+  {
+    "id": "F-06-007",
+    "verdict": "CONFIRMED",
+    "note": "set_debug_role release-disabled"
+  },
+  {
+    "id": "F-01-001",
+    "verdict": "CONFIRMED",
+    "note": "hardcoded Windows Hello in state.rs"
+  },
+  {
+    "id": "F-XF-001",
+    "verdict": "CONFIRMED",
+    "note": "documented intentional Oracle survival across lock"
+  },
+  {
+    "id": "F-XF-001b",
+    "verdict": "WEAKENED",
+    "note": "may stop something"
+  },
+  {
+    "id": "F-MCP-001",
+    "verdict": "CONFIRMED",
+    "note": "Python implements own CF rotate HTTP"
+  },
+  {
+    "id": "F-XF-002",
+    "verdict": "CONFIRMED",
+    "note": "dual stack real"
+  },
+  {
+    "id": "F-MCP-001b",
+    "verdict": "CONFIRMED",
+    "note": "MCP never names Tauri perform_scaleway command"
+  },
+  {
+    "id": "F-04-020",
+    "verdict": "CONFIRMED",
+    "note": "orchestrator has rotate in role_rules"
+  },
+  {
+    "id": "F-MCP-002",
+    "verdict": "CONFIRMED",
+    "note": "same"
+  },
+  {
+    "id": "F-MCP-002b",
+    "verdict": "CONFIRMED",
+    "note": "CODER_LIKE includes orchestrator path exists"
+  },
+  {
+    "id": "F-04-021",
+    "verdict": "CONFIRMED",
+    "note": "verifier no rotate"
+  },
+  {
+    "id": "F-04-022",
+    "verdict": "CONFIRMED",
+    "note": "mini tools=['agent_register', 'oracle_context', 'project_structure', 'get_neighborhood', 'find_imports']"
+  },
+  {
+    "id": "F-05-007",
+    "verdict": "CONFIRMED",
+    "note": "global allowlist-exempt documented in code"
+  },
+  {
+    "id": "F-05-007b",
+    "verdict": "CONFIRMED",
+    "note": "validate_command only rejects control chars"
+  },
+  {
+    "id": "F-04-012",
+    "verdict": "CONFIRMED",
+    "note": "bare node spawn path present"
+  },
+  {
+    "id": "F-04-024",
+    "verdict": "CONFIRMED",
+    "note": "pi default-on opt-out"
+  },
+  {
+    "id": "F-04-024b",
+    "verdict": "CONFIRMED",
+    "note": "no classify in pigeon_service.rs"
+  },
+  {
+    "id": "F-04-011",
+    "verdict": "WEAKENED",
+    "note": "may have been fixed"
+  },
+  {
+    "id": "F-05-004-positive",
+    "verdict": "CONFIRMED",
+    "note": ".env treated sensitive in collect"
+  },
+  {
+    "id": "F-05-004",
+    "verdict": "CONFIRMED",
+    "note": "residual content secrets still possible (basename-based only)"
+  },
+  {
+    "id": "F-05-006",
+    "verdict": "CONFIRMED",
+    "note": "install uses require_graph_auth"
+  },
+  {
+    "id": "F-08-002-superseded",
+    "verdict": "CONFIRMED",
+    "note": "cargo audit was run"
+  },
+  {
+    "id": "F-RCH-001",
+    "verdict": "CONFIRMED",
+    "note": "quick_xml used on S3 XML parse"
+  },
+  {
+    "id": "F-RCH-002",
+    "verdict": "CONFIRMED",
+    "note": "dompurify in production dependencies"
+  },
+  {
+    "id": "F-RCH-004",
+    "verdict": "CONFIRMED",
+    "note": "vitest is devDependency"
+  },
+  {
+    "id": "F-RCH-003",
+    "verdict": "CONFIRMED",
+    "note": "rmcp used for stdio only in oracle-core"
+  },
+  {
+    "id": "F-02-006",
+    "verdict": "CONFIRMED",
+    "note": "external url allowlist present"
+  },
+  {
+    "id": "F-04-013",
+    "verdict": "CONFIRMED",
+    "note": "meta denylist present"
+  },
+  {
+    "id": "F-05-010",
+    "verdict": "CONFIRMED",
+    "note": "source identity check"
+  },
+  {
+    "id": "F-05-011",
+    "verdict": "CONFIRMED",
+    "note": "safe tar + signature"
+  },
+  {
+    "id": "F-01-002",
+    "verdict": "CONFIRMED",
+    "note": "reset has unlock but no ManageDevices"
+  },
+  {
+    "id": "F-03-010",
+    "verdict": "CONFIRMED",
+    "note": "perform_scaleway session gated"
+  },
+  {
+    "id": "F-04-001",
+    "verdict": "CONFIRMED",
+    "note": "sandbox scoped to loopback local"
+  },
+  {
+    "id": "F-06-003",
+    "verdict": "CONFIRMED",
+    "note": "no localStorage.setItem with token/secret in non-test src"
+  },
+  {
+    "id": "F-02-012",
+    "verdict": "CONFIRMED",
+    "note": "polis_debug_log no unlock"
+  },
+  {
+    "id": "F-07-001",
+    "verdict": "PLAUSIBLE",
+    "note": "e2e ledger import; not re-repro'd this verification pass"
+  },
+  {
+    "id": "F-07-002",
+    "verdict": "PLAUSIBLE",
+    "note": "e2e ledger import; not re-repro'd this verification pass"
+  },
+  {
+    "id": "F-08-004",
+    "verdict": "PLAUSIBLE",
+    "note": "never executed resource secret scan; remains unchecked not confirmed"
+  },
+  {
+    "id": "F-04-009",
+    "verdict": "WEAKENED",
+    "note": "superseded by F-04-011: path safety exists in PASS1; residual is TOCTOU only"
+  },
+  {
+    "id": "F-02-020-mini_activity-as-mutate",
+    "verdict": "REFUTED",
+    "note": "mini_activity_snapshot likely read-only snapshot"
+  },
+  {
+    "id": "F-02-020-list_pending",
+    "verdict": "WEAKENED",
+    "note": "list is read; claim/complete are real mutates"
+  },
+  {
+    "id": "F-05-012",
+    "verdict": "WEAKENED",
+    "note": "role\u00d7tool matrix done in pass 3; residual is per-handler deep trace only"
+  },
+  {
+    "id": "F-05-009",
+    "verdict": "WEAKENED",
+    "note": "same - role rules audited; tool handlers partially traced"
+  },
+  {
+    "id": "F-03-002",
+    "verdict": "WEAKENED",
+    "note": "write matrix exists; confirm helper expansion still incomplete (F-03-011)"
+  }
+]

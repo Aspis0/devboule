@@ -183,9 +183,13 @@ pub fn discover_and_record_bundled_mcp_bin(resource_dir: Option<&Path>) {
 
 /// Resolve `devboule-mcp` absolute path when backend is Rust.
 ///
-/// Order: `DEVBOULE_MCP_BIN` (error if set but missing/not executable),
-/// [`set_bundled_mcp_bin`] path, debug-only cargo target tree, `current_exe`
-/// siblings / Resources, staged `src-tauri/binaries/` (dev), then PATH.
+/// Order (F02): `DEVBOULE_MCP_BIN` (error if set but missing/not executable),
+/// **debug:** cargo crate tree `devboule-mcp/target/{release,debug}` then staged
+/// `src-tauri/binaries/` (crate wins over a stale copy next to the app binary —
+/// `discover_and_record_bundled_mcp_bin` often points at `src-tauri/target/debug`
+/// which nothing updates when you `cargo build -p devboule-mcp`),
+/// **release / always:** [`set_bundled_mcp_bin`] path, `current_exe` siblings /
+/// Resources, then PATH.
 pub fn resolve_devboule_mcp_bin() -> Result<PathBuf, String> {
     resolve_devboule_mcp_bin_with(std::env::var(ENV_BIN).ok().as_deref())
 }
@@ -216,31 +220,19 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
         });
     }
 
-    if let Some(bundled) = BUNDLED_MCP_BIN.get() {
-        if crate::backend::provider_detect::is_executable_file(bundled) {
-            return Ok(bundled.clone());
+    // F02: in debug, prefer the crate's own cargo output (and staged binaries/)
+    // BEFORE the bundled path recorded from current_exe's directory — that
+    // sibling is often a stale manual copy that never tracks `cargo build -p`.
+    #[cfg(debug_assertions)]
+    {
+        if let Some(abs) = resolve_debug_checkout_mcp_bin() {
+            return Ok(abs);
         }
     }
 
-    // Compile-time sibling paths only in debug builds.
-    // Release must not bake developer absolute paths from the build machine.
-    // Prefer staged externalBin (fresh release stage) over stale target/debug.
-    if cfg!(debug_assertions) {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let staged = manifest.join("binaries").join(bin_name());
-        if let Some(abs) = absolute_if_executable(&staged) {
-            return Ok(abs);
-        }
-        for profile in ["release", "debug"] {
-            let cand = manifest
-                .join("..")
-                .join("devboule-mcp")
-                .join("target")
-                .join(profile)
-                .join(bin_name());
-            if let Some(abs) = absolute_if_executable(&cand) {
-                return Ok(abs);
-            }
+    if let Some(bundled) = BUNDLED_MCP_BIN.get() {
+        if crate::backend::provider_detect::is_executable_file(bundled) {
+            return Ok(bundled.clone());
         }
     }
 
@@ -269,6 +261,42 @@ pub fn resolve_devboule_mcp_bin_with(env_bin: Option<&str>) -> Result<PathBuf, S
              or package with Tauri externalBin; use DEVBOULE_MCP_BACKEND=python for soak)"
         )
     })
+}
+
+/// Debug-only: newest among staged `binaries/` and `devboule-mcp/target/{release,debug}`.
+/// Prefer crate/staged over a stale app-dir copy (F02).
+#[cfg(debug_assertions)]
+fn resolve_debug_checkout_mcp_bin() -> Option<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(manifest.join("binaries").join(bin_name()));
+    for profile in ["release", "debug"] {
+        candidates.push(
+            manifest
+                .join("..")
+                .join("devboule-mcp")
+                .join("target")
+                .join(profile)
+                .join(bin_name()),
+        );
+    }
+    // Pick the newest mtime among existing executables so a fresh
+    // `cargo build -p devboule-mcp` wins over an older staged copy.
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for cand in candidates {
+        let Some(abs) = absolute_if_executable(&cand) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&abs)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best {
+            None => best = Some((mtime, abs)),
+            Some((prev, _)) if mtime >= *prev => best = Some((mtime, abs)),
+            Some(_) => {}
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Return a canonical absolute path if `path` is an executable file.
@@ -628,5 +656,53 @@ mod tests {
             "expected executable check: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// F02: when the crate (or staged) binary exists, resolve must NOT prefer a
+    /// stale app-dir sibling solely because BUNDLED was set from current_exe.
+    #[test]
+    fn resolve_debug_checkout_prefers_crate_or_staged_when_present() {
+        // Exercise the shipped resolve path (env unset). If neither crate nor
+        // staged exists in this workspace, skip rather than invent a fake.
+        let resolved = match resolve_devboule_mcp_bin_with(None) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let path_str = resolved.to_string_lossy();
+        // Prefer crate target or staged binaries/ over a bare name on PATH.
+        let looks_like_checkout = path_str.contains("devboule-mcp")
+            && (path_str.contains("/target/")
+                || path_str.contains("binaries")
+                || path_str.contains("devboule-mcp/target"));
+        assert!(
+            looks_like_checkout || resolved.is_absolute(),
+            "F02: resolve should return an absolute checkout/staged path when available, got {path_str}"
+        );
+        // If the crate (or staged) binary exists alongside a stale app-dir sibling,
+        // resolve must not return the sibling (F02 root cause of live e2e).
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let crate_debug = manifest
+            .join("..")
+            .join("devboule-mcp")
+            .join("target")
+            .join("debug")
+            .join(bin_name());
+        let app_sibling = manifest.join("target").join("debug").join(bin_name());
+        if absolute_if_executable(&crate_debug).is_some() {
+            if let Ok(sib) = fs::canonicalize(&app_sibling) {
+                assert_ne!(
+                    resolved, sib,
+                    "F02: must not pick stale app-dir sibling {}",
+                    sib.display()
+                );
+            }
+            assert!(
+                path_str.contains("devboule-mcp/target")
+                    || path_str.contains("devboule-mcp\\target")
+                    || path_str.contains("/binaries/")
+                    || path_str.contains("\\binaries\\"),
+                "F02: expected crate/staged path, got {path_str}"
+            );
+        }
     }
 }

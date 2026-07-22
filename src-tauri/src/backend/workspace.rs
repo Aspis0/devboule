@@ -130,12 +130,17 @@ const ALWAYS_EXCLUDED_DIRS: &[&str] = &[
     "venv",
 ];
 
+/// F47: async + spawn_blocking — resolve_workspace_root / report FS I/O off main thread.
 #[tauri::command]
-pub fn get_workspace_hygiene_snapshot(
+pub async fn get_workspace_hygiene_snapshot(
     state: State<'_, BackendState>,
 ) -> Result<WorkspaceHygieneSnapshot, String> {
     state.ensure_unlocked()?;
-    snapshot_from_reports(resolve_workspace_root()?, false)
+    tauri::async_runtime::spawn_blocking(|| {
+        snapshot_from_reports(resolve_workspace_root()?, false)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -143,8 +148,8 @@ pub async fn scan_workspace_hygiene(
     state: State<'_, BackendState>,
 ) -> Result<WorkspaceHygieneSnapshot, String> {
     state.ensure_unlocked()?;
-    let root = resolve_workspace_root()?;
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(|| {
+        let root = resolve_workspace_root()?;
         write_workspace_reports(&root)?;
         snapshot_from_reports(root, true)
     })
@@ -152,13 +157,16 @@ pub async fn scan_workspace_hygiene(
     .map_err(|e| format!("Workspace scan task failed: {e}"))?
 }
 
+/// F47: async + spawn_blocking — snapshot reads device keys from the keyring.
 #[tauri::command]
-pub fn get_workspace_package_snapshot(
+pub async fn get_workspace_package_snapshot(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
 ) -> Result<WorkspacePackageSnapshot, String> {
     state.ensure_unlocked()?;
-    workspace_package_snapshot(&app)
+    tauri::async_runtime::spawn_blocking(move || workspace_package_snapshot(&app))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]

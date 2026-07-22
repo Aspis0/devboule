@@ -992,43 +992,50 @@ pub fn project_git_commit(
 /// Push the project repo's CURRENT branch to origin. NEVER force-pushes. On a git
 /// failure the trimmed stderr is surfaced so the UI shows the real reason (e.g.
 /// no upstream, rejected non-fast-forward).
+///
+/// F47: async + spawn_blocking — authenticated push reads the GitHub PAT from the
+/// keyring via `git_run_authenticated`.
 #[tauri::command]
-pub fn project_git_push(
+pub async fn project_git_push(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     project_id: String,
 ) -> Result<ProjectGitCommandResult, String> {
     state.ensure_unlocked()?;
-    let project = read_project_by_id(&app, &project_id)?;
-    let repo_root = resolve_project_repo_root(&project)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = read_project_by_id(&app, &project_id)?;
+        let repo_root = resolve_project_repo_root(&project)?;
 
-    let push_args = git_push_args();
-    // Defense in depth: refuse to run a push whose argv somehow carries a force
-    // flag. The argv is built by git_push_args() (asserted force-free in tests),
-    // so this can only trip if that helper regresses.
-    if args_contain_force(&push_args) {
-        return Err("Refusing to force-push from the app.".into());
-    }
-    let push_argv: Vec<&str> = push_args.iter().map(String::as_str).collect();
-    // Authenticated push: the GitHub PAT is injected via GIT_ASKPASS (off argv,
-    // off .git/config, off the PTY/logs). Fails closed if no token is configured.
-    let push = git_run_authenticated(&repo_root, &push_argv, GIT_PUSH_TIMEOUT)?;
-    if push.exit_code != 0 {
-        return Err(if push.stderr.is_empty() {
-            "git push failed.".into()
-        } else {
-            push.stderr
-        });
-    }
+        let push_args = git_push_args();
+        // Defense in depth: refuse to run a push whose argv somehow carries a force
+        // flag. The argv is built by git_push_args() (asserted force-free in tests),
+        // so this can only trip if that helper regresses.
+        if args_contain_force(&push_args) {
+            return Err("Refusing to force-push from the app.".into());
+        }
+        let push_argv: Vec<&str> = push_args.iter().map(String::as_str).collect();
+        // Authenticated push: the GitHub PAT is injected via GIT_ASKPASS (off argv,
+        // off .git/config, off the PTY/logs). Fails closed if no token is configured.
+        let push = git_run_authenticated(&repo_root, &push_argv, GIT_PUSH_TIMEOUT)?;
+        if push.exit_code != 0 {
+            return Err(if push.stderr.is_empty() {
+                "git push failed.".into()
+            } else {
+                push.stderr
+            });
+        }
 
-    let git_status = project_git_status(project.metadata.root_path.as_deref());
-    let branch = git_status.branch.clone().unwrap_or_default();
-    Ok(ProjectGitCommandResult {
-        project_id,
-        branch,
-        message: "Pushed the current branch to origin.".into(),
-        git_status,
+        let git_status = project_git_status(project.metadata.root_path.as_deref());
+        let branch = git_status.branch.clone().unwrap_or_default();
+        Ok(ProjectGitCommandResult {
+            project_id,
+            branch,
+            message: "Pushed the current branch to origin.".into(),
+            git_status,
+        })
     })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,13 +1125,25 @@ fn clear_request_needs_user(state: &mut super::model::AgentLiveState, agent_id: 
 ///   * TOKEN never surfaced: the push runs via `git_run_authenticated`, which redacts
 ///     the token from stdout/stderr before we ever store it on the request.
 ///   * needs_user cleared on the pushed AND push_failed paths.
+/// F47: async + spawn_blocking — approve path calls `git_run_authenticated` (keyring).
 #[tauri::command]
-pub fn approve_git_push_request(
+pub async fn approve_git_push_request(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     request_id: String,
 ) -> Result<GitPushRequest, String> {
     state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        approve_git_push_request_blocking(app, request_id)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+fn approve_git_push_request_blocking(
+    app: tauri::AppHandle,
+    request_id: String,
+) -> Result<GitPushRequest, String> {
     let request_id = request_id.trim().to_string();
     if request_id.is_empty() {
         return Err("Missing push request id.".into());
@@ -1487,8 +1506,10 @@ fn clone_base_dir(dest_parent: Option<&str>) -> Result<PathBuf, String> {
 /// starting with `-` can never be read as a flag. We refuse to clone into an
 /// existing non-empty directory (never clobber). On success the cloned working
 /// tree is registered as a project rooted at the new directory.
+/// F47: async + spawn_blocking for the authenticated clone (keyring + network);
+/// project registration stays on the command after the blocking section.
 #[tauri::command]
-pub fn project_git_clone(
+pub async fn project_git_clone(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     url: String,
@@ -1496,73 +1517,81 @@ pub fn project_git_clone(
 ) -> Result<ProjectDetail, String> {
     state.ensure_unlocked()?;
 
-    // 1) Validate the remote with the canonical parser (https/github.com only).
-    let (owner, repo) = super::github::parse_github_repo(&url).ok_or_else(|| {
-        "Enter a valid GitHub repository URL (https://github.com/owner/repo).".to_string()
-    })?;
+    // Pure validation + destination claim + authenticated clone off the main thread.
+    let clone_result = tauri::async_runtime::spawn_blocking(move || {
+        // 1) Validate the remote with the canonical parser (https/github.com only).
+        let (owner, repo) = super::github::parse_github_repo(&url).ok_or_else(|| {
+            "Enter a valid GitHub repository URL (https://github.com/owner/repo).".to_string()
+        })?;
 
-    // 2) Safe destination: <base>/<safe repo name>. Both pieces validated.
-    let dir_name = clone_dir_name(&repo)?;
-    let base = clone_base_dir(dest_parent.as_deref())?;
-    let dest = base.join(&dir_name);
+        // 2) Safe destination: <base>/<safe repo name>. Both pieces validated.
+        let dir_name = clone_dir_name(&repo)?;
+        let base = clone_base_dir(dest_parent.as_deref())?;
+        let dest = base.join(&dir_name);
 
-    // 3) Never clobber: cheap pre-check so an OBVIOUSLY occupied destination gives a
-    //    clear error before we attempt anything. This is advisory only — the real
-    //    guard is the atomic exclusive create in step 4 (this read→create gap is a
-    //    TOCTOU window the exclusive create closes).
-    if dir_is_non_empty(&dest) {
-        return Err(format!(
-            "A non-empty folder named \"{dir_name}\" already exists here. Move or remove it first."
-        ));
-    }
-
-    // 4) FIX 5 (TOCTOU): atomically claim the destination. `fs::create_dir`
-    //    (NON-recursive) is exclusive — it fails with AlreadyExists if anything is
-    //    already there (an existing empty dir, a symlink, or a racing concurrent
-    //    clone that won the create). This closes the check→create race and the
-    //    empty-symlink write-through window: we proceed ONLY when WE created the dir,
-    //    which also makes the FIX-2 cleanup below safe (we never remove a pre-existing
-    //    directory we did not create). git clones cleanly into a pre-made empty dir.
-    match fs::create_dir(&dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        // 3) Never clobber: cheap pre-check so an OBVIOUSLY occupied destination gives a
+        //    clear error before we attempt anything. This is advisory only — the real
+        //    guard is the atomic exclusive create in step 4 (this read→create gap is a
+        //    TOCTOU window the exclusive create closes).
+        if dir_is_non_empty(&dest) {
             return Err(format!(
-                "A folder named \"{dir_name}\" already exists here. Move or remove it first."
+                "A non-empty folder named \"{dir_name}\" already exists here. Move or remove it first."
             ));
         }
-        Err(e) => {
-            return Err(format!("Could not create the clone destination: {e}"));
-        }
-    }
 
-    // 5) Credential-free plain URL, rebuilt from validated segments (never the raw
-    //    input). `--` guards against a URL being parsed as a flag. The dest is the
-    //    verbatim-prefix-stripped path (git clone chokes on `\\?\C:\...`).
-    let clone_url = plain_clone_url(&owner, &repo);
-    let dest_str = strip_verbatim_prefix(&dest.to_string_lossy());
-    let clone = match git_run_authenticated(
-        &base,
-        &["clone", "--", &clone_url, &dest_str],
-        GIT_CLONE_TIMEOUT,
-    ) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            // We created the (empty) dest; git may have left a partial tree. Remove
-            // the dir WE own so a retry is not blocked by the clobber guard.
-            let _ = fs::remove_dir_all(&dest);
-            return Err(e);
+        // 4) FIX 5 (TOCTOU): atomically claim the destination. `fs::create_dir`
+        //    (NON-recursive) is exclusive — it fails with AlreadyExists if anything is
+        //    already there (an existing empty dir, a symlink, or a racing concurrent
+        //    clone that won the create). This closes the check→create race and the
+        //    empty-symlink write-through window: we proceed ONLY when WE created the dir,
+        //    which also makes the FIX-2 cleanup below safe (we never remove a pre-existing
+        //    directory we did not create). git clones cleanly into a pre-made empty dir.
+        match fs::create_dir(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "A folder named \"{dir_name}\" already exists here. Move or remove it first."
+                ));
+            }
+            Err(e) => {
+                return Err(format!("Could not create the clone destination: {e}"));
+            }
         }
-    };
-    if clone.exit_code != 0 {
-        // git failed (bad URL/auth/network). Tear down the dir WE created (and any
-        // partial clone in it) so the user can retry without hitting the guard.
-        let _ = fs::remove_dir_all(&dest);
-        return Err(if clone.stderr.is_empty() {
-            "git clone failed.".into()
-        } else {
-            clone.stderr
-        });
-    }
+
+        // 5) Credential-free plain URL, rebuilt from validated segments (never the raw
+        //    input). `--` guards against a URL being parsed as a flag. The dest is the
+        //    verbatim-prefix-stripped path (git clone chokes on `\\?\C:\...`).
+        let clone_url = plain_clone_url(&owner, &repo);
+        let dest_str = strip_verbatim_prefix(&dest.to_string_lossy());
+        let clone = match git_run_authenticated(
+            &base,
+            &["clone", "--", &clone_url, &dest_str],
+            GIT_CLONE_TIMEOUT,
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // We created the (empty) dest; git may have left a partial tree. Remove
+                // the dir WE own so a retry is not blocked by the clobber guard.
+                let _ = fs::remove_dir_all(&dest);
+                return Err(e);
+            }
+        };
+        if clone.exit_code != 0 {
+            // git failed (bad URL/auth/network). Tear down the dir WE created (and any
+            // partial clone in it) so the user can retry without hitting the guard.
+            let _ = fs::remove_dir_all(&dest);
+            return Err(if clone.stderr.is_empty() {
+                "git clone failed.".into()
+            } else {
+                clone.stderr
+            });
+        }
+        Ok((repo, dir_name, dest, dest_str))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+
+    let (repo, dir_name, dest, dest_str) = clone_result;
 
     // 6) Register the cloned working tree as a project rooted at the new dir. Reuse
     //    the canonical create_project path so the new project is identical in shape
@@ -1570,6 +1599,8 @@ pub fn project_git_clone(
     //    FIX 2: if registration fails (e.g. a duplicate project id), the clone is
     //    already on disk — remove the dir WE created so the user is not left with an
     //    orphaned, un-re-clonable folder, and explain what happened.
+    //    create_project is sync disk I/O (no keyring); keep it outside spawn_blocking
+    //    so State<'_, BackendState> does not need to cross the 'static boundary.
     match create_project(
         app,
         state,
@@ -1607,43 +1638,48 @@ fn git_pull_args() -> Vec<String> {
 /// forward / divergence git fails and `--ff-only` leaves the working tree CLEAN;
 /// we surface git's (already sanitized) message telling the user to resolve it
 /// manually, never swallowing the error.
+/// F47: async + spawn_blocking — pull reads the GitHub PAT via keyring.
 #[tauri::command]
-pub fn project_git_pull(
+pub async fn project_git_pull(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     project_id: String,
 ) -> Result<ProjectGitCommandResult, String> {
     state.ensure_unlocked()?;
-    let project = read_project_by_id(&app, &project_id)?;
-    let repo_root = resolve_project_repo_root(&project)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = read_project_by_id(&app, &project_id)?;
+        let repo_root = resolve_project_repo_root(&project)?;
 
-    let pull_args = git_pull_args();
-    let pull_argv: Vec<&str> = pull_args.iter().map(String::as_str).collect();
-    let pull = git_run_authenticated(&repo_root, &pull_argv, GIT_PULL_TIMEOUT)?;
-    if pull.exit_code != 0 {
-        return Err(if pull.stderr.is_empty() {
-            if pull.stdout.is_empty() {
-                "git pull failed.".into()
+        let pull_args = git_pull_args();
+        let pull_argv: Vec<&str> = pull_args.iter().map(String::as_str).collect();
+        let pull = git_run_authenticated(&repo_root, &pull_argv, GIT_PULL_TIMEOUT)?;
+        if pull.exit_code != 0 {
+            return Err(if pull.stderr.is_empty() {
+                if pull.stdout.is_empty() {
+                    "git pull failed.".into()
+                } else {
+                    pull.stdout
+                }
             } else {
-                pull.stdout
-            }
-        } else {
-            pull.stderr
-        });
-    }
+                pull.stderr
+            });
+        }
 
-    let git_status = project_git_status(project.metadata.root_path.as_deref());
-    let branch = git_status.branch.clone().unwrap_or_default();
-    // Best-effort: kick an incremental Oracle index if the index_mode pref is
-    // "commit" AND this pulled repo is within the Oracle index root. The call is
-    // fire-and-forget (returns immediately) and must not fail the git command.
-    crate::backend::oracle_service::notify_local_commit(&repo_root);
-    Ok(ProjectGitCommandResult {
-        project_id,
-        branch,
-        message: "Pulled the latest changes (fast-forward) from origin.".into(),
-        git_status,
+        let git_status = project_git_status(project.metadata.root_path.as_deref());
+        let branch = git_status.branch.clone().unwrap_or_default();
+        // Best-effort: kick an incremental Oracle index if the index_mode pref is
+        // "commit" AND this pulled repo is within the Oracle index root. The call is
+        // fire-and-forget (returns immediately) and must not fail the git command.
+        crate::backend::oracle_service::notify_local_commit(&repo_root);
+        Ok(ProjectGitCommandResult {
+            project_id,
+            branch,
+            message: "Pulled the latest changes (fast-forward) from origin.".into(),
+            git_status,
+        })
     })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 fn sanitize_git_remote(value: &str) -> String {

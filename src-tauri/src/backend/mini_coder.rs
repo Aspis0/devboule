@@ -145,6 +145,11 @@ pub struct CensorMiniSummary {
     /// [`CENSOR_MINI_SUMMARY_FILES_CAP`] entries). The set is order-stable
     /// (first-seen order) and deduped by the caller.
     pub files: Vec<String>,
+    /// F15/F30: true when phase-a censor actually executed (even with zero
+    /// findings). Distinguishes "all clean" from "never reviewed". NO-CHURN:
+    /// omitted when false so legacy summaries without the key still deserialize.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ran: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +532,14 @@ pub struct MiniCoderDirective {
     /// directive — there is no parent session to die). NO-CHURN: omitted when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// F07: Kanban task this Main/write directive is implementing. Optional —
+    /// populated by `spawn_main_coder` / `append_main_coder_directive` when the
+    /// caller knows the task, or copied from the parent session's
+    /// `current_task_id` at launch when missing. On successful write finalize
+    /// (`done`), the executor promotes this task to `review`. NO-CHURN: omitted
+    /// when None so existing JSON round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// Backend override (ollama|api|codex); None -> the global configured backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -2030,6 +2043,7 @@ mod tests {
             write_mode: WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: None,
+            task_id: None,
             task: "docstring foo()".into(),
             files: vec!["src/a.rs".into()],
             backend: None,
@@ -2065,6 +2079,7 @@ mod tests {
             write_mode: WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: None,
+            task_id: None,
             files: vec!["src/a.rs".into()],
             backend: Some("ollama".into()),
             allow_oracle: true,
@@ -4239,6 +4254,7 @@ mod tests {
         let summary = CensorMiniSummary {
             total: 7,
             files: vec!["src/a.rs".into(), "src/b.ts".into()],
+            ran: false,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"total\":7"), "json: {json}");
@@ -4264,6 +4280,7 @@ mod tests {
         d.censor_summary = Some(CensorMiniSummary {
             total: 3,
             files: vec!["src/x.rs".into()],
+            ran: false,
         });
         let json = serde_json::to_string(&d).unwrap();
         assert!(

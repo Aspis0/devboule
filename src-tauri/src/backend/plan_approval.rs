@@ -341,9 +341,77 @@ fn decide_plan_request(
     // best-effort; a deny leaves the draft hidden.
     if approve {
         super::projects::promote_draft_project_to_active(app, &resolved.project_id);
+        // F03: approval must not be inert. Best-effort nudge the requesting agent
+        // (if a live pi session exists) so it materializes tasks + dispatches Main
+        // without requiring the human to re-prompt the orchestrator.
+        nudge_orchestrator_after_plan_approve(app, &resolved);
     }
 
     Ok(resolved)
+}
+
+/// F03: post-approve handoff. Fail-soft — never fails the approve command.
+fn nudge_orchestrator_after_plan_approve(app: &tauri::AppHandle, resolved: &PlanApprovalRequest) {
+    let agent_id = resolved.agent_id.trim();
+    if agent_id.is_empty() {
+        return;
+    }
+    if !crate::backend::pi_sidecar::pi_session_exists(app, agent_id) {
+        // No live orch session: still try to enqueue a Main coder if board already
+        // has a ready todo (human may have created tasks another way).
+        let _ = try_spawn_main_for_first_todo(app, &resolved.project_id);
+        return;
+    }
+    let plan_id = resolved.id.clone();
+    let project_id = resolved.project_id.clone();
+    let msg = format!(
+        "Plan APPROVED by the human (plan_id={plan_id}, project_id={project_id}). \
+         Immediately call project_create_plan_tasks with your structured task list \
+         for this plan_id (one-shot), then spawn_main_coder for the first ready task \
+         with its task_id. Do not wait for another human message."
+    );
+    let _ = crate::backend::pi_sidecar::inject_console_entry(
+        app,
+        agent_id,
+        crate::backend::mini_activity::ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: msg.clone(),
+            time: crate::backend::mini_activity::console_now_str(),
+            msg_id: None,
+        },
+    );
+    let _ = crate::backend::pi_sidecar::send_prompt_to_session(app, agent_id, &msg);
+}
+
+/// If the board already has a todo/wip-less ready task, enqueue Main (F03 fallback
+/// when orch is offline). Best-effort; never errors to caller.
+fn try_spawn_main_for_first_todo(app: &tauri::AppHandle, project_id: &str) -> Result<(), String> {
+    let project_id = project_id.trim();
+    if project_id.is_empty() {
+        return Ok(());
+    }
+    let project = match crate::backend::projects::read_project_by_id(app, project_id) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    let Some(task) = project.state.tasks.iter().find(|t| t.status == "todo") else {
+        return Ok(());
+    };
+    // Need at least one file in scope for Main validation — use scope or a placeholder.
+    let files: Vec<String> = if !task.scope.is_empty() {
+        task.scope.clone()
+    } else {
+        vec!["README.md".into()]
+    };
+    let task_text = format!("{}: {}", task.id, task.title);
+    let _ = crate::backend::main_coder::append_main_coder_directive(
+        app,
+        project_id,
+        task_text,
+        files,
+        Some(task.id.clone()),
+    );
+    Ok(())
 }
 
 /// Human→agent reply-box: answer an agent's blocking `ask_user` question. Caps the

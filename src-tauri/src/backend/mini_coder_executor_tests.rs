@@ -22,6 +22,7 @@ fn directive(id: &str, parent: &str) -> MiniCoderDirective {
         write_mode: mini_coder::WriteMode::EmitEdits,
         tier: Default::default(),
         project_id: None,
+        task_id: None,
         allow_oracle: false,
         kill_requested: false,
         steer_queue: Vec::new(),
@@ -52,6 +53,47 @@ fn mini_agent_id_is_allowlist_safe_and_namespaced() {
     // Parent short is the alnum head (no '-'): "coder171".
     assert!(id.contains("coder171"), "id: {id}");
     assert!(id.contains("abcd1234"), "id: {id}");
+}
+
+/// F30: phase-A censor gate — trusted + (diffs OR files_touched) enters;
+/// untrusted never; empty both never.
+#[test]
+fn phase_a_censor_gate_predicate() {
+    // Non-empty diffs + trusted → true
+    assert!(should_run_phase_a_censor(true, false, true));
+    // Empty diffs, non-empty files_touched (agentic), trusted → true (F30)
+    assert!(should_run_phase_a_censor(false, true, true));
+    // Both non-empty + trusted → true
+    assert!(should_run_phase_a_censor(true, true, true));
+    // Untrusted always false
+    assert!(!should_run_phase_a_censor(true, true, false));
+    assert!(!should_run_phase_a_censor(false, true, false));
+    assert!(!should_run_phase_a_censor(true, false, false));
+    // Trusted but nothing to censor → false
+    assert!(!should_run_phase_a_censor(false, false, true));
+}
+
+/// F07 NO-CHURN: a directive without taskId serializes without the key.
+#[test]
+fn directive_task_id_no_churn_when_none() {
+    let d = directive("d1", "coder-1");
+    assert!(d.task_id.is_none());
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(
+        !json.contains("taskId"),
+        "taskId must be omitted when None: {json}"
+    );
+}
+
+/// F07: taskId round-trips when set.
+#[test]
+fn directive_task_id_round_trips() {
+    let mut d = directive("d1", "coder-1");
+    d.task_id = Some("T1".into());
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(json.contains("\"taskId\":\"T1\""), "json: {json}");
+    let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.task_id.as_deref(), Some("T1"));
 }
 
 #[test]
@@ -1944,6 +1986,7 @@ fn p4_directive(allow_oracle: bool) -> MiniCoderDirective {
         write_mode: mini_coder::WriteMode::EmitEdits,
         tier: Default::default(),
         project_id: None,
+        task_id: None,
         allow_oracle,
         kill_requested: false,
         steer_queue: Vec::new(),
@@ -4421,6 +4464,7 @@ fn app_authored_directive_carries_its_own_project_and_never_loses_a_parent() {
             write_mode: crate::backend::mini_coder::WriteMode::AgenticIterative,
             tier: Default::default(),
             project_id: None,
+            task_id: None,
             backend: None,
             allow_oracle: false,
             kill_requested: false,
@@ -4548,7 +4592,8 @@ fn stuck_report_project_id_derived_from_parent_session_for_mcp_directive() {
 #[test]
 fn backend_supports_directive_dispatch_cloud_is_rejected() {
     use super::super::mini_coder::MiniCoderBackendKind;
-    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Cloud).is_err());
+    // F40/B03: Cloud is supported via agentic HTTP loop — gate is always Ok.
+    assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Cloud).is_ok());
     assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Ollama).is_ok());
     assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Omlx).is_ok());
     assert!(backend_supports_directive_dispatch(MiniCoderBackendKind::Codex).is_ok());

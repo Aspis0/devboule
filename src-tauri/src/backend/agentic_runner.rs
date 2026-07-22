@@ -143,6 +143,8 @@ pub fn default_tool_definitions() -> Value {
 /// Assemble the components and run the agentic coding loop. `root` is the scope (the
 /// directive's project/scratch root); `system` is the local-coder house rules
 /// (docs/local-coder-AGENTS.md). Blocking — call on a worker thread.
+///
+/// `on_progress` (F08): optional observer for live activity append during the loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run_agentic_coder(
     base_url: String,
@@ -163,6 +165,7 @@ pub fn run_agentic_coder(
     cancel: &std::sync::atomic::AtomicBool,
     // Optional Bearer token for Cloud/OpenRouter. None for local oMLX/Ollama.
     api_key: Option<String>,
+    mut on_progress: Option<&mut dyn FnMut(crate::backend::agentic_loop::AgenticProgress)>,
 ) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String> {
     // A4 (§4c live wiring): hold a compute permit for the WHOLE local agentic decode so the
     // coordinator's `active_local_decodes` reflects real GPU activity (what `admit_local_spawn`
@@ -200,14 +203,26 @@ pub fn run_agentic_coder(
         .with_net(net)
         .with_working_set(working_set)
         .with_oracle(oracle_scope);
-    let outcome = run_agent_loop(
-        &mut llm,
-        &mut fs_tools,
-        &effective_system,
-        task,
-        max_rounds,
-        cancel,
-    );
+    let outcome = match on_progress {
+        Some(cb) => run_agent_loop(
+            &mut llm,
+            &mut fs_tools,
+            &effective_system,
+            task,
+            max_rounds,
+            cancel,
+            Some(cb),
+        ),
+        None => run_agent_loop(
+            &mut llm,
+            &mut fs_tools,
+            &effective_system,
+            task,
+            max_rounds,
+            cancel,
+            None,
+        ),
+    };
     let touched = fs_tools.touched().to_vec();
     let net_blocked = fs_tools.net_blocked();
     let out_of_scope_write = fs_tools.out_of_scope_write().map(str::to_string);

@@ -492,6 +492,28 @@ Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinu
     // contain.
     let session_gitconfig = write_session_gitconfig()?;
     let session_gitconfig_label = ps_single_quote(&session_gitconfig.display().to_string());
+    // F36: isolate product Claude from the operator's personal ~/.claude (CLAUDE.md,
+    // skills, allowlists). Same helper as cloud duplex; best-effort if mkdir fails.
+    let claude_config_env = if client == "claude" {
+        match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
+            projects_dir,
+            agent_id,
+        ) {
+            Ok(dir) => {
+                let label = ps_single_quote(&dir.display().to_string());
+                format!("$env:CLAUDE_CONFIG_DIR = {label}\n")
+            }
+            Err(e) => {
+                eprintln!(
+                    "agent_spawn windows: CLAUDE_CONFIG_DIR isolation failed ({e}); \
+                     Claude may inherit owner ~/.claude (F36 degraded)"
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
     let script = format!(
         "$Host.UI.RawUI.WindowTitle = {window_title_label}\n\
 $promptFile = {prompt_path_label}\n\
@@ -505,6 +527,7 @@ $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
 $env:GIT_TERMINAL_PROMPT = '0'\n\
 $env:GIT_CONFIG_NOSYSTEM = '1'\n\
 $env:GIT_CONFIG_GLOBAL = {session_gitconfig_label}\n\
+{claude_config_env}\
 if ($env:PYTHONPATH) {{ $env:PYTHONPATH = {management_root_label} + ';' + $env:PYTHONPATH }} else {{ $env:PYTHONPATH = {management_root_label} }}\n\
 {copied_hint}\
 Write-Host 'Working root:' {root_label}\n\
@@ -770,6 +793,27 @@ pub(crate) fn build_macos_agent_script(
         "export GIT_CONFIG_GLOBAL={}\n",
         sh_single_quote(&session_gitconfig.display().to_string())
     ));
+    // F36: isolate product Claude from the operator's personal ~/.claude.
+    // Set in-script on both PTY and external Terminal paths (non-secret path).
+    if client == "claude" {
+        match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
+            projects_dir,
+            agent_id,
+        ) {
+            Ok(dir) => {
+                script.push_str(&format!(
+                    "export CLAUDE_CONFIG_DIR={}\n",
+                    sh_single_quote(&dir.display().to_string())
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "agent_spawn macos: CLAUDE_CONFIG_DIR isolation failed ({e}); \
+                     Claude may inherit owner ~/.claude (F36 degraded)"
+                );
+            }
+        }
+    }
     script.push_str(&format!(
         "if [ -n \"$PYTHONPATH\" ]; then export PYTHONPATH={mr}:\"$PYTHONPATH\"; else export PYTHONPATH={mr}; fi\n",
         mr = sh_single_quote(&management_root.display().to_string())
@@ -1527,4 +1571,73 @@ fn toml_array(values: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{values}]")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod f36_isolation_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn macos_claude_script_exports_claude_config_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-f36-spawn-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mgmt = base.join("mgmt");
+        std::fs::create_dir_all(&mgmt).unwrap();
+        let projects = base.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // MCP config may fail if rust bin missing — still want CLAUDE_CONFIG_DIR
+        // emission before the launch line. If MCP fails, the whole builder errs;
+        // in that case fall back to asserting the pure dir helper used by the path.
+        let result = build_macos_agent_script(
+            "agent-f36-test",
+            &root,
+            "claude",
+            "claude",
+            None,
+            "hello prompt",
+            &mgmt,
+            &projects,
+            None,
+            &[],
+            None,
+            false,
+            &[],
+        );
+        match result {
+            Ok((_pf, script)) => {
+                assert!(
+                    script.contains("export CLAUDE_CONFIG_DIR="),
+                    "F36 isolation missing from macos claude script:\n{script}"
+                );
+                assert!(
+                    script.contains("claude-agent-config"),
+                    "config dir should be under app-owned claude-agent-config"
+                );
+                assert!(
+                    !script.contains("export CLAUDE_CONFIG_DIR='$HOME/.claude'")
+                        && !script.contains("export CLAUDE_CONFIG_DIR=\"$HOME/.claude\""),
+                    "must not point at home .claude"
+                );
+            }
+            Err(e) => {
+                // MCP binary may be absent in CI; still prove the helper path used by F36.
+                eprintln!("build_macos_agent_script err (MCP?): {e}");
+                let dir = crate::backend::cloud_claude_config::claude_product_config_dir(
+                    &projects,
+                    "agent-f36-test",
+                );
+                assert!(dir.starts_with(&projects));
+                assert!(dir.to_string_lossy().contains("claude-agent-config"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

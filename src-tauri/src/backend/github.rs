@@ -33,55 +33,70 @@ struct GithubUserResponse {
     html_url: Option<String>,
 }
 
+// F47: vault keyring I/O off the Tauri main thread.
 #[tauri::command]
-pub fn get_github_connection_status(
+pub async fn get_github_connection_status(
     state: State<'_, BackendState>,
 ) -> Result<GithubConnectionStatus, String> {
     state.ensure_unlocked()?;
-    github_connection_status()
+    tauri::async_runtime::spawn_blocking(github_connection_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_github_token(
+pub async fn save_github_token(
     state: State<'_, BackendState>,
     token: String,
 ) -> Result<GithubConnectionStatus, String> {
     state.ensure_unlocked()?;
-    let cleaned = token.trim();
-    let mut status = github_connection_status_for_token(cleaned, false, "manual_token")?;
-    if status.status == "valid" {
-        vault::save_github_token(cleaned)?;
-        status.configured = true;
-        status.message =
-            Some("GitHub token is valid and stored in Windows Credential Manager.".into());
-    }
-    Ok(status)
+    tauri::async_runtime::spawn_blocking(move || {
+        let cleaned = token.trim();
+        let mut status = github_connection_status_for_token(cleaned, false, "manual_token")?;
+        if status.status == "valid" {
+            vault::save_github_token(cleaned)?;
+            status.configured = true;
+            status.message =
+                Some("GitHub token is valid and stored in Windows Credential Manager.".into());
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn delete_github_token(
+pub async fn delete_github_token(
     state: State<'_, BackendState>,
 ) -> Result<GithubConnectionStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_github_token()?;
-    github_connection_status()
+    tauri::async_runtime::spawn_blocking(|| {
+        vault::delete_github_token()?;
+        github_connection_status()
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn import_github_token_from_cli(
+pub async fn import_github_token_from_cli(
     state: State<'_, BackendState>,
 ) -> Result<GithubConnectionStatus, String> {
     state.ensure_unlocked()?;
-    let token = github_cli_token()?;
-    let mut status = github_connection_status_for_token(&token, false, "github_cli")?;
-    if status.status == "valid" {
-        vault::save_github_token(&token)?;
-        status.configured = true;
-        status.source = "github_cli_imported_to_windows_vault".into();
-        status.message =
-            Some("Imported your GitHub CLI login into Windows Credential Manager.".into());
-    }
-    Ok(status)
+    tauri::async_runtime::spawn_blocking(|| {
+        let token = github_cli_token()?;
+        let mut status = github_connection_status_for_token(&token, false, "github_cli")?;
+        if status.status == "valid" {
+            vault::save_github_token(&token)?;
+            status.configured = true;
+            status.source = "github_cli_imported_to_windows_vault".into();
+            status.message =
+                Some("Imported your GitHub CLI login into Windows Credential Manager.".into());
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 pub fn github_connection_status() -> Result<GithubConnectionStatus, String> {

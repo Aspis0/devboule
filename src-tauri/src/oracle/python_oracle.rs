@@ -378,7 +378,8 @@ fn add_default_user_roots(candidates: &mut Vec<PathBuf>) {
 }
 
 pub fn parse_python_oracle_json<T: DeserializeOwned>(stdout: &str) -> Result<T, String> {
-    serde_json::from_str(stdout).map_err(|e| format!("Python Oracle output was invalid: {e}"))
+    // F01: engine-neutral copy (Rust and Python share this HTTP client path).
+    serde_json::from_str(stdout).map_err(|e| format!("Oracle output was invalid: {e}"))
 }
 
 fn oracle_http_session() -> &'static OracleHttpSession {

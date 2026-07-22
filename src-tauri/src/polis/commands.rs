@@ -821,11 +821,13 @@ pub fn polis_fix_sin(
     let prompt = build_capped_fix_sin_prompt(&record, &oracle_excerpts)?;
 
     // 7. Dispatch the directive (rel_path passes through validate_main_coder_request).
+    // Fix-sin is project-level work (no Kanban task) — task_id stays None.
     let directive_id = crate::backend::main_coder::append_main_coder_directive(
         &app,
         &project_id,
         prompt,
         vec![rel_path.clone()],
+        None,
     )?;
 
     // 8. Mark the sin as dispatched.  Pass the previous fix_directive_id as the
@@ -3209,6 +3211,7 @@ mod tests {
             write_mode: WriteMode::AgenticIterative,
             tier: DirectiveTier::Main,
             project_id: None,
+            task_id: None,
             backend: None,
             allow_oracle: false,
             kill_requested: false,

@@ -1,0 +1,326 @@
+{
+  "list_pending_design_requests": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "design_request_claim": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "design_request_claim"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "design_request_complete": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "design_request_complete"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "project_cloud_orchestrator_interrupt": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "project_cloud_orchestrator_interrupt"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "project_cloud_orchestrator_send": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "project_cloud_orchestrator_send"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "mini_activity_snapshot": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "mini_coder_steer": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "mini_coder_steer"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "pi_extensions_list": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "pi_extension_install": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "pi_extension_install"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "pi_extension_remove": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "pi_extension_remove"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "skills_featured_marketplaces": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "skills_library_catalog": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "skills_lang_catalog": {
+    "direct_gates": [],
+    "gate_paths": [],
+    "reaches_gate": false
+  },
+  "orchestrator_steer": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "orchestrator_steer"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "planner_reset_chat": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "planner_reset_chat"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "polis_debug_log": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "polis_debug_log"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "save_provider_token": {
+    "direct_gates": [
+      "ensure_same_sensitive_session",
+      "sensitive_session_id"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "save_provider_token"
+        ],
+        "gates": [
+          "ensure_same_sensitive_session",
+          "sensitive_session_id"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "rotate_cloudflare_worker_secret": {
+    "direct_gates": [
+      "ensure_same_sensitive_session",
+      "sensitive_session_id"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "rotate_cloudflare_worker_secret"
+        ],
+        "gates": [
+          "ensure_same_sensitive_session",
+          "sensitive_session_id"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "perform_scaleway_resource_action": {
+    "direct_gates": [
+      "ensure_same_sensitive_session",
+      "sensitive_session_id"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "perform_scaleway_resource_action"
+        ],
+        "gates": [
+          "ensure_same_sensitive_session",
+          "sensitive_session_id"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "launch_project_agent_terminal": {
+    "direct_gates": [],
+    "gate_paths": [
+      {
+        "path": [
+          "launch_project_agent_terminal",
+          "prepare_or_launch_project_agent"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 1
+      }
+    ],
+    "reaches_gate": true
+  },
+  "ask_oracle": {
+    "direct_gates": [
+      "require_oracle_auth"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "ask_oracle"
+        ],
+        "gates": [
+          "require_oracle_auth"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "approve_git_push_request": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "approve_git_push_request"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  },
+  "mini_coder_kill": {
+    "direct_gates": [
+      "ensure_unlocked"
+    ],
+    "gate_paths": [
+      {
+        "path": [
+          "mini_coder_kill"
+        ],
+        "gates": [
+          "ensure_unlocked"
+        ],
+        "depth": 0
+      }
+    ],
+    "reaches_gate": true
+  }
+}

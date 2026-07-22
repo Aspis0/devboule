@@ -1233,7 +1233,25 @@ async fn index_files_handler(
             file_ids.retain(|id| id.to_lowercase().contains(&needle));
         }
         let total = file_ids.len();
-        let page: Vec<String> = file_ids.into_iter().skip(offset).take(limit).collect();
+        // F01: UI expects `OracleIndexedFile` objects, not bare path strings.
+        let page: Vec<serde_json::Value> = file_ids
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|path| {
+                let meta = manifest_files.get(&path);
+                let chunks = meta.and_then(|m| m.chunks).unwrap_or(0);
+                let updated_at = meta
+                    .map(|m| m.updated_at.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                serde_json::json!({
+                    "path": path,
+                    "chunks": chunks,
+                    "updatedAt": updated_at,
+                })
+            })
+            .collect();
         serde_json::json!({
             "files": page,
             "total": total,

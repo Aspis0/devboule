@@ -119,12 +119,58 @@ pub struct OracleLlmSettingsStatus {
 #[serde(rename_all = "camelCase")]
 pub struct OracleIndexPreferences {
     pub auto_watch_on_unlock: bool,
+    /// Single-value alias kept for back-compat (pre multi-root). When both
+    /// `index_root` and `index_roots` are present, `index_roots` wins for the
+    /// multi-root list; `index_root` remains the "primary" root (first entry).
     #[serde(default)]
     pub index_root: Option<String>,
+    /// Multi-root list (Layer 2). Empty/absent means fall back to `index_root`
+    /// only. Old blobs without this key still deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_roots: Vec<String>,
     /// "watch" | "commit". Absent means watch (default). Serialized only when
     /// present so older persisted blobs without the key round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_mode: Option<String>,
+}
+
+impl OracleIndexPreferences {
+    /// Effective ordered list of index roots: `index_roots` if non-empty,
+    /// else the single `index_root` (if set). Dedupes while preserving order.
+    pub fn effective_index_roots(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push = |out: &mut Vec<String>, s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                return;
+            }
+            if !out.iter().any(|e| e == t) {
+                out.push(t.to_string());
+            }
+        };
+        if !self.index_roots.is_empty() {
+            for r in &self.index_roots {
+                push(&mut out, r);
+            }
+            // Keep primary alias in sync for consumers that only read index_root.
+            if let Some(primary) = self.index_root.as_deref() {
+                // primary already first if listed; if not listed, prepend for safety
+                if !out.iter().any(|e| e == primary.trim()) {
+                    out.insert(0, primary.trim().to_string());
+                }
+            }
+            return out;
+        }
+        if let Some(r) = self.index_root.as_deref() {
+            push(&mut out, r);
+        }
+        out
+    }
+
+    /// Primary root: first effective root (keeps alias + multi-root list aligned).
+    pub fn primary_index_root(&self) -> Option<String> {
+        self.effective_index_roots().into_iter().next()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2310,6 +2356,7 @@ mod tests {
         let preferences = OracleIndexPreferences {
             auto_watch_on_unlock: true,
             index_root: Some("C:\\Users\\gualt\\Desktop\\aspis bio".into()),
+            index_roots: vec![],
             index_mode: None,
         };
 
@@ -2777,5 +2824,45 @@ mod tests {
             back.contains(r#""indexMode":"watch""#),
             "key must survive: {back}"
         );
+    }
+
+    /// Layer 2: old blob with only `indexRoot` still deserializes; effective
+    /// roots list is a single entry.
+    #[test]
+    fn oracle_index_preferences_legacy_single_root_still_loads() {
+        let json = r#"{"autoWatchOnUnlock":true,"indexRoot":"/Users/me/proj"}"#;
+        let prefs: OracleIndexPreferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.index_root.as_deref(), Some("/Users/me/proj"));
+        assert!(prefs.index_roots.is_empty());
+        assert_eq!(
+            prefs.effective_index_roots(),
+            vec!["/Users/me/proj".to_string()]
+        );
+        assert_eq!(
+            prefs.primary_index_root().as_deref(),
+            Some("/Users/me/proj")
+        );
+        // Empty indexRoots must not be emitted (skip_serializing_if).
+        let back = serde_json::to_string(&prefs).unwrap();
+        assert!(
+            !back.contains("indexRoots"),
+            "empty index_roots must not churn: {back}"
+        );
+    }
+
+    /// Layer 2: multi-root list round-trips; primary is first entry.
+    #[test]
+    fn oracle_index_preferences_multi_root_round_trip() {
+        let json = r#"{"autoWatchOnUnlock":true,"indexRoot":"/a","indexRoots":["/a","/b"]}"#;
+        let prefs: OracleIndexPreferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.index_roots, vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(
+            prefs.effective_index_roots(),
+            vec!["/a".to_string(), "/b".to_string()]
+        );
+        assert_eq!(prefs.primary_index_root().as_deref(), Some("/a"));
+        let back = serde_json::to_string(&prefs).unwrap();
+        assert!(back.contains("indexRoots"), "{back}");
+        assert!(back.contains("/b"), "{back}");
     }
 }

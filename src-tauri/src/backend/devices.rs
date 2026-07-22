@@ -52,87 +52,106 @@ struct DeviceJoinRequest {
     signing_public_key: Option<String>,
 }
 
+// F47: device keyring reads/writes off the Tauri main thread.
 #[tauri::command]
-pub fn get_devices_invites_snapshot(
+pub async fn get_devices_invites_snapshot(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
 ) -> Result<DevicesInvitesSnapshot, String> {
     state.ensure_unlocked()?;
-    devices_snapshot(&app)
+    tauri::async_runtime::spawn_blocking(move || devices_snapshot(&app))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn ensure_local_device_identity(
+pub async fn ensure_local_device_identity(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
 ) -> Result<DevicesInvitesSnapshot, String> {
     state.ensure_unlocked()?;
-    ensure_local_device(&app)?;
-    devices_snapshot(&app)
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_local_device(&app)?;
+        devices_snapshot(&app)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn reset_local_device_identity(
+pub async fn reset_local_device_identity(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
 ) -> Result<DevicesInvitesSnapshot, String> {
     state.ensure_unlocked()?;
-    let path = local_device_path(&app)?;
-    let _ = fs::remove_file(path);
-    vault::delete_device_private_key()?;
-    vault::delete_device_signing_private_key()?;
-    ensure_local_device(&app)?;
-    devices_snapshot(&app)
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = local_device_path(&app)?;
+        let _ = fs::remove_file(path);
+        vault::delete_device_private_key()?;
+        vault::delete_device_signing_private_key()?;
+        ensure_local_device(&app)?;
+        devices_snapshot(&app)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn approve_device_invite(
+pub async fn approve_device_invite(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     input: DeviceInviteInput,
 ) -> Result<DevicesInvitesSnapshot, String> {
     state.ensure_unlocked()?;
     super::roles::require_capability(&app, super::roles::Capability::ManageDevices)?;
-    let mut store = read_invites_store(&app)?;
-    let record = invite_record_from_input(input)?;
-    store.invites.retain(|invite| {
-        !invite
-            .public_key_fingerprint
-            .eq_ignore_ascii_case(&record.public_key_fingerprint)
-    });
-    store.invites.push(record);
-    write_invites_store(&app, &store)?;
-    devices_snapshot(&app)
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = read_invites_store(&app)?;
+        let record = invite_record_from_input(input)?;
+        store.invites.retain(|invite| {
+            !invite
+                .public_key_fingerprint
+                .eq_ignore_ascii_case(&record.public_key_fingerprint)
+        });
+        store.invites.push(record);
+        write_invites_store(&app, &store)?;
+        devices_snapshot(&app)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn revoke_device_invite(
+pub async fn revoke_device_invite(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     invite_id: String,
 ) -> Result<DevicesInvitesSnapshot, String> {
     state.ensure_unlocked()?;
     super::roles::require_capability(&app, super::roles::Capability::ManageDevices)?;
-    let id = invite_id.trim();
+    let id = invite_id.trim().to_string();
     if id.is_empty() {
         return Err("Invite id is required.".into());
     }
-    let mut store = read_invites_store(&app)?;
-    let now = now();
-    let mut found = false;
-    for invite in &mut store.invites {
-        if invite.id == id {
-            invite.status = "revoked".into();
-            invite.revoked_at = Some(now.clone());
-            found = true;
-            break;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = read_invites_store(&app)?;
+        let now = now();
+        let mut found = false;
+        for invite in &mut store.invites {
+            if invite.id == id {
+                invite.status = "revoked".into();
+                invite.revoked_at = Some(now.clone());
+                found = true;
+                break;
+            }
         }
-    }
-    if !found {
-        return Err("Invite not found.".into());
-    }
-    write_invites_store(&app, &store)?;
-    devices_snapshot(&app)
+        if !found {
+            return Err("Invite not found.".into());
+        }
+        write_invites_store(&app, &store)?;
+        devices_snapshot(&app)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 fn devices_snapshot(app: &tauri::AppHandle) -> Result<DevicesInvitesSnapshot, String> {

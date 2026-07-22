@@ -1478,101 +1478,136 @@ pub fn touch_idle_activity(state: State<'_, BackendState>) -> Result<(), String>
     state.touch_idle_activity()
 }
 
+// F47: all keyring-backed vault commands are async + spawn_blocking so macOS
+// SecurityAgent ACL prompts never pin the Tauri main thread (see F31 oracle prefs).
+
 #[tauri::command]
-pub fn get_secret_status(state: State<'_, BackendState>) -> Result<Vec<SecretStatus>, String> {
+pub async fn get_secret_status(
+    state: State<'_, BackendState>,
+) -> Result<Vec<SecretStatus>, String> {
     state.ensure_unlocked()?;
-    vault::all_statuses()
+    tauri::async_runtime::spawn_blocking(vault::all_statuses)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_provider_scope_status(
+pub async fn get_provider_scope_status(
     state: State<'_, BackendState>,
 ) -> Result<Vec<ProviderScopeStatus>, String> {
     state.ensure_unlocked()?;
-    vault::all_scope_statuses()
+    tauri::async_runtime::spawn_blocking(vault::all_scope_statuses)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_cloudflare_agent_token_profiles(
+pub async fn get_cloudflare_agent_token_profiles(
     state: State<'_, BackendState>,
 ) -> Result<Vec<CloudflareAgentTokenProfileStatus>, String> {
     state.ensure_unlocked()?;
-    vault::all_cloudflare_agent_token_profile_statuses()
+    tauri::async_runtime::spawn_blocking(vault::all_cloudflare_agent_token_profile_statuses)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_cloudflare_agent_token_profile(
+pub async fn save_cloudflare_agent_token_profile(
     state: State<'_, BackendState>,
     profile_id: String,
     token: String,
 ) -> Result<CloudflareAgentTokenProfileStatus, String> {
     state.ensure_unlocked()?;
-    vault::save_cloudflare_agent_token_profile(&profile_id, &token)
+    tauri::async_runtime::spawn_blocking(move || {
+        vault::save_cloudflare_agent_token_profile(&profile_id, &token)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn delete_cloudflare_agent_token_profile(
+pub async fn delete_cloudflare_agent_token_profile(
     state: State<'_, BackendState>,
     profile_id: String,
 ) -> Result<CloudflareAgentTokenProfileStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_cloudflare_agent_token_profile(&profile_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        vault::delete_cloudflare_agent_token_profile(&profile_id)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_scaleway_object_access_key_status(
+pub async fn get_scaleway_object_access_key_status(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::scaleway_object_access_key_status()
+    tauri::async_runtime::spawn_blocking(vault::scaleway_object_access_key_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_scaleway_object_access_key(
+pub async fn save_scaleway_object_access_key(
     state: State<'_, BackendState>,
     access_key: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::save_scaleway_object_access_key(&access_key)?;
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        vault::save_scaleway_object_access_key(&access_key)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(ProviderId::Scaleway)?;
     Ok(status)
 }
 
 #[tauri::command]
-pub fn delete_scaleway_object_access_key(
+pub async fn delete_scaleway_object_access_key(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::delete_scaleway_object_access_key()?;
+    let status = tauri::async_runtime::spawn_blocking(vault::delete_scaleway_object_access_key)
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(ProviderId::Scaleway)?;
     Ok(status)
 }
 
 #[tauri::command]
-pub fn get_scaleway_object_secret_key_status(
+pub async fn get_scaleway_object_secret_key_status(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::scaleway_object_secret_key_status()
+    tauri::async_runtime::spawn_blocking(vault::scaleway_object_secret_key_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_scaleway_object_secret_key(
+pub async fn save_scaleway_object_secret_key(
     state: State<'_, BackendState>,
     secret_key: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::save_scaleway_object_secret_key(&secret_key)?;
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        vault::save_scaleway_object_secret_key(&secret_key)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(ProviderId::Scaleway)?;
     Ok(status)
 }
 
 #[tauri::command]
-pub fn delete_scaleway_object_secret_key(
+pub async fn delete_scaleway_object_secret_key(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::delete_scaleway_object_secret_key()?;
+    let status = tauri::async_runtime::spawn_blocking(vault::delete_scaleway_object_secret_key)
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(ProviderId::Scaleway)?;
     Ok(status)
 }
@@ -1583,28 +1618,34 @@ pub fn delete_scaleway_object_secret_key(
 // the configured https endpoint — the one Censor path that egresses code off-device (opt-in).
 
 #[tauri::command]
-pub fn get_censor_cloud_key_status(
+pub async fn get_censor_cloud_key_status(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::censor_cloud_key_status()
+    tauri::async_runtime::spawn_blocking(vault::censor_cloud_key_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_censor_cloud_key(
+pub async fn save_censor_cloud_key(
     state: State<'_, BackendState>,
     key: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::save_censor_cloud_key(&key)
+    tauri::async_runtime::spawn_blocking(move || vault::save_censor_cloud_key(&key))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn delete_censor_cloud_key(
+pub async fn delete_censor_cloud_key(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_censor_cloud_key()
+    tauri::async_runtime::spawn_blocking(vault::delete_censor_cloud_key)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 // Cloud main-coder API key for the local Devboule orchestrator's OPT-IN Cloud mode.
@@ -1614,26 +1655,34 @@ pub fn delete_censor_cloud_key(
 // only when present AND the configured backend is `cloud`.
 
 #[tauri::command]
-pub fn get_cloud_llm_key_status(
+pub async fn get_cloud_llm_key_status(
     state: State<'_, BackendState>,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::cloud_llm_key_status()
+    tauri::async_runtime::spawn_blocking(vault::cloud_llm_key_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_cloud_llm_key(
+pub async fn save_cloud_llm_key(
     state: State<'_, BackendState>,
     key: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::save_cloud_llm_key(&key)
+    tauri::async_runtime::spawn_blocking(move || vault::save_cloud_llm_key(&key))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn delete_cloud_llm_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
+pub async fn delete_cloud_llm_key(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_cloud_llm_key()
+    tauri::async_runtime::spawn_blocking(vault::delete_cloud_llm_key)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 // --- Web-search key commands (parameterized, 5 providers) ---------------------
@@ -1643,31 +1692,37 @@ pub fn delete_cloud_llm_key(state: State<'_, BackendState>) -> Result<AuxCredent
 // EXISTING `provider:exa` so no key is orphaned by this refactor.
 
 #[tauri::command]
-pub fn websearch_key_status(
+pub async fn websearch_key_status(
     state: State<'_, BackendState>,
     provider: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::websearch_key_status(&provider)
+    tauri::async_runtime::spawn_blocking(move || vault::websearch_key_status(&provider))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn websearch_save_key(
+pub async fn websearch_save_key(
     state: State<'_, BackendState>,
     provider: String,
     key: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::save_websearch_key(&provider, &key)
+    tauri::async_runtime::spawn_blocking(move || vault::save_websearch_key(&provider, &key))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn websearch_delete_key(
+pub async fn websearch_delete_key(
     state: State<'_, BackendState>,
     provider: String,
 ) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_websearch_key(&provider)
+    tauri::async_runtime::spawn_blocking(move || vault::delete_websearch_key(&provider))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 // Web-search default-provider config (web-search.json) ----------------------
@@ -1692,21 +1747,27 @@ pub fn websearch_set_config(
 }
 
 #[tauri::command]
-pub fn get_oracle_llm_settings(
+pub async fn get_oracle_llm_settings(
     state: State<'_, BackendState>,
 ) -> Result<OracleLlmSettingsStatus, String> {
     state.ensure_unlocked()?;
-    vault::oracle_llm_settings_status()
+    tauri::async_runtime::spawn_blocking(vault::oracle_llm_settings_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_oracle_llm_settings(
+pub async fn save_oracle_llm_settings(
     state: State<'_, BackendState>,
     settings: OracleLlmSettings,
     api_key: Option<String>,
 ) -> Result<OracleLlmSettingsStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::save_oracle_llm_settings(&settings, api_key.as_deref())?;
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        vault::save_oracle_llm_settings(&settings, api_key.as_deref())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
     // The resident Oracle server captures the LLM credentials at (re)spawn time
     // (rust_oracle::apply_llm_env_in_process, run inside ensure_rust_oracle_server)
     // and never re-reads the vault, so an already-running server would keep its
@@ -1721,28 +1782,36 @@ pub fn save_oracle_llm_settings(
 }
 
 #[tauri::command]
-pub fn delete_oracle_llm_api_key(
+pub async fn delete_oracle_llm_api_key(
     state: State<'_, BackendState>,
 ) -> Result<OracleLlmSettingsStatus, String> {
     state.ensure_unlocked()?;
-    vault::delete_oracle_llm_api_key()
+    tauri::async_runtime::spawn_blocking(vault::delete_oracle_llm_api_key)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
+/// F31: async so keychain / file I/O never runs on the Tauri main thread
+/// (sync keychain ACL prompts freeze the whole webview — pilot ping OK, eval/ipc dead).
 #[tauri::command]
-pub fn get_oracle_index_preferences(
+pub async fn get_oracle_index_preferences(
     state: State<'_, BackendState>,
 ) -> Result<OracleIndexPreferences, String> {
     state.ensure_unlocked()?;
-    vault::read_oracle_index_preferences()
+    tauri::async_runtime::spawn_blocking(vault::read_oracle_index_preferences)
+        .await
+        .map_err(|e| format!("Oracle index preferences read task failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn save_oracle_index_preferences(
+pub async fn save_oracle_index_preferences(
     state: State<'_, BackendState>,
     preferences: OracleIndexPreferences,
 ) -> Result<OracleIndexPreferences, String> {
     state.ensure_unlocked()?;
-    let saved = vault::save_oracle_index_preferences(&preferences)?;
+    let saved = tokio::task::spawn_blocking(move || vault::save_oracle_index_preferences(&preferences))
+        .await
+        .map_err(|e| format!("Oracle index preferences save task failed: {e}"))??;
     // Re-arm the watcher one-shot so the supervisor's next tick picks up the
     // new index_mode (e.g. switching from "watch" to "commit" takes effect
     // immediately on the next ~10s tick rather than waiting for a restart).
@@ -1795,12 +1864,14 @@ pub async fn save_provider_scope(
 }
 
 #[tauri::command]
-pub fn delete_provider_scope(
+pub async fn delete_provider_scope(
     state: State<'_, BackendState>,
     provider: ProviderId,
 ) -> Result<ProviderScopeStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::delete_scope(provider)?;
+    let status = tauri::async_runtime::spawn_blocking(move || vault::delete_scope(provider))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(provider)?;
     Ok(status)
 }
@@ -1906,12 +1977,14 @@ pub async fn save_provider_token(
 }
 
 #[tauri::command]
-pub fn delete_provider_token(
+pub async fn delete_provider_token(
     state: State<'_, BackendState>,
     provider: ProviderId,
 ) -> Result<SecretStatus, String> {
     state.ensure_unlocked()?;
-    let status = vault::delete_token(provider)?;
+    let status = tauri::async_runtime::spawn_blocking(move || vault::delete_token(provider))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
     state.clear_provider_inventory(provider)?;
     Ok(status)
 }

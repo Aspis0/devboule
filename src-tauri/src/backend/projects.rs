@@ -181,6 +181,56 @@ fn project_folder_is_new(root: Option<&str>) -> bool {
     }
 }
 
+/// F13 residual: product index artifacts under an ATTACHED project root must not be
+/// committed by a coder's `git add -A`. Seed/append these lines into the root's
+/// `.gitignore` when missing. Best-effort — never fails project create/attach.
+pub(crate) const ATTACHED_ROOT_GITIGNORE_ENTRIES: &[&str] = &[
+    ".aspis/",
+    ".aspis-censor/",
+    ".aspis-mini/",
+    ".pi/",
+    "oracle-data/",
+];
+
+/// Pure: which of `entries` are missing from existing gitignore text (line-aware).
+pub(crate) fn missing_gitignore_entries(existing: &str, entries: &[&str]) -> Vec<String> {
+    let lines: std::collections::HashSet<&str> = existing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    entries
+        .iter()
+        .filter(|e| !lines.contains(**e))
+        .map(|e| (*e).to_string())
+        .collect()
+}
+
+/// Append missing product ignore lines to `{root}/.gitignore` (create if needed).
+pub(crate) fn seed_attached_root_gitignore(root: &std::path::Path) {
+    if !root.is_dir() {
+        return;
+    }
+    let path = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let missing = missing_gitignore_entries(&existing, ATTACHED_ROOT_GITIGNORE_ENTRIES);
+    if missing.is_empty() {
+        return;
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if out.is_empty() || !out.contains("Devboule product artifacts") {
+        out.push_str("\n# Devboule product artifacts (do not commit)\n");
+    }
+    for line in missing {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let _ = std::fs::write(&path, out);
+}
+
 #[tauri::command]
 pub fn create_project(
     app: tauri::AppHandle,
@@ -235,6 +285,11 @@ pub fn create_project(
     };
     fs::write(&path, initial_project_markdown(&metadata, &state_block)?)
         .map_err(|e| format!("Could not create project file: {e}"))?;
+    // F13 residual: seed .gitignore under the attached root so .aspis/.pi/oracle-data
+    // are not committed by agent `git add -A` in the sandbox repo.
+    if let Some(ref root) = metadata.root_path {
+        seed_attached_root_gitignore(std::path::Path::new(root));
+    }
     let parsed = read_project_file(&path)?;
     Ok(detail_from_project(parsed, ProjectLiveStatus::default()))
 }
@@ -262,6 +317,9 @@ pub fn update_project_metadata(
             if patch.root_path.is_some() {
                 project.metadata.root_path =
                     validate_project_root_for_save(patch.root_path.as_deref())?;
+                if let Some(ref root) = project.metadata.root_path {
+                    seed_attached_root_gitignore(std::path::Path::new(root));
+                }
             }
             Ok(())
         },
@@ -1380,22 +1438,34 @@ pub fn set_censor_local_ai(
     Ok(normalized)
 }
 
+/// F47: async + spawn_blocking — launch path reads vault (`read_cloud_llm_key` via
+/// `resolve_coder_env_for_sidecar`); a sync keychain ACL prompt freezes the main thread.
 #[tauri::command]
-pub fn launch_project_agent_terminal(
+pub async fn launch_project_agent_terminal(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     input: ProjectAgentLaunchInput,
 ) -> Result<ProjectAgentLaunchResult, String> {
-    prepare_or_launch_project_agent(app, state, input, true)
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_or_launch_project_agent(app, input, true)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn prepare_project_agent_prompt(
+pub async fn prepare_project_agent_prompt(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
     input: ProjectAgentLaunchInput,
 ) -> Result<ProjectAgentLaunchResult, String> {
-    prepare_or_launch_project_agent(app, state, input, false)
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_or_launch_project_agent(app, input, false)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 /// PHASE 1: delegate an orchestrator launch to the pi sidecar instead of the
@@ -1604,11 +1674,10 @@ fn fence_stale_orchestrator(
 
 fn prepare_or_launch_project_agent(
     app: tauri::AppHandle,
-    state: State<'_, BackendState>,
     input: ProjectAgentLaunchInput,
     launch_terminal: bool,
 ) -> Result<ProjectAgentLaunchResult, String> {
-    state.ensure_unlocked()?;
+    // Unlock is checked by the async command wrappers before spawn_blocking.
     let project = read_project_by_id(&app, &input.project_id)?;
     // Built-in (codex/claude/powershell) or a configured custom client id. For a
     // custom client, `custom_command` is the configured command line the script
@@ -4343,6 +4412,54 @@ fn claude_permission_mode(mode: crate::backend::broker::SandboxMode) -> &'static
     }
 }
 
+/// F33: locate `claude_consent_hook` so headless Claude duplex can widen
+/// permission-mode under an app-owned PreToolUse bridge.
+///
+/// Order: `DEVBOULE_CLAUDE_CONSENT_HOOK`, sibling of the app binary, then
+/// debug/release cargo targets under `CARGO_MANIFEST_DIR` (tauri dev).
+fn resolve_claude_consent_hook_path() -> Option<String> {
+    let name = if cfg!(windows) {
+        "claude_consent_hook.exe"
+    } else {
+        "claude_consent_hook"
+    };
+    if let Ok(p) = std::env::var("DEVBOULE_CLAUDE_CONSENT_HOOK") {
+        let pb = PathBuf::from(p.trim());
+        if pb.is_file() {
+            return Some(pb.to_string_lossy().into_owned());
+        }
+    }
+    if let Some(mut p) = resolve_app_binary() {
+        p.set_file_name(name);
+        if p.is_file() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for profile in ["debug", "release"] {
+        let cand = manifest.join("target").join(profile).join(name);
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// F33: headless stream-json cannot answer interactive permission prompts.
+/// When the consent hook is active, honor the project sandbox mapping.
+/// When it is not, use `acceptEdits` so MCP register/plan/task tools are not
+/// universally denied (still not `bypassPermissions` without a hook).
+fn claude_headless_permission_mode(
+    mode: crate::backend::broker::SandboxMode,
+    hook_active: bool,
+) -> &'static str {
+    if hook_active {
+        claude_permission_mode(mode)
+    } else {
+        "acceptEdits"
+    }
+}
+
 /// Role-gated KAIRION env vars for the cloud duplex launch. Returns the
 /// `ASPIS_ORCHESTRATOR_THINKING` env pair only for the orchestrator role; an
 /// empty vec for every other role (coder, verifier, etc.) so a coder duplex does
@@ -4425,23 +4542,14 @@ fn build_cloud_duplex_launch(
             // every Patch/Exec tool call round-trips through OUR consent UI. If it cannot
             // be resolved, we FALL BACK to omitting --settings (the launch still works,
             // just without the consent hook) and log a milestone — never block the launch.
-            let hook_bin = resolve_app_binary().map(|mut p| {
-                p.set_file_name(if cfg!(windows) {
-                    "claude_consent_hook.exe"
-                } else {
-                    "claude_consent_hook"
-                });
-                p
-            });
-            let hook_path: Option<String> = hook_bin
-                .as_ref()
-                .filter(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into_owned());
+            // F33: resolve consent hook from app-dir OR cargo debug/release target
+            // (tauri dev often has the hook in target/debug, not next to the GUI binary).
+            let hook_path: Option<String> = resolve_claude_consent_hook_path();
             if hook_path.is_none() {
                 eprintln!(
-                    "cloud claude: claude_consent_hook binary not found next to the app binary; \
-                     launching Claude WITHOUT the PreToolUse consent hook (net deny rules still \
-                     applied; tool edits are not gated, so the permission mode stays 'default')."
+                    "cloud claude: claude_consent_hook binary not found (app dir / target/debug); \
+                     launching WITHOUT PreToolUse hook — using acceptEdits for headless MCP \
+                     (F33; set DEVBOULE_CLAUDE_CONSENT_HOOK or cargo build --bin claude_consent_hook)."
                 );
             }
             // Build the settings (with the hook when available, deny-only — net rules only —
@@ -4494,11 +4602,7 @@ fn build_cloud_duplex_launch(
             // edits, so we MUST stay on `default` (Claude prompts interactively) and never run
             // an Unattended project unrestricted.
             let hook_active = hook_path.is_some() && settings_path.is_some();
-            let perm_mode = if hook_active {
-                claude_permission_mode(mode)
-            } else {
-                "default"
-            };
+            let perm_mode = claude_headless_permission_mode(mode, hook_active);
             for a in [
                 "-p",
                 "--input-format",
@@ -4582,23 +4686,11 @@ fn build_cloud_duplex_launch(
             // PreToolUse hook via --settings so every Patch/Exec tool call round-trips through
             // OUR consent UI. If it cannot be resolved, fall back to launching WITHOUT the hook
             // and log a milestone — never block the launch.
-            let hook_bin = resolve_app_binary().map(|mut p| {
-                p.set_file_name(if cfg!(windows) {
-                    "claude_consent_hook.exe"
-                } else {
-                    "claude_consent_hook"
-                });
-                p
-            });
-            let hook_path: Option<String> = hook_bin
-                .as_ref()
-                .filter(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into_owned());
+            let hook_path: Option<String> = resolve_claude_consent_hook_path();
             if hook_path.is_none() {
                 eprintln!(
-                    "cloud openai: claude_consent_hook binary not found next to the app binary; \
-                     launching OpenAI WITHOUT the PreToolUse consent hook (net deny rules still \
-                     applied; tool edits are not gated, so the permission mode stays 'default')."
+                    "cloud openai: claude_consent_hook binary not found; launching WITHOUT \
+                     PreToolUse hook (F33 headless acceptEdits)."
                 );
             }
             // Build the settings (with the hook when available, deny-only — net rules only —
@@ -4648,11 +4740,8 @@ fn build_cloud_duplex_launch(
             // edits, so we MUST stay on `default` (OpenAI prompts interactively) and never run
             // an Unattended project unrestricted.
             let hook_active = hook_path.is_some() && settings_path.is_some();
-            let perm_mode = if hook_active {
-                claude_permission_mode(mode)
-            } else {
-                "default"
-            };
+            // F33: headless cannot answer interactive "default" prompts.
+            let perm_mode = claude_headless_permission_mode(mode, hook_active);
             for a in [
                 "-p",
                 "--input-format",
@@ -4784,6 +4873,24 @@ fn build_cloud_duplex_launch(
         // to 300s). Kept strictly BELOW the settings hook `timeout` (600s) so the CLI never
         // kills the hook before its own poll deadline.
         envs.push(("ASPIS_CONSENT_TIMEOUT_SECS".to_string(), "300".to_string()));
+        // F36: isolate Claude from the owner's personal ~/.claude (CLAUDE.md, skills,
+        // allowlists). Config lives under the app projects_dir, not $HOME.
+        match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
+            projects_dir,
+            agent_id,
+        ) {
+            Ok(cfg_dir) => {
+                envs.push(crate::backend::cloud_claude_config::claude_config_dir_env(
+                    &cfg_dir,
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "cloud claude: could not create isolated CLAUDE_CONFIG_DIR under projects_dir \
+                     ({e}); launch continues but may inherit owner ~/.claude (F36 degraded)."
+                );
+            }
+        }
         // KAIRION (orchestrator-only, always-on): force adaptive SUMMARIZED thinking for the
         // cloud orchestrator duplex so the doubt sensor has a (summarized) reasoning trace
         // to read. Carried as the FROZEN thinking config object. Delivered via env (NOT an argv
@@ -5328,6 +5435,116 @@ pub(crate) fn normalize_task_status(value: &str) -> Result<String, String> {
     }
 }
 
+/// F07 pure: the Kanban status a task should take after a successful Main-coder
+/// WRITE finalize (`done`). `todo`/`wip`/`blocked` → `review` (work done, ready
+/// for verifier). Already-`review`/`done`/unknown → `None` (leave alone).
+pub(crate) fn task_status_after_main_write_done(current: &str) -> Option<&'static str> {
+    match current.trim().to_ascii_lowercase().as_str() {
+        "todo" | "wip" | "blocked" => Some("review"),
+        _ => None,
+    }
+}
+
+/// F07 pure transition helper: mutates `task` in place to `review` when the
+/// current status allows it. Returns true when the status changed. Unit-tested
+/// without AppHandle; the finalize path calls this via
+/// [`promote_task_to_review_after_main_write`].
+pub(crate) fn apply_main_write_done_task_transition(
+    task: &mut ProjectTask,
+    now_rfc3339: &str,
+) -> bool {
+    let Some(next) = task_status_after_main_write_done(&task.status) else {
+        return false;
+    };
+    task.status = next.to_string();
+    task.updated_at = now_rfc3339.to_string();
+    true
+}
+
+/// F07: after a successful Main write finalize, move the linked Kanban task to
+/// `review` and upsert an agent claim so the board shows progress. Best-effort:
+/// missing project/task is a silent no-op (`Ok(false)`). Uses the same project
+/// mutation + claim patterns as the manual Kanban move path — no parallel store.
+pub(crate) fn promote_task_to_review_after_main_write(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<bool, String> {
+    let project_id = project_id.trim();
+    let task_id = task_id.trim();
+    let agent_id = agent_id.trim();
+    if project_id.is_empty() || task_id.is_empty() {
+        return Ok(false);
+    }
+    let path = match project_path_by_id(app, project_id) {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    let ts = now();
+    let mut changed = false;
+    let mut task_title = String::new();
+    let mut project_title = String::new();
+    let saved = mutate_project_file_latest(&path, |project| {
+        project_title = project.metadata.title.clone();
+        if let Some(task) = project
+            .state
+            .tasks
+            .iter_mut()
+            .find(|t| t.id == task_id)
+        {
+            task_title = task.title.clone();
+            changed = apply_main_write_done_task_transition(task, &ts);
+        }
+        Ok(())
+    })?;
+    if saved.is_none() || !changed {
+        return Ok(false);
+    }
+    // Reconcile claims + audit event (same machinery as a manual move to review).
+    // Also upsert a claim row for this agent so the board WHO badge is not null.
+    let _ = crate::backend::agents::record_manual_task_status(app, project_id, task_id, "review");
+    let _ = crate::backend::agents::mutate_agent_live_state(app, |state| {
+        let role = "coder".to_string();
+        if let Some(claim) = state.claims.iter_mut().find(|c| {
+            c.project_id == project_id && c.task_id == task_id
+        }) {
+            claim.status = "review".into();
+            claim.updated_at = ts.clone();
+            if claim.agent_id.trim().is_empty() && !agent_id.is_empty() {
+                claim.agent_id = agent_id.to_string();
+                claim.role = role;
+            }
+            if claim.evidence.is_none() {
+                claim.evidence = Some("Main coder write finished; task moved to review.".into());
+            }
+        } else if !agent_id.is_empty() {
+            state.claims.push(crate::backend::model::AgentClaim {
+                project_id: project_id.to_string(),
+                project_title: if project_title.is_empty() {
+                    None
+                } else {
+                    Some(project_title.clone())
+                },
+                task_id: task_id.to_string(),
+                task_title: if task_title.is_empty() {
+                    None
+                } else {
+                    Some(task_title.clone())
+                },
+                agent_id: agent_id.to_string(),
+                role,
+                status: "review".into(),
+                claimed_at: ts.clone(),
+                updated_at: ts.clone(),
+                lease_until: None,
+                evidence: Some("Main coder write finished; task moved to review.".into()),
+            });
+        }
+    });
+    Ok(true)
+}
+
 pub(crate) fn validate_task_id(value: &str) -> Result<(), String> {
     let id = value.trim();
     let mut chars = id.chars();
@@ -5710,6 +5927,79 @@ mod tests {
             claude_permission_mode(SandboxMode::Unattended),
             "bypassPermissions"
         );
+    }
+
+    #[test]
+    fn f13_missing_gitignore_entries_detects_product_paths() {
+        let existing = "node_modules/\n.DS_Store\n";
+        let missing = missing_gitignore_entries(existing, ATTACHED_ROOT_GITIGNORE_ENTRIES);
+        assert!(missing.iter().any(|e| e == ".aspis/"));
+        assert!(missing.iter().any(|e| e == ".aspis-censor/"));
+        assert!(missing.iter().any(|e| e == ".aspis-mini/"));
+        assert!(missing.iter().any(|e| e == ".pi/"));
+        assert!(missing.iter().any(|e| e == "oracle-data/"));
+        let full = ".aspis/\n.aspis-censor/\n.aspis-mini/\n.pi/\noracle-data/\n";
+        assert!(missing_gitignore_entries(full, ATTACHED_ROOT_GITIGNORE_ENTRIES).is_empty());
+        // Partial: already has `.aspis/` → only the still-missing product lines.
+        let partial = ".aspis/\n";
+        let only_missing = missing_gitignore_entries(partial, ATTACHED_ROOT_GITIGNORE_ENTRIES);
+        assert!(!only_missing.iter().any(|e| e == ".aspis/"));
+        assert_eq!(
+            only_missing,
+            vec![
+                ".aspis-censor/".to_string(),
+                ".aspis-mini/".to_string(),
+                ".pi/".to_string(),
+                "oracle-data/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn f13_seed_attached_root_gitignore_writes_file() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-f13-gitignore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        seed_attached_root_gitignore(&base);
+        let text = std::fs::read_to_string(base.join(".gitignore")).unwrap();
+        assert!(text.contains(".aspis/"));
+        assert!(text.contains(".aspis-censor/"));
+        assert!(text.contains(".aspis-mini/"));
+        assert!(text.contains(".pi/"));
+        assert!(text.contains("oracle-data/"));
+        // Idempotent.
+        seed_attached_root_gitignore(&base);
+        let text2 = std::fs::read_to_string(base.join(".gitignore")).unwrap();
+        assert_eq!(
+            text2.matches(".aspis/").count(),
+            1,
+            "must not duplicate entries"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f13_seed_appends_only_missing_when_partial() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-f13-gitignore-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // User already ignores `.aspis/`; censor/mini must be appended without duplicating.
+        std::fs::write(base.join(".gitignore"), "node_modules/\n.aspis/\n").unwrap();
+        seed_attached_root_gitignore(&base);
+        let text = std::fs::read_to_string(base.join(".gitignore")).unwrap();
+        assert!(text.contains("node_modules/"), "keep existing user content");
+        assert_eq!(text.matches(".aspis/").count(), 1, "must not duplicate .aspis/");
+        assert!(text.contains(".aspis-censor/"));
+        assert!(text.contains(".aspis-mini/"));
+        assert!(text.contains(".pi/"));
+        assert!(text.contains("oracle-data/"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -6486,6 +6776,37 @@ mod tests {
     fn app_task_status_rejects_direct_done() {
         assert_eq!(normalize_app_task_status("review").unwrap(), "review");
         assert!(normalize_app_task_status("done").is_err());
+    }
+
+    /// F07: pure transition helper — todo/wip/blocked → review on successful
+    /// Main write finalize; already-review/done/unknown left alone.
+    #[test]
+    fn main_write_done_task_transition_todo_and_wip_become_review() {
+        for status in ["todo", "wip", "blocked", "TODO", " Wip "] {
+            let mut t = task(status.trim());
+            // Normalize the test fixture status to the raw input for the helper.
+            t.status = status.to_string();
+            let changed = apply_main_write_done_task_transition(&mut t, "2026-07-21T12:00:00Z");
+            assert!(changed, "status {status:?} must transition");
+            assert_eq!(t.status, "review");
+            assert_eq!(t.updated_at, "2026-07-21T12:00:00Z");
+        }
+        // Already review / done / unknown: no-op.
+        for status in ["review", "done", "unknown"] {
+            let mut t = task(status);
+            t.status = status.to_string();
+            let before = t.clone();
+            assert!(
+                !apply_main_write_done_task_transition(&mut t, "2026-07-21T12:00:00Z"),
+                "status {status:?} must not transition"
+            );
+            assert_eq!(t.status, before.status);
+        }
+        // Predicate alone matches.
+        assert_eq!(task_status_after_main_write_done("todo"), Some("review"));
+        assert_eq!(task_status_after_main_write_done("wip"), Some("review"));
+        assert_eq!(task_status_after_main_write_done("review"), None);
+        assert_eq!(task_status_after_main_write_done("done"), None);
     }
 
     #[test]
@@ -7909,23 +8230,25 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
     }
 
-    // ROLE UNTANGLE (owner decision) — the orchestrator selects the SAME provider
-    // env surface as a coder: same write profile in the vault, same role-scoped
-    // assembly path (no client strip-hack, no special case). The verifier stays
-    // read-only and unknown roles stay empty.
+    // ROLE least-privilege: orchestrator + verifier share read-only Cloudflare
+    // profile; coder alone gets write. (F40: stale fixture expected orch==coder.)
     #[test]
     fn orchestrator_role_selects_coder_provider_profile() {
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            vault::cloudflare_agent_token_profile_id_for_role("coder"),
-        );
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_ids_for_role("orchestrator"),
-            vault::cloudflare_agent_token_profile_ids_for_role("coder"),
+            Some("verifier-readonly"),
         );
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("verifier"),
-            Some("verifier-readonly")
+            Some("verifier-readonly"),
+        );
+        assert_eq!(
+            vault::cloudflare_agent_token_profile_id_for_role("coder"),
+            Some("coder-worker-write"),
+        );
+        assert_ne!(
+            vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
+            vault::cloudflare_agent_token_profile_id_for_role("coder"),
         );
         assert!(vault::cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
     }
@@ -10931,7 +11254,7 @@ Use project_append_note for evidence, project_update_status for visible Kanban m
 Always end every turn with a short plain-text message to the user (what you did / what's next). Never end a turn with only tool calls or empty output.
 MCP servers are already configured and connected; never call auth or OAuth actions on the mcp tool.
 Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
-Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through delegation (spawn_main_coder for substantial work, spawn_mini_coder for cheap mechanical sub-tasks; you plan and front-load context; they write). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Split the plan into SMALL, self-contained tasks (nanophases) — NOT one per phase: one task = one testable, committable unit; a task's scope (the files it modifies) has AT MOST 3 entries, so split anything larger; give every task a deterministically verifiable acceptance (a test/typecheck/lint command). Pass plan_id = the `planId` field returned by plan_submit, and tasks = the nano-task list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. Route by weight: set weight:"main" for substantial multi-file or build-and-verify tasks; omit it (or "mini") for cheap mechanical edits. The assigned coder may be a small local model that relies SOLELY on your task title, acceptance and scope — make them unambiguous and complete, front-load everything it needs, and preserve exact file paths, function names and error messages. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or "stop" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
+Plan and hand off — you NEVER write or edit files yourself, and you NEVER spawn minis. You have no file-write tool. EVERY implementation goes through spawn_main_coder (Main coder); the Main coder alone may call spawn_mini_coder for cheap mechanical sub-tasks. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks, then spawn_main_coder, then agent_heartbeat status="done" so you sleep. You return only via the human Change plan action. Split the plan into SMALL, self-contained tasks (nanophases): one task = one testable, committable unit; scope AT MOST 3 files; every task needs a deterministically verifiable acceptance. Pass plan_id = the `planId` from plan_submit, and tasks each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. Front-load titles, acceptance, and exact paths for the Main coder. For project or codebase questions use oracle_ask / oracle_context FIRST. Do not set Kanban tasks to done (verifier-only). When finished planning, status="done" — do NOT linger as an active worker on the Work console.
 Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
 "#;
@@ -11109,7 +11432,11 @@ Never print provider tokens, launch tokens, session tokens or secrets. Provider 
             None,
         );
         assert!(!orch_no_task.contains("Preferred task_id"));
-        assert!(orch_no_task.contains("Plan and DELEGATE"));
+        assert!(
+            orch_no_task.contains("Plan and hand off")
+                || orch_no_task.contains("NEVER spawn minis"),
+            "orchestrator persona must hand off to Main (no direct mini spawn)"
+        );
     }
 
     // --- kairion_thinking_env: role-gated env for cloud duplex launches ---

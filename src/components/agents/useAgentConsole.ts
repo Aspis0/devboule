@@ -107,11 +107,30 @@ export function applyMiniActivityEvent(
   event: MiniActivityEvent,
 ): ConsoleActivity {
   switch (event.type) {
-    case "snapshot":
+    case "snapshot": {
       // Full replace. Normalize an empty/missing snapshot to the resting state.
-      return event.activity && Object.keys(event.activity).length > 0
-        ? event.activity
-        : emptyActivity();
+      // F06: do not drop question entries the tail reader already has when the
+      // snapshot omits them (pi/snapshot paths often lack type:"question").
+      if (!event.activity || Object.keys(event.activity).length === 0) {
+        return emptyActivity();
+      }
+      const next = event.activity;
+      const prevEntries = prev.entries ?? [];
+      const nextEntries = next.entries ?? [];
+      const nextHasQuestion = nextEntries.some(
+        (e: { type?: string }) => e?.type === "question",
+      );
+      if (nextHasQuestion) return next;
+      const orphanQuestions = prevEntries.filter(
+        (e: { type?: string }) => e?.type === "question",
+      );
+      if (orphanQuestions.length === 0) return next;
+      return {
+        ...next,
+        empty: false,
+        entries: [...nextEntries, ...orphanQuestions],
+      };
+    }
 
     case "appendEntry": {
       const entries = [...(prev.entries ?? []), event.entry];

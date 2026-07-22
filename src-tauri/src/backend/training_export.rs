@@ -917,6 +917,7 @@ mod tests {
             write_mode: WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: None,
+            task_id: None,
             backend: None,
             allow_oracle: false,
             kill_requested: false,

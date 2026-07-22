@@ -242,7 +242,14 @@ pub(crate) fn overlay_pi_sessions(
             existing.last_seen_at = Some(now.to_string());
             existing.client = Some(client);
             existing.role = session_role;
-            if existing.model.is_none() {
+            // F24/F19: always prefer the live launch model when present. Keeping a
+            // stale Some(model) forever left the planner header on e.g. gpt-5.2 after
+            // a local Qwen relaunch.
+            if let Some(ref m) = lp.model {
+                if !m.trim().is_empty() {
+                    existing.model = Some(m.clone());
+                }
+            } else if existing.model.is_none() {
                 existing.model = lp.model.clone();
             }
             if existing.current_project_id.is_none() {
@@ -2711,12 +2718,47 @@ impl EventMapper {
             // Take the text out FIRST so the `push_entry(&mut self)` call does
             // not conflict with the mutable borrow of `self.accumulated_text`.
             let text = std::mem::take(&mut self.accumulated_text);
-            self.push_entry(ConsoleEntry::Chat {
-                role: "assistant".to_string(),
-                text,
-                time: Self::now_str(),
-                msg_id: None,
-            });
+            // F06 (pi path): parse KAIRION_QUESTION like cloud_claude so the
+            // planner feed gets type:"question" and DoubtPanel can mount.
+            if let Some((preamble, parsed)) =
+                super::doubt_sensor_text::parse_question_marker_with_preamble(&text)
+            {
+                if let Some(pre) = preamble {
+                    let chat_text = pre.trim();
+                    if !chat_text.is_empty() {
+                        self.push_entry(ConsoleEntry::Chat {
+                            role: "assistant".to_string(),
+                            text: chat_text.to_string(),
+                            time: Self::now_str(),
+                            msg_id: None,
+                        });
+                    }
+                }
+                let options: Vec<super::mini_activity::QOption> = parsed
+                    .options
+                    .into_iter()
+                    .map(|(id, label)| super::mini_activity::QOption { id, label })
+                    .collect();
+                self.push_entry(ConsoleEntry::Question {
+                    id: parsed.id,
+                    text: parsed.text,
+                    options,
+                    unrest: 0.0,
+                    candidates: Vec::new(),
+                    lean: None,
+                    direction_confidence: 0.0,
+                    status: parsed.status,
+                    affects: parsed.affects,
+                    time: Self::now_str(),
+                });
+            } else {
+                self.push_entry(ConsoleEntry::Chat {
+                    role: "assistant".to_string(),
+                    text,
+                    time: Self::now_str(),
+                    msg_id: None,
+                });
+            }
         }
         // A whitespace-only block never became an entry; drop it so it doesn't leak
         // into the next flush.
@@ -3733,13 +3775,25 @@ fn run_pi_censor_review(
 /// B helper: extract a list of `PageEntry` from a web_search `details` value,
 /// tolerating several response shapes (a bare array, or an object with a
 /// `results`/`pages`/`items`/`hits`/`data` array, or a single url/title object).
+/// F44: also parse `_content` text (model-visible tool content) for markdown links
+/// when structured arrays are missing (Exa keyless often ships meta-only details).
 /// Unknown/empty items are skipped; returns an empty vec if nothing parseable.
 fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
     let items: Vec<&serde_json::Value> = match results {
         serde_json::Value::Array(arr) => arr.iter().collect(),
         serde_json::Value::Object(map) => {
             let mut found: Vec<&serde_json::Value> = Vec::new();
-            for key in ["results", "pages", "items", "hits", "data", "entries", "organic_results"] {
+            for key in [
+                "results",
+                "pages",
+                "items",
+                "hits",
+                "data",
+                "entries",
+                "organic_results",
+                "searchResults",
+                "webPages",
+            ] {
                 if let Some(arr) = map.get(key).and_then(|v| v.as_array()) {
                     found = arr.iter().collect();
                     break;
@@ -3752,12 +3806,26 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
         }
         _ => Vec::new(),
     };
-    items
+    let mut pages: Vec<PageEntry> = items
         .iter()
         .filter_map(|item| {
+            // Bare URL string in an array.
+            if let Some(s) = item.as_str() {
+                let url = s.trim();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return Some(PageEntry {
+                        url: url.to_string(),
+                        title: url.to_string(),
+                        summary: String::new(),
+                    });
+                }
+                return None;
+            }
             let url = item
                 .get("url")
                 .and_then(|v| v.as_str())
+                .or_else(|| item.get("link").and_then(|v| v.as_str()))
+                .or_else(|| item.get("href").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string();
             let title = item
@@ -3772,6 +3840,7 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
                 .or_else(|| item.get("snippet").and_then(|v| v.as_str()))
                 .or_else(|| item.get("text").and_then(|v| v.as_str()))
                 .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                .or_else(|| item.get("description").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string();
             if title.is_empty() && url.is_empty() {
@@ -3779,7 +3848,65 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
             }
             Some(PageEntry { url, title, summary })
         })
-        .collect()
+        .collect();
+
+    // F44: structured arrays empty → harvest markdown / plain URLs from tool content text.
+    if pages.is_empty() {
+        if let Some(text) = results
+            .get("_content")
+            .and_then(|v| v.as_str())
+            .or_else(|| results.get("content").and_then(|v| v.as_str()))
+            .or_else(|| results.get("text").and_then(|v| v.as_str()))
+        {
+            pages = extract_pages_from_text(text);
+        }
+    }
+    pages
+}
+
+/// F44: recover page rows from model-visible web_search tool text when `details`
+/// is meta-only. Accepts markdown links `[title](url)` and bare https URLs.
+fn extract_pages_from_text(text: &str) -> Vec<PageEntry> {
+    let mut pages = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Markdown links first: [Title](https://…)
+    let md = regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)\s]+)\)").ok();
+    if let Some(re) = md.as_ref() {
+        for cap in re.captures_iter(text) {
+            let title = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+            let url = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+            if url.is_empty() || !seen.insert(url.to_string()) {
+                continue;
+            }
+            pages.push(PageEntry {
+                url: url.to_string(),
+                title: if title.is_empty() {
+                    url.to_string()
+                } else {
+                    title.to_string()
+                },
+                summary: String::new(),
+            });
+        }
+    }
+    // Bare URLs not already captured.
+    let bare = regex::Regex::new(r#"https?://[^\s\)\]\>"']+"#).ok();
+    if let Some(re) = bare.as_ref() {
+        for m in re.find_iter(text) {
+            let url = m.as_str().trim_end_matches(['.', ',', ';', ':']).to_string();
+            if url.is_empty() || !seen.insert(url.clone()) {
+                continue;
+            }
+            pages.push(PageEntry {
+                title: url.clone(),
+                url,
+                summary: String::new(),
+            });
+        }
+    }
+    // Cap rail noise.
+    pages.truncate(20);
+    pages
 }
 
 // ---- Phase 2 Pigeon control commands ------------------------------------
@@ -4978,6 +5105,32 @@ mod tests {
                 assert_eq!(pages[1].title, "Beta");
             }
             other => panic!("expected WebSearch entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f44_extract_pages_from_meta_only_plus_content_text() {
+        // Live Exa keyless often ships details={queries,totalResults} with hits only
+        // in the tool content string the model sees — rail must still extract pages.
+        let results = serde_json::json!({
+            "queries": ["anthropic claude"],
+            "totalResults": 3,
+            "successfulQueries": 1,
+            "_content": "1. [Claude](https://www.anthropic.com/claude) — models\n2. https://docs.anthropic.com/en/docs\n3. [API](https://www.anthropic.com/api) more"
+        });
+        let pages = extract_pages(&results);
+        assert!(
+            pages.len() >= 2,
+            "expected pages from _content markdown/urls, got {pages:?}"
+        );
+        assert!(pages.iter().any(|p| p.url.contains("anthropic.com")));
+        let mut mapper = EventMapper::new("pi-f44", Arc::new(Mutex::new(Vec::new())));
+        mapper.handle_devboule_websearch("anthropic claude", &results);
+        match mapper.entries.last() {
+            Some(ConsoleEntry::WebSearch { pages, .. }) => {
+                assert!(!pages.is_empty(), "must not emit 'not extractable' banner");
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
         }
     }
 

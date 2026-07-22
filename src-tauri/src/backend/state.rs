@@ -576,127 +576,184 @@ fn oracle_service_on_unlock() {
     super::oracle_service::on_unlock();
 }
 
+/// F40: crate-visible lock for process-wide `DEVBOULE_DEV_UNLOCK` mutations.
+/// Any test (any module) that sets/clears this env OR asserts locked/unlocked
+/// baseline after `BackendState::new()` must hold this mutex for the duration.
+#[cfg(test)]
+pub(crate) static DEV_UNLOCK_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
+    use std::sync::MutexGuard;
+
+    fn lock_dev_unlock_env() -> MutexGuard<'static, ()> {
+        DEV_UNLOCK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Run `f` with DEV unlock env forced OFF (locked baseline). Restores prior value.
+    fn with_dev_unlock_env_off<R>(f: impl FnOnce() -> R) -> R {
+        let _g = lock_dev_unlock_env();
+        let prev = std::env::var_os("DEVBOULE_DEV_UNLOCK");
+        std::env::remove_var("DEVBOULE_DEV_UNLOCK");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var("DEVBOULE_DEV_UNLOCK", v),
+            None => std::env::remove_var("DEVBOULE_DEV_UNLOCK"),
+        }
+        match result {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    /// Run `f` with DEV unlock env forced ON. Restores prior value.
+    fn with_dev_unlock_env_on<R>(f: impl FnOnce() -> R) -> R {
+        let _g = lock_dev_unlock_env();
+        let prev = std::env::var_os("DEVBOULE_DEV_UNLOCK");
+        std::env::set_var("DEVBOULE_DEV_UNLOCK", "1");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var("DEVBOULE_DEV_UNLOCK", v),
+            None => std::env::remove_var("DEVBOULE_DEV_UNLOCK"),
+        }
+        match result {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
 
     #[test]
     fn sensitive_gate_blocks_when_locked() {
-        let state = BackendState::new();
-        assert!(state.ensure_unlocked().is_err());
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            assert!(state.ensure_unlocked().is_err());
+        });
     }
 
     #[test]
     fn dev_unlock_skips_biometric_and_idle_ttl() {
-        // Opt in explicitly — unit tests default DEV unlock off.
-        std::env::set_var("DEVBOULE_DEV_UNLOCK", "1");
-        let state = BackendState::new();
-        assert!(
-            !state.auth_state().unwrap().locked,
-            "debug + DEVBOULE_DEV_UNLOCK=1 starts unlocked"
-        );
-        assert!(state.ensure_unlocked().is_ok());
-        // Far past idle TTL — still open.
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.unlocked_instant = Some(
-                Instant::now()
-                    - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 10) * 60),
+        with_dev_unlock_env_on(|| {
+            let state = BackendState::new();
+            assert!(
+                !state.auth_state().unwrap().locked,
+                "debug + DEVBOULE_DEV_UNLOCK=1 starts unlocked"
             );
-        }
-        assert!(
-            state.ensure_unlocked().is_ok(),
-            "dev unlock must not idle-expire"
-        );
-        // No biometric path required.
-        assert!(state.verify_unlock("dev").is_ok());
-        std::env::remove_var("DEVBOULE_DEV_UNLOCK");
+            assert!(state.ensure_unlocked().is_ok());
+            // Far past idle TTL — still open.
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.unlocked_instant = Some(
+                    Instant::now()
+                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 10) * 60),
+                );
+            }
+            assert!(
+                state.ensure_unlocked().is_ok(),
+                "dev unlock must not idle-expire"
+            );
+            // No biometric path required.
+            assert!(state.verify_unlock("dev").is_ok());
+        });
     }
 
     #[test]
     fn sensitive_gate_expires_after_ttl() {
-        let state = BackendState::new();
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.locked = false;
-            auth.last_unlocked_at = Some(Utc::now() - Duration::minutes(UNLOCK_TTL_MINUTES + 1));
-            // D2: expiry is now measured against the monotonic instant.
-            auth.unlocked_instant =
-                Some(Instant::now() - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60));
-            auth.lock_reason = None;
-        }
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.locked = false;
+                auth.last_unlocked_at =
+                    Some(Utc::now() - Duration::minutes(UNLOCK_TTL_MINUTES + 1));
+                // D2: expiry is now measured against the monotonic instant.
+                auth.unlocked_instant = Some(
+                    Instant::now()
+                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60),
+                );
+                auth.lock_reason = None;
+            }
 
-        let err = state.ensure_unlocked().unwrap_err();
-        assert!(err.contains("App is locked"), "{err}");
-        assert_eq!(
-            state.auth_state().unwrap().lock_reason.as_deref(),
-            Some("idle")
-        );
+            let err = state.ensure_unlocked().unwrap_err();
+            assert!(err.contains("App is locked"), "{err}");
+            assert_eq!(
+                state.auth_state().unwrap().lock_reason.as_deref(),
+                Some("idle")
+            );
+        });
     }
 
     #[test]
     fn ensure_unlocked_does_not_refresh_idle_ttl() {
         // ensure_unlocked is a pure gate: background pollers must not reset idle.
-        let state = BackendState::new();
-        let almost_expired = Instant::now()
-            - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30);
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.locked = false;
-            auth.last_unlocked_at = Some(Utc::now());
-            auth.unlocked_instant = Some(almost_expired);
-            auth.lock_reason = None;
-        }
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            let almost_expired = Instant::now()
+                - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30);
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.locked = false;
+                auth.last_unlocked_at = Some(Utc::now());
+                auth.unlocked_instant = Some(almost_expired);
+                auth.lock_reason = None;
+            }
 
-        assert!(state.ensure_unlocked().is_ok());
-        let elapsed = {
-            let auth = state.auth.read().unwrap();
-            auth.unlocked_instant.expect("unchanged").elapsed()
-        };
-        // Still near TTL (≈30s remaining), not refreshed to "now".
-        assert!(
-            elapsed > StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 60),
-            "ensure_unlocked must not refresh idle clock, elapsed={elapsed:?}"
-        );
-        assert!(!state.auth_state().unwrap().locked);
+            assert!(state.ensure_unlocked().is_ok());
+            let elapsed = {
+                let auth = state.auth.read().unwrap();
+                auth.unlocked_instant.expect("unchanged").elapsed()
+            };
+            // Still near TTL (≈30s remaining), not refreshed to "now".
+            assert!(
+                elapsed > StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 60),
+                "ensure_unlocked must not refresh idle clock, elapsed={elapsed:?}"
+            );
+            assert!(!state.auth_state().unwrap().locked);
+        });
     }
 
     #[test]
     fn touch_idle_activity_refreshes_idle_ttl_when_unlocked() {
         // Genuine user activity extends the expire window.
-        let state = BackendState::new();
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.locked = false;
-            auth.last_unlocked_at = Some(Utc::now());
-            // Almost expired (TTL - 30s). Without touch, waiting would expire.
-            auth.unlocked_instant = Some(
-                Instant::now()
-                    - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30),
-            );
-            auth.lock_reason = None;
-        }
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.locked = false;
+                auth.last_unlocked_at = Some(Utc::now());
+                // Almost expired (TTL - 30s). Without touch, waiting would expire.
+                auth.unlocked_instant = Some(
+                    Instant::now()
+                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64) * 60 - 30),
+                );
+                auth.lock_reason = None;
+            }
 
-        assert!(state.touch_idle_activity().is_ok());
-        let elapsed = {
-            let auth = state.auth.read().unwrap();
-            auth.unlocked_instant.expect("refreshed").elapsed()
-        };
-        assert!(
-            elapsed < StdDuration::from_secs(5),
-            "expected touch to Instant::now(), elapsed={elapsed:?}"
-        );
-        // Expire window extended: ensure_unlocked still succeeds after the touch.
-        assert!(state.ensure_unlocked().is_ok());
-        assert!(!state.auth_state().unwrap().locked);
+            assert!(state.touch_idle_activity().is_ok());
+            let elapsed = {
+                let auth = state.auth.read().unwrap();
+                auth.unlocked_instant.expect("refreshed").elapsed()
+            };
+            assert!(
+                elapsed < StdDuration::from_secs(5),
+                "expected touch to Instant::now(), elapsed={elapsed:?}"
+            );
+            // Expire window extended: ensure_unlocked still succeeds after the touch.
+            assert!(state.ensure_unlocked().is_ok());
+            assert!(!state.auth_state().unwrap().locked);
+        });
     }
 
     #[test]
     fn touch_idle_activity_errors_when_locked() {
-        let state = BackendState::new();
-        let err = state.touch_idle_activity().unwrap_err();
-        assert!(err.contains("App is locked"), "{err}");
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            let err = state.touch_idle_activity().unwrap_err();
+            assert!(err.contains("App is locked"), "{err}");
+        });
     }
 
     #[test]
@@ -704,55 +761,66 @@ mod tests {
         // D2: pushing the wall-clock timestamp far into the FUTURE (simulating a
         // backward system-clock change relative to unlock) must NOT keep the
         // session unlocked once the monotonic TTL elapses.
-        let state = BackendState::new();
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.locked = false;
-            // Wall clock claims we just unlocked (or even in the future), but the
-            // monotonic instant is already past the TTL.
-            auth.last_unlocked_at = Some(Utc::now() + Duration::minutes(60));
-            auth.unlocked_instant =
-                Some(Instant::now() - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60));
-            auth.lock_reason = None;
-        }
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.locked = false;
+                // Wall clock claims we just unlocked (or even in the future), but the
+                // monotonic instant is already past the TTL.
+                auth.last_unlocked_at = Some(Utc::now() + Duration::minutes(60));
+                auth.unlocked_instant = Some(
+                    Instant::now()
+                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60),
+                );
+                auth.lock_reason = None;
+            }
 
-        assert!(state.ensure_unlocked().is_err());
-        assert_eq!(
-            state.auth_state().unwrap().lock_reason.as_deref(),
-            Some("idle")
-        );
+            assert!(state.ensure_unlocked().is_err());
+            assert_eq!(
+                state.auth_state().unwrap().lock_reason.as_deref(),
+                Some("idle")
+            );
+        });
     }
 
     #[test]
     fn sensitive_gate_expiry_clears_runtime_provider_cache() {
-        let state = BackendState::new();
-        state.unlock_after_verification().unwrap();
-        state
-            .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
-            .unwrap();
-        {
-            let mut auth = state.auth.write().unwrap();
-            auth.last_unlocked_at = Some(Utc::now() - Duration::minutes(UNLOCK_TTL_MINUTES + 1));
-            // D2: drive expiry via the monotonic instant.
-            auth.unlocked_instant =
-                Some(Instant::now() - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60));
-        }
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            state.unlock_after_verification().unwrap();
+            state
+                .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
+                .unwrap();
+            {
+                let mut auth = state.auth.write().unwrap();
+                auth.last_unlocked_at =
+                    Some(Utc::now() - Duration::minutes(UNLOCK_TTL_MINUTES + 1));
+                // D2: drive expiry via the monotonic instant.
+                auth.unlocked_instant = Some(
+                    Instant::now()
+                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60),
+                );
+            }
 
-        assert!(state.ensure_unlocked().is_err());
+            assert!(state.ensure_unlocked().is_err());
 
-        assert!(state.cached_provider_inventories().unwrap().is_empty());
+            assert!(state.cached_provider_inventories().unwrap().is_empty());
+        });
     }
 
     #[test]
     fn sensitive_session_rejects_operations_after_relock() {
-        let state = BackendState::new();
-        state.unlock_after_verification().unwrap();
-        let session_id = state.sensitive_session_id().unwrap();
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            state.unlock_after_verification().unwrap();
+            let session_id = state.sensitive_session_id().unwrap();
 
-        state.lock("manual").unwrap();
-        state.unlock_after_verification().unwrap();
+            state.lock("manual").unwrap();
+            state.unlock_after_verification().unwrap();
 
-        assert!(state.ensure_same_sensitive_session(session_id).is_err());
+            assert!(state.ensure_same_sensitive_session(session_id).is_err());
+        });
     }
 
     #[test]
@@ -901,17 +969,19 @@ mod tests {
 
     #[test]
     fn locking_clears_runtime_provider_cache() {
-        let state = BackendState::new();
-        state.unlock_after_verification().unwrap();
-        state
-            .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
-            .unwrap();
-        assert_eq!(state.cached_provider_inventories().unwrap().len(), 1);
+        with_dev_unlock_env_off(|| {
+            let state = BackendState::new();
+            state.unlock_after_verification().unwrap();
+            state
+                .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
+                .unwrap();
+            assert_eq!(state.cached_provider_inventories().unwrap().len(), 1);
 
-        state.lock("manual").unwrap();
+            state.lock("manual").unwrap();
 
-        assert!(state.cached_provider_inventories().unwrap().is_empty());
-        assert!(state.ensure_unlocked().is_err());
+            assert!(state.cached_provider_inventories().unwrap().is_empty());
+            assert!(state.ensure_unlocked().is_err());
+        });
     }
 
     #[test]

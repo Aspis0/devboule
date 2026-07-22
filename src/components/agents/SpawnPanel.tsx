@@ -487,7 +487,13 @@ export function SpawnPanel({
 				</select>
 			) : (
 				<p className="mb-3 text-[10px] leading-4 text-cream-400">
-					No open task; the agent will work at project level.
+					{/* F10: distinguish empty board vs no project selected vs all done. */}
+					{!(lockedProjectId ?? selectedProjectId) ||
+					(lockedProjectId ?? selectedProjectId) === "all"
+						? "Select a project to attach a Kanban task (or launch project-level)."
+						: tasks.length === 0
+							? "This project has no tasks yet; the agent will work at project level."
+							: "No open (non-done) tasks; the agent will work at project level."}
 				</p>
 			)}
 

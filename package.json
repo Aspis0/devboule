@@ -13,6 +13,8 @@
     "devboule-pilot:app": "bash tools/devboule-pilot/run-app.sh",
     "devboule-pilot:smoke": "bash tools/devboule-pilot/smoke-ping.sh",
     "test": "vitest run",
+    "test:design": "VITEST_INCLUDE_DESIGN=1 vitest run src/components/design",
+    "test:all": "VITEST_INCLUDE_DESIGN=1 vitest run",
     "test:watch": "vitest",
     "rig:smoke": "RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v",
     "rig:rust": "cargo test --manifest-path src-tauri/Cargo.toml rig_tests -- --ignored",

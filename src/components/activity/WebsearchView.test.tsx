@@ -19,6 +19,14 @@ describe("WebsearchView", () => {
     expect(out).toContain("searching the web right now");
   });
 
+  // F25: parent used to pass live=!!orchestratorAgentId, which kept the
+  // skeleton forever even with zero search events.
+  it("stays idle when live=true but pages and findings are empty (F25)", () => {
+    const out = html({ pages: [], findings: [], isAuto: true, live: true });
+    expect(out).toContain("searching the web right now");
+    expect(out).not.toContain("READING LIVE PAGES");
+  });
+
   it("renders a page hostname when a live page is present", () => {
     const pages: StagePage[] = [{ url: "https://docs.rs/tokio", title: "Tokio", summary: "" }];
     const out = html({ pages, findings: [], isAuto: true, live: true });

@@ -39,9 +39,11 @@ use std::time::{Duration, Instant};
 
 // ── constants ───────────────────────────────────────────────────────────────
 
-const UNREACHABLE_MESSAGE: &str = "Oracle server unreachable — open the Devboule app \
-(the resident Oracle server answers this tool; there is no \
-in-process fallback anymore).";
+// F21: stale discovery (dead pid/port left on disk) is the common failure mode
+// while the app IS open — "open the app" misleads operators. Point at discovery.
+const UNREACHABLE_MESSAGE: &str = "Oracle retrieval endpoint unreachable — the app may be open \
+but discovery is stale or the resident server is down. Restart Devboule (or wait for \
+Oracle bring-up) so projects/.oracle-server.json is republished with a live port.";
 
 const ORACLE_HTTP_BASE_ENVS: &[&str] = &[
     "DEVBOULE_ORACLE_HTTP_BASE",
@@ -375,6 +377,13 @@ pub fn resolve_project_work_root(projects_dir: &Path, project_id: &str) -> ToolR
 
 // ── manifest scope (fail-closed) ────────────────────────────────────────────
 
+/// Cap on project/management-controlled manifest reads (DoS / OOM guard).
+const MANIFEST_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Registry of indexed Oracle roots (Layer 2). Lives under management-root
+/// `oracle-data/.oracle-roots.json`.
+const ROOTS_REGISTRY_FILENAME: &str = ".oracle-roots.json";
+
 fn strip_windows_verbatim_prefix(value: &str) -> String {
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{rest}");
@@ -385,53 +394,103 @@ fn strip_windows_verbatim_prefix(value: &str) -> String {
     value.to_string()
 }
 
+/// Normalize a root path string for registry / manifest key equality.
+/// Strips Windows verbatim prefixes and, when the path exists, canonicalizes
+/// so `/var` and `/private/var` collapse on macOS.
+pub fn normalize_root_key(path: &Path) -> String {
+    let raw = strip_windows_verbatim_prefix(&path.to_string_lossy());
+    if let Ok(canon) = Path::new(&raw).canonicalize() {
+        return strip_windows_verbatim_prefix(&canon.to_string_lossy());
+    }
+    raw
+}
+
+fn path_keys_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let na = strip_windows_verbatim_prefix(a);
+    let nb = strip_windows_verbatim_prefix(b);
+    if na == nb {
+        return true;
+    }
+    // Collapse /var ↔ /private/var (macOS) without requiring the path to exist.
+    let fold = |s: &str| {
+        s.strip_prefix("/private/var/")
+            .map(|r| format!("/var/{r}"))
+            .unwrap_or_else(|| s.to_string())
+    };
+    fold(&na) == fold(&nb)
+}
+
+/// Load a chunk-index manifest fail-closed: missing, oversize, non-object, or
+/// corrupt JSON → empty object (never panic).
 fn manifest_load(path: &Path) -> Value {
     if !path.exists() {
         return json!({"files": {}});
     }
-    match fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| json!({"files": {}})),
-        Err(_) => json!({"files": {}}),
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return json!({"files": {}}),
+    };
+    if meta.len() > MANIFEST_MAX_BYTES {
+        return json!({"files": {}});
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return json!({"files": {}}),
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => json!({"files": {}}),
     }
 }
 
 fn manifest_files_for_root(manifest: &mut Value, root: &Path) -> HashSet<String> {
-    let root_key = strip_windows_verbatim_prefix(&root.to_string_lossy());
-    let roots = {
-        let obj = manifest.as_object_mut().unwrap_or_else(|| {
-            // unreachable if load always returns object
-            panic!("manifest not object")
-        });
-        if !obj.contains_key("roots") {
-            obj.insert("roots".into(), json!({}));
-        }
-        // legacy single-root form
-        if let (Some(legacy_root), Some(legacy_files)) = (
-            obj.get("root").and_then(|v| v.as_str()).map(str::to_string),
-            obj.get("files").cloned(),
-        ) {
-            let roots_obj = obj.get_mut("roots").and_then(|v| v.as_object_mut());
-            if let Some(roots_obj) = roots_obj {
-                if !roots_obj.contains_key(&legacy_root) && legacy_files.is_object() {
-                    roots_obj.insert(legacy_root, json!({"files": legacy_files}));
-                }
-            }
-        }
-        obj.get_mut("roots")
-    };
-    let Some(roots) = roots.and_then(|v| v.as_object_mut()) else {
+    let root_key = normalize_root_key(root);
+    let Some(obj) = manifest.as_object_mut() else {
         return HashSet::new();
     };
-    // prune verbatim-prefixed duplicates
+    if !obj.contains_key("roots") {
+        obj.insert("roots".into(), json!({}));
+    }
+    // legacy single-root form
+    if let (Some(legacy_root), Some(legacy_files)) = (
+        obj.get("root").and_then(|v| v.as_str()).map(str::to_string),
+        obj.get("files").cloned(),
+    ) {
+        let roots_obj = obj.get_mut("roots").and_then(|v| v.as_object_mut());
+        if let Some(roots_obj) = roots_obj {
+            if !roots_obj.contains_key(&legacy_root) && legacy_files.is_object() {
+                roots_obj.insert(legacy_root, json!({"files": legacy_files}));
+            }
+        }
+    }
+    let Some(roots) = obj.get_mut("roots").and_then(|v| v.as_object_mut()) else {
+        return HashSet::new();
+    };
+    // Prefer exact key; else any key equivalent under path normalization.
+    let matched_key = if roots.contains_key(&root_key) {
+        Some(root_key.clone())
+    } else {
+        roots
+            .keys()
+            .find(|k| path_keys_equivalent(k, &root_key))
+            .cloned()
+    };
+    let Some(matched_key) = matched_key else {
+        return HashSet::new();
+    };
+    // prune verbatim-prefixed / alias duplicates into the matched key
     let dup_keys: Vec<String> = roots
         .keys()
-        .filter(|k| k.as_str() != root_key && strip_windows_verbatim_prefix(k) == root_key)
+        .filter(|k| k.as_str() != matched_key && path_keys_equivalent(k, &matched_key))
         .cloned()
         .collect();
     for k in dup_keys {
         if let Some(duplicate) = roots.remove(&k) {
             let canonical = roots
-                .entry(root_key.clone())
+                .entry(matched_key.clone())
                 .or_insert_with(|| json!({"files": {}}));
             if let (Some(cf), Some(df)) = (
                 canonical
@@ -446,16 +505,257 @@ fn manifest_files_for_root(manifest: &mut Value, root: &Path) -> HashSet<String>
             }
         }
     }
-    let entry = match roots.get(&root_key) {
+    let entry = match roots.get(&matched_key) {
         Some(e) => e,
         None => return HashSet::new(),
     };
-    let files = entry
+    entry
         .get("files")
         .and_then(|f| f.as_object())
         .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-    files
+        .unwrap_or_default()
+}
+
+// ── multi-root registry (Layer 2) ───────────────────────────────────────────
+
+/// Discovery credentials for one indexed root (loopback only at resolve time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleRootDiscovery {
+    pub base_url: String,
+    pub auth_token: String,
+    pub pid: Option<i64>,
+    pub index_root: Option<String>,
+}
+
+/// One registry entry for an indexed Oracle root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleRootEntry {
+    pub path: String,
+    pub manifest_path: String,
+    pub discovery: Option<OracleRootDiscovery>,
+    pub last_indexed_at: Option<String>,
+    pub status: String,
+}
+
+/// Registry of indexed roots (pure data; I/O via load/save helpers).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OracleRootsRegistry {
+    pub roots: Vec<OracleRootEntry>,
+}
+
+impl OracleRootsRegistry {
+    pub fn lookup_by_path(&self, root: &Path) -> Option<&OracleRootEntry> {
+        let key = normalize_root_key(root);
+        self.roots
+            .iter()
+            .find(|e| path_keys_equivalent(&e.path, &key))
+    }
+
+    pub fn upsert(&mut self, entry: OracleRootEntry) {
+        let key = normalize_root_key(Path::new(&entry.path));
+        if let Some(slot) = self
+            .roots
+            .iter_mut()
+            .find(|e| path_keys_equivalent(&e.path, &key))
+        {
+            *slot = entry;
+        } else {
+            self.roots.push(entry);
+        }
+    }
+
+    /// True iff `root` is registered **and** status is `indexed` (P3 gate).
+    pub fn is_registered(&self, root: &Path) -> bool {
+        self.lookup_by_path(root)
+            .map(|e| e.status.trim().eq_ignore_ascii_case("indexed") || e.status.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Path of the roots registry under the management root.
+pub fn oracle_roots_registry_path(management_root: &Path) -> PathBuf {
+    management_root
+        .join("oracle-data")
+        .join(ROOTS_REGISTRY_FILENAME)
+}
+
+/// Parse registry JSON fail-closed (unknown shape → empty registry).
+pub fn oracle_roots_registry_from_value(value: &Value) -> OracleRootsRegistry {
+    let mut reg = OracleRootsRegistry::default();
+    let Some(arr) = value.get("roots").and_then(|v| v.as_array()) else {
+        return reg;
+    };
+    for item in arr {
+        let Some(path) = item.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let manifest_path = item
+            .get("manifestPath")
+            .or_else(|| item.get("manifest_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let discovery = item.get("discovery").and_then(|d| {
+            if d.is_null() {
+                return None;
+            }
+            let base = d
+                .get("baseUrl")
+                .or_else(|| d.get("base_url"))
+                .and_then(|v| v.as_str())?
+                .trim();
+            let token = d
+                .get("authToken")
+                .or_else(|| d.get("auth_token"))
+                .and_then(|v| v.as_str())?
+                .trim();
+            if base.is_empty() || token.is_empty() {
+                return None;
+            }
+            let pid = d.get("pid").and_then(|v| v.as_i64());
+            let index_root = d
+                .get("indexRoot")
+                .or_else(|| d.get("index_root"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(OracleRootDiscovery {
+                base_url: base.to_string(),
+                auth_token: token.to_string(),
+                pid,
+                index_root,
+            })
+        });
+        let last_indexed_at = item
+            .get("lastIndexedAt")
+            .or_else(|| item.get("last_indexed_at"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("indexed")
+            .to_string();
+        reg.roots.push(OracleRootEntry {
+            path: path.to_string(),
+            manifest_path,
+            discovery,
+            last_indexed_at,
+            status,
+        });
+    }
+    reg
+}
+
+pub fn oracle_roots_registry_to_value(reg: &OracleRootsRegistry) -> Value {
+    let roots: Vec<Value> = reg
+        .roots
+        .iter()
+        .map(|e| {
+            let discovery = match &e.discovery {
+                Some(d) => {
+                    let mut m = Map::new();
+                    m.insert("baseUrl".into(), json!(d.base_url));
+                    m.insert("authToken".into(), json!(d.auth_token));
+                    if let Some(pid) = d.pid {
+                        m.insert("pid".into(), json!(pid));
+                    }
+                    if let Some(ref ir) = d.index_root {
+                        m.insert("indexRoot".into(), json!(ir));
+                    }
+                    Value::Object(m)
+                }
+                None => Value::Null,
+            };
+            json!({
+                "path": e.path,
+                "manifestPath": e.manifest_path,
+                "discovery": discovery,
+                "lastIndexedAt": e.last_indexed_at,
+                "status": e.status,
+            })
+        })
+        .collect();
+    json!({ "roots": roots })
+}
+
+pub fn load_oracle_roots_registry(management_root: &Path) -> OracleRootsRegistry {
+    let path = oracle_roots_registry_path(management_root);
+    if !path.exists() {
+        return OracleRootsRegistry::default();
+    }
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return OracleRootsRegistry::default(),
+    };
+    if meta.len() > MANIFEST_MAX_BYTES {
+        return OracleRootsRegistry::default();
+    }
+    let raw = match fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return OracleRootsRegistry::default(),
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(v) => oracle_roots_registry_from_value(&v),
+        Err(_) => OracleRootsRegistry::default(),
+    }
+}
+
+pub fn save_oracle_roots_registry(
+    management_root: &Path,
+    reg: &OracleRootsRegistry,
+) -> std::io::Result<()> {
+    let path = oracle_roots_registry_path(management_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_string_pretty(&oracle_roots_registry_to_value(reg))
+        .unwrap_or_else(|_| "{\"roots\":[]}".into());
+    fs::write(path, raw)
+}
+
+/// Merge + re-rank chunks by score (desc), hard-cap at `limit` (P3).
+/// Optionally tags each chunk with `index_root` basename when `tag_root` is set.
+pub fn merge_rerank_chunks(mut chunks: Vec<Value>, limit: usize) -> Vec<Value> {
+    fn score_of(c: &Value) -> f64 {
+        c.get("score")
+            .or_else(|| c.get("relevance"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+    }
+    chunks.sort_by(|a, b| {
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if chunks.len() > limit {
+        chunks.truncate(limit);
+    }
+    chunks
+}
+
+/// Tag each chunk with the root basename so union results are disambiguable.
+fn tag_chunks_with_root(chunks: Vec<Value>, root: &Path) -> Vec<Value> {
+    let label = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("root")
+        .to_string();
+    chunks
+        .into_iter()
+        .map(|mut c| {
+            if let Some(obj) = c.as_object_mut() {
+                obj.entry("index_root".to_string())
+                    .or_insert_with(|| json!(label));
+            }
+            c
+        })
+        .collect()
 }
 
 fn oracle_index_root_for_project(
@@ -488,24 +788,30 @@ fn oracle_index_root_for_project(
 ///
 /// * Empty / missing `project_id` → management-root files only (never the union
 ///   of every project). An empty set is fail-closed (callers return no chunks).
-/// * Project-scoped → that project's work-root files only. Does **not**
-///   auto-merge the entire management-root corpus into every project scope.
+/// * Project-scoped → that project's work-root files only, loaded from
+///   `<project_root>/oracle-data/chunk-index-manifest.json` (not the management
+///   root's manifest — F45 / multi-root Layer 1). Does **not** auto-merge the
+///   management-root corpus into every project scope.
 pub fn oracle_allowed_file_ids(
     projects_dir: &Path,
     project_id: Option<&str>,
 ) -> ToolResult<HashSet<String>> {
     let management_root = management_root_from_projects_dir(projects_dir);
-    let manifest_path = management_root
-        .join("oracle-data")
-        .join("chunk-index-manifest.json");
-    let mut manifest = manifest_load(&manifest_path);
-
     let project_id = project_id.map(str::trim).filter(|s| !s.is_empty());
     if project_id.is_none() {
         // Unscoped → management root only (never union of all projects).
+        let manifest_path = management_root
+            .join("oracle-data")
+            .join("chunk-index-manifest.json");
+        let mut manifest = manifest_load(&manifest_path);
         return Ok(manifest_files_for_root(&mut manifest, &management_root));
     }
+    // Project scope: load THIS project's own oracle-data manifest (F45).
     let root = oracle_index_root_for_project(projects_dir, project_id)?;
+    let manifest_path = root
+        .join("oracle-data")
+        .join("chunk-index-manifest.json");
+    let mut manifest = manifest_load(&manifest_path);
     // Project scope only — no management-root auto-merge (HIGH #4).
     Ok(manifest_files_for_root(&mut manifest, &root))
 }
@@ -667,20 +973,44 @@ struct TargetCache {
 
 static TARGET_CACHE: Mutex<Option<(String, TargetCache)>> = Mutex::new(None);
 
-/// Resolve (base_url, auth_token) or None (caller fails closed).
+/// Resolve (base_url, auth_token) for the **default** (management / global)
+/// discovery file under `projects_dir`, or None (caller fails closed).
 pub fn resolve_oracle_http_target(projects_dir: &Path) -> Option<(String, String)> {
-    let key = projects_dir.to_string_lossy().to_string();
+    resolve_oracle_http_target_for_root(projects_dir, None)
+}
+
+/// Resolve HTTP target for a specific index root (P2).
+///
+/// Resolution order:
+/// 1. Env override (`DEVBOULE_ORACLE_HTTP_*`) — only when `index_root` is None
+///    (unscoped) or when the env is the only available target.
+/// 2. Registry entry for `index_root` with live discovery credentials.
+/// 3. Per-root discovery file at `<root>/oracle-data/.oracle-server.json`.
+/// 4. Global `projects_dir/.oracle-server.json` **only when** the discovery's
+///    `indexRoot` (if present) matches `index_root`, or when `index_root` is
+///    None / equals management root. Prevents cross-root file_id leaks (P1 audit #3).
+pub fn resolve_oracle_http_target_for_root(
+    projects_dir: &Path,
+    index_root: Option<&Path>,
+) -> Option<(String, String)> {
+    let cache_key = format!(
+        "{}|{}",
+        projects_dir.to_string_lossy(),
+        index_root
+            .map(|p| normalize_root_key(p))
+            .unwrap_or_default()
+    );
     if let Ok(guard) = TARGET_CACHE.lock() {
         if let Some((k, cached)) = guard.as_ref() {
-            if k == &key && cached.at.elapsed() < TARGET_CACHE_TTL {
+            if k == &cache_key && cached.at.elapsed() < TARGET_CACHE_TTL {
                 return cached.value.clone();
             }
         }
     }
-    let result = resolve_oracle_http_target_uncached(projects_dir);
+    let result = resolve_oracle_http_target_for_root_uncached(projects_dir, index_root);
     if let Ok(mut guard) = TARGET_CACHE.lock() {
         *guard = Some((
-            key,
+            cache_key,
             TargetCache {
                 at: Instant::now(),
                 value: result.clone(),
@@ -690,17 +1020,7 @@ pub fn resolve_oracle_http_target(projects_dir: &Path) -> Option<(String, String
     result
 }
 
-fn resolve_oracle_http_target_uncached(projects_dir: &Path) -> Option<(String, String)> {
-    if let (Some(base), Some(token)) = (env_first(ORACLE_HTTP_BASE_ENVS), env_first(ORACLE_HTTP_TOKEN_ENVS))
-    {
-        if !is_loopback_http_base(&base) {
-            return None;
-        }
-        return Some((base, token));
-    }
-    let path = projects_dir.join(DISCOVERY_FILE);
-    let raw = fs::read_to_string(path).ok()?;
-    let data: Value = serde_json::from_str(&raw).ok()?;
+fn discovery_from_json(data: &Value) -> Option<(String, String, Option<String>)> {
     let base = data.get("baseUrl").and_then(|v| v.as_str())?.trim();
     let token = data.get("authToken").and_then(|v| v.as_str())?.trim();
     if base.is_empty() || token.is_empty() {
@@ -711,12 +1031,18 @@ fn resolve_oracle_http_target_uncached(projects_dir: &Path) -> Option<(String, S
     }
     if let Some(hb) = data.get("heartbeatAt").and_then(|v| v.as_str()) {
         let hb = hb.trim();
+        if !hb.is_empty() && !heartbeat_fresh(hb) {
+            return None;
+        }
+        // Valid or empty heartbeat handled below for pid.
         if !hb.is_empty() {
-            if !heartbeat_fresh(hb) {
-                return None;
-            }
-            // Valid heartbeat → accept without pid probe.
-            return Some((base.to_string(), token.to_string()));
+            let index_root = data
+                .get("indexRoot")
+                .or_else(|| data.get("index_root"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Some((base.to_string(), token.to_string(), index_root));
         }
     }
     if let Some(pid) = data.get("pid").and_then(|v| v.as_i64()) {
@@ -724,7 +1050,104 @@ fn resolve_oracle_http_target_uncached(projects_dir: &Path) -> Option<(String, S
             return None;
         }
     }
-    Some((base.to_string(), token.to_string()))
+    let index_root = data
+        .get("indexRoot")
+        .or_else(|| data.get("index_root"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((base.to_string(), token.to_string(), index_root))
+}
+
+fn discovery_matches_root(discovery_index_root: Option<&str>, wanted: &Path) -> bool {
+    let Some(dir) = discovery_index_root else {
+        // Legacy discovery without indexRoot: only safe for unscoped callers.
+        return false;
+    };
+    path_keys_equivalent(dir, &normalize_root_key(wanted))
+}
+
+fn resolve_oracle_http_target_for_root_uncached(
+    projects_dir: &Path,
+    index_root: Option<&Path>,
+) -> Option<(String, String)> {
+    let management_root = management_root_from_projects_dir(projects_dir);
+
+    if let Some(root) = index_root {
+        // Env override must NOT pin every project root to one server (P2 audit #2).
+        // Scoped resolution uses registry / per-root / global-with-indexRoot only.
+
+        // 1) Registry discovery for this root — require indexRoot match when set.
+        let reg = load_oracle_roots_registry(&management_root);
+        if let Some(entry) = reg.lookup_by_path(root) {
+            if entry.status.trim().eq_ignore_ascii_case("indexed")
+                || entry.status.trim().is_empty()
+            {
+                if let Some(d) = &entry.discovery {
+                    if is_loopback_http_base(&d.base_url) {
+                        let root_ok = d
+                            .index_root
+                            .as_deref()
+                            .map(|r| discovery_matches_root(Some(r), root))
+                            .unwrap_or(false);
+                        if root_ok {
+                            if let Some(pid) = d.pid {
+                                if pid > 0 && pid <= i32::MAX as i64 && !pid_alive(pid as i32) {
+                                    // fall through
+                                } else {
+                                    return Some((d.base_url.clone(), d.auth_token.clone()));
+                                }
+                            } else {
+                                // No pid → require fail-closed (audit #7): skip.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2) Per-root discovery file (management-owned only preferred; still require match).
+        let per_root = root.join("oracle-data").join(DISCOVERY_FILE);
+        if let Ok(raw) = fs::read_to_string(&per_root) {
+            if let Ok(data) = serde_json::from_str::<Value>(&raw) {
+                if let Some((base, token, disc_root)) = discovery_from_json(&data) {
+                    // Require explicit indexRoot match — never trust legacy no-root files
+                    // for a scoped project (prevents cross-root content leak).
+                    if discovery_matches_root(disc_root.as_deref(), root) {
+                        return Some((base, token));
+                    }
+                }
+            }
+        }
+        // 3) Global discovery only if it advertises this exact root.
+        let global = projects_dir.join(DISCOVERY_FILE);
+        if let Ok(raw) = fs::read_to_string(global) {
+            if let Ok(data) = serde_json::from_str::<Value>(&raw) {
+                if let Some((base, token, disc_root)) = discovery_from_json(&data) {
+                    if discovery_matches_root(disc_root.as_deref(), root) {
+                        return Some((base, token));
+                    }
+                    // Mismatch or legacy no-indexRoot: fail closed for scoped.
+                    return None;
+                }
+            }
+        }
+        return None;
+    }
+
+    // Unscoped only: env override is allowed.
+    if let (Some(base), Some(token)) =
+        (env_first(ORACLE_HTTP_BASE_ENVS), env_first(ORACLE_HTTP_TOKEN_ENVS))
+    {
+        if !is_loopback_http_base(&base) {
+            return None;
+        }
+        return Some((base, token));
+    }
+    let path = projects_dir.join(DISCOVERY_FILE);
+    let raw = fs::read_to_string(path).ok()?;
+    let data: Value = serde_json::from_str(&raw).ok()?;
+    let (base, token, _) = discovery_from_json(&data)?;
+    Some((base, token))
 }
 
 fn http_timeout_secs() -> f64 {
@@ -813,7 +1236,7 @@ fn refilter_ask_payload(mut result: Value, allowed: &HashSet<String>) -> Value {
     result
 }
 
-struct FilterArgs {
+pub(crate) struct FilterArgs {
     kind: Option<String>,
     language: Option<String>,
     symbols: Option<Vec<String>>,
@@ -941,9 +1364,11 @@ fn dispatch_oracle_context(
     limit: i64,
     allowed: &HashSet<String>,
     filters: &FilterArgs,
+    index_root: Option<&Path>,
 ) -> ToolResult<Vec<Value>> {
-    // Fail-closed: concrete scope required (empty set is concrete → empty result).
-    let target = resolve_oracle_http_target(projects_dir)
+    // Fail-closed: require a live target first (empty scope is still a concrete
+    // empty result only when the resident server/discovery is reachable).
+    let target = resolve_oracle_http_target_for_root(projects_dir, index_root)
         .ok_or_else(|| ToolError::new(UNREACHABLE_MESSAGE))?;
     let (base, token) = target;
     if allowed.is_empty() {
@@ -974,8 +1399,9 @@ fn dispatch_oracle_ask(
     limit: i64,
     allowed: &HashSet<String>,
     filters: &FilterArgs,
+    index_root: Option<&Path>,
 ) -> ToolResult<Value> {
-    let target = resolve_oracle_http_target(projects_dir)
+    let target = resolve_oracle_http_target_for_root(projects_dir, index_root)
         .ok_or_else(|| ToolError::new(UNREACHABLE_MESSAGE))?;
     let (base, token) = target;
     if allowed.is_empty() {
@@ -990,6 +1416,79 @@ fn dispatch_oracle_ask(
     apply_filters(&mut payload, filters);
     let result = oracle_http_post(&base, &token, "/ask-bounded", &Value::Object(payload))?;
     Ok(refilter_ask_payload(result, allowed))
+}
+
+/// Fan-out context across registered roots and merge/re-rank (P3).
+///
+/// * `primary_root` — project root or management root (always queried first when
+///   allowed is non-empty for it).
+/// * `extra_roots` — additional roots; each must already be in the registry
+///   (fail closed with ToolError if not).
+pub(crate) fn dispatch_oracle_context_union(
+    projects_dir: &Path,
+    query: &str,
+    limit: i64,
+    filters: &FilterArgs,
+    primary_root: &Path,
+    primary_allowed: &HashSet<String>,
+    extra_roots: &[PathBuf],
+) -> ToolResult<Vec<Value>> {
+    let management_root = management_root_from_projects_dir(projects_dir);
+    let reg = load_oracle_roots_registry(&management_root);
+
+    let mut all: Vec<Value> = Vec::new();
+
+    // Primary root (may be empty scope → skip HTTP).
+    if !primary_allowed.is_empty() {
+        let chunks = dispatch_oracle_context(
+            projects_dir,
+            query,
+            limit,
+            primary_allowed,
+            filters,
+            Some(primary_root),
+        )?;
+        all.extend(tag_chunks_with_root(chunks, primary_root));
+    }
+
+    for extra in extra_roots {
+        if path_has_forbidden_components(extra) {
+            return Err(ToolError::new(
+                "extra_roots path is invalid (forbidden path components).",
+            ));
+        }
+        if !reg.is_registered(extra) {
+            return Err(ToolError::new(format!(
+                "Oracle extra_roots path is not a registered indexed root \
+                 (no query-time indexing): {}",
+                extra.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unregistered")
+            )));
+        }
+        // Allowed IDs for that root's own manifest.
+        let mut manifest = manifest_load(
+            &extra
+                .join("oracle-data")
+                .join("chunk-index-manifest.json"),
+        );
+        let allowed = manifest_files_for_root(&mut manifest, extra);
+        if allowed.is_empty() {
+            continue;
+        }
+        let chunks = dispatch_oracle_context(
+            projects_dir,
+            query,
+            limit,
+            &allowed,
+            filters,
+            Some(extra.as_path()),
+        )?;
+        all.extend(tag_chunks_with_root(chunks, extra));
+    }
+
+    let cap = limit.clamp(1, 50) as usize;
+    Ok(merge_rerank_chunks(all, cap))
 }
 
 // ── public tool handlers ────────────────────────────────────────────────────
@@ -1020,7 +1519,15 @@ pub fn oracle_ask(
     enforce_mini_oracle_project_scope(projects_dir, &agent_id, &role, pid.as_deref())?;
     let allowed = oracle_allowed_file_ids(projects_dir, pid.as_deref())?;
     let filters = parse_filter_args(kind, language, symbols, None, None, group_by_file);
-    let mut result = dispatch_oracle_ask(projects_dir, &query, limit, &allowed, &filters)?;
+    let index_root = oracle_index_root_for_project(projects_dir, pid.as_deref()).ok();
+    let mut result = dispatch_oracle_ask(
+        projects_dir,
+        &query,
+        limit,
+        &allowed,
+        &filters,
+        index_root.as_deref(),
+    )?;
     let status = http_readiness_placeholder();
     if let Some(obj) = result.as_object_mut() {
         obj.insert(
@@ -1058,6 +1565,39 @@ pub fn oracle_context(
     imports: Option<&[String]>,
     module: Option<&str>,
 ) -> ToolResult<Value> {
+    oracle_context_with_extra_roots(
+        projects_dir,
+        agent_id,
+        role,
+        session_token,
+        query,
+        limit,
+        project_id,
+        kind,
+        language,
+        symbols,
+        imports,
+        module,
+        &[],
+    )
+}
+
+/// Like [`oracle_context`] but can fan out to additional **registered** roots (P3).
+pub fn oracle_context_with_extra_roots(
+    projects_dir: &Path,
+    agent_id: &str,
+    role: &str,
+    session_token: Option<&str>,
+    query: &str,
+    limit: Option<i64>,
+    project_id: Option<&str>,
+    kind: Option<&str>,
+    language: Option<&str>,
+    symbols: Option<&[String]>,
+    imports: Option<&[String]>,
+    module: Option<&str>,
+    extra_roots: &[PathBuf],
+) -> ToolResult<Value> {
     let (agent_id, role) =
         require_agent_tool(projects_dir, agent_id, role, "oracle_context", session_token)?;
     enforce_mini_oracle_project_scope(
@@ -1066,6 +1606,25 @@ pub fn oracle_context(
         &role,
         project_id.map(str::trim).filter(|s| !s.is_empty()),
     )?;
+    // SEC: mini must never fan out to other registered roots (P2 audit #3).
+    if role == "mini" && !extra_roots.is_empty() {
+        return Err(ToolError::new(
+            "A mini agent cannot use extra_roots (multi-root union is not allowed for mini).",
+        ));
+    }
+    // Cap fan-out (DoS / timeout storms).
+    if extra_roots.len() > 8 {
+        return Err(ToolError::new(
+            "extra_roots is limited to at most 8 registered roots.",
+        ));
+    }
+    for er in extra_roots {
+        if path_has_forbidden_components(er) {
+            return Err(ToolError::new(
+                "extra_roots path is invalid (forbidden path components).",
+            ));
+        }
+    }
     let query = clean_text(query, "Query", 2000)?;
     let limit = limit.unwrap_or(8).clamp(1, 50);
     let pid = project_id
@@ -1083,7 +1642,27 @@ pub fn oracle_context(
     );
     let allowed = oracle_allowed_file_ids(projects_dir, pid.as_deref())?;
     let filters = parse_filter_args(kind, language, symbols, imports, module, false);
-    let chunks = dispatch_oracle_context(projects_dir, &query, limit, &allowed, &filters)?;
+    let primary_root = oracle_index_root_for_project(projects_dir, pid.as_deref())?;
+    let chunks = if extra_roots.is_empty() {
+        dispatch_oracle_context(
+            projects_dir,
+            &query,
+            limit,
+            &allowed,
+            &filters,
+            Some(primary_root.as_path()),
+        )?
+    } else {
+        dispatch_oracle_context_union(
+            projects_dir,
+            &query,
+            limit,
+            &filters,
+            &primary_root,
+            &allowed,
+            extra_roots,
+        )?
+    };
     let status = http_readiness_placeholder();
     Ok(json!({
         "query": query,
@@ -1135,7 +1714,15 @@ pub fn oracle_find(
         None,
         false,
     );
-    let chunks = dispatch_oracle_context(projects_dir, &query, find_limit, &scope, &filters)?;
+    let index_root = oracle_index_root_for_project(projects_dir, pid.as_deref()).ok();
+    let chunks = dispatch_oracle_context(
+        projects_dir,
+        &query,
+        find_limit,
+        &scope,
+        &filters,
+        index_root.as_deref(),
+    )?;
     let status = http_readiness_placeholder();
     Ok(json!({
         "query": query,
@@ -1162,7 +1749,17 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drop cached HTTP targets so tests that clear env/discovery don't see
+    /// a stale hit from a prior case (TTL is 5s).
+    fn clear_target_cache() {
+        if let Ok(mut g) = TARGET_CACHE.lock() {
+            *g = None;
+        }
     }
 
     fn temp_projects() -> (TempDir, PathBuf) {
@@ -1196,6 +1793,490 @@ mod tests {
         assert!(allowed.is_empty() || !allowed.is_empty());
     }
 
+    /// F45 / P1: project-scoped allowed IDs must load the **project root**
+    /// manifest, not the management-root manifest. External attached projects
+    /// only have files under their own `oracle-data/`.
+    #[test]
+    fn project_scoped_allowed_ids_use_project_root_manifest() {
+        let _g = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let external = tmp.path().join("external-app");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(external.join("oracle-data")).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+
+        // Management has only mgmt-only files. Key must match the path form
+        // management_root_from_projects_dir returns (may differ from canonicalize
+        // on macOS /var vs /private/var) — write BOTH keys when they differ.
+        let mgmt_as_resolver = management_root_from_projects_dir(&projects);
+        let mgmt_canon = mgmt.canonicalize().unwrap_or_else(|_| mgmt.clone());
+        let mut mgmt_roots = serde_json::Map::new();
+        for key in [mgmt_as_resolver.to_string_lossy().to_string(), mgmt_canon.to_string_lossy().to_string()] {
+            mgmt_roots.insert(
+                key,
+                json!({"files": { "mgmt-only.rs": { "hash": "a" } }}),
+            );
+        }
+        fs::write(
+            mgmt.join("oracle-data").join("chunk-index-manifest.json"),
+            json!({
+                "version": 1,
+                "root": mgmt_as_resolver.to_string_lossy(),
+                "roots": mgmt_roots,
+                "files": { "mgmt-only.rs": { "hash": "a" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // External project has its own index (the F45 case).
+        // Project work-root is canonicalized by validate_project_work_root.
+        let ext_canon = external.canonicalize().unwrap();
+        let ext_key_s = ext_canon.to_string_lossy().to_string();
+        fs::write(
+            external
+                .join("oracle-data")
+                .join("chunk-index-manifest.json"),
+            json!({
+                "version": 1,
+                "root": ext_key_s,
+                "roots": {
+                    ext_key_s.clone(): {
+                        "files": {
+                            "README.md": { "hash": "b" },
+                            "index.html": { "hash": "c" }
+                        }
+                    }
+                },
+                "files": {
+                    "README.md": { "hash": "b" },
+                    "index.html": { "hash": "c" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let md = format!(
+            "---\nid: external-app\ntitle: External\nstatus: active\nroot_path: {}\nupdated_at: 2026-01-01T00:00:00Z\n---\n\n```aspis-project\n{{\"version\":1,\"tasks\":[],\"notes\":[]}}\n```\n",
+            external.display()
+        );
+        fs::write(projects.join("external-app.md"), md).unwrap();
+
+        let allowed =
+            oracle_allowed_file_ids(&projects, Some("external-app")).expect("allowed ids");
+        assert!(
+            allowed.contains("README.md"),
+            "must include project-root manifest files, got {allowed:?}"
+        );
+        assert!(
+            allowed.contains("index.html"),
+            "must include project-root manifest files, got {allowed:?}"
+        );
+        assert!(
+            !allowed.contains("mgmt-only.rs"),
+            "must NOT pull management-root files into project scope: {allowed:?}"
+        );
+        assert_eq!(allowed.len(), 2, "{allowed:?}");
+    }
+
+    /// Unscoped stays on management-root manifest only (never silent union).
+    #[test]
+    fn unscoped_allowed_ids_use_management_manifest_only() {
+        let _g = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let external = tmp.path().join("other");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(external.join("oracle-data")).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+
+        let mgmt_as_resolver = management_root_from_projects_dir(&projects);
+        let mgmt_canon = mgmt.canonicalize().unwrap_or_else(|_| mgmt.clone());
+        let mut mgmt_roots = serde_json::Map::new();
+        for key in [mgmt_as_resolver.to_string_lossy().to_string(), mgmt_canon.to_string_lossy().to_string()] {
+            mgmt_roots.insert(
+                key,
+                json!({"files": { "only-mgmt.ts": { "hash": "m" } }}),
+            );
+        }
+        fs::write(
+            mgmt.join("oracle-data").join("chunk-index-manifest.json"),
+            json!({
+                "version": 1,
+                "root": mgmt_as_resolver.to_string_lossy(),
+                "roots": mgmt_roots,
+                "files": { "only-mgmt.ts": { "hash": "m" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ext_key = external.canonicalize().unwrap();
+        let ext_key_s = ext_key.to_string_lossy().to_string();
+        fs::write(
+            external
+                .join("oracle-data")
+                .join("chunk-index-manifest.json"),
+            json!({
+                "version": 1,
+                "root": ext_key_s,
+                "roots": {
+                    ext_key_s: {
+                        "files": { "other.md": { "hash": "o" } }
+                    }
+                },
+                "files": { "other.md": { "hash": "o" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let allowed = oracle_allowed_file_ids(&projects, None).unwrap();
+        assert!(
+            allowed.contains("only-mgmt.ts"),
+            "unscoped must see management files: {allowed:?}"
+        );
+        assert!(
+            !allowed.contains("other.md"),
+            "unscoped must NOT union external project manifests: {allowed:?}"
+        );
+    }
+
+    /// P1 audit: corrupt non-object manifest must not panic — empty allowlist.
+    #[test]
+    fn project_scoped_non_object_manifest_is_empty_not_panic() {
+        let _g = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let external = tmp.path().join("corrupt-app");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(external.join("oracle-data")).unwrap();
+        fs::write(
+            external
+                .join("oracle-data")
+                .join("chunk-index-manifest.json"),
+            "[]",
+        )
+        .unwrap();
+        let md = format!(
+            "---\nid: corrupt-app\ntitle: C\nstatus: active\nroot_path: {}\nupdated_at: 2026-01-01T00:00:00Z\n---\n\n```aspis-project\n{{\"version\":1,\"tasks\":[],\"notes\":[]}}\n```\n",
+            external.display()
+        );
+        fs::write(projects.join("corrupt-app.md"), md).unwrap();
+        let allowed = oracle_allowed_file_ids(&projects, Some("corrupt-app")).expect("ok");
+        assert!(allowed.is_empty(), "corrupt manifest → empty, got {allowed:?}");
+    }
+
+    /// Unscoped with only canonical root key still resolves (macOS /var fold).
+    #[test]
+    fn unscoped_resolves_when_manifest_key_is_canonical_only() {
+        let _g = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        let mgmt_canon = mgmt.canonicalize().unwrap();
+        let key = mgmt_canon.to_string_lossy().to_string();
+        fs::write(
+            mgmt.join("oracle-data").join("chunk-index-manifest.json"),
+            json!({
+                "version": 1,
+                "root": key,
+                "roots": { key.clone(): { "files": { "canon-only.rs": {"hash":"1"} } } },
+                "files": { "canon-only.rs": {"hash":"1"} }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let allowed = oracle_allowed_file_ids(&projects, None).unwrap();
+        assert!(
+            allowed.contains("canon-only.rs"),
+            "must match via path_keys_equivalent, got {allowed:?}"
+        );
+    }
+
+    // ── P2 registry ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn registry_round_trip_and_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        let root_a = tmp.path().join("proj-a");
+        let root_b = tmp.path().join("proj-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let mut reg = OracleRootsRegistry::default();
+        reg.upsert(OracleRootEntry {
+            path: root_a.to_string_lossy().to_string(),
+            manifest_path: root_a
+                .join("oracle-data/chunk-index-manifest.json")
+                .to_string_lossy()
+                .to_string(),
+            discovery: Some(OracleRootDiscovery {
+                base_url: "http://127.0.0.1:9001".into(),
+                auth_token: "tok-a".into(),
+                pid: Some(111),
+                index_root: Some(root_a.to_string_lossy().to_string()),
+            }),
+            last_indexed_at: Some("2026-07-21T00:00:00Z".into()),
+            status: "indexed".into(),
+        });
+        reg.upsert(OracleRootEntry {
+            path: root_b.to_string_lossy().to_string(),
+            manifest_path: root_b
+                .join("oracle-data/chunk-index-manifest.json")
+                .to_string_lossy()
+                .to_string(),
+            discovery: Some(OracleRootDiscovery {
+                base_url: "http://127.0.0.1:9002".into(),
+                auth_token: "tok-b".into(),
+                pid: Some(222),
+                index_root: Some(root_b.to_string_lossy().to_string()),
+            }),
+            last_indexed_at: None,
+            status: "indexed".into(),
+        });
+        save_oracle_roots_registry(&mgmt, &reg).unwrap();
+        let loaded = load_oracle_roots_registry(&mgmt);
+        assert_eq!(loaded.roots.len(), 2);
+        let a = loaded.lookup_by_path(&root_a).expect("root a");
+        assert_eq!(
+            a.discovery.as_ref().map(|d| d.auth_token.as_str()),
+            Some("tok-a")
+        );
+        assert!(loaded.is_registered(&root_b));
+        assert!(!loaded.is_registered(Path::new("/tmp/not-registered-xyz")));
+    }
+
+    #[test]
+    fn registry_missing_file_is_empty_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("no-reg");
+        fs::create_dir_all(&mgmt).unwrap();
+        let reg = load_oracle_roots_registry(&mgmt);
+        assert!(reg.roots.is_empty());
+        assert!(!reg.is_registered(Path::new("/any")));
+    }
+
+    #[test]
+    fn resolve_target_uses_registry_discovery_for_project_root() {
+        let _g = env_lock();
+        clear_target_cache();
+        for k in ORACLE_HTTP_BASE_ENVS
+            .iter()
+            .chain(ORACLE_HTTP_TOKEN_ENVS.iter())
+        {
+            std::env::remove_var(k);
+        }
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let root_a = tmp.path().join("proj-a");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        fs::create_dir_all(&root_a).unwrap();
+
+        let mut reg = OracleRootsRegistry::default();
+        reg.upsert(OracleRootEntry {
+            path: normalize_root_key(&root_a),
+            manifest_path: String::new(),
+            discovery: Some(OracleRootDiscovery {
+                base_url: "http://127.0.0.1:9111".into(),
+                auth_token: "secret-a".into(),
+                // Live pid required (fail-closed without pid — P2 audit #7).
+                pid: Some(std::process::id() as i64),
+                index_root: Some(normalize_root_key(&root_a)),
+            }),
+            last_indexed_at: None,
+            status: "indexed".into(),
+        });
+        save_oracle_roots_registry(&mgmt, &reg).unwrap();
+
+        // Global discovery points at a DIFFERENT root — must not win for root_a.
+        fs::write(
+            projects.join(DISCOVERY_FILE),
+            json!({
+                "baseUrl": "http://127.0.0.1:7000",
+                "authToken": "global-tok",
+                "indexRoot": mgmt.to_string_lossy(),
+                "pid": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let target = resolve_oracle_http_target_for_root(&projects, Some(&root_a))
+            .expect("registry discovery");
+        assert_eq!(target.0, "http://127.0.0.1:9111");
+        assert_eq!(target.1, "secret-a");
+    }
+
+    #[test]
+    fn resolve_target_fail_closed_when_global_index_root_mismatches() {
+        let _g = env_lock();
+        clear_target_cache();
+        for k in ORACLE_HTTP_BASE_ENVS
+            .iter()
+            .chain(ORACLE_HTTP_TOKEN_ENVS.iter())
+        {
+            std::env::remove_var(k);
+        }
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let external = tmp.path().join("external");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        // No registry entry.
+        fs::write(
+            projects.join(DISCOVERY_FILE),
+            json!({
+                "baseUrl": "http://127.0.0.1:7000",
+                "authToken": "global-tok",
+                "indexRoot": mgmt.canonicalize().unwrap().to_string_lossy(),
+                "heartbeatAt": chrono::Utc::now().to_rfc3339()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let miss = resolve_oracle_http_target_for_root(&projects, Some(&external));
+        assert!(
+            miss.is_none(),
+            "must not use global server for a different root: {miss:?}"
+        );
+    }
+
+    // ── P3 union ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_rerank_caps_and_orders_by_score() {
+        let chunks = vec![
+            json!({"file_id": "a", "score": 0.1}),
+            json!({"file_id": "b", "score": 0.9}),
+            json!({"file_id": "c", "score": 0.5}),
+            json!({"file_id": "d", "score": 0.7}),
+        ];
+        let merged = merge_rerank_chunks(chunks, 2);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["file_id"], "b");
+        assert_eq!(merged[1]["file_id"], "d");
+    }
+
+    #[test]
+    fn union_rejects_unregistered_extra_root() {
+        let _g = env_lock();
+        clear_target_cache();
+        for k in ORACLE_HTTP_BASE_ENVS
+            .iter()
+            .chain(ORACLE_HTTP_TOKEN_ENVS.iter())
+        {
+            std::env::remove_var(k);
+        }
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let primary = tmp.path().join("primary");
+        let rogue = tmp.path().join("rogue");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&rogue).unwrap();
+        // Empty registry — rogue not registered.
+        let filters = parse_filter_args(None, None, None, None, None, false);
+        let err = dispatch_oracle_context_union(
+            &projects,
+            "q",
+            5,
+            &filters,
+            &primary,
+            &HashSet::new(),
+            &[rogue],
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("not a registered") || err.message.contains("unregistered"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn mini_cannot_use_extra_roots() {
+        let _g = env_lock();
+        clear_target_cache();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "mini-extra", "mini");
+        with_agents_lock(&projects, || {
+            let mut state = read_agents_state(&projects).unwrap();
+            if let Some(s) = crate::state::find_session_mut(&mut state, "mini-extra") {
+                s.insert("currentProjectId".into(), json!("proj-a"));
+            }
+            write_agents_state(&projects, state).unwrap();
+            Ok::<(), ToolError>(())
+        })
+        .unwrap();
+        let err = oracle_context_with_extra_roots(
+            &projects,
+            "mini-extra",
+            "mini",
+            Some(&tok),
+            "query",
+            Some(3),
+            Some("proj-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[PathBuf::from("/tmp/some-registered")],
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("extra_roots") || err.message.contains("mini"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn env_override_does_not_apply_to_scoped_root() {
+        let _g = env_lock();
+        clear_target_cache();
+        std::env::set_var("DEVBOULE_ORACLE_HTTP_BASE", "http://127.0.0.1:19999");
+        std::env::set_var("DEVBOULE_ORACLE_AUTH_TOKEN", "env-tok");
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        let projects = mgmt.join("projects");
+        let external = tmp.path().join("ext");
+        fs::create_dir_all(&projects).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::create_dir_all(mgmt.join("oracle-data")).unwrap();
+        // No registry/discovery for external — env must NOT fill in.
+        let miss = resolve_oracle_http_target_for_root(&projects, Some(&external));
+        assert!(
+            miss.is_none(),
+            "scoped root must not use env override: {miss:?}"
+        );
+        // Unscoped still may use env.
+        let unscoped = resolve_oracle_http_target_for_root(&projects, None);
+        assert_eq!(
+            unscoped,
+            Some(("http://127.0.0.1:19999".into(), "env-tok".into()))
+        );
+        std::env::remove_var("DEVBOULE_ORACLE_HTTP_BASE");
+        std::env::remove_var("DEVBOULE_ORACLE_AUTH_TOKEN");
+        clear_target_cache();
+    }
+
     #[test]
     fn loopback_gate_rejects_remote_base() {
         assert!(!is_loopback_http_base("https://evil.example/oracle"));
@@ -1206,6 +2287,7 @@ mod tests {
     #[test]
     fn oracle_ask_fail_closed_without_server() {
         let _g = env_lock();
+        clear_target_cache();
         // Clear any env targets.
         for k in ORACLE_HTTP_BASE_ENVS
             .iter()

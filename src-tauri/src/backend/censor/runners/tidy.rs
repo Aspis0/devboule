@@ -5,13 +5,19 @@
 //! settled) loop. We invoke it in error-checking mode:
 //!
 //! ```text
-//! tidy -q -e <file>
+//! tidy -q -e \
+//!   --new-blocklevel-tags header,main,section,article,nav,footer,aside,figure,figcaption,dialog,template,details,summary \
+//!   --new-inline-tags mark,time,output,progress,meter,datalist \
+//!   <file>
 //! ```
 //!
 //! Flags:
 //!   - `-q` (quiet) — suppress the version banner / non-diagnostic chatter.
 //!   - `-e` (errors) — show ONLY errors and warnings; do NOT emit the cleaned markup on
 //!     stdout (we never want tidy to print a rewritten document).
+//!   - `--new-blocklevel-tags` / `--new-inline-tags` — teach pre-HTML5 tidy (e.g. the
+//!     ancient macOS system build) about modern elements so `<header>`, `<main>`, etc.
+//!     are not false "not recognized" findings. Harmless additive options on tidy 5.x.
 //!
 //! tidy writes its diagnostics to STDERR in the form:
 //!
@@ -67,6 +73,7 @@ pub fn parse_tidy(stderr: &str, file_hint: &str) -> Vec<RawFinding> {
 /// [`RawFinding`], or `None` if the line does not match the shape (no panic). The
 /// recognized severities are `Warning` and `Error` (case-insensitively); any other
 /// leading token (e.g. tidy's `Info:` or a summary line) → `None`. An empty message → `None`.
+/// Also drops residual macOS-tidy noise: `<{taught-html5-tag}> is not approved by W3C`.
 fn parse_tidy_line(line: &str, file: &str) -> Option<RawFinding> {
     // Expected: "line N column M - Severity: message"
     let rest = line.strip_prefix("line ")?;
@@ -87,6 +94,10 @@ fn parse_tidy_line(line: &str, file: &str) -> Option<RawFinding> {
     if sev_lower != "warning" && sev_lower != "error" {
         return None;
     }
+    // Ancient tidy still warns that taught HTML5 tags are "not approved by W3C" — drop those.
+    if is_taught_html5_not_approved_noise(message) {
+        return None;
+    }
     // tidy emits `0` as a line number for a document-level note; treat that as no line.
     let line_field = (line_no != 0).then_some(line_no);
 
@@ -103,6 +114,47 @@ fn parse_tidy_line(line: &str, file: &str) -> Option<RawFinding> {
     })
 }
 
+/// HTML5 tags taught to pre-HTML5 tidy via `--new-blocklevel-tags` / `--new-inline-tags`
+/// (option name and comma-list are separate argv tokens). Shared so tests can assert the
+/// token shape without requiring a specific tidy binary version.
+const HTML5_BLOCKLEVEL_TAGS: &str =
+    "header,main,section,article,nav,footer,aside,figure,figcaption,dialog,template,details,summary";
+const HTML5_INLINE_TAGS: &str = "mark,time,output,progress,meter,datalist";
+
+/// True when `message` is exactly `<{tag}> is not approved by W3C` for a taught HTML5 tag
+/// (case-insensitive tag compare). Proprietary tags keep their "not approved" findings.
+fn is_taught_html5_not_approved_noise(message: &str) -> bool {
+    let rest = match message.strip_prefix('<') {
+        Some(r) => r,
+        None => return false,
+    };
+    let (tag, after_tag) = match rest.split_once('>') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if after_tag != " is not approved by W3C" {
+        return false;
+    }
+    let tag_l = tag.to_ascii_lowercase();
+    HTML5_BLOCKLEVEL_TAGS
+        .split(',')
+        .chain(HTML5_INLINE_TAGS.split(','))
+        .any(|t| t.eq_ignore_ascii_case(&tag_l))
+}
+
+/// Build tidy argv: `-q -e`, HTML5 tag options, then the file path last.
+fn tidy_argv(file_rel_path: &str) -> Vec<&str> {
+    vec![
+        "-q",
+        "-e",
+        "--new-blocklevel-tags",
+        HTML5_BLOCKLEVEL_TAGS,
+        "--new-inline-tags",
+        HTML5_INLINE_TAGS,
+        file_rel_path,
+    ]
+}
+
 /// Run tidy on a single file from the project root. Absent `tidy` → empty (never an
 /// error). Diagnostics go to STDERR (stdout would carry the cleaned markup, which `-e`
 /// suppresses), so we capture the stderr stream with the default per-file timeout. The
@@ -113,9 +165,10 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
     if !crate::backend::projects::command_exists("tidy") {
         return Vec::new();
     }
+    let args = tidy_argv(&target.file_rel_path);
     let stderr = run_capture_stderr_with_timeout(
         "tidy",
-        &["-q", "-e", &target.file_rel_path],
+        &args,
         root,
         DEFAULT_RUNNER_TIMEOUT,
     );
@@ -211,6 +264,32 @@ line 12 column 4 - Error: unescaped & or unknown entity
         assert!(!f.title.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {}", f.title);
         assert!(!f.body.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {}", f.body);
         assert!(f.body.contains("[redacted]"));
+    }
+
+    #[test]
+    fn tidy_argv_teaches_html5_tags_as_separate_tokens() {
+        // Option names and comma-lists are SEPARATE argv entries; -q -e first, file last.
+        let args = tidy_argv("index.html");
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], "-e");
+        assert_eq!(args[2], "--new-blocklevel-tags");
+        assert!(args[3].contains("header") && args[3].contains("main"));
+        assert_eq!(args[4], "--new-inline-tags");
+        assert!(args[5].contains("mark") && args[5].contains("time"));
+        assert_eq!(args[6], "index.html");
+    }
+
+    #[test]
+    fn drops_taught_html5_not_approved_keeps_proprietary() {
+        // Ancient tidy residual noise for taught tags vs genuine proprietary tags.
+        let stderr = "\
+line 1 column 18 - Warning: <header> is not approved by W3C
+line 2 column 1 - Warning: <blink> is not approved by W3C
+";
+        let findings = parse_tidy(stderr, "index.html");
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert_eq!(findings[0].line, Some(2));
+        assert!(findings[0].body.contains("<blink> is not approved by W3C"));
     }
 
     // ---- presence-gated integration: skip when tidy absent; ONE tiny run when present

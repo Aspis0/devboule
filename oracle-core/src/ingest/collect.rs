@@ -15,6 +15,7 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".cxx",
     ".agents",
     ".aspis",
+    ".aspis-censor",
     ".claude",
     ".claude-mimo",
     ".codex",
@@ -33,6 +34,7 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".mypy_cache",
     ".next",
     ".npm-cache",
+    ".pi",
     ".pytest_cache",
     ".rnaseq-reference-cache",
     ".ruff_cache",
@@ -761,5 +763,13 @@ mod tests {
         assert!(!basename_is_secret(".tokenrc")); // no data extension anyway
         assert!(basename_is_secret("my-secret-config.json"));
         assert!(!basename_is_secret("readme.json"));
+    }
+
+    /// F30: censor/pi noise dirs must not be ingested.
+    #[test]
+    fn excluded_dirs_includes_censor_and_pi() {
+        assert!(EXCLUDED_DIRS.contains(&".aspis-censor"));
+        assert!(EXCLUDED_DIRS.contains(&".pi"));
+        assert!(EXCLUDED_DIRS.contains(&"oracle-data"));
     }
 }

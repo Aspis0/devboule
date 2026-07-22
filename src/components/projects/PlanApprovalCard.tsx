@@ -123,7 +123,24 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
           planId: request.id,
         });
         if (!mountedRef.current) return;
-        setExpanded({ requestId: request.id, markdown: md ?? "", loading: false, error: null });
+        // F04: empty/failed load must not render MarkdownRenderer(null) → blank
+        // expand with no error. Surface an explicit message instead.
+        const text = (md ?? "").trim();
+        if (!text) {
+          setExpanded({
+            requestId: request.id,
+            markdown: null,
+            loading: false,
+            error: "Plan markdown is empty or missing on disk.",
+          });
+          return;
+        }
+        setExpanded({
+          requestId: request.id,
+          markdown: text,
+          loading: false,
+          error: null,
+        });
       } catch (e) {
         if (mountedRef.current) {
           setExpanded({
@@ -158,6 +175,12 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
           if (mountedRef.current) setLastResolved(null);
         }, RESOLVED_LINGER_MS);
         if (expanded?.requestId === request.id) setExpanded(null);
+        // F05: notify PlansDockTab to refetch approval history immediately.
+        try {
+          window.dispatchEvent(new CustomEvent("devboule:plans-refresh"));
+        } catch {
+          /* ignore */
+        }
         // Do NOT manually reset inFlightRef here: `load()` owns it via try/finally.
         // Resetting it would let a poll load already in flight be stomped, opening a
         // concurrent-load race. If a poll load is running, this load() correctly bails.

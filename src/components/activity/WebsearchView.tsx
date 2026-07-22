@@ -10,8 +10,13 @@ interface WebsearchViewProps {
   live: boolean;
 }
 
-export function WebsearchView({ pages, findings, isAuto, live }: WebsearchViewProps) {
-  const idle = !live && pages.length === 0;
+export function WebsearchView({ pages, findings, isAuto, live: _live }: WebsearchViewProps) {
+  // F25: idle when there is no websearch payload. A merely-alive orchestrator
+  // (parent passed live=!!orchestratorAgentId) must NOT show the "READING LIVE
+  // PAGES / loading…" skeleton — that looked stuck when no search was running.
+  // `_live` kept for API stability / future "search in flight" signal.
+  void _live;
+  const idle = pages.length === 0 && findings.length === 0;
   const total = Math.max(pages.length, 3);
   const shown = Math.min(pages.length, 3);
 

@@ -249,6 +249,134 @@ mod tests {
             true
         ));
     }
+
+    #[test]
+    fn f41_activity_write_path_never_dual_writes_bridged() {
+        use super::AgenticActivityWritePath;
+        use super::agentic_activity_write_path;
+        // Production path: store + projects_dir → bridged only (no second file write).
+        assert_eq!(
+            agentic_activity_write_path(true, true),
+            AgenticActivityWritePath::BridgedOnly
+        );
+        assert_eq!(
+            agentic_activity_write_path(true, false),
+            AgenticActivityWritePath::StorePlusFile
+        );
+        assert_eq!(
+            agentic_activity_write_path(false, true),
+            AgenticActivityWritePath::FileOnly
+        );
+        assert_eq!(
+            agentic_activity_write_path(false, false),
+            AgenticActivityWritePath::FileOnly
+        );
+    }
+}
+
+/// F41: how a single milestone is persisted (never dual-write to the same JSONL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgenticActivityWritePath {
+    /// MiniActivityStore + projects_dir → `update_bridged` alone (file write included).
+    BridgedOnly,
+    /// Store without projects_dir → in-memory + optional direct file.
+    StorePlusFile,
+    /// No store → direct file only.
+    FileOnly,
+}
+
+/// Pure decision for F41 — unit-tested so dual-write cannot regress silently.
+pub(crate) fn agentic_activity_write_path(
+    has_store: bool,
+    has_projects_dir: bool,
+) -> AgenticActivityWritePath {
+    match (has_store, has_projects_dir) {
+        (true, true) => AgenticActivityWritePath::BridgedOnly,
+        (true, false) => AgenticActivityWritePath::StorePlusFile,
+        (false, _) => AgenticActivityWritePath::FileOnly,
+    }
+}
+
+/// F08: append one milestone so the Work console lights up live during an agentic run.
+///
+/// F41: write the durable JSONL bridge **once**. Prefer the MiniActivityStore path
+/// (`update_bridged` already appends the bridge line). Direct file write is only the
+/// fallback when the store is unavailable (unit tests / no AppHandle state) — never both.
+/// Best-effort — observability never blocks the loop.
+fn append_agentic_activity(
+    activity_file: Option<&std::path::Path>,
+    app: &AppHandle,
+    agent_id: &str,
+    text: &str,
+    node: Option<super::mini_activity::NodeStyle>,
+) {
+    let has_store = app
+        .try_state::<super::mini_activity::MiniActivityStore>()
+        .is_some();
+    let projects_dir = super::projects::ensure_projects_dir(app).ok();
+    let path = agentic_activity_write_path(has_store, projects_dir.is_some());
+    match path {
+        AgenticActivityWritePath::BridgedOnly => {
+            let store = app
+                .try_state::<super::mini_activity::MiniActivityStore>()
+                .expect("has_store");
+            let pd = projects_dir.as_ref().expect("has_projects_dir");
+            let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+            let text_owned = text.to_string();
+            let f = move |a: &mut super::mini_activity::ConsoleActivity| {
+                super::mini_activity::push_coder_milestone(a, &text_owned, node, &ts);
+            };
+            store.update_bridged(app, agent_id, pd, f);
+        }
+        AgenticActivityWritePath::StorePlusFile => {
+            if let Some(store) = app.try_state::<super::mini_activity::MiniActivityStore>() {
+                let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                let text_owned = text.to_string();
+                let for_file = text_owned.clone();
+                let f = move |a: &mut super::mini_activity::ConsoleActivity| {
+                    super::mini_activity::push_coder_milestone(a, &text_owned, node, &ts);
+                };
+                store.update(app, agent_id, f);
+                write_agentic_activity_file_line(activity_file, &for_file, node);
+            }
+        }
+        AgenticActivityWritePath::FileOnly => {
+            write_agentic_activity_file_line(activity_file, text, node);
+        }
+    }
+}
+
+/// Direct JSONL append used only when MiniActivityStore is absent (or projects_dir
+/// missing so `update_bridged` cannot resolve the path). F41: never pair this with
+/// a successful `update_bridged` for the same milestone.
+fn write_agentic_activity_file_line(
+    activity_file: Option<&std::path::Path>,
+    text: &str,
+    node: Option<super::mini_activity::NodeStyle>,
+) {
+    let Some(path) = activity_file else {
+        return;
+    };
+    let capped: String = text.chars().take(240).collect();
+    let node_val = match node {
+        Some(super::mini_activity::NodeStyle::Dot) => "dot",
+        Some(super::mini_activity::NodeStyle::Sage) => "sage",
+        Some(super::mini_activity::NodeStyle::Terra) => "terra",
+        Some(super::mini_activity::NodeStyle::Hollow) | None => "",
+    };
+    let line = serde_json::json!({
+        "kind": "milestone",
+        "text": capped,
+        "node": node_val,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// Launch the AGENTIC tool-loop coder on a detached worker thread — the peer of
@@ -326,6 +454,16 @@ pub(crate) fn spawn_agentic_worker(
         )
     });
 
+    // F08: resolve the activity JSONL path BEFORE spawning so the worker can append
+    // live milestones (start / tool rounds / done|failed). Same directory other
+    // coders use (`.devboule-activity/<agent_id>.jsonl`). Best-effort: missing
+    // projects dir disables the bridge without blocking the run.
+    let activity_file = super::projects::ensure_projects_dir(app)
+        .ok()
+        .and_then(|pd| super::mini_activity::activity_file_path(&pd, &agent_id));
+    let activity_agent_id = agent_id.clone();
+    let app_for_console = app.clone();
+
     let spawned = std::thread::Builder::new()
         .name("agentic-coder-worker".into())
         .spawn(move || {
@@ -341,6 +479,50 @@ pub(crate) fn spawn_agentic_worker(
                 agentic_skill_block.as_deref(),
                 agentic_lang_block.as_deref(),
             );
+
+            // F08: start milestone so the Work console is not blind during the run.
+            append_agentic_activity(
+                activity_file.as_deref(),
+                &app_for_console,
+                &activity_agent_id,
+                "Agentic coder started",
+                Some(super::mini_activity::NodeStyle::Dot),
+            );
+
+            let mut progress_cb = |p: crate::backend::agentic_loop::AgenticProgress| {
+                match p {
+                    crate::backend::agentic_loop::AgenticProgress::ToolRound {
+                        round,
+                        tool_names,
+                    } => {
+                        let names = if tool_names.is_empty() {
+                            "tool".to_string()
+                        } else {
+                            // Cap the joined list so a pathological multi-tool turn
+                            // cannot bloat the bridge file.
+                            let joined = tool_names
+                                .iter()
+                                .take(6)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if tool_names.len() > 6 {
+                                format!("{joined}, …")
+                            } else {
+                                joined
+                            }
+                        };
+                        append_agentic_activity(
+                            activity_file.as_deref(),
+                            &app_for_console,
+                            &activity_agent_id,
+                            &format!("Round {round}: {names}"),
+                            Some(super::mini_activity::NodeStyle::Sage),
+                        );
+                    }
+                }
+            };
+
             let json = match crate::backend::agentic_runner::run_agentic_coder(
                 base_url,
                 model,
@@ -355,8 +537,37 @@ pub(crate) fn spawn_agentic_worker(
                 max_rounds,
                 &cancel,
                 api_key,
+                Some(&mut progress_cb),
             ) {
                 Ok((outcome, touched, net_blocked, out_of_scope_write)) => {
+                    let done_text = match &outcome {
+                        crate::backend::agentic_loop::LoopOutcome::Done { rounds, .. } => {
+                            format!(
+                                "Agentic coder done · {rounds} round{} · {} file{}",
+                                if *rounds != 1 { "s" } else { "" },
+                                touched.len(),
+                                if touched.len() != 1 { "s" } else { "" }
+                            )
+                        }
+                        crate::backend::agentic_loop::LoopOutcome::Aborted { reason, rounds } => {
+                            format!("Agentic coder stopped · round {rounds}: {reason}")
+                        }
+                    };
+                    let style = match &outcome {
+                        crate::backend::agentic_loop::LoopOutcome::Done { .. } => {
+                            Some(super::mini_activity::NodeStyle::Sage)
+                        }
+                        crate::backend::agentic_loop::LoopOutcome::Aborted { .. } => {
+                            Some(super::mini_activity::NodeStyle::Terra)
+                        }
+                    };
+                    append_agentic_activity(
+                        activity_file.as_deref(),
+                        &app_for_console,
+                        &activity_agent_id,
+                        &done_text,
+                        style,
+                    );
                     crate::backend::agentic_runner::agentic_result_json(
                         &outcome,
                         &touched,
@@ -366,15 +577,24 @@ pub(crate) fn spawn_agentic_worker(
                 }
                 // Transport/init failure → escalate (NOT a false "done"); net_blocked=false,
                 // out_of_scope_write=None (the LLM never got to run a tool).
-                Err(e) => crate::backend::agentic_runner::agentic_result_json(
-                    &crate::backend::agentic_loop::LoopOutcome::Aborted {
-                        reason: e,
-                        rounds: 0,
-                    },
-                    &[],
-                    false,
-                    None,
-                ),
+                Err(e) => {
+                    append_agentic_activity(
+                        activity_file.as_deref(),
+                        &app_for_console,
+                        &activity_agent_id,
+                        &format!("Agentic coder failed: {e}"),
+                        Some(super::mini_activity::NodeStyle::Terra),
+                    );
+                    crate::backend::agentic_runner::agentic_result_json(
+                        &crate::backend::agentic_loop::LoopOutcome::Aborted {
+                            reason: e,
+                            rounds: 0,
+                        },
+                        &[],
+                        false,
+                        None,
+                    )
+                }
             };
             // Write the result the finalize path reads, BEFORE the guard releases the in-flight
             // id (so run_pass never finalizes against a missing file). A write failure leaves no

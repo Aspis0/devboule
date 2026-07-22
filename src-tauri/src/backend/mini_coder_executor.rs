@@ -1793,10 +1793,42 @@ fn claim_and_launch(
     let nest_id = agent_id.clone();
     // Stamp the SAME project resolved above onto the mini session.
     let mini_project = Some(project_id.clone());
+    // F07: if a MAIN directive has no task_id, inherit the parent session's
+    // current_task_id (orchestrator often has the task selected). Minis do not
+    // inherit — only Main owns the Kanban promote-on-done path.
+    let inherited_task_id: Option<String> = if !matches!(directive.tier, mini_coder::DirectiveTier::Main)
+        || directive
+            .task_id
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+    {
+        None // not Main, or already set
+    } else {
+        agents::read_agent_live_state_snapshot(app)
+            .ok()
+            .and_then(|snap| {
+                snap.sessions
+                    .iter()
+                    .find(|s| s.agent_id == parent_id)
+                    .and_then(|s| s.current_task_id.clone())
+            })
+            .filter(|t| !t.trim().is_empty())
+    };
+    let session_task_id = directive
+        .task_id
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| inherited_task_id.clone());
     let _ = agents::mutate_agent_live_state(app, |state| {
         transition_directive(state, &directive_id, |d| {
             mini_coder::apply_launched(d, nest_id.clone(), started_at.clone()).map(|mut next| {
                 next.scratch_path = Some(scratch_path_str.clone());
+                // F07: stamp inherited task_id so finalize can promote Kanban.
+                if next.task_id.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                    if let Some(tid) = inherited_task_id.clone() {
+                        next.task_id = Some(tid);
+                    }
+                }
                 next
             })
         });
@@ -1810,6 +1842,12 @@ fn claim_and_launch(
             oracle_grant.as_ref().map(|(_, hash)| hash.as_str()),
             directive.tier,
         );
+        // F07: pin the mini session's current_task_id so the board/rail can show WHO.
+        if let Some(tid) = session_task_id.as_deref() {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.agent_id == nest_id) {
+                session.current_task_id = Some(tid.to_string());
+            }
+        }
         cap_pass(state);
     });
 
@@ -1820,7 +1858,7 @@ fn claim_and_launch(
     // launches as its own directive seeds the console at its own round). Pure observer: a
     // missing store (unmanaged in some tests) makes this a no-op.
     if let Some(store) = console_store(app) {
-        let model = console_model_label(&backend);
+        let model = console_model_label_for_tier(&backend, directive.tier);
         let label = console_run_label(directive);
         let scope = directive.files.clone();
         let round_n = directive.attempt.saturating_add(1);
@@ -1937,9 +1975,40 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // with FINE coalescing (skip files censorated in the last 5s). Findings are written
     // atomically to `.aspis-mini/<agent_id>/steer_censor` + `steer_ready` flag for retry
     // injection, and pushed to the Activity Console for the human.
-    if !write_diffs.is_empty() && trusted {
-        let modified_files: Vec<String> =
-            write_diffs.iter().map(|(path, _)| path.clone()).collect();
+    //
+    // F30: agentic path applies edits via tools → `write_diffs` is empty but
+    // `outcome.files_touched` carries the real paths. Still enter fine/coarse when
+    // trusted and either source is non-empty.
+    let modified_files: Vec<String> = if !write_diffs.is_empty() {
+        write_diffs.iter().map(|(path, _)| path.clone()).collect()
+    } else {
+        outcome.files_touched.clone()
+    };
+    let phase_a_censor = should_run_phase_a_censor(
+        !write_diffs.is_empty(),
+        !outcome.files_touched.is_empty(),
+        trusted,
+    );
+    // F15/F30: surface whether censor ran on the durable directive summary so
+    // "all clean" is distinguishable from "never reviewed". Stamp immediately
+    // when the gate fires (ran=true, total=0 until the async pass finishes);
+    // leave None when the gate is skipped.
+    if phase_a_censor {
+        let summary_files: Vec<String> = modified_files
+            .iter()
+            .take(crate::backend::mini_coder::CENSOR_MINI_SUMMARY_FILES_CAP)
+            .cloned()
+            .collect();
+        let early = crate::backend::mini_coder::CensorMiniSummary {
+            total: 0,
+            files: summary_files,
+            ran: true,
+        };
+        let _ = agents::mutate_agent_live_state(app, |state| {
+            attach_censor_summary(state, &directive.id, early);
+        });
+    }
+    if phase_a_censor {
         if let Some(ref root) = apply_root {
             let app = app.clone();
             let root = root.clone();
@@ -2067,6 +2136,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 let summary = crate::backend::mini_coder::CensorMiniSummary {
                     total,
                     files: summary_files,
+                    ran: true,
                 };
                 let _ = agents::mutate_agent_live_state(&app, |state| {
                     attach_censor_summary(state, &directive_id, summary);
@@ -2367,6 +2437,13 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             }
         }
     }
+    // F08: close the mini/main session on EVERY terminal finalize so the rail
+    // drops "Main coder running" ghosts (timeout/parent-gone paths already call
+    // close_mini_session; the normal EOF path did not).
+    let session_close_id = directive
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| mini_agent_id(directive));
     let _ = agents::mutate_agent_live_state(app, |state| {
         if let Some(d) = state
             .mini_coder_directives
@@ -2376,7 +2453,60 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             d.status = outcome.status;
             d.result = Some(outcome.clone());
         }
+        close_mini_session(state, &session_close_id);
+        // Also close by deterministic id in case agent_id diverged.
+        let det = mini_agent_id(directive);
+        if det != session_close_id {
+            close_mini_session(state, &det);
+        }
     });
+
+    // F07: successful MAIN write finalize → promote linked Kanban task to review.
+    // Only Main tier (not a delegated mini) and only clean `done` (not
+    // killed/failed/aborted/needs_clarification). A mini finishing mid-task must
+    // not flip the board to review while the Main chain is still open.
+    if matches!(directive.tier, mini_coder::DirectiveTier::Main)
+        && directive.write
+        && matches!(outcome.status, MiniCoderStatus::Done)
+    {
+        let resolved_project = project_id
+            .clone()
+            .or_else(|| {
+                directive
+                    .project_id
+                    .clone()
+                    .filter(|p| !p.trim().is_empty())
+            })
+            .or_else(|| snapshot.as_ref().and_then(|s| directive_project(s, directive)));
+        let resolved_task = directive
+            .task_id
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                // Parent session's current_task_id as last-resort fallback.
+                snapshot.as_ref().and_then(|s| {
+                    s.sessions
+                        .iter()
+                        .find(|sess| sess.agent_id == directive.parent_agent_id)
+                        .and_then(|sess| sess.current_task_id.clone())
+                })
+            })
+            .filter(|t| !t.trim().is_empty());
+        if let (Some(pid), Some(tid)) = (resolved_project, resolved_task) {
+            if let Err(e) = super::projects::promote_task_to_review_after_main_write(
+                app,
+                &pid,
+                &tid,
+                &session_close_id,
+            ) {
+                eprintln!(
+                    "F07: promote task {tid} to review failed for directive {}: {e}",
+                    directive.id
+                );
+            }
+        }
+    }
+
     // v6 Phase 5: on a terminal failure/timeout, emit a structured stuck report so the
     // human gets an actionable record (task, attempts, reason, last-output excerpt)
     // instead of a bare block. Fire-and-forget (a missing listener is fine).
@@ -2413,6 +2543,17 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     {
         let _ = std::fs::remove_file(Path::new(scratch).join(&directive.result_path));
     }
+}
+
+/// F30 pure predicate: whether finalize should enter the phase-A fine censor /
+/// coarse dirty path. Trusted writes with either non-empty write_diffs OR
+/// non-empty files_touched (agentic tools already applied edits) must run.
+pub(crate) fn should_run_phase_a_censor(
+    write_diffs_nonempty: bool,
+    files_touched_nonempty: bool,
+    trusted: bool,
+) -> bool {
+    trusted && (write_diffs_nonempty || files_touched_nonempty)
 }
 
 /// WARNING 3 (PURE): derive `(project_id, trusted)` from ONE agent-state snapshot. The
@@ -3262,16 +3403,25 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
 /// "mini · ollama/qwen2.5-coder" or "mini · codex". The backend kind label + the resolved
 /// model tag (when set); a backend with no model tag (api/codex without a pinned model)
 /// shows just the kind. Privacy-safe: only the already-surfaced runtime label, no secrets.
-fn console_model_label(backend: &MiniCoderBackend) -> String {
+/// F08: model chip label. Main-tier sessions must not render as pure "Mini".
+fn console_model_label_for_tier(
+    backend: &MiniCoderBackend,
+    tier: mini_coder::DirectiveTier,
+) -> String {
     let kind = backend_client_label(backend);
+    let role = if matches!(tier, mini_coder::DirectiveTier::Main) {
+        "main"
+    } else {
+        "mini"
+    };
     match backend
         .model
         .as_deref()
         .map(str::trim)
         .filter(|m| !m.is_empty())
     {
-        Some(model) => format!("mini · {kind}/{model}"),
-        None => format!("mini · {kind}"),
+        Some(model) => format!("{role} · {kind}/{model}"),
+        None => format!("{role} · {kind}"),
     }
 }
 
@@ -4260,6 +4410,7 @@ mod attach_censor_summary_tests {
                     write_mode: crate::backend::mini_coder::WriteMode::EmitEdits,
                     tier: crate::backend::mini_coder::DirectiveTier::Mini,
                     project_id: None,
+                    task_id: None,
                     backend: None,
                     allow_oracle: false,
                     kill_requested: false,
@@ -4287,6 +4438,7 @@ mod attach_censor_summary_tests {
             crate::backend::mini_coder::CensorMiniSummary {
                 total: 5,
                 files: vec!["src/a.rs".into()],
+                ran: false,
             },
         );
         assert!(attached, "must find the directive row");
@@ -4309,6 +4461,7 @@ mod attach_censor_summary_tests {
             crate::backend::mini_coder::CensorMiniSummary {
                 total: 1,
                 files: vec![],
+                ran: false,
             },
         );
         assert!(!attached, "must not find a missing directive");
@@ -4325,6 +4478,7 @@ mod attach_censor_summary_tests {
             censor_summary: Some(crate::backend::mini_coder::CensorMiniSummary {
                 total: 1,
                 files: vec!["old.rs".into()],
+                ran: false,
             }),
             ..Default::default()
         };
@@ -4335,6 +4489,7 @@ mod attach_censor_summary_tests {
             crate::backend::mini_coder::CensorMiniSummary {
                 total: 9,
                 files: vec!["new.rs".into()],
+                ran: false,
             },
         );
         assert!(attached);

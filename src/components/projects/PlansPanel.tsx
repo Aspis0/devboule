@@ -243,9 +243,16 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
     const id = window.setInterval(() => {
       if (document.visibilityState === "visible") void fetch(false);
     }, PLANS_POLL_INTERVAL_MS);
+    // F05: PlanApprovalCard fires this after approve/deny so history updates
+    // immediately instead of waiting for the 12s poll.
+    const onRefresh = () => {
+      if (document.visibilityState === "visible") void fetch(false);
+    };
+    window.addEventListener("devboule:plans-refresh", onRefresh);
     return () => {
       mountedRef.current = false;
       window.clearInterval(id);
+      window.removeEventListener("devboule:plans-refresh", onRefresh);
     };
   }, [fetch]);
 

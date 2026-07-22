@@ -473,3 +473,23 @@ export function stripLabel(view: StageView): 'searching' | 'planning' | 'designi
       return 'designing';
   }
 }
+
+/**
+ * F48: when open doubts arrive (or are already open on first observation), the stage
+ * must show the plan view — DoubtPanel only mounts under `view === "plan"`.
+ *
+ * - question arrival (`len > prevLen`) → `'plan'`
+ * - mount / first-obs with open questions (`prevLen === 0 && len > 0`) → `'plan'`
+ *   (callers init the prev ref to `0` so remount-with-open-doubts is covered)
+ * - no change → `null` (leave the current view alone)
+ *
+ * `currentView` is unused for the decision (kept for call-site clarity / future).
+ */
+export function stageViewOnDoubts(
+  prevLen: number,
+  len: number,
+  _currentView: StageView,
+): "plan" | null {
+  if (len > prevLen) return "plan";
+  return null;
+}

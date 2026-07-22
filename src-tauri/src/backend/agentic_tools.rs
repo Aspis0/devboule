@@ -22,7 +22,10 @@ const MAX_GREP_DEPTH: usize = 50;
 const MAX_GREP_FILES: usize = 2000;
 const MAX_GREP_MATCHES: usize = 100;
 const MAX_RUN_OUTPUT: usize = 64 * 1024;
-const RUN_TIMEOUT_SECS: u64 = 600; // generous: real test/build runs are slow; bounds a hang
+/// Wall-clock cap for a single `run` tool invocation (F42).
+/// Builds/tests need headroom, but multi-minute server hangs (e.g. `python -m http.server`)
+/// must not block the agentic round indefinitely. Process group is killed on expiry.
+const RUN_TIMEOUT_SECS: u64 = 180;
 
 /// PURE security core: normalize a model-supplied relative path and reject anything that
 /// could escape the scope (absolute, drive/scheme `:`, `..`). `.` and empty components are
@@ -87,6 +90,231 @@ const RUN_PROGRAMS: &[&str] = &[
     "swift", "zig", "dart", "flutter", "elixir", "mix",
 ];
 
+/// Package-manager script names that typically start a listen-forever / watch loop.
+const BLOCKING_PM_SCRIPTS: &[&str] = &["dev", "start", "serve", "watch"];
+
+/// True if `name` is a blocking PM script (exact, or prefix + `:`/`-`, case-insensitive).
+/// `dev:api` / `serve-docs` block; `build:watch` does not (prefix only on the blocking base).
+fn is_blocking_script_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    for base in BLOCKING_PM_SCRIPTS {
+        if lower == *base {
+            return true;
+        }
+        if lower.starts_with(&format!("{base}:")) || lower.starts_with(&format!("{base}-")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if any token is a watch-mode flag. `-w` only counts when `prog` is `tsc`
+/// (for npm, `-w` means workspace). `--watchAll=false` is allowed; bare/`=true` block.
+fn has_watch_flag(prog: &str, tokens: &[String]) -> bool {
+    tokens.iter().any(|t| {
+        if t == "--watch" || t == "--watch-all" || t.starts_with("--watch=") {
+            return true;
+        }
+        if t == "--watchAll" || t == "--watchAll=true" {
+            return true;
+        }
+        // Jest: `--watchAll=false` stays allowed (not matched above).
+        if t == "-w" && prog == "tsc" {
+            return true;
+        }
+        false
+    })
+}
+
+/// First npm subcommand token, skipping flags and value-taking options (`-w pkg`, `--prefix x`).
+fn first_npm_subcommand(tokens: &[String]) -> Option<&str> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let s = tokens[i].as_str();
+        // Flags that consume the next token as their value.
+        if s == "-w" || s == "--workspace" || s == "--prefix" || s == "-C" {
+            i += 2;
+            continue;
+        }
+        if s.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(s);
+    }
+    None
+}
+
+/// True when a package-manager invocation names a blocking forever script.
+/// Locates the `run` token by position (so `npm -w pkg run dev` is caught).
+fn is_blocking_pm_script(prog: &str, tokens: &[String]) -> bool {
+    match prog {
+        // `npm start` | `npm run dev|…` | `npm -w pkg run dev` | `npm --prefix x run dev`
+        "npm" => {
+            // Bare lifecycle `start` only as the subcommand (first non-flag after npm,
+            // skipping `-w pkg` etc.). Positional `start` after `run build` stays allowed.
+            if first_npm_subcommand(tokens).is_some_and(|c| c.eq_ignore_ascii_case("start")) {
+                return true;
+            }
+            if let Some(i) = tokens.iter().position(|t| t.eq_ignore_ascii_case("run")) {
+                if let Some(script) = tokens.get(i + 1) {
+                    return is_blocking_script_name(script);
+                }
+            }
+            false
+        }
+        // `yarn|pnpm|bun dev` | `yarn|pnpm|bun run start` (bare scripts + run form)
+        "yarn" | "pnpm" | "bun" => {
+            if let Some(i) = tokens.iter().position(|t| t.eq_ignore_ascii_case("run")) {
+                if let Some(script) = tokens.get(i + 1) {
+                    if is_blocking_script_name(script) {
+                        return true;
+                    }
+                }
+            }
+            // Bare script as first non-flag after prog (`bun dev`, `yarn start`).
+            if let Some(cmd) = tokens.iter().skip(1).find(|t| !t.starts_with('-')) {
+                if !cmd.eq_ignore_ascii_case("run") && is_blocking_script_name(cmd) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Bare `vitest` defaults to watch mode; only an explicit `run` subcommand is finite.
+fn is_blocking_vitest_invocation(tokens: &[String], vitest_idx: usize) -> bool {
+    let rest = &tokens[vitest_idx + 1..];
+    match rest.iter().find(|t| !t.starts_with('-')) {
+        None => true, // bare / only flags → watch default
+        Some(sub) if sub.eq_ignore_ascii_case("run") => false,
+        Some(sub) if sub.eq_ignore_ascii_case("watch") => true,
+        Some(_) => false,
+    }
+}
+
+/// F42: long-running server / listen-forever patterns the agent must not start via `run`.
+/// These hang the tool until timeout and can squat reserved ports (e.g. 8000 = oMLX).
+pub fn is_blocking_server_run(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let prog = tokens[0].as_str();
+
+    // Runner-prefix bypass: `uv|poetry run <cmd…>` → re-check the inner command.
+    if matches!(prog, "uv" | "poetry")
+        && tokens
+            .get(1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("run"))
+        && tokens.len() > 2
+    {
+        return is_blocking_server_run(&tokens[2..]);
+    }
+
+    // Watch-mode flags on any allowlisted program (`tsc --watch`, `jest --watchAll`, …).
+    if has_watch_flag(prog, tokens) {
+        return true;
+    }
+
+    // Package-manager forever scripts (`npm run dev`, `bun dev`, `npm run dev:api`, …).
+    if is_blocking_pm_script(prog, tokens) {
+        return true;
+    }
+
+    // Bare forever-servers as the program itself (e.g. after `poetry run uvicorn`).
+    if matches!(prog, "uvicorn" | "gunicorn" | "waitress") {
+        return true;
+    }
+
+    // `python -m http.server` / `python3 -m http.server` / versioned `python3.12`, SimpleHTTPServer
+    // plus ASGI/WSGI forever servers and `flask run`.
+    let is_python = prog == "python"
+        || prog == "python3"
+        || (prog.starts_with("python3.") && prog.len() > "python3.".len());
+    if is_python {
+        let joined = tokens.join(" ");
+        if joined.contains("http.server") || joined.contains("SimpleHTTPServer") {
+            return true;
+        }
+        if let Some(m_idx) = tokens.iter().position(|t| t == "-m") {
+            if let Some(mod_name) = tokens.get(m_idx + 1).map(|s| s.to_ascii_lowercase()) {
+                match mod_name.as_str() {
+                    "uvicorn" | "gunicorn" | "waitress" => return true,
+                    "flask"
+                        if tokens
+                            .get(m_idx + 2)
+                            .is_some_and(|t| t.eq_ignore_ascii_case("run")) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // npx forever-servers.
+    if prog == "npx" {
+        if tokens.iter().any(|t| {
+            t.eq_ignore_ascii_case("serve")
+                || t.eq_ignore_ascii_case("http-server")
+                || t.eq_ignore_ascii_case("nodemon")
+                || t.eq_ignore_ascii_case("json-server")
+        }) {
+            return true;
+        }
+        if tokens.iter().any(|t| t.eq_ignore_ascii_case("vite"))
+            && !tokens.iter().any(|t| t.eq_ignore_ascii_case("build"))
+        {
+            return true;
+        }
+        if tokens.windows(2).any(|w| {
+            w[0].eq_ignore_ascii_case("next")
+                && (w[1].eq_ignore_ascii_case("dev") || w[1].eq_ignore_ascii_case("start"))
+        }) {
+            return true;
+        }
+        if tokens
+            .windows(2)
+            .any(|w| w[0].eq_ignore_ascii_case("webpack") && w[1].eq_ignore_ascii_case("serve"))
+        {
+            return true;
+        }
+        if let Some(i) = tokens.iter().position(|t| t.eq_ignore_ascii_case("vitest")) {
+            if is_blocking_vitest_invocation(tokens, i) {
+                return true;
+            }
+        }
+    }
+
+    // Common forever-servers: `php -S`, `ruby -run`, `flutter run`.
+    if prog == "php" && tokens.iter().any(|t| t == "-S") {
+        return true;
+    }
+    if prog == "ruby" && tokens.iter().any(|t| t == "-run") {
+        return true;
+    }
+    if prog == "flutter" && tokens.iter().any(|t| t.eq_ignore_ascii_case("run")) {
+        return true;
+    }
+    // `deno serve` as the subcommand only (`deno task serve` stays allowed).
+    if prog == "deno"
+        && tokens
+            .get(1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("serve"))
+    {
+        return true;
+    }
+    // Bare `vitest` / `vitest watch` block; `vitest run` allowed.
+    if prog == "vitest" && is_blocking_vitest_invocation(tokens, 0) {
+        return true;
+    }
+
+    false
+}
+
 /// PURE RCE gate for the `run` tool: validate a command into an argv vector for a NO-SHELL
 /// exec. (1) rejects shell metacharacters (no chaining/substitution/redirection — also defangs
 /// `python -c "…"` etc. since quotes/parens are blocked); (2) requires the program (token 0) to
@@ -114,6 +342,14 @@ pub fn parse_run_command(input: &str) -> Result<Vec<String>, String> {
     }
     if !RUN_PROGRAMS.contains(&tokens[0].as_str()) {
         return Err(format!("Program not in the dev-tool allowlist: {}", tokens[0]));
+    }
+    // F42: reject listen-forever servers before spawn (timeout alone still burns minutes).
+    if is_blocking_server_run(&tokens) {
+        return Err(
+            "Blocking/server command is not allowed via run (use a finite test/build command; \
+             long-lived servers hang the agent and may occupy reserved ports)"
+                .to_string(),
+        );
     }
 
     for (i, token) in tokens.iter().enumerate() {
@@ -1027,6 +1263,63 @@ mod tests {
         ] {
             assert!(parse_run_command(bad).is_err(), "{bad} must be rejected (escape)");
         }
+        // F42: long-running servers rejected (even when program is allowlisted)
+        for bad in [
+            "python -m http.server 8000",
+            "python3 -m http.server",
+            "npx serve",
+            "npx http-server",
+            "php -S 127.0.0.1:8000",
+        ] {
+            let err = parse_run_command(bad).expect_err(&format!("{bad} must be rejected (server)"));
+            assert!(
+                err.contains("Blocking/server") || err.contains("server"),
+                "{bad} err should mention server: {err}"
+            );
+        }
+        // finite python still allowed
+        assert!(parse_run_command("python -m pytest").is_ok());
+    }
+
+    fn toks(cmd: &str) -> Vec<String> {
+        cmd.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn f42_is_blocking_server_run_detects_http_server() {
+        assert!(is_blocking_server_run(&toks("python -m http.server 8000")));
+        assert!(!is_blocking_server_run(&toks("python -m pytest")));
+        // Package-manager forever scripts vs finite build/test.
+        assert!(is_blocking_server_run(&toks("npm run dev")));
+        assert!(!is_blocking_server_run(&toks("npm run build")));
+        // Watch flags / vitest subcommands.
+        assert!(is_blocking_server_run(&toks("tsc --watch")));
+        assert!(!is_blocking_server_run(&toks("vitest run")));
+        assert!(is_blocking_server_run(&toks("vitest watch")));
+        // Python ASGI forever vs finite pytest module.
+        assert!(is_blocking_server_run(&toks("python -m uvicorn")));
+        assert!(!is_blocking_server_run(&toks("python -m pytest")));
+        // Review-round gaps.
+        assert!(is_blocking_server_run(&toks("bun dev")));
+        assert!(is_blocking_server_run(&toks("npm RUN dev")));
+        assert!(is_blocking_server_run(&toks("npx next start")));
+        assert!(is_blocking_server_run(&toks("jest --watchAll")));
+        assert!(!is_blocking_server_run(&toks("jest --watchAll=false")));
+        assert!(is_blocking_server_run(&toks("tsc -w")));
+        assert!(is_blocking_server_run(&toks("npm -w pkg run dev")));
+        assert!(!is_blocking_server_run(&toks("npm -w pkg run build")));
+        assert!(is_blocking_server_run(&toks("vitest")));
+        assert!(!is_blocking_server_run(&toks("npx vitest run")));
+        assert!(is_blocking_server_run(&toks("uv run python -m http.server")));
+        assert!(is_blocking_server_run(&toks("poetry run uvicorn app")));
+        assert!(!is_blocking_server_run(&toks("uv run pytest")));
+        assert!(is_blocking_server_run(&toks("npm run dev:api")));
+        assert!(!is_blocking_server_run(&toks("npm run build:watch")));
+        assert!(!is_blocking_server_run(&toks("deno task serve")));
+        assert!(is_blocking_server_run(&toks("deno serve mod.ts")));
+        // `start` is only the npm subcommand, not a later positional arg.
+        assert!(!is_blocking_server_run(&toks("npm run build start")));
+        assert!(is_blocking_server_run(&toks("npm -w pkg start")));
     }
 
     // FS tests: build a temp scope with an INSIDE file and an OUTSIDE secret reachable only

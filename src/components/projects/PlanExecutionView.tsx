@@ -141,9 +141,9 @@ export function PlanExecutionBody({
           />
         ))}
       </div>
-      {/* Footer */}
+      {/* Footer — F16: never hardcode "local runner" (cloud directives were mislabeled). */}
       <p className="mt-2 text-[10px] text-cream-400">
-        {model.doneCount}/{model.totalCount} done · executor: local runner
+        {model.doneCount}/{model.totalCount} done · plan tasks
       </p>
     </div>
   );

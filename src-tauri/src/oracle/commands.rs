@@ -129,7 +129,8 @@ pub(crate) fn current_oracle_index_root() -> Result<std::path::PathBuf, OracleEr
     // string crosses the IPC boundary).
     let preferences = vault::read_oracle_index_preferences()
         .map_err(|_| OracleError::internal("Could not read Oracle preferences."))?;
-    resolve_oracle_index_root(preferences.index_root.as_deref())
+    // Multi-root: primary is first of index_roots, else legacy index_root.
+    resolve_oracle_index_root(preferences.primary_index_root().as_deref())
 }
 
 /// Operator-path alias for [`current_oracle_index_root`]. Kept as a thin wrapper

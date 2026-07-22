@@ -107,9 +107,15 @@ describe("work-mode routing", () => {
 // ---- top-bar git line -------------------------------------------------------
 
 describe("workspaceGitLine", () => {
-	it("derives committed?/pushed? from dirtyCount/aheadCount", () => {
+	it("derives committed?/pushed? from dirtyCount/aheadCount + upstream (F27)", () => {
 		const clean = workspaceGitLine(
-			git({ isGitRepo: true, branch: "main", dirtyCount: 0, aheadCount: 0 }),
+			git({
+				isGitRepo: true,
+				branch: "main",
+				dirtyCount: 0,
+				aheadCount: 0,
+				upstream: "origin/main",
+			}),
 		);
 		expect(clean.committed).toBe(true);
 		expect(clean.pushed).toBe(true);
@@ -119,8 +125,21 @@ describe("workspaceGitLine", () => {
 		expect(clean.segments.some((s) => s.includes("modified"))).toBe(false);
 		expect(clean.segments).not.toContain("0 modified");
 
+		// F27: no upstream + aheadCount 0 must NOT claim pushed.
+		const noUpstream = workspaceGitLine(
+			git({ isGitRepo: true, branch: "feat", dirtyCount: 0, aheadCount: 0 }),
+		);
+		expect(noUpstream.pushed).toBe(false);
+		expect(noUpstream.segments).toContain("pushed?: no upstream");
+
 		const dirty = workspaceGitLine(
-			git({ isGitRepo: true, branch: "feat", dirtyCount: 2, aheadCount: 1 }),
+			git({
+				isGitRepo: true,
+				branch: "feat",
+				dirtyCount: 2,
+				aheadCount: 1,
+				upstream: "origin/feat",
+			}),
 		);
 		expect(dirty.committed).toBe(false);
 		expect(dirty.pushed).toBe(false);

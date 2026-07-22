@@ -170,6 +170,7 @@ mod tests {
             write_mode: crate::backend::mini_coder::WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: None,
+            task_id: None,
             allow_oracle: false,
             kill_requested: false,
             steer_queue: Vec::new(),

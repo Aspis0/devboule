@@ -973,11 +973,14 @@ export function ProjectWorkspace({
             type="button"
             onClick={() => setCommitOpen((open) => !open)}
             disabled={!gitLine.isGitRepo || gitActionBusy || readOnly}
-            data-help-title="This commits the tracked changes on the current branch."
-            data-help-lines="A commit records the modified, tracked files on the current branch only.|Untracked files are not swept in; stage them in your editor if needed.|Enter a short message describing the change.|The app never force-anything; on failure the git error is shown."
+            data-testid="git-commit-toggle"
+            aria-expanded={commitOpen}
+            aria-label={commitOpen ? "Hide commit form" : "Show commit form"}
+            data-help-title="This opens the commit message form (does not commit)."
+            data-help-lines="This button only toggles the commit form.|Type a message and press Create commit to record the change.|A second click closes the form without committing."
             className="inline-flex items-center gap-1.5 rounded-lg bg-terracotta px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
           >
-            Commit
+            {commitOpen ? "Cancel" : "Commit…"}
           </button>
           <button
             type="button"
@@ -1010,9 +1013,11 @@ export function ProjectWorkspace({
             type="button"
             onClick={submitCommit}
             disabled={!commitMessage.trim() || gitActionBusy || readOnly}
+            data-testid="git-commit-submit"
+            aria-label="Create commit with message"
             className="shrink-0 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
           >
-            Commit
+            Create commit
           </button>
         </div>
       )}

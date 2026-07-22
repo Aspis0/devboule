@@ -38,6 +38,7 @@ fn write_directive(id: &str, files: &[&str]) -> MiniCoderDirective {
         write_mode: mini_coder::WriteMode::EmitEdits,
         tier: Default::default(),
         project_id: None,
+        task_id: None,
         allow_oracle: false,
         kill_requested: false,
         steer_queue: Vec::new(),
@@ -739,6 +740,7 @@ fn test_agentic_full_chain_vs_mock_llm() {
         4,
         &std::sync::atomic::AtomicBool::new(false),
         None,
+        None,
     );
 
     // ── Assert outcome ───────────────────────────────────────────────────
@@ -864,6 +866,7 @@ fn test_agentic_allowlist_blocks_out_of_scope_write() {
         4,
         &std::sync::atomic::AtomicBool::new(false),
         None,
+        None,
     );
 
     // ── Outcome: Done (loop continues after a tool error; agentic_loop.rs) ─
@@ -978,6 +981,7 @@ fn test_stuck_report_persists_on_directive_row() {
         write_mode: mini_coder::WriteMode::EmitEdits,
         tier: Default::default(),
         project_id: None,
+        task_id: None,
         allow_oracle: false,
         kill_requested: false,
         steer_queue: Vec::new(),
@@ -1217,6 +1221,7 @@ fn regen_agents_state_fixture() {
             write_mode: mini_coder::WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: Some("my-proj".into()),
+            task_id: None,
             allow_oracle: false,
             kill_requested: false,
             steer_queue: vec![],
@@ -1246,6 +1251,7 @@ fn regen_agents_state_fixture() {
             write_mode: mini_coder::WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: Some("my-proj".into()),
+            task_id: None,
             allow_oracle: false,
             kill_requested: false,
             steer_queue: vec![],
@@ -1295,6 +1301,7 @@ fn regen_agents_state_fixture() {
             censor_summary: Some(mini_coder::CensorMiniSummary {
                 total: 2,
                 files: vec!["src/auth.rs".into(), "src/db.rs".into()],
+                ran: false,
             }),
             status: MiniCoderStatus::Done,
             task: "Refactor auth module".into(),
@@ -1304,6 +1311,7 @@ fn regen_agents_state_fixture() {
             write_mode: mini_coder::WriteMode::EmitEdits,
             tier: Default::default(),
             project_id: Some("my-proj".into()),
+            task_id: None,
             allow_oracle: false,
             kill_requested: false,
             steer_queue: vec![],

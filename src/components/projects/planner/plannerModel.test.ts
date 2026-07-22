@@ -11,6 +11,7 @@ import {
   steerPickOption,
   steerYouDecide,
   doubtTouchesCard,
+  stageViewOnDoubts,
   type PlanCard,
   type PiPlan,
 } from "./plannerModel";
@@ -627,5 +628,23 @@ describe("chatMessagesWithMilestones (plan-role filtering)", () => {
       { role: "user", text: "build auth" },
       { role: "assistant", text: "On it" },
     ]);
+  });
+});
+
+describe("stageViewOnDoubts (F48 — force plan when doubts arrive)", () => {
+  it("question arrival (len grows) → plan", () => {
+    expect(stageViewOnDoubts(0, 1, "exa")).toBe("plan");
+    expect(stageViewOnDoubts(2, 3, "design")).toBe("plan");
+  });
+
+  it("no change in open-question count → null", () => {
+    expect(stageViewOnDoubts(0, 0, "exa")).toBeNull();
+    expect(stageViewOnDoubts(3, 3, "exa")).toBeNull();
+    expect(stageViewOnDoubts(2, 1, "plan")).toBeNull();
+  });
+
+  it("mount / first-obs with open questions (prevLen 0, len > 0) → plan", () => {
+    // Callers init prevQuestionsLen to 0 so remount-with-open-doubts is an arrival.
+    expect(stageViewOnDoubts(0, 3, "exa")).toBe("plan");
   });
 });
