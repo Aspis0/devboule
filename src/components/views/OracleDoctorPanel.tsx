@@ -26,9 +26,10 @@ const CHECK_LABELS: Record<string, string> = {
 const RETRY_DELAY_MS = 4000;
 
 // The truthful-health panel (mockup section 5). On mount it runs the Oracle
-// doctor and renders each of the 5 checks as a row (green check / red alert,
-// detail, and remediation when not ok). A doctor call can itself fail (the
-// command throws an OracleError), so loading + error states are first-class.
+// doctor and renders each check as a row (green check / red alert, detail,
+// and remediation when not ok). Check count comes from the report, never a
+// hardcoded number. A doctor call can itself fail (the command throws an
+// OracleError), so loading + error states are first-class.
 export function OracleDoctorPanel({
   onReport,
 }: {
@@ -111,7 +112,11 @@ export function OracleDoctorPanel({
             <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
               Doctor
             </h3>
-            <p className="text-[11px] text-cream-400">Truthful health, 5 checks</p>
+            <p className="text-[11px] text-cream-400">
+              {report && (report.checks ?? []).length > 0
+                ? `Truthful health, ${(report.checks ?? []).length} checks`
+                : "Truthful health"}
+            </p>
           </div>
         </div>
         <button
@@ -158,10 +163,10 @@ export function OracleDoctorPanel({
 
       {report ? (
         <div className="space-y-2">
-          {report.checks.map((check) => (
+          {(report.checks ?? []).map((check) => (
             <DoctorRow key={check.id} check={check} />
           ))}
-          {report.checks.length === 0 && (
+          {(report.checks ?? []).length === 0 && (
             <p className="text-[12px] text-cream-400">
               No checks were reported.
             </p>

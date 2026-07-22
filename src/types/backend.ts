@@ -11,6 +11,8 @@ export interface AuthState {
 		| "windows_resume"
 		| "unavailable"
 		| null;
+	/** True when DEVBOULE_DEV_UNLOCK was active at backend startup (stable for the process). */
+	devUnlock: boolean;
 }
 
 export interface SecretStatus {

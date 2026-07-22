@@ -256,7 +256,10 @@ function AppShell() {
   };
 
   return (
-    <div className="flex h-screen flex-col bg-cream-100 font-sans md:flex-row">
+    <div
+      data-testid="devboule-app"
+      className="flex h-screen flex-col bg-cream-100 font-sans md:flex-row"
+    >
       <Sidebar />
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <Header />

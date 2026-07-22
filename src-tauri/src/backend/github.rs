@@ -25,6 +25,17 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Platform-correct name for the OS credential store (F52).
+fn vault_store_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS Keychain"
+    } else if cfg!(target_os = "windows") {
+        "Windows Credential Manager"
+    } else {
+        "OS keyring"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubUserResponse {
     login: String,
@@ -56,8 +67,10 @@ pub async fn save_github_token(
         if status.status == "valid" {
             vault::save_github_token(cleaned)?;
             status.configured = true;
-            status.message =
-                Some("GitHub token is valid and stored in Windows Credential Manager.".into());
+            status.message = Some(format!(
+                "GitHub token is valid and stored in {}.",
+                vault_store_label()
+            ));
         }
         Ok(status)
     })
@@ -90,8 +103,10 @@ pub async fn import_github_token_from_cli(
             vault::save_github_token(&token)?;
             status.configured = true;
             status.source = "github_cli_imported_to_windows_vault".into();
-            status.message =
-                Some("Imported your GitHub CLI login into Windows Credential Manager.".into());
+            status.message = Some(format!(
+                "Imported your GitHub CLI login into {}.",
+                vault_store_label()
+            ));
         }
         Ok(status)
     })

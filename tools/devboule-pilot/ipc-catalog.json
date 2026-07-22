@@ -1,0 +1,272 @@
+{
+  "schemaVersion": 1,
+  "product": "Devboule",
+  "appIdentifier": "com.devboule.app",
+  "source": "src-tauri generate_handler — curated agent subset; invoke args use Tauri 2 camelCase",
+  "notes": [
+    "Invoke: fpilot ipc <name> --args '<json>' --json",
+    "Tauri 2 command args are camelCase (projectId not project_id; agentId; requestId)",
+    "Structs with rename_all=camelCase use camelCase fields; ProjectCreateInput has NO rename_all → nested snake_case (root_path)",
+    "create_project needs wrapper: { \"input\": { \"title\": \"...\", \"root_path\": null } }",
+    "Most project/agent cmds need unlocked session — DEVBOULE_DEV_UNLOCK=1 for pilot",
+    "IPC timeout 600s (patched plugin) for long backends",
+    "AuthState response is camelCase: locked, helloAvailable, lastUnlockedAt, lockReason",
+    "Dangerous cmds (delete_project, lock_app) require DEVBOULE_PILOT_ALLOW_DESTRUCTIVE=1 in scenarios"
+  ],
+  "agentWorkflows": [
+    {
+      "name": "session-ready",
+      "steps": ["get_auth_state", "get_config", "list_projects"],
+      "purpose": "Confirm unlock + shell data"
+    },
+    {
+      "name": "project-board",
+      "steps": ["list_projects", "get_project", "list_project_plans", "get_agent_live_state"],
+      "purpose": "Inspect board / plans / live agents"
+    },
+    {
+      "name": "create-smoke-project",
+      "steps": ["create_project", "list_projects", "get_project"],
+      "purpose": "Create disposable project (unique title)"
+    },
+    {
+      "name": "oracle-health",
+      "steps": ["get_oracle_enabled", "get_oracle_index_status", "get_oracle_doctor"],
+      "purpose": "Code intelligence status"
+    },
+    {
+      "name": "cloud-billing-smoke",
+      "steps": ["get_cloud_dashboard_snapshot", "get_secret_status"],
+      "purpose": "Cloud readiness (may need tokens)"
+    }
+  ],
+  "commands": [
+    {
+      "name": "get_auth_state",
+      "purpose": "Session lock: locked, helloAvailable, lockReason",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none",
+      "agentNotes": "If locked===true, board IPC fails. Pilot must use DEVBOULE_DEV_UNLOCK=1."
+    },
+    {
+      "name": "get_config",
+      "purpose": "App config (navigation, defaults)",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "list_projects",
+      "purpose": "Board project summaries",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none",
+      "returns": "ProjectSummary[] (camelCase fields: id, title, rootPath, …)"
+    },
+    {
+      "name": "get_project",
+      "purpose": "Full project detail + tasks",
+      "args": { "projectId": "string" },
+      "example": { "args": { "projectId": "my-app" } },
+      "sideEffects": "none"
+    },
+    {
+      "name": "create_project",
+      "purpose": "Create project file under app projects dir",
+      "args": {
+        "input": {
+          "id": "string|null",
+          "title": "string",
+          "status": "string|null",
+          "root_path": "string|null"
+        }
+      },
+      "example": {
+        "args": {
+          "input": {
+            "title": "Pilot Smoke",
+            "id": null,
+            "status": "active",
+            "root_path": null
+          }
+        }
+      },
+      "sideEffects": "writes project markdown",
+      "agentNotes": "Nested input uses snake_case root_path (no rename_all on ProjectCreateInput). Top-level key is input."
+    },
+    {
+      "name": "delete_project",
+      "purpose": "Delete project by id — DESTRUCTIVE",
+      "args": { "projectId": "string" },
+      "example": { "args": { "projectId": "pilot-smoke-disposable" } },
+      "sideEffects": "deletes project file",
+      "dangerous": true,
+      "agentNotes": "Only with DEVBOULE_PILOT_ALLOW_DESTRUCTIVE=1; never on real projects"
+    },
+    {
+      "name": "create_project_task",
+      "purpose": "Add task to project board",
+      "args": {
+        "projectId": "string",
+        "task": "ProjectTaskInput object"
+      },
+      "example": {
+        "args": {
+          "projectId": "my-app",
+          "task": { "title": "Smoke task", "status": "todo" }
+        }
+      },
+      "sideEffects": "mutates project",
+      "agentNotes": "Confirm ProjectTaskInput fields in projects.rs before production use"
+    },
+    {
+      "name": "get_agent_live_state",
+      "purpose": "Live agent claims/events",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "stop_agent",
+      "purpose": "Stop running agent process",
+      "args": { "agentId": "string" },
+      "example": { "args": { "agentId": "orch-my-app" } },
+      "sideEffects": "kills agent"
+    },
+    {
+      "name": "list_project_plans",
+      "purpose": "Plans for a project",
+      "args": { "projectId": "string" },
+      "example": { "args": { "projectId": "my-app" } },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_plan_markdown",
+      "purpose": "Read plan markdown body",
+      "args": { "projectId": "string", "planId": "string" },
+      "example": { "args": { "projectId": "my-app", "planId": "plan-1" } },
+      "sideEffects": "none"
+    },
+    {
+      "name": "approve_plan_request",
+      "purpose": "Approve pending plan request",
+      "args": { "requestId": "string", "note": "string|null" },
+      "example": { "args": { "requestId": "req-1", "note": null } },
+      "sideEffects": "unblocks agent"
+    },
+    {
+      "name": "deny_plan_request",
+      "purpose": "Deny pending plan request",
+      "args": { "requestId": "string", "note": "string|null" },
+      "example": { "args": { "requestId": "req-1", "note": "needs work" } },
+      "sideEffects": "rejects plan"
+    },
+    {
+      "name": "plan_approval_requests_list",
+      "purpose": "Pending plan approvals",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "consent_requests_list",
+      "purpose": "Pending net/folder consents",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_local_role",
+      "purpose": "Machine role (admin/operator)",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_oracle_enabled",
+      "purpose": "Oracle feature flag",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_oracle_index_status",
+      "purpose": "Index job status",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_oracle_doctor",
+      "purpose": "Oracle health diagnostics",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_oracle_snapshot",
+      "purpose": "Oracle graph snapshot",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_secret_status",
+      "purpose": "Which secrets configured (no values)",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "get_cloud_dashboard_snapshot",
+      "purpose": "Cloud dashboard aggregate",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "may network"
+    },
+    {
+      "name": "detect_hardware",
+      "purpose": "Local hardware for model placement",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "detect_providers",
+      "purpose": "Detected providers on machine",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "none"
+    },
+    {
+      "name": "lock_app",
+      "purpose": "Force soft-lock — DANGEROUS mid-pilot",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "locks session",
+      "dangerous": true
+    },
+    {
+      "name": "request_unlock",
+      "purpose": "Trigger unlock (Touch ID / platform)",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "UI auth prompt"
+    },
+    {
+      "name": "touch_idle_activity",
+      "purpose": "Reset idle lock timer",
+      "args": {},
+      "example": { "args": {} },
+      "sideEffects": "extends unlock window"
+    },
+    {
+      "name": "open_external_url",
+      "purpose": "Open URL in system browser (HTTPS allowlist-ish)",
+      "args": { "url": "string" },
+      "example": { "args": { "url": "https://example.com" } },
+      "sideEffects": "opens external app"
+    }
+  ]
+}

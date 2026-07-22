@@ -263,6 +263,33 @@ describe("PolisBottomBar", () => {
     const text = container.textContent ?? "";
     expect(text).toContain("Aws");
   });
+
+  // F69 — mapped city with 0 buildings must still expose File types so the
+  // user can re-enable extensions after a filter emptied the city.
+  it("empty-mapped city (0 buildings) still exposes File types, hides other panels", () => {
+    const { container } = renderBar({
+      buildingCount: 0,
+      roadCount: 0,
+      agentCount: 0,
+      onFocusFile: vi.fn(),
+      handleRef: makeHandleRef(),
+      viewportReady: false,
+      immersive: false,
+      polisFocusedRef: { current: false },
+      filterSets: null,
+    });
+
+    const labels = Array.from(container.querySelectorAll("button")).map(
+      (b) => b.textContent ?? "",
+    );
+    const hasFileTypes = labels.some((t) => t.includes("File types"));
+    expect(hasFileTypes).toBe(true);
+
+    // Other panel affordances are meaningless with 0 buildings.
+    for (const hidden of ["Legend", "Oracle", "Anomalies", "Filters", "Guide"]) {
+      expect(labels.some((t) => t.includes(hidden))).toBe(false);
+    }
+  });
 });
 
 // Fix 1 — providerSwatch deterministic fallback for unknown providers.

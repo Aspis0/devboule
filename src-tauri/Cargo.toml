@@ -47,7 +47,9 @@ libc = "0.2" # process-group kill for the sandboxed `run` tool timeout (unix)
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 # Optional: only with --features ui-pilot (debug agent UI automation).
-tauri-plugin-pilot = { version = "=0.7.2", optional = true }
+# Patched fork: IPC eval timeout 600s (upstream 10s kills assistant_run / long flows).
+# Source: /Users/user/Projects/vendor/tauri-plugin-pilot (based on 0.7.2).
+tauri-plugin-pilot = { path = "../../vendor/tauri-plugin-pilot", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"

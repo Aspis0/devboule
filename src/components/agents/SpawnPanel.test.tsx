@@ -37,6 +37,8 @@ describe("SpawnPanel CLI options", () => {
     // The radio buttons render the option labels verbatim.
     expect(html).toContain(">codex<");
     expect(html).toContain(">claude<");
+    // OpenAI has no agent CLI — must not appear as a built-in option.
+    expect(html).not.toContain(">openai<");
   });
 
   it("offers the local Devboule orchestrator as a selectable client", () => {

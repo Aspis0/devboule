@@ -619,6 +619,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         helloAvailable: false,
         lastUnlockedAt: null,
         lockReason: "unavailable",
+        devUnlock: false,
       });
       authEpochRef.current += 1;
       clearSensitiveState();
@@ -635,6 +636,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         helloAvailable: false,
         lastUnlockedAt: null,
         lockReason: "unavailable",
+        devUnlock: false,
       });
       authEpochRef.current += 1;
       clearSensitiveState();
@@ -2493,6 +2495,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (isLocked || !isDesktopRuntime) return;
+    // DEV unlock sessions (pilot automation, overnight agent drives) keep the
+    // window hidden for long stretches — installing visibility auto-lock would
+    // fight that. Backend already promises "no idle soft-lock" in that mode.
+    if (authState?.devUnlock) return;
     // Auto-lock when the window stays HIDDEN for a grace period — NOT instantly
     // on every visibilitychange. The old instant lock fired on momentary macOS
     // Space switches, a window briefly covered, and the dev-rebuild window
@@ -2500,11 +2506,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return installVisibilityLock(() => {
       if (!unlockInFlightRef.current) void lock();
     }, VISIBILITY_LOCK_GRACE_MS);
-  }, [isDesktopRuntime, isLocked, lock]);
+  }, [authState?.devUnlock, isDesktopRuntime, isLocked, lock]);
 
   // Soft-lock idle TTL tracks USER activity only. Background pollers call
   // ensure_unlocked and must not refresh the clock (that was the security hole).
   // pointerdown/keydown are genuine interaction; throttle to at most one IPC/min.
+  // Backend `expire_if_needed` already never idles out under DEVBOULE_DEV_UNLOCK,
+  // so this touch channel is left installed even in dev (harmless no-op for lock).
   useEffect(() => {
     if (isLocked || !isDesktopRuntime) return;
     let lastTouchMs = 0;

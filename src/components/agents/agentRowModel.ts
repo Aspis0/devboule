@@ -322,7 +322,7 @@ export interface SpawnSelection {
 	// value" means "let the agent self-report" and no hint is sent.
 	model: string;
 	taskId: string;
-	// Built-in CLIs ("codex" | "claude" | "openai" | "powershell" | "orchestrator") or a
+	// Built-in CLIs ("codex" | "claude" | "orchestrator") or a
 	// user-configured custom agent client id (validated [a-z0-9-]{1,32}).
 	// "orchestrator" (L2.4) selects the LOCAL Devboule main coder (oMLX); the
 	// backend dispatches its own binary instead of an external CLI. Kept as a string
@@ -421,7 +421,7 @@ export function normalizeModelHint(model: string): string | null {
 
 // Quick-fill model suggestions for the Spawn panel's free-text model input,
 // scoped to the selected CLI. Only the Claude CLI has a meaningful, stable set of
-// model names we can pre-fill (opus/sonnet/haiku); for codex, openai, powershell and any
+// model names we can pre-fill (opus/sonnet/haiku); for codex, powershell and any
 // user-configured custom client we deliberately invent NOTHING — the operator
 // types the model name themselves (or leaves it blank to self-report). Pure so
 // SpawnPanel can both render the chips and detect "did the user pick a suggestion"
@@ -497,7 +497,7 @@ export function buildLaunchInput(
 				: undefined,
 		// Duplex is the DEFAULT for in-app Claude launches (product decision). Undefined
 		// (not false) for every other combination so all other launches stay byte-identical.
-		// Codex/openai keep their current behavior (Planner-only duplex, set elsewhere).
+		// Codex keeps its current behavior (Planner-only duplex, set elsewhere).
 		cloudDuplex:
 			selection.client === "claude" &&
 			host === "app" &&

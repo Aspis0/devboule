@@ -184,13 +184,92 @@ fn project_folder_is_new(root: Option<&str>) -> bool {
 /// F13 residual: product index artifacts under an ATTACHED project root must not be
 /// committed by a coder's `git add -A`. Seed/append these lines into the root's
 /// `.gitignore` when missing. Best-effort — never fails project create/attach.
+///
+/// F57: also the single source of truth for paths excluded from dirty/untracked
+/// git status counts and the Changes untracked section (projects created before
+/// the F13 seed still show these as `??` otherwise).
 pub(crate) const ATTACHED_ROOT_GITIGNORE_ENTRIES: &[&str] = &[
     ".aspis/",
     ".aspis-censor/",
+    ".aspis-meta.json",
     ".aspis-mini/",
     ".pi/",
+    "_workspace/",
     "oracle-data/",
 ];
+
+/// Pure (F57): true when `rel` is a product-internal path from
+/// [`ATTACHED_ROOT_GITIGNORE_ENTRIES`] (e.g. `.aspis/foo`, `oracle-data/`,
+/// `.aspis-meta.json`). Accepts optional `./` prefix and either slash style;
+/// never rewrites .gitignore.
+///
+/// F57/A-13: directory entries (trailing `/`) match only the dir itself or its
+/// contents (`oracle-data/` or `oracle-data/x`) — a **file** named `oracle-data`
+/// is not excluded. File entries (no trailing `/`) match by exact equality only
+/// (so `.aspis-meta.json.bak` is not excluded).
+pub(crate) fn is_attached_product_path(rel: &str) -> bool {
+    let mut rel = rel.trim().trim_matches('"');
+    if let Some(stripped) = rel.strip_prefix("./") {
+        rel = stripped;
+    }
+    // Normalize only for comparison; input may use either separator.
+    let rel_norm = rel.replace('\\', "/");
+    for entry in ATTACHED_ROOT_GITIGNORE_ENTRIES {
+        if entry.ends_with('/') {
+            // Dir entry: porcelain prints untracked dirs with a trailing slash;
+            // contents appear as `<base>/...`.
+            if rel_norm.starts_with(entry) {
+                return true;
+            }
+        } else if rel_norm == *entry {
+            // File entry: exact equality only.
+            return true;
+        }
+    }
+    false
+}
+
+/// Pure (F57): path from a `git status --porcelain=v1` line (`XY path` or `?? path`).
+/// Returns None for empty/too-short lines. Rename lines keep the whole remainder
+/// (product dirs are almost never renames).
+pub(crate) fn porcelain_status_path(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    if line.len() < 4 {
+        return None;
+    }
+    // Porcelain v1: two status chars, space, path (or "old -> new" for renames).
+    Some(line[3..].trim())
+}
+
+/// Pure (F57): apply porcelain lines to dirty/untracked/staged/unstaged counts,
+/// skipping product-internal paths so pre-F13 roots do not show fake dirty cards.
+pub(crate) fn accumulate_porcelain_counts(
+    porcelain: &str,
+    dirty: &mut u32,
+    untracked: &mut u32,
+    staged: &mut u32,
+    unstaged: &mut u32,
+) {
+    for line in porcelain.lines().filter(|line| !line.trim().is_empty()) {
+        if let Some(path) = porcelain_status_path(line) {
+            if is_attached_product_path(path) {
+                continue;
+            }
+        }
+        *dirty = dirty.saturating_add(1);
+        let bytes = line.as_bytes();
+        if line.starts_with("??") {
+            *untracked = untracked.saturating_add(1);
+            continue;
+        }
+        if bytes.first().is_some_and(|value| *value != b' ') {
+            *staged = staged.saturating_add(1);
+        }
+        if bytes.get(1).is_some_and(|value| *value != b' ') {
+            *unstaged = unstaged.saturating_add(1);
+        }
+    }
+}
 
 /// Pure: which of `entries` are missing from existing gitignore text (line-aware).
 pub(crate) fn missing_gitignore_entries(existing: &str, entries: &[&str]) -> Vec<String> {
@@ -712,6 +791,82 @@ pub fn move_project_task(
     Ok(detail)
 }
 
+/// Pure status gate for [`delete_project_task`]: only `todo` / `blocked` may be
+/// deleted. DOM/app/IO-free so unit tests can pin the guard without a Tauri runtime.
+fn assert_task_status_deletable(status: &str) -> Result<(), String> {
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized == "todo" || normalized == "blocked" {
+        return Ok(());
+    }
+    Err(format!(
+        "Only todo or blocked tasks can be deleted (task is {status})."
+    ))
+}
+
+/// Pure delete body for [`delete_project_task`]: status gate + remove + strip
+/// dangling `depends_on` edges that pointed at the deleted id. DOM/app/IO-free
+/// so unit tests can pin the mutation without a Tauri runtime. Claim checking
+/// stays in the command (needs agent state); it runs INSIDE `mutate_project`
+/// under the project write lock so check+delete are atomic vs. concurrent
+/// project mutations.
+fn apply_delete_project_task(
+    project: &mut ParsedProject,
+    task_id: &str,
+) -> Result<(), String> {
+    let index = project
+        .state
+        .tasks
+        .iter()
+        .position(|item| item.id == task_id)
+        .ok_or_else(|| "Task not found.".to_string())?;
+    assert_task_status_deletable(&project.state.tasks[index].status)?;
+    project.state.tasks.remove(index);
+    // Drop dangling depends_on edges that pointed at the deleted task so the
+    // remaining DAG stays consistent (a dependent must not wait on a ghost id).
+    for remaining in &mut project.state.tasks {
+        remaining.depends_on.retain(|dep| dep != task_id);
+    }
+    Ok(())
+}
+
+/// Delete a project task permanently. Mirrors [`move_project_task`]'s shape
+/// (unlock gate → claim gate → optimistic `expected_revision` locked
+/// read-modify-write via `mutate_project` → return updated `ProjectDetail`).
+///
+/// Allowed only when the task is `todo` or `blocked` AND has no open agent
+/// claim. WIP / review / done tasks (or any claimed task) refuse with a clear
+/// error so a mistyped Todo can be removed without risking in-flight agent work.
+///
+/// Claim check runs INSIDE `mutate_project` (under the project write lock) so an
+/// agent cannot claim the task between an outer pre-check and the delete — the
+/// outer pre-check alone would be a TOCTOU window.
+#[tauri::command]
+pub fn delete_project_task(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    project_id: String,
+    task_id: String,
+    expected_revision: String,
+) -> Result<ProjectDetail, String> {
+    state.ensure_unlocked()?;
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Err("Task id is required.".into());
+    }
+    mutate_project(
+        &app,
+        &state,
+        &project_id,
+        expected_revision.as_str(),
+        |project| {
+            // Claim gate under the same write lock as the delete (no TOCTOU
+            // window vs. concurrent project mutations that also take the lock).
+            reject_delete_for_claimed_task(&app, &project_id, &task_id)?;
+            apply_delete_project_task(project, &task_id)
+        },
+    )
+}
+
 fn reject_manual_move_for_claimed_task(
     app: &tauri::AppHandle,
     project_id: &str,
@@ -720,6 +875,19 @@ fn reject_manual_move_for_claimed_task(
     if let Some(owner) = open_task_claim_summary(app, project_id, task_id)? {
         return Err(format!(
             "Task is controlled by an open agent claim ({owner}). Manual Kanban moves are blocked until the agent updates status through MCP or the claim expires."
+        ));
+    }
+    Ok(())
+}
+
+fn reject_delete_for_claimed_task(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    if let Some(owner) = open_task_claim_summary(app, project_id, task_id)? {
+        return Err(format!(
+            "Task is controlled by an open agent claim ({owner}). Delete is blocked until the agent updates status through MCP or the claim expires."
         ));
     }
     Ok(())
@@ -2513,6 +2681,23 @@ fn prepare_or_launch_project_agent(
     })
 }
 
+/// Optimistic-concurrency gate for [`mutate_project`]: empty/mismatch refuse
+/// before any write. Pure (no I/O) so unit tests can pin the messages without a
+/// Tauri runtime.
+fn assert_expected_revision(
+    project: &ParsedProject,
+    expected_revision: &str,
+) -> Result<(), String> {
+    let expected = expected_revision.trim();
+    if expected.is_empty() {
+        return Err("Project revision is required. Reload before saving.".into());
+    }
+    if expected != project.revision {
+        return Err("Project changed on disk. Reload before saving.".into());
+    }
+    Ok(())
+}
+
 fn mutate_project<F>(
     app: &tauri::AppHandle,
     state: &BackendState,
@@ -2532,13 +2717,7 @@ where
         return Err("Project not found.".into());
     }
     let mut project = read_project_file(&path)?;
-    let expected = expected_revision.trim();
-    if expected.is_empty() {
-        return Err("Project revision is required. Reload before saving.".into());
-    }
-    if expected != project.revision {
-        return Err("Project changed on disk. Reload before saving.".into());
-    }
+    assert_expected_revision(&project, expected_revision)?;
     update(&mut project)?;
     project.metadata.updated_at = now();
     write_project_file(&project)?;
@@ -4884,9 +5063,14 @@ fn build_cloud_duplex_launch(
         envs.push(("ASPIS_CONSENT_TIMEOUT_SECS".to_string(), "300".to_string()));
         // F36: isolate Claude from the owner's personal ~/.claude (CLAUDE.md, skills,
         // allowlists). Config lives under the app projects_dir, not $HOME.
+        // F46-close / F65: vault setup-token is sole auth when present — compute once,
+        // seed config dir without stale .credentials.json, then inject env (never log).
+        let vault_oauth =
+            crate::backend::cloud_claude_config::claude_oauth_token_env_from_vault();
         match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
             projects_dir,
             agent_id,
+            vault_oauth.is_some(),
         ) {
             Ok(cfg_dir) => {
                 envs.push(crate::backend::cloud_claude_config::claude_config_dir_env(
@@ -4900,10 +5084,7 @@ fn build_cloud_duplex_launch(
                 );
             }
         }
-        // F46-close: setup-token for headless auth (never log the value).
-        if let Some(pair) =
-            crate::backend::cloud_claude_config::claude_oauth_token_env_from_vault()
-        {
+        if let Some(pair) = vault_oauth {
             envs.push(pair);
         }
         // KAIRION (orchestrator-only, always-on): force adaptive SUMMARIZED thinking for the
@@ -5953,7 +6134,8 @@ mod tests {
         assert!(missing.iter().any(|e| e == ".aspis-mini/"));
         assert!(missing.iter().any(|e| e == ".pi/"));
         assert!(missing.iter().any(|e| e == "oracle-data/"));
-        let full = ".aspis/\n.aspis-censor/\n.aspis-mini/\n.pi/\noracle-data/\n";
+        let full =
+            ".aspis/\n.aspis-censor/\n.aspis-meta.json\n.aspis-mini/\n.pi/\n_workspace/\noracle-data/\n";
         assert!(missing_gitignore_entries(full, ATTACHED_ROOT_GITIGNORE_ENTRIES).is_empty());
         // Partial: already has `.aspis/` → only the still-missing product lines.
         let partial = ".aspis/\n";
@@ -5963,11 +6145,68 @@ mod tests {
             only_missing,
             vec![
                 ".aspis-censor/".to_string(),
+                ".aspis-meta.json".to_string(),
                 ".aspis-mini/".to_string(),
                 ".pi/".to_string(),
+                "_workspace/".to_string(),
                 "oracle-data/".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn f57_is_attached_product_path_matches_f13_seed_prefixes() {
+        assert!(is_attached_product_path(".aspis/"));
+        assert!(is_attached_product_path(".aspis/last_coarse_run"));
+        assert!(is_attached_product_path("./.aspis-censor/shard.json"));
+        assert!(is_attached_product_path(".pi/config.json"));
+        assert!(is_attached_product_path("oracle-data/x"));
+        assert!(is_attached_product_path(".aspis-mini\\out"));
+        // Dir entry with trailing slash (porcelain untracked dir).
+        assert!(is_attached_product_path("oracle-data/"));
+        // File entry: exact equality only.
+        assert!(is_attached_product_path(".aspis-meta.json"));
+        // Real user paths must not be excluded.
+        assert!(!is_attached_product_path("src/main.rs"));
+        assert!(!is_attached_product_path("aspis-not-product"));
+        assert!(!is_attached_product_path(".aspis-extra/"));
+        assert!(!is_attached_product_path("readme.aspis"));
+        // F57/A-13: a FILE named like a product dir base must NOT match the dir entry.
+        assert!(!is_attached_product_path("oracle-data"));
+        // File entry must not match a longer name.
+        assert!(!is_attached_product_path(".aspis-meta.json.bak"));
+    }
+
+    #[test]
+    fn f57_accumulate_porcelain_counts_skips_product_internal() {
+        // NOTE: no `\`-continuation here — it would strip the significant leading
+        // space of the ` M` porcelain line.
+        let porcelain = concat!(
+            "?? .aspis/\n",
+            "?? .aspis-censor/\n",
+            "?? .aspis-mini/\n",
+            "?? .pi/\n",
+            "?? oracle-data/\n",
+            "?? src/real.rs\n",
+            " M tracked.txt\n",
+            "A  staged.txt\n",
+        );
+        let mut dirty = 0u32;
+        let mut untracked = 0u32;
+        let mut staged = 0u32;
+        let mut unstaged = 0u32;
+        accumulate_porcelain_counts(
+            porcelain,
+            &mut dirty,
+            &mut untracked,
+            &mut staged,
+            &mut unstaged,
+        );
+        // Only src/real.rs (??), tracked.txt ( M), staged.txt (A ) count.
+        assert_eq!(dirty, 3, "product dirs must not inflate dirty_count");
+        assert_eq!(untracked, 1, "only real untracked file");
+        assert_eq!(staged, 1);
+        assert_eq!(unstaged, 1);
     }
 
     #[test]
@@ -9401,6 +9640,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             None,
             None,
             &[],
+            false,
         )
         .expect("script builds");
         // CLIPBOARD: the prompt is delivered to the user via the clipboard only.
@@ -9435,6 +9675,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 None,
                 None,
                 &[],
+                false,
             )
             .expect("script builds");
             assert!(
@@ -9476,6 +9717,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             None,
             None,
             &[],
+            false,
         )
         .expect("script builds");
         // GIT_TERMINAL_PROMPT=0 → never block on an interactive credential prompt.
@@ -9915,6 +10157,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             None,
             None,
             &[],
+            false,
         )
         .expect("script builds");
 
@@ -10335,6 +10578,166 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 ..task(status)
             }
         }
+    }
+
+    #[test]
+    fn delete_task_status_guard_allows_todo_and_blocked() {
+        assert!(assert_task_status_deletable("todo").is_ok());
+        assert!(assert_task_status_deletable("blocked").is_ok());
+        assert!(assert_task_status_deletable("TODO").is_ok());
+        assert!(assert_task_status_deletable(" Blocked ").is_ok());
+    }
+
+    #[test]
+    fn delete_task_status_guard_refuses_non_deletable_status() {
+        for status in ["wip", "review", "done"] {
+            let err = assert_task_status_deletable(status).unwrap_err();
+            assert!(
+                err.contains("Only todo or blocked"),
+                "status={status} err={err}"
+            );
+            assert!(err.contains(status), "status={status} err={err}");
+        }
+    }
+
+    /// Integration-style: temp project file with T1 (todo) + T2 depending on T1
+    /// → delete T1 → T1 gone and T2.depends_on no longer lists T1. Also pins the
+    /// revision mismatch gate and the wip refusal path used by `delete_project_task`.
+    #[test]
+    fn delete_project_task_removes_task_strips_depends_on_and_guards() {
+        let (root, path) = write_temp_project("delete-task-deps");
+
+        // Seed T2 depending on the fixture T1 (todo).
+        mutate_project_file_latest(&path, |project| {
+            project.state.tasks.push(ProjectTask {
+                id: "T2".into(),
+                title: "Depends on T1".into(),
+                status: "todo".into(),
+                depends_on: vec!["T1".into()],
+                ..task("todo")
+            });
+            // Also a third task that does NOT depend on T1 — must stay untouched.
+            project.state.tasks.push(ProjectTask {
+                id: "T3".into(),
+                title: "Independent".into(),
+                status: "todo".into(),
+                depends_on: vec!["T2".into()],
+                ..task("todo")
+            });
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+
+        let before = read_project_file(&path).unwrap();
+        assert_eq!(before.state.tasks.len(), 3);
+        let t2_before = before
+            .state
+            .tasks
+            .iter()
+            .find(|t| t.id == "T2")
+            .expect("T2");
+        assert!(t2_before.depends_on.iter().any(|d| d == "T1"));
+
+        // Happy path: apply the same pure delete body the command uses under
+        // mutate_project (claim check needs agent state and is unit-tested
+        // separately via reject_delete; revision gate is shared with mutate_project).
+        let saved = mutate_project_file_latest(&path, |project| {
+            apply_delete_project_task(project, "T1")
+        })
+        .unwrap()
+        .expect("present project");
+
+        assert!(
+            !saved.state.tasks.iter().any(|t| t.id == "T1"),
+            "T1 must be gone after delete"
+        );
+        let t2 = saved
+            .state
+            .tasks
+            .iter()
+            .find(|t| t.id == "T2")
+            .expect("T2 must remain");
+        assert!(
+            !t2.depends_on.iter().any(|d| d == "T1"),
+            "T2.depends_on must no longer list deleted T1, got {:?}",
+            t2.depends_on
+        );
+        let t3 = saved
+            .state
+            .tasks
+            .iter()
+            .find(|t| t.id == "T3")
+            .expect("T3 must remain");
+        assert_eq!(
+            t3.depends_on,
+            vec!["T2".to_string()],
+            "unrelated depends_on edges must be preserved"
+        );
+
+        // WIP refusal: a non-deletable status must not remove the task or touch
+        // depends_on edges.
+        mutate_project_file_latest(&path, |project| {
+            project.state.tasks.push(ProjectTask {
+                id: "T-wip".into(),
+                title: "In flight".into(),
+                status: "wip".into(),
+                ..task("wip")
+            });
+            // Point T3 at the wip task so a failed delete must not strip it.
+            if let Some(t3) = project.state.tasks.iter_mut().find(|t| t.id == "T3") {
+                t3.depends_on.push("T-wip".into());
+            }
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+
+        // No `expect_err`: the Ok type carries ParsedProject, which has no Debug.
+        let wip_err = match mutate_project_file_latest(&path, |project| {
+            apply_delete_project_task(project, "T-wip")
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("wip delete must fail"),
+        };
+        assert!(
+            wip_err.contains("Only todo or blocked"),
+            "got: {wip_err}"
+        );
+        // Failed mutate_project_file_latest does not write — re-read on-disk state.
+        let after_wip = read_project_file(&path).unwrap();
+        assert!(
+            after_wip.state.tasks.iter().any(|t| t.id == "T-wip"),
+            "failed delete must leave the wip task on disk"
+        );
+        let t3_after = after_wip
+            .state
+            .tasks
+            .iter()
+            .find(|t| t.id == "T3")
+            .expect("T3");
+        assert!(
+            t3_after.depends_on.iter().any(|d| d == "T-wip"),
+            "failed delete must not strip depends_on"
+        );
+
+        // Revision mismatch gate — same pure check `mutate_project` applies
+        // before the delete_project_task closure. Stale/empty refuse; match ok.
+        let on_disk = read_project_file(&path).unwrap();
+        let empty_err = assert_expected_revision(&on_disk, "").unwrap_err();
+        assert!(
+            empty_err.contains("revision is required"),
+            "got: {empty_err}"
+        );
+        let stale = format!("{}-stale", on_disk.revision);
+        let mismatch_err = assert_expected_revision(&on_disk, &stale).unwrap_err();
+        assert!(
+            mismatch_err.contains("Project changed on disk"),
+            "got: {mismatch_err}"
+        );
+        assert!(assert_expected_revision(&on_disk, &on_disk.revision).is_ok());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

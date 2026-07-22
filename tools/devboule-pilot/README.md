@@ -1,66 +1,71 @@
-# devboule-pilot — agent UI drive for **Devboule** (DEV ONLY)
+# Devboule UI Pilot
 
-Name in this repo: **`devboule-pilot`** (MCP server + npm scripts + this folder).
+**Product-specific** agent FE+BE automation for **Devboule only**  
+(not Figlyph, not multi-app auto-socket).
 
-Under the hood it uses the upstream binary **`tauri-pilot`**
-([mpiton/tauri-pilot](https://github.com/mpiton/tauri-pilot), MIT) — same stack as
-Figlyph, **different MCP server name** so agents do not mix the two apps.
+| | |
+|--|--|
+| App id | `com.devboule.app` |
+| Window title | `Devboule` |
+| FE | `http://127.0.0.1:1420` |
+| Socket | plugin-aligned `…/tauri-pilot-com.devboule.app.sock` |
+| Unlock | **`DEVBOULE_DEV_UNLOCK=1`** for agent overnight |
 
-| Name you see | What it is |
-|--------------|------------|
-| **`devboule-pilot`** | This glue: MCP entry, scripts, docs (Devboule only) |
-| **`tauri-pilot`** | Upstream CLI binary on PATH (`cargo install tauri-pilot-cli`) |
-| **`devboule-mcp`** | Product agent tools (projects/plan/cloud) — **not** UI drive |
-| Figlyph’s pilot | Lives only under the **figlyph** repo (`.mcp.json` there) |
+Under the hood: upstream **`tauri-pilot` CLI** + patched **`tauri-plugin-pilot`**  
+(path: `Projects/vendor/tauri-plugin-pilot`, IPC timeout **600s** for long backends).
 
-**Never enable for production installers.**
+## Why this exists (Devboule-specific)
 
-## Critical run rule
+| Need | Tooling |
+|------|---------|
+| Stay off lock screen | `DEVBOULE_DEV_UNLOCK=1` in `run-app.sh` / `up.sh` |
+| Board is the product | `list_projects` / `get_project` / `create_project` |
+| Session oracle | `get_auth_state` before any project IPC |
+| Not figure canvas | No `get_document` — use projects/agents/oracle |
+| Avoid Figlyph mix-up | Title gate + socket pin + MCP id `devboule_pilot` |
 
-Frontend on **`http://localhost:1420`** must be up, then the app with pilot:
-
-```bash
-# Terminal FE
-npm run dev
-
-# Terminal app
-npm run devboule-pilot:app
-```
-
-Socket `ping` without FE still “works”; title/snapshot/eval need `:1420`.
-
-## Install CLI once
+## Quick start
 
 ```bash
-cargo install tauri-pilot-cli --version 0.7.2 --locked
+./tools/devboule-pilot/up.sh --start-app
+./tools/devboule-pilot/ready.sh --json
+./tools/devboule-pilot/fpilot snapshot -i
+./tools/devboule-pilot/scenarios/smoke-session.sh
+./tools/devboule-pilot/scenarios/list-projects.sh
 ```
 
-## Smoke
+Or npm: `npm run devboule-pilot:app` + `npm run devboule-pilot:smoke`
 
-```bash
-npm run devboule-pilot:smoke
-# or START_FRONTEND=1 npm run devboule-pilot:smoke
-```
+Agent runbook: [`SKILL.md`](./SKILL.md) · IPC recipes: [`ipc-catalog.json`](./ipc-catalog.json)
+
+## Layout
+
+| Path | Role |
+|------|------|
+| `env.sh`, `fpilot` | Socket/window pin |
+| `ready.sh`, `up.sh`, `ensure-devurl.sh`, `run-app.sh` | Bring-up |
+| `ipc-catalog.json` | Curated agent IPC (not full 300+) |
+| `lib/assert_json.py`, `validate_ipc_catalog.py` | Offline checks |
+| `scenarios/` | session + projects + chrome-shell.toml |
+| `mcp_proxy_for_grok.py` | Grok names + title gate |
+
+## Chrome testids
+
+`devboule-app`, `sidebar`, `nav-{id}`, `header`, `projects-view`  
+(only when unlocked — lock screen has no shell)
 
 ## MCP
 
-| Client | Server id | Config |
-|--------|-----------|--------|
-| Claude / Cursor | `devboule-pilot` | repo `.mcp.json` |
-| Grok Build | `devboule_pilot` | `.grok/config.toml` + name proxy |
+| Client | Id |
+|--------|-----|
+| Claude/Cursor | `devboule-pilot` |
+| Grok | `devboule_pilot` |
 
-See [MCP.md](./MCP.md).
+## IPC timeout (long agent/LLM work)
 
-## Safety
+```bash
+export TAURI_PILOT_IPC_TIMEOUT_MS=1800000   # optional, on the *app* process
+# default ipc = 600s via vendor plugin
+```
 
-- Feature `ui-pilot` + `debug_assertions` only  
-- Ephemeral `capabilities/pilot.json` (gitignored)  
-- Not shipped in release builds  
-
-## Detach
-
-1. Drop `ui-pilot` feature + dep from `Cargo.toml`  
-2. Drop cfg block in `lib.rs`  
-3. Remove `src-tauri/tauri.pilot.conf.json`  
-4. Delete `tools/devboule-pilot/` + MCP entries  
-5. `rm -f src-tauri/capabilities/pilot.json`  
+See `Projects/vendor/tauri-plugin-pilot/PATCHES.md`.

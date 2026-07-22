@@ -172,6 +172,88 @@ pub enum RunnerId {
 }
 
 impl RunnerId {
+    /// Canonical list of every [`RunnerId`] variant (declaration order).
+    ///
+    /// EXHAUSTIVENESS (F56/A-5): pinned by [`Self::exhaustive_witness`] (wildcard-free
+    /// match) plus the `all_runner_ids_*` tests — adding a variant makes the witness
+    /// non-exhaustive (compile error) and trips membership tests until listed here.
+    pub const ALL: [RunnerId; 33] = [
+        RunnerId::Clippy,
+        RunnerId::CargoCheck,
+        RunnerId::CargoAudit,
+        RunnerId::CargoDeny,
+        RunnerId::CargoFmt,
+        RunnerId::Tsc,
+        RunnerId::Eslint,
+        RunnerId::Knip,
+        RunnerId::Prettier,
+        RunnerId::NpmAudit,
+        RunnerId::Oxlint,
+        RunnerId::Ruff,
+        RunnerId::RuffFormat,
+        RunnerId::PipAudit,
+        RunnerId::Pyright,
+        RunnerId::Bandit,
+        RunnerId::Vulture,
+        RunnerId::Gofmt,
+        RunnerId::GoVet,
+        RunnerId::Cppcheck,
+        RunnerId::Tidy,
+        RunnerId::Ktlint,
+        RunnerId::Shellcheck,
+        RunnerId::Yamllint,
+        RunnerId::Sqlfluff,
+        RunnerId::Hadolint,
+        RunnerId::Actionlint,
+        RunnerId::Stylelint,
+        RunnerId::Gitleaks,
+        RunnerId::Jscpd,
+        RunnerId::Lizard,
+        RunnerId::Semgrep,
+        RunnerId::Zizmor,
+    ];
+
+    /// Identity map over every variant via a wildcard-free `match`. Compile-time
+    /// exhaustiveness anchor for [`Self::ALL`] (F56/A-5). Test-only.
+    #[cfg(test)]
+    const fn exhaustive_witness(self) -> RunnerId {
+        match self {
+            RunnerId::Clippy => RunnerId::Clippy,
+            RunnerId::CargoCheck => RunnerId::CargoCheck,
+            RunnerId::CargoAudit => RunnerId::CargoAudit,
+            RunnerId::CargoDeny => RunnerId::CargoDeny,
+            RunnerId::CargoFmt => RunnerId::CargoFmt,
+            RunnerId::Tsc => RunnerId::Tsc,
+            RunnerId::Eslint => RunnerId::Eslint,
+            RunnerId::Knip => RunnerId::Knip,
+            RunnerId::Prettier => RunnerId::Prettier,
+            RunnerId::NpmAudit => RunnerId::NpmAudit,
+            RunnerId::Oxlint => RunnerId::Oxlint,
+            RunnerId::Ruff => RunnerId::Ruff,
+            RunnerId::RuffFormat => RunnerId::RuffFormat,
+            RunnerId::PipAudit => RunnerId::PipAudit,
+            RunnerId::Pyright => RunnerId::Pyright,
+            RunnerId::Bandit => RunnerId::Bandit,
+            RunnerId::Vulture => RunnerId::Vulture,
+            RunnerId::Gofmt => RunnerId::Gofmt,
+            RunnerId::GoVet => RunnerId::GoVet,
+            RunnerId::Cppcheck => RunnerId::Cppcheck,
+            RunnerId::Tidy => RunnerId::Tidy,
+            RunnerId::Ktlint => RunnerId::Ktlint,
+            RunnerId::Shellcheck => RunnerId::Shellcheck,
+            RunnerId::Yamllint => RunnerId::Yamllint,
+            RunnerId::Sqlfluff => RunnerId::Sqlfluff,
+            RunnerId::Hadolint => RunnerId::Hadolint,
+            RunnerId::Actionlint => RunnerId::Actionlint,
+            RunnerId::Stylelint => RunnerId::Stylelint,
+            RunnerId::Gitleaks => RunnerId::Gitleaks,
+            RunnerId::Jscpd => RunnerId::Jscpd,
+            RunnerId::Lizard => RunnerId::Lizard,
+            RunnerId::Semgrep => RunnerId::Semgrep,
+            RunnerId::Zizmor => RunnerId::Zizmor,
+        }
+    }
+
     /// The trigger granularity of this runner.
     ///
     /// COARSE = project-wide: the tool inspects the whole project (or the whole
@@ -873,6 +955,65 @@ mod tests {
 
     fn kinds(list: &[ProjectKind]) -> HashSet<ProjectKind> {
         list.iter().copied().collect()
+    }
+
+    #[test]
+    fn all_runner_ids_is_exhaustive_and_unique() {
+        // F56/A-5: every entry round-trips through the wildcard-free witness; set is
+        // duplicate-free. A new enum variant makes exhaustive_witness non-exhaustive
+        // (compile error) and, once handled there, membership forces it into ALL.
+        let set: HashSet<RunnerId> = RunnerId::ALL.into_iter().collect();
+        assert_eq!(set.len(), RunnerId::ALL.len(), "ALL has duplicates");
+        for id in RunnerId::ALL {
+            assert_eq!(id.exhaustive_witness(), id);
+            assert!(set.contains(&id.exhaustive_witness()));
+        }
+    }
+
+    #[test]
+    fn each_known_runner_id_is_present_in_all() {
+        // Spell out every known variant so adding one to the enum (+ witness) but
+        // forgetting ALL is caught.
+        for id in [
+            RunnerId::Clippy,
+            RunnerId::CargoCheck,
+            RunnerId::CargoAudit,
+            RunnerId::CargoDeny,
+            RunnerId::CargoFmt,
+            RunnerId::Tsc,
+            RunnerId::Eslint,
+            RunnerId::Knip,
+            RunnerId::Prettier,
+            RunnerId::NpmAudit,
+            RunnerId::Oxlint,
+            RunnerId::Ruff,
+            RunnerId::RuffFormat,
+            RunnerId::PipAudit,
+            RunnerId::Pyright,
+            RunnerId::Bandit,
+            RunnerId::Vulture,
+            RunnerId::Gofmt,
+            RunnerId::GoVet,
+            RunnerId::Cppcheck,
+            RunnerId::Tidy,
+            RunnerId::Ktlint,
+            RunnerId::Shellcheck,
+            RunnerId::Yamllint,
+            RunnerId::Sqlfluff,
+            RunnerId::Hadolint,
+            RunnerId::Actionlint,
+            RunnerId::Stylelint,
+            RunnerId::Gitleaks,
+            RunnerId::Jscpd,
+            RunnerId::Lizard,
+            RunnerId::Semgrep,
+            RunnerId::Zizmor,
+        ] {
+            assert!(
+                RunnerId::ALL.contains(&id),
+                "RunnerId::{id:?} missing from RunnerId::ALL"
+            );
+        }
     }
 
     #[test]

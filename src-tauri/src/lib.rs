@@ -599,6 +599,7 @@ pub fn run() {
             backend::projects::append_project_note,
             backend::projects::create_project,
             backend::projects::create_project_task,
+            backend::projects::delete_project_task,
             backend::projects::get_design_llm_backend,
             backend::projects::get_mini_write_behavior,
             backend::projects::set_mini_write_behavior,

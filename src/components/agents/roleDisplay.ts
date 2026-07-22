@@ -47,3 +47,14 @@ export function displayRole(session: RoleDisplaySource): DisplayRole {
         : "coder";
   return { role, orchestratorBadge: role === "orchestrator" };
 }
+
+/** Presentational chip label for the Activity stream (and similar surfaces).
+ *  Maps the session's stored role to a human title; unknown/empty → "Agent". */
+export function roleChipLabel(role: string | null | undefined): string {
+  const stored = (role ?? "").trim().toLowerCase();
+  if (stored === "orchestrator") return "Orchestrator";
+  if (stored === "verifier") return "Verifier";
+  if (stored === "mini") return "Mini";
+  if (stored === "coder") return "Coder";
+  return "Agent";
+}

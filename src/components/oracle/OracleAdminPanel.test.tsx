@@ -201,10 +201,10 @@ describe("OracleAdminPanel — health strip", () => {
     const { container } = await render();
     // The strip header + server badge render.
     expect(container.textContent).toContain("Oracle server:");
-    // Coarse pass-count: runtime + live_server + workspace + index = 4 of 6
-    // (embedder + provider stay neutral). The ratio text proves coarse mode.
-    expect(container.textContent).toContain("4/6 checks pass");
-    // The five+ doctor dots render (one per check id).
+    // No real doctor report yet — never claim a fabricated pre-run total.
+    expect(container.textContent).toContain("— checks");
+    expect(container.textContent).not.toMatch(/\d+\/\d+ checks pass/);
+    // Doctor dots still render (one per known check id).
     const dots = container.querySelectorAll("span[title]");
     const ids = Array.from(dots).map((d) => d.getAttribute("title"));
     expect(ids).toContain("runtime");
@@ -235,9 +235,12 @@ describe("OracleAdminPanel — health strip", () => {
       await Promise.resolve();
     });
     rerender(root);
-    // Full report: 5 of 6 checks pass (index failed). This proves the strip is
-    // now driven by the doctor report, not the coarse inference.
+    // Full report: 5 of 6 checks pass (index failed). Count comes from the
+    // report (report.checks.length), never a hardcoded default.
     expect(container.textContent).toContain("5/6 checks pass");
+    // The doctor headline is not part of the health strip; just prove no
+    // hardcoded pre-report count leaks into this render.
+    expect(container.textContent).not.toContain("Truthful health, 5 checks");
   });
 });
 

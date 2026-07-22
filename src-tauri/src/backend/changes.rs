@@ -175,6 +175,9 @@ fn run_git(git: &Path, root: &Path, args: &[&str]) -> Result<String, String> {
 /// WARNING 4: list the repo's untracked, non-ignored files. `git diff HEAD` omits
 /// these entirely, so a repo whose only changes are brand-new (un-added) files would
 /// otherwise look clean. Rendered as a labeled section appended to the diff.
+///
+/// F57: product-internal dirs (F13 seed list) are excluded so pre-seed roots do not
+/// flood the Changes view with `.aspis/` / `.pi/` / etc. Never rewrites .gitignore.
 fn untracked_section(git: &Path, root: &Path) -> Option<String> {
     let out = run_git(git, root, &["ls-files", "--others", "--exclude-standard"]).ok()?;
     let trimmed = out.trim();
@@ -182,10 +185,18 @@ fn untracked_section(git: &Path, root: &Path) -> Option<String> {
         return None;
     }
     let mut section = String::from("# Untracked files (not staged):\n");
+    let mut any = false;
     for file in trimmed.lines() {
+        if crate::backend::projects::is_attached_product_path(file) {
+            continue;
+        }
         section.push_str("?? ");
         section.push_str(file);
         section.push('\n');
+        any = true;
+    }
+    if !any {
+        return None;
     }
     Some(section)
 }
@@ -530,6 +541,36 @@ mod tests {
             out.contains("?? brand_new.txt"),
             "missing untracked file line: {out}"
         );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn working_diff_hides_product_internal_untracked_dirs() {
+        // F57: product dirs from the F13 seed list must not appear in the untracked
+        // section even when git still reports them (pre-seed roots with no .gitignore).
+        let Some(git) = git_or_skip() else { return };
+        let repo = temp_repo_dir("product-untracked");
+        git_in(&git, &repo, &["init", "-q"]);
+        std::fs::write(repo.join("seed.txt"), "x\n").unwrap();
+        git_in(&git, &repo, &["add", "seed.txt"]);
+        git_in(&git, &repo, &["commit", "-q", "-m", "init"]);
+        std::fs::create_dir_all(repo.join(".aspis")).unwrap();
+        std::fs::write(repo.join(".aspis/marker"), "m\n").unwrap();
+        std::fs::create_dir_all(repo.join(".pi")).unwrap();
+        std::fs::write(repo.join(".pi/cfg"), "c\n").unwrap();
+        std::fs::write(repo.join("real_new.txt"), "hello\n").unwrap();
+
+        let out = working_diff_for_root(&git, &repo).unwrap();
+        assert!(
+            out.contains("?? real_new.txt"),
+            "real untracked must surface: {out}"
+        );
+        assert!(
+            !out.contains(".aspis"),
+            "product .aspis must be hidden: {out}"
+        );
+        assert!(!out.contains(".pi"), "product .pi must be hidden: {out}");
 
         let _ = std::fs::remove_dir_all(&repo);
     }

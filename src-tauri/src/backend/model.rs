@@ -44,6 +44,10 @@ pub struct AuthState {
     pub hello_available: bool,
     pub last_unlocked_at: Option<String>,
     pub lock_reason: Option<String>,
+    /// True when `DEVBOULE_DEV_UNLOCK` was active at process startup (cached on
+    /// BackendState — not re-read per call). FE uses this to skip visibility
+    /// auto-lock so pilot/agent sessions can keep the window hidden.
+    pub dev_unlock: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

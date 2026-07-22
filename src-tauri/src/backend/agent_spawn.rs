@@ -21,6 +21,14 @@ use tauri::Manager;
 use super::agents::process_creation_time;
 use super::user_mcp_config;
 
+/// F65: true when the caller already injected a vault Claude OAuth token into
+/// `provider_env` (single vault read at launch assembly in `projects.rs`). Config-dir
+/// sites must use this instead of re-reading the vault (audit A-1).
+fn vault_oauth_present_in(provider_env: &[AgentLaunchEnv]) -> bool {
+    provider_env
+        .iter()
+        .any(|e| e.name == "CLAUDE_CODE_OAUTH_TOKEN")
+}
 
 /// What a successful agent terminal spawn yields. `pid` is the spawned child's id
 /// (the conhost child on Windows; the osascript helper on macOS — see the macOS
@@ -219,6 +227,7 @@ fn spawn_agent_terminal_app_impl(
         model,
         orchestrator,
         user_servers,
+        vault_oauth_present_in(provider_env),
     )?;
 
     // PTY host: run powershell directly (NO conhost — the PTY IS the console). Same
@@ -368,6 +377,9 @@ pub(crate) fn build_windows_agent_script(
     // config. EMPTY ⇒ command_line byte-identical to before. NEVER reaches the mini
     // (this is the MAIN-coder launch path only — design §6).
     user_servers: &[user_mcp_config::UserMcpServer],
+    // F65/A-1: vault setup-token presence from the caller's single vault read
+    // (threaded via provider_env), NOT a re-read here.
+    vault_token_present: bool,
 ) -> Result<(PathBuf, String), String> {
     let is_custom = custom_command.is_some();
     let command_line = if let Some(orchestrator) = orchestrator {
@@ -494,10 +506,13 @@ Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinu
     let session_gitconfig_label = ps_single_quote(&session_gitconfig.display().to_string());
     // F36: isolate product Claude from the operator's personal ~/.claude (CLAUDE.md,
     // skills, allowlists). Same helper as cloud duplex; best-effort if mkdir fails.
+    // F65: when vault setup-token is present (caller-threaded, single vault read),
+    // drop stale .credentials.json so the injected CLAUDE_CODE_OAUTH_TOKEN is sole auth.
     let claude_config_env = if client == "claude" {
         match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
             projects_dir,
             agent_id,
+            vault_token_present,
         ) {
             Ok(dir) => {
                 let label = ps_single_quote(&dir.display().to_string());
@@ -566,6 +581,7 @@ fn spawn_agent_terminal_impl(
         model,
         orchestrator,
         user_servers,
+        vault_oauth_present_in(provider_env),
     )?;
     // Launch through conhost.exe so the agent always gets its OWN dedicated
     // CLASSIC console window (tagged with the unique title above), not a shared
@@ -795,10 +811,14 @@ pub(crate) fn build_macos_agent_script(
     ));
     // F36: isolate product Claude from the operator's personal ~/.claude.
     // Set in-script on both PTY and external Terminal paths (non-secret path).
+    // F65: vault presence from caller-threaded provider_env (single vault read at
+    // launch assembly) — do not re-read the vault here (audit A-1).
     if client == "claude" {
+        let vault_token_present = vault_oauth_present_in(provider_env);
         match crate::backend::cloud_claude_config::ensure_claude_product_config_dir(
             projects_dir,
             agent_id,
+            vault_token_present,
         ) {
             Ok(dir) => {
                 script.push_str(&format!(

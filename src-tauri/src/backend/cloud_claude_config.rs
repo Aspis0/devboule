@@ -302,20 +302,49 @@ fn seed_owner_login_state(config_dir: &Path) -> std::io::Result<()> {
 ///
 /// F46: isolation targets CLAUDE.md / skills / permissions — **not** authentication.
 /// Credentials are deliberately shared from the owner install by seeding
-/// `~/.claude/.credentials.json` into the isolated dir when missing or stale.
+/// `~/.claude/.credentials.json` into the isolated dir when missing or stale —
+/// **unless** a vault setup-token is present (see `vault_token_present`).
 ///
 /// F46-auto: also reuses the machine login *state* from `$HOME/.claude.json`
 /// (`oauthAccount` / `userID`) into the isolated dir's `.claude.json` when dest is not
 /// already logged in — the keychain credential item is already shared; only the login
 /// state was missing. The setup-token env path remains the explicit override.
 ///
+/// F65: when `vault_token_present` is true, the env token (`CLAUDE_CODE_OAUTH_TOKEN`) is
+/// the single auth source. Stale per-agent `.credentials.json` files (seeded while auth
+/// was broken) shadow the env token and cause `401 Invalid bearer token` — so delete that
+/// file and skip `seed_owner_credentials`. Login-state seed still runs (display only).
+///
 /// macOS keychain-stored credentials cannot be fully synthesized if neither file nor
 /// token is available; if still logged-out the CLI will report that and the app surface
 /// should show the auth error (out of scope here).
-pub fn ensure_claude_product_config_dir(base: &Path, agent_id: &str) -> std::io::Result<PathBuf> {
+pub fn ensure_claude_product_config_dir(
+    base: &Path,
+    agent_id: &str,
+    vault_token_present: bool,
+) -> std::io::Result<PathBuf> {
     let dir = claude_product_config_dir(base, agent_id);
     std::fs::create_dir_all(&dir)?;
-    seed_owner_credentials(&dir)?;
+    if vault_token_present {
+        // Env token is sole auth — drop any stale credentials seed so the CLI cannot
+        // prefer a broken file over CLAUDE_CODE_OAUTH_TOKEN. Best-effort; ignore NotFound.
+        // F65/A-3: surface non-NotFound errors (EACCES/EPERM) so stuck stale-creds is
+        // diagnosable — never log file contents or token values, only the config dir.
+        let creds = dir.join(".credentials.json");
+        match std::fs::remove_file(&creds) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!(
+                    "cloud claude: could not remove stale .credentials.json under {} ({e}); \
+                     vault token may be shadowed (F65 best-effort)",
+                    dir.display()
+                );
+            }
+        }
+    } else {
+        seed_owner_credentials(&dir)?;
+    }
     seed_owner_login_state(&dir)?;
     Ok(dir)
 }
@@ -535,7 +564,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&base);
-        let dir = ensure_claude_product_config_dir(&base, "agent-1").unwrap();
+        let dir = ensure_claude_product_config_dir(&base, "agent-1", false).unwrap();
         assert!(dir.is_dir());
         assert!(dir.starts_with(&base));
         let _ = std::fs::remove_dir_all(&base);
@@ -589,7 +618,7 @@ mod tests {
         std::fs::write(&src, br#"{"token":"fake-seed-only"}"#).unwrap();
 
         with_fake_home(&home, || {
-            let dir = ensure_claude_product_config_dir(&base, "agent-seed").unwrap();
+            let dir = ensure_claude_product_config_dir(&base, "agent-seed", false).unwrap();
             let dest = dir.join(".credentials.json");
             assert!(dest.is_file(), "credentials should be seeded into isolated dir");
             assert_eq!(
@@ -616,7 +645,7 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude")).unwrap();
 
         with_fake_home(&home, || {
-            let dir = ensure_claude_product_config_dir(&base, "agent-absent").unwrap();
+            let dir = ensure_claude_product_config_dir(&base, "agent-absent", false).unwrap();
             assert!(dir.is_dir());
             assert!(
                 !dir.join(".credentials.json").exists(),
@@ -645,7 +674,7 @@ mod tests {
         std::fs::write(&dest, br#"{"token":"newer-dest"}"#).unwrap();
 
         with_fake_home(&home, || {
-            let out = ensure_claude_product_config_dir(&base, "agent-newer").unwrap();
+            let out = ensure_claude_product_config_dir(&base, "agent-newer", false).unwrap();
             assert_eq!(out, dir);
             assert_eq!(
                 std::fs::read_to_string(&dest).unwrap(),
@@ -672,7 +701,7 @@ mod tests {
         .unwrap();
 
         with_fake_home(&home, || {
-            let dir = ensure_claude_product_config_dir(&base, "agent-login").unwrap();
+            let dir = ensure_claude_product_config_dir(&base, "agent-login", false).unwrap();
             let dest = dir.join(".claude.json");
             assert!(dest.is_file(), "login state should be seeded");
             let v: serde_json::Value =
@@ -712,7 +741,7 @@ mod tests {
         .unwrap();
 
         with_fake_home(&home, || {
-            ensure_claude_product_config_dir(&base, "agent-keep").unwrap();
+            ensure_claude_product_config_dir(&base, "agent-keep", false).unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
             assert_eq!(v["oauthAccount"]["email"], "already@isolated.local");
@@ -730,13 +759,14 @@ mod tests {
         let base = f46_temp("base-login-absent");
         // No .claude.json under home.
         with_fake_home(&home, || {
-            let dir = ensure_claude_product_config_dir(&base, "agent-absent-login").unwrap();
+            let dir = ensure_claude_product_config_dir(&base, "agent-absent-login", false).unwrap();
             assert!(!dir.join(".claude.json").exists());
         });
         // Garbage JSON → still no-op.
         std::fs::write(home.join(".claude.json"), b"not-json{{{{").unwrap();
         with_fake_home(&home, || {
-            let dir = ensure_claude_product_config_dir(&base, "agent-garbage-login").unwrap();
+            let dir =
+                ensure_claude_product_config_dir(&base, "agent-garbage-login", false).unwrap();
             assert!(!dir.join(".claude.json").exists());
         });
 
@@ -760,13 +790,61 @@ mod tests {
         std::fs::write(&dest, r#"{"theme":"dark","numStartups":3}"#).unwrap();
 
         with_fake_home(&home, || {
-            ensure_claude_product_config_dir(&base, "agent-merge").unwrap();
+            ensure_claude_product_config_dir(&base, "agent-merge", false).unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
             assert!(v.get("oauthAccount").is_some());
             assert_eq!(v["userID"], "uid-1");
             assert_eq!(v["theme"], "dark");
             assert_eq!(v["numStartups"], 3);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- F65: vault token present → drop stale .credentials.json, skip seed -----
+
+    #[test]
+    fn f65_vault_token_present_removes_stale_credentials() {
+        let base = f46_temp("base-f65-drop");
+        let dir = claude_product_config_dir(&base, "agent-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join(".credentials.json");
+        std::fs::write(&creds, br#"{"token":"stale-broken-seed"}"#).unwrap();
+        assert!(creds.is_file());
+
+        let out = ensure_claude_product_config_dir(&base, "agent-stale", true).unwrap();
+        assert_eq!(out, dir);
+        assert!(
+            !creds.exists(),
+            "F65: vault token present must delete isolated .credentials.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f65_vault_token_absent_keeps_credentials() {
+        let base = f46_temp("base-f65-keep");
+        let dir = claude_product_config_dir(&base, "agent-keep-creds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join(".credentials.json");
+        std::fs::write(&creds, br#"{"token":"keep-me"}"#).unwrap();
+
+        // No owner source under a fake empty home → seed is no-op; dest must stay.
+        let home = f46_temp("home-f65-keep");
+        with_fake_home(&home, || {
+            let out = ensure_claude_product_config_dir(&base, "agent-keep-creds", false).unwrap();
+            assert_eq!(out, dir);
+            assert!(
+                creds.is_file(),
+                "F65: vault token absent must keep existing .credentials.json"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&creds).unwrap(),
+                r#"{"token":"keep-me"}"#
+            );
         });
 
         let _ = std::fs::remove_dir_all(&home);

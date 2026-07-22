@@ -2259,8 +2259,24 @@ fn git_repo_status(root: &Path, path: &Path) -> WorkspaceGitRepoStatus {
         git_output(path, &["branch", "--show-current"]).unwrap_or_else(|| "unknown".into());
     let origin =
         git_output(path, &["remote", "get-url", "origin"]).map(|value| sanitize_remote_url(&value));
+    // F57/A-11: same product-internal path filter as project cards
+    // (`accumulate_porcelain_counts` / `is_attached_product_path`) so workspace
+    // hygiene and project dirty badges agree.
     let dirty_count = git_output(path, &["status", "--porcelain=v1"])
-        .map(|value| value.lines().filter(|line| !line.trim().is_empty()).count() as u32)
+        .map(|value| {
+            let mut dirty = 0u32;
+            let mut untracked = 0u32;
+            let mut staged = 0u32;
+            let mut unstaged = 0u32;
+            crate::backend::projects::accumulate_porcelain_counts(
+                &value,
+                &mut dirty,
+                &mut untracked,
+                &mut staged,
+                &mut unstaged,
+            );
+            dirty
+        })
         .unwrap_or(0);
     let git_size = git_output(path, &["count-objects", "-vH"]).and_then(|raw| {
         raw.lines().find_map(|line| {

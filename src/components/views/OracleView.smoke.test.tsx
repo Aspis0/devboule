@@ -8,22 +8,40 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
+import type { OracleAnswer } from "../../types/backend";
 
-const askOracle = vi.fn(async (_query: string, _limit?: number) => ({
-  answer: "ok",
-  citations: [],
-}));
+/** Minimal real-shape OracleAnswer used by askOracle mocks. */
+function mockAnswer(overrides: Partial<OracleAnswer> = {}): OracleAnswer {
+  return {
+    mode: "extractive",
+    query: "test query",
+    summary: "",
+    answer: "ok",
+    citations: [],
+    notFound: false,
+    suggestedPath: null,
+    results: [],
+    ...overrides,
+  };
+}
+
+const askOracle = vi.fn(async (_query: string, _limit?: number) => mockAnswer());
 const requestView = vi.fn();
+
+// Mutable mock context — tests flip providerConfigured via oracleLlmSettings.
+const mockCtx = {
+  askOracle,
+  requestView,
+  oracleLlmSettings: { apiKeyConfigured: true } as {
+    apiKeyConfigured: boolean;
+  } | null,
+  secretStatuses: [] as unknown[],
+};
 
 // Provider configured → ask controls enabled. The view reads askOracle,
 // requestView, oracleLlmSettings, secretStatuses from context.
 vi.mock("../../context/AppContext", () => ({
-  useAppContext: () => ({
-    askOracle,
-    requestView,
-    oracleLlmSettings: { apiKeyConfigured: true },
-    secretStatuses: [],
-  }),
+  useAppContext: () => mockCtx,
 }));
 
 vi.mock("../oracle/OracleAdminPanel", () => ({
@@ -40,7 +58,10 @@ let container: HTMLElement;
 
 beforeEach(() => {
   askOracle.mockClear();
+  askOracle.mockImplementation(async () => mockAnswer());
   requestView.mockClear();
+  mockCtx.oracleLlmSettings = { apiKeyConfigured: true };
+  mockCtx.secretStatuses = [];
   container = document.createElement("div");
   document.body.appendChild(container);
 });
@@ -99,6 +120,79 @@ describe("OracleView (restored standalone page)", () => {
     expect(askOracle.mock.calls[0][1]).toBe(8);
   });
 
+  // Without a provider key the backend still returns extractive answers.
+  // Ask + seed chips must stay enabled; only the hint changes.
+  it("allows asking without a provider (extractive mode)", async () => {
+    mockCtx.oracleLlmSettings = { apiKeyConfigured: false };
+
+    const { OracleView } = await import("./OracleView");
+    await act(async () => {
+      createRoot(container).render(createElement(OracleView));
+    });
+
+    expect(container.textContent).toContain(
+      "Answers are extractive (citations only) until a provider key is added.",
+    );
+
+    const askBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Ask",
+    )! as HTMLButtonElement;
+    expect(askBtn.disabled).toBe(false);
+
+    const chips = Array.from(container.querySelectorAll("button")).filter((b) =>
+      b.textContent?.includes("?"),
+    );
+    expect(chips.length).toBeGreaterThan(0);
+    expect(chips.every((c) => !(c as HTMLButtonElement).disabled)).toBe(true);
+
+    await act(async () => {
+      askBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(askOracle).toHaveBeenCalledTimes(1);
+  });
+
+  // Extractive path: empty answer/summary + at least one citation must render
+  // the retrieval-only presentation, never the "Empty answer." dead-end.
+  it("renders extractive presentation when answer/summary are empty but citations exist", async () => {
+    askOracle.mockImplementationOnce(async () =>
+      mockAnswer({
+        answer: "",
+        summary: "",
+        citations: [
+          {
+            ref: "c1",
+            fileSource: "src/example.ts",
+            chunkId: "chunk-1",
+            chunkIndex: 0,
+            startChar: 10,
+            endChar: 40,
+            retrieval: "dense",
+            score: 0.9,
+          },
+        ],
+      }),
+    );
+
+    const { OracleView } = await import("./OracleView");
+    await act(async () => {
+      createRoot(container).render(createElement(OracleView));
+    });
+
+    const askBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Ask",
+    )!;
+
+    await act(async () => {
+      askBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain(
+      "Retrieval-only answer — no provider key, showing the matching code:",
+    );
+    expect(container.textContent).toContain("src/example.ts");
+    expect(container.textContent).not.toContain("Empty answer.");
+  });
+
   // Regression (migrated from the deleted dashboard/OraclePanel.test.tsx): the
   // ask flow must ignore a second submit while a query is already in flight. In
   // OracleView the guard is the Ask button's `disabled={querying || …}` — once a
@@ -106,7 +200,7 @@ describe("OracleView (restored standalone page)", () => {
   // askOracle fires exactly once.
   it("ignores a second submit while a query is in flight (one askOracle call)", async () => {
     // Hold the first call pending so `querying` stays true across the 2nd click.
-    let resolveFirst!: (v: { answer: string; citations: never[] }) => void;
+    let resolveFirst!: (v: OracleAnswer) => void;
     askOracle.mockReturnValueOnce(
       new Promise((res) => {
         resolveFirst = res;
@@ -137,7 +231,7 @@ describe("OracleView (restored standalone page)", () => {
 
     // Resolve the first call.
     await act(async () => {
-      resolveFirst({ answer: "ok", citations: [] });
+      resolveFirst(mockAnswer());
       await Promise.resolve();
     });
 
@@ -149,7 +243,7 @@ describe("OracleView (restored standalone page)", () => {
   // and then resolving the in-flight promise must not throw or emit an act()
   // warning (which would be a setState-after-unmount).
   it("does not setState after unmount when a query resolves post-unmount", async () => {
-    let resolveQ!: (v: { answer: string; citations: never[] }) => void;
+    let resolveQ!: (v: OracleAnswer) => void;
     askOracle.mockReturnValueOnce(
       new Promise((res) => {
         resolveQ = res;
@@ -185,7 +279,7 @@ describe("OracleView (restored standalone page)", () => {
       // Resolving after unmount must be a no-op (mountedRef === false): no throw.
       await expect(
         act(async () => {
-          resolveQ({ answer: "ok", citations: [] });
+          resolveQ(mockAnswer());
           await Promise.resolve();
         }),
       ).resolves.toBeUndefined();

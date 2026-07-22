@@ -28,6 +28,7 @@ const viewTitles: Record<string, string> = {
   oracle: "Oracle",
   design: "Design",
   skills: "Skills",
+  labs: "Labs",
   help: "Help",
   // Re-homed views still resolve a title for any lingering deep-link.
   secrets: "Secrets & API Keys",
@@ -36,7 +37,6 @@ const viewTitles: Record<string, string> = {
   budget: "Budget & Consumption",
   devices: "Devices",
   workspace: "Workspace",
-
 };
 
 export { viewTitles };
@@ -213,7 +213,10 @@ export function Header() {
   }, [notificationsOpen]);
 
   return (
-    <header className="relative z-40 flex min-h-16 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-cream-200 bg-cream-50/80 px-4 py-3 backdrop-blur-sm md:h-16 md:flex-nowrap md:px-8 md:py-0">
+    <header
+      data-testid="header"
+      className="relative z-40 flex min-h-16 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-cream-200 bg-cream-50/80 px-4 py-3 backdrop-blur-sm md:h-16 md:flex-nowrap md:px-8 md:py-0"
+    >
       <h2 className="min-w-0 truncate text-base font-semibold text-cream-800">
         {viewTitles[activeView] || "Projects"}
       </h2>
@@ -427,11 +430,13 @@ export function Header() {
         )}
 
         <button
+          type="button"
           onClick={lock}
           data-help-title="This locks the app again."
           data-help-lines="Locking hides the dashboard behind device authentication (Windows Hello or Touch ID).|It does not stop background provider data already loaded in memory.|Use it before leaving the computer unattended.|Unlock again with PIN, face, or fingerprint depending on your system setup."
           className="p-2.5 rounded-2xl hover:bg-cream-100 transition-colors"
           title="Lock app"
+          aria-label="Lock app"
         >
           <Lock className="w-[18px] h-[18px] text-cream-500" />
         </button>

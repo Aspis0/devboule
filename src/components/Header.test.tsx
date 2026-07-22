@@ -93,6 +93,10 @@ describe("Header viewTitles (S6)", () => {
   it("resolves the Skills view title so the header shows 'Skills'", () => {
     expect(viewTitles.skills).toBe("Skills");
   });
+
+  it("resolves the Labs view title so the header shows 'Labs'", () => {
+    expect(viewTitles.labs).toBe("Labs");
+  });
 });
 
 describe("Header risk flags skip ALPHA_HIDDEN_PROVIDERS (B)", () => {

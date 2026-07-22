@@ -462,7 +462,7 @@ export function OracleAdminPanel() {
   const doctorOkById = useMemo(() => {
     const map = new Map<string, boolean>();
     if (doctor) {
-      for (const check of doctor.checks) map.set(check.id, check.ok);
+      for (const check of doctor.checks ?? []) map.set(check.id, check.ok);
       return map;
     }
     // Coarse, model-free inference. The runtime dot uses the DEBOUNCED readiness
@@ -495,15 +495,18 @@ export function OracleAdminPanel() {
     providerConfigured,
   ]);
 
-  // Pass/total. With a real doctor report we count its checks; otherwise we only
-  // count the lightweight dots we could actually resolve (neutral dots are not
-  // counted toward the total so the ratio is never misleading).
-  const totalChecks = doctor
-    ? doctor.checks.length
-    : DOCTOR_CHECK_ORDER.length;
-  const passCount = doctor
-    ? doctor.checks.filter((c) => c.ok).length
-    : DOCTOR_CHECK_ORDER.filter((id) => doctorOkById.get(id) === true).length;
+  // Pass/total — only claim a count once a real doctor report with checks
+  // exists. Pre-run defaults used to hardcode DOCTOR_CHECK_ORDER.length (6),
+  // which disagreed with the live doctor (5 checks). Without a report — or a
+  // report with zero/missing checks — the UI shows the no-count variant
+  // ("— checks"), never "0/0 checks pass".
+  const doctorChecks = doctor?.checks ?? [];
+  const totalChecks =
+    doctor && doctorChecks.length > 0 ? doctorChecks.length : null;
+  const passCount =
+    doctor && doctorChecks.length > 0
+      ? doctorChecks.filter((c) => c.ok).length
+      : null;
 
   // server badge: honest liveness — not "has workspace ⇒ running".
   //   no-workspace → coral
@@ -826,7 +829,9 @@ export function OracleAdminPanel() {
                       Doctor
                     </h3>
                     <p className="text-[11px] text-cream-400">
-                      Truthful health, {totalChecks} checks
+                      {totalChecks != null
+                        ? `Truthful health, ${totalChecks} checks`
+                        : "Truthful health"}
                     </p>
                   </div>
                 </div>
@@ -841,8 +846,9 @@ export function OracleAdminPanel() {
                 </button>
               </div>
               <p className="text-[11px] leading-5 text-cream-500">
-                {passCount}/{totalChecks} checks pass. Run the doctor for the full
-                per-check breakdown and remediation steps.
+                {passCount != null && totalChecks != null
+                  ? `${passCount}/${totalChecks} checks pass. Run the doctor for the full per-check breakdown and remediation steps.`
+                  : "Run the doctor for the full per-check breakdown and remediation steps."}
               </p>
             </section>
           )}
@@ -949,8 +955,9 @@ function HealthStrip({
 }: {
   serverState: "running" | "indexing" | "no-workspace" | "down" | "starting";
   checkOk: Map<string, boolean>;
-  passCount: number;
-  totalChecks: number;
+  /** null until a real doctor report exists — never invent a pre-run total. */
+  passCount: number | null;
+  totalChecks: number | null;
   chunks: number;
   files: number;
   backend: string;
@@ -1035,7 +1042,9 @@ function HealthStrip({
             })}
           </div>
           <span className="text-[11px] text-cream-500">
-            {passCount}/{totalChecks} checks pass
+            {passCount != null && totalChecks != null
+              ? `${passCount}/${totalChecks} checks pass`
+              : "— checks"}
           </span>
         </div>
 

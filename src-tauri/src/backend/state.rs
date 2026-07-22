@@ -63,6 +63,9 @@ pub struct BackendState {
     auth_prompt: Mutex<()>,
     auth_retry_after: Mutex<Option<Instant>>,
     hello_available: OnceLock<bool>,
+    /// Captured once at construction from `dev_unlock_enabled()` so AuthState
+    /// reports a stable `devUnlock` without re-reading the env on every poll.
+    dev_unlock: bool,
     scaleway_compute: RwLock<Vec<ScalewayResourceSummary>>,
     scaleway_compute_initialized: RwLock<bool>,
     /// Last synced Instance offer catalog. Read by the Instance create dry-run to
@@ -113,6 +116,7 @@ impl BackendState {
             auth_prompt: Mutex::new(()),
             auth_retry_after: Mutex::new(None),
             hello_available: OnceLock::new(),
+            dev_unlock: dev,
             scaleway_compute: RwLock::new(Vec::new()),
             scaleway_compute_initialized: RwLock::new(false),
             scaleway_offers: RwLock::new(Vec::new()),
@@ -142,6 +146,7 @@ impl BackendState {
             hello_available: *self.hello_available.get_or_init(auth::hello_available),
             last_unlocked_at,
             lock_reason,
+            dev_unlock: self.dev_unlock,
         })
     }
 

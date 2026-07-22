@@ -19,6 +19,22 @@ export interface AnswerCardProps {
 }
 
 export function AnswerCard({ answer, onCitationClick }: AnswerCardProps) {
+  // Extractive (retrieval-only) mode returns empty answer/summary text with
+  // citations/results only. Show a clear header instead of "Empty answer."
+  // when there is matching context to list below.
+  const hasExtractiveContext =
+    (answer.citations ?? []).length > 0 || (answer.results ?? []).length > 0;
+  // Trim so a whitespace-only answer/summary (" ") doesn't count as real text and
+  // suppress the retrieval-only / not-found message below.
+  const bodyText =
+    answer.answer?.trim() ||
+    answer.summary?.trim() ||
+    (answer.notFound
+      ? "No matching context found."
+      : hasExtractiveContext
+        ? "Retrieval-only answer — no provider key, showing the matching code:"
+        : "Empty answer.");
+
   return (
     <div
       className={`mt-4 rounded-xl border p-4 ${
@@ -27,11 +43,7 @@ export function AnswerCard({ answer, onCitationClick }: AnswerCardProps) {
           : "border-cream-200 bg-cream-50"
       }`}
     >
-      <p className="text-[13px] leading-relaxed text-cream-800">
-        {answer.answer ||
-          answer.summary ||
-          (answer.notFound ? "No matching context found." : "Empty answer.")}
-      </p>
+      <p className="text-[13px] leading-relaxed text-cream-800">{bodyText}</p>
 
       {/* The extractive (retrieval-only) degrade reason — the only fallback. */}
       {answer.fallbackReason && (

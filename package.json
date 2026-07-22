@@ -18,7 +18,12 @@
     "test:watch": "vitest",
     "rig:smoke": "RIG=1 oracle-data/venv/bin/python -m pytest rig/ -v",
     "rig:rust": "cargo test --manifest-path src-tauri/Cargo.toml rig_tests -- --ignored",
-    "rig": "npm run rig:smoke && npm run rig:rust"
+    "rig": "npm run rig:smoke && npm run rig:rust",
+    "devboule-pilot:up": "bash tools/devboule-pilot/up.sh --start-app",
+    "devboule-pilot:ready": "bash tools/devboule-pilot/ready.sh",
+    "devboule-pilot:session": "bash tools/devboule-pilot/scenarios/smoke-session.sh",
+    "devboule-pilot:projects": "bash tools/devboule-pilot/scenarios/list-projects.sh",
+    "devboule-pilot:chrome": "bash tools/devboule-pilot/scenarios/run-chrome-shell.sh"
   },
   "dependencies": {
     "@fontsource-variable/instrument-sans": "^5.2.8",

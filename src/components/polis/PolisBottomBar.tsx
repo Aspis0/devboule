@@ -255,6 +255,14 @@ function PolisBottomBarInner({
     );
   }, [filterState]);
 
+  // F69: when the city is mapped but has 0 buildings (e.g. File-types filter
+  // emptied it), only File types stays meaningful — other panels operate on
+  // buildings and must not replace the recovery affordance.
+  const emptyMappedCity = buildingCount === 0;
+  const visiblePanelItems = emptyMappedCity
+    ? PANEL_ITEMS.filter((item) => item.id === "filetypes")
+    : PANEL_ITEMS;
+
   // --- Zoom cluster state ---
   const [zoomPct, setZoomPct] = useState(100);
   const rafRef = useRef<number | null>(null);
@@ -346,7 +354,7 @@ function PolisBottomBarInner({
   return (
     <div className="pointer-events-none absolute inset-0 z-20">
       {/* --- Panels --- */}
-      {open === "guide" && (
+      {open === "guide" && !emptyMappedCity && (
         <HelpPanel
           buildingCount={buildingCount}
           roadCount={roadCount}
@@ -354,15 +362,17 @@ function PolisBottomBarInner({
           onClose={() => setOpen(null)}
         />
       )}
-      {open === "legend" && <LegendOverlay onClose={() => setOpen(null)} />}
+      {open === "legend" && !emptyMappedCity && (
+        <LegendOverlay onClose={() => setOpen(null)} />
+      )}
       {open === "filetypes" && <FileTypesPanel onClose={() => setOpen(null)} />}
-      {open === "oracle" && (
+      {open === "oracle" && !emptyMappedCity && (
         <OracleAskPanel
           onFocusFile={handleFocusFile}
           onClose={() => setOpen(null)}
         />
       )}
-      {open === "anomalies" && (
+      {open === "anomalies" && !emptyMappedCity && (
         <AnomaliesPanel
           onSelectBuilding={onSelectBuilding}
           handleRef={handleRef}
@@ -370,7 +380,7 @@ function PolisBottomBarInner({
           filterSets={filterSets}
         />
       )}
-      {open === "filters" && (
+      {open === "filters" && !emptyMappedCity && (
         <FiltersPanel onClose={() => setOpen(null)} filterSets={filterSets} />
       )}
 
@@ -399,9 +409,9 @@ function PolisBottomBarInner({
             </div>
           )}
 
-          {/* PANELS cluster */}
+          {/* PANELS cluster — File types alone when mapped city is empty (F69) */}
           <div className="flex items-center gap-0.5">
-            {PANEL_ITEMS.map((item) => {
+            {visiblePanelItems.map((item) => {
               const Icon = item.icon;
               const active = open === item.id;
               const badge =
@@ -428,22 +438,24 @@ function PolisBottomBarInner({
               );
             })}
 
-            {/* Filters — active when any axis is non-default */}
-            <button
-              onClick={() => toggle('filters')}
-              title="Filter buildings by anomaly, severity, quarter, or path"
-              className={`relative flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                open === 'filters'
-                  ? 'bg-terracotta text-white'
-                  : 'text-cream-600 hover:bg-cream-100 hover:text-cream-800'
-              }`}
-            >
-              <SlidersHorizontal className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Filters</span>
-              {filterActiveDot && (
-                <span className="absolute right-1 top-0.5 h-2 w-2 rounded-full bg-coral" />
-              )}
-            </button>
+            {/* Filters — meaningless with 0 buildings; hide in empty-mapped state */}
+            {!emptyMappedCity && (
+              <button
+                onClick={() => toggle('filters')}
+                title="Filter buildings by anomaly, severity, quarter, or path"
+                className={`relative flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+                  open === 'filters'
+                    ? 'bg-terracotta text-white'
+                    : 'text-cream-600 hover:bg-cream-100 hover:text-cream-800'
+                }`}
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Filters</span>
+                {filterActiveDot && (
+                  <span className="absolute right-1 top-0.5 h-2 w-2 rounded-full bg-coral" />
+                )}
+              </button>
+            )}
           </div>
 
           {/* ZOOM cluster */}

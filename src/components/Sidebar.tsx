@@ -120,7 +120,10 @@ export function Sidebar() {
 	const navigation = baseNavigation.filter((n) => allowedIds.has(n.id));
 
 	return (
-		<aside className="flex max-h-44 shrink-0 flex-col border-b border-cream-200 bg-cream-50 md:h-screen md:max-h-none md:w-60 md:border-b-0 md:border-r">
+		<aside
+			data-testid="sidebar"
+			className="flex max-h-44 shrink-0 flex-col border-b border-cream-200 bg-cream-50 md:h-screen md:max-h-none md:w-60 md:border-b-0 md:border-r"
+		>
 			<div className="flex items-center gap-3 p-4 pb-2 md:p-6 md:pb-4">
 				<img
 					src="/assets/devboule-logo.jpeg"
@@ -149,6 +152,7 @@ export function Sidebar() {
 						return (
 							<button
 								key={item.id}
+								data-testid={`nav-${item.id}`}
 								onClick={() => setActiveView(item.id)}
 								data-help-title={`This opens the ${item.label} page.`}
 								data-help-lines="The sidebar only changes what you see in the app.|It does not call Cloudflare, Scaleway, Oracle, or agents by itself.|Use Projects for the work board; open a project to enter its Work mode with agent terminals, and use provider pages for live cloud operations.|If a page looks empty, run its sync or refresh action after opening it."

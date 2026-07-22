@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""stdio MCP proxy for **devboule-pilot** (Grok Build name rewrite).
+"""stdio MCP proxy for Devboule UI Pilot (Devboule product only).
 
-Grok rejects dotted tool names (pilot.ping → invalid). Upstream binary
-`tauri-pilot mcp` still emits pilot.<cmd>; this proxy:
-
-  tools/list  → pilot.ping  becomes  pilot_ping
-  tools/call  → pilot_ping  maps back to pilot.ping
-
-MCP server id in Grok config: devboule_pilot (not figlyph / not tauri_pilot).
+- Dotted tool names → underscores for Grok
+- Socket pin com.devboule.app (plugin-aligned XDG or /tmp)
+- Title gate: must be Devboule
 """
 from __future__ import annotations
 
@@ -16,14 +12,33 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
-
 PILOT_BIN = os.environ.get("TAURI_PILOT_BIN", "tauri-pilot")
-# Pin Devboule app socket so we never hit Figlyph when both are running.
-# Identifier comes from src-tauri/tauri.conf.json → com.devboule.app
-DEFAULT_SOCKET = "/tmp/tauri-pilot-com.devboule.app.sock"
-PILOT_SOCKET = os.environ.get("TAURI_PILOT_SOCKET", DEFAULT_SOCKET)
+APP_ID = os.environ.get("DEVBOULE_APP_IDENTIFIER", "com.devboule.app")
+PRODUCT = os.environ.get("DEVBOULE_PRODUCT_NAME", "Devboule")
+WINDOW = os.environ.get("TAURI_PILOT_WINDOW", "main")
+
+
+def default_socket() -> str:
+    name = f"tauri-pilot-{APP_ID}.sock"
+    if os.environ.get("DEVBOULE_PILOT_FORCE_TMP_SOCKET") == "1":
+        return f"/tmp/{name}"
+    if os.environ.get("TAURI_PILOT_SOCKET"):
+        return os.environ["TAURI_PILOT_SOCKET"]
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or ""
+    if xdg and os.path.isdir(xdg):
+        try:
+            st = os.stat(xdg)
+            if st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0:
+                return str(Path(xdg) / name)
+        except OSError:
+            pass
+    return f"/tmp/{name}"
+
+
+DEFAULT_SOCKET = default_socket()
 
 
 def to_grok(name: str) -> str:
@@ -37,7 +52,6 @@ def to_pilot(name: str) -> str:
 
 
 def rewrite_outgoing_to_client(msg: dict[str, Any]) -> dict[str, Any]:
-    """Server → Grok: rename tools in list results."""
     if msg.get("id") is not None and isinstance(msg.get("result"), dict):
         result = msg["result"]
         tools = result.get("tools")
@@ -60,7 +74,6 @@ def rewrite_outgoing_to_client(msg: dict[str, Any]) -> dict[str, Any]:
 
 
 def rewrite_incoming_from_client(msg: dict[str, Any]) -> dict[str, Any]:
-    """Grok → server: map tool names on tools/call."""
     if msg.get("method") == "tools/call":
         params = msg.get("params")
         if isinstance(params, dict) and isinstance(params.get("name"), str):
@@ -83,21 +96,100 @@ def pump(src, dst, transform, label: str) -> None:
                 dst.write(line + "\n")
                 dst.flush()
                 continue
-            msg = transform(msg)
+            if isinstance(msg, dict):
+                msg = transform(msg)
             dst.write(json.dumps(msg, separators=(",", ":")) + "\n")
             dst.flush()
-    except BrokenPipeError:
-        pass
     except Exception as e:
-        sys.stderr.write(f"mcp_proxy_for_grok [{label}]: {e}\n")
+        sys.stderr.write(f"devboule-pilot mcp_proxy {label}: {e}\n")
+        sys.stderr.flush()
+
+
+def build_cmd(extra: list[str]) -> list[str]:
+    cmd = [PILOT_BIN]
+    joined = " ".join(extra)
+    if "--socket" not in joined:
+        cmd.extend(["--socket", DEFAULT_SOCKET])
+    if "--window" not in joined:
+        cmd.extend(["--window", WINDOW])
+    cmd.append("mcp")
+    cmd.extend(extra)
+    return cmd
+
+
+def title_and_unlock_gate() -> None:
+    if os.environ.get("DEVBOULE_PILOT_SKIP_TITLE_GATE") == "1":
+        return
+    try:
+        r = subprocess.run(
+            [PILOT_BIN, "--socket", DEFAULT_SOCKET, "--window", WINDOW, "title"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except FileNotFoundError:
+        sys.stderr.write(f"devboule-pilot: {PILOT_BIN} not found\n")
+        raise SystemExit(1)
+    title = (r.stdout or "").strip()
+    if r.returncode != 0 or not title:
+        sys.stderr.write(
+            f"devboule-pilot title gate FAILED (socket={DEFAULT_SOCKET}): app not ready\n"
+        )
+        raise SystemExit(1)
+    if title != PRODUCT:
+        sys.stderr.write(
+            f"devboule-pilot title gate FAILED: title={title!r} expected={PRODUCT!r}\n"
+        )
+        raise SystemExit(1)
+    # Unlock gate: get_auth_state must show locked === false
+    auth = subprocess.run(
+        [
+            PILOT_BIN,
+            "--socket",
+            DEFAULT_SOCKET,
+            "--window",
+            WINDOW,
+            "ipc",
+            "get_auth_state",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if auth.returncode != 0:
+        sys.stderr.write(
+            f"devboule-pilot unlock gate FAILED: get_auth_state error: {auth.stderr or auth.stdout}\n"
+        )
+        raise SystemExit(1)
+    try:
+        payload = json.loads(auth.stdout)
+        data = payload
+        if isinstance(data, dict):
+            for k in ("result", "data"):
+                if k in data and isinstance(data[k], dict):
+                    data = data[k]
+                    break
+        if not isinstance(data, dict) or data.get("locked") is not False:
+            sys.stderr.write(
+                f"devboule-pilot unlock gate FAILED: locked={data.get('locked') if isinstance(data, dict) else data!r} "
+                "(use DEVBOULE_DEV_UNLOCK=1)\n"
+            )
+            raise SystemExit(1)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"devboule-pilot unlock gate FAILED: bad auth JSON: {e}\n")
+        raise SystemExit(1)
+    sys.stderr.write(f"devboule-pilot title+unlock gate OK ({title})\n")
 
 
 def main() -> int:
+    title_and_unlock_gate()
+    cmd = build_cmd(sys.argv[1:])
+    sys.stderr.write(f"devboule-pilot mcp: {' '.join(cmd)}\n")
+    sys.stderr.flush()
     try:
-        cmd = [PILOT_BIN]
-        if PILOT_SOCKET:
-            cmd.extend(["--socket", PILOT_SOCKET])
-        cmd.append("mcp")
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -105,45 +197,32 @@ def main() -> int:
             stderr=sys.stderr,
             text=True,
             bufsize=1,
-            env={**os.environ, "TAURI_PILOT_SOCKET": PILOT_SOCKET},
         )
     except FileNotFoundError:
-        sys.stderr.write(
-            f"devboule-pilot: upstream CLI not found ({PILOT_BIN}). Install:\n"
-            "  cargo install tauri-pilot-cli --version 0.7.2 --locked\n"
-        )
         return 1
-
     assert proc.stdin and proc.stdout
     t_out = threading.Thread(
         target=pump,
         args=(proc.stdout, sys.stdout, rewrite_outgoing_to_client, "out"),
         daemon=True,
     )
+    t_in = threading.Thread(
+        target=pump,
+        args=(sys.stdin, proc.stdin, rewrite_incoming_from_client, "in"),
+        daemon=True,
+    )
     t_out.start()
+    t_in.start()
+    t_in.join()
     try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                proc.stdin.write(line + "\n")
-                proc.stdin.flush()
-                continue
-            msg = rewrite_incoming_from_client(msg)
-            proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
-            proc.stdin.flush()
-    except BrokenPipeError:
+        proc.stdin.close()
+    except Exception:
         pass
-    finally:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
+    try:
         proc.wait(timeout=5)
-    return 0
+    except Exception:
+        proc.kill()
+    return proc.returncode or 0
 
 
 if __name__ == "__main__":

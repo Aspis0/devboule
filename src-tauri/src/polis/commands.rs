@@ -2098,8 +2098,57 @@ pub fn polis_open_in_editor(
     launch_editor(editor, &abs_path)
 }
 
+/// Pure plan for the OS-native "plain text editor" slug (`notepad`).
+/// Cross-platform: TextEdit/default via `open -t` on macOS, Notepad on Windows,
+/// `xdg-open` on Linux. No process is spawned — tests assert the argv.
+pub(crate) fn notepad_argv(abs_path: &Path) -> (&'static str, Vec<String>) {
+    let path = abs_path.display().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        ("open", vec!["-t".into(), path])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ("notepad", vec![path])
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        ("xdg-open", vec![path])
+    }
+}
+
+/// Pure plan for the OS-native "reveal in file manager" slug (`explorer`).
+/// Cross-platform: `open -R` (reveal in Finder) on macOS, Explorer `/select`
+/// on Windows, `xdg-open` of the parent directory on Linux (best-effort).
+/// No process is spawned — tests assert the argv.
+pub(crate) fn explorer_argv(abs_path: &Path) -> (&'static str, Vec<String>) {
+    let path = abs_path.display().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        ("open", vec!["-R".into(), path])
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Production spawn uses `raw_arg` so only the path is quoted
+        // (`/select,"…"`). Tests assert this logical fragment.
+        ("explorer", vec![format!("/select,\"{path}\"")])
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let parent = abs_path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or(path);
+        ("xdg-open", vec![parent])
+    }
+}
+
 /// Launch one of the allowlisted editors against an ALREADY-VALIDATED absolute
 /// path. Spawns detached; never panics; returns a clear `Err` on spawn failure.
+///
+/// OS-native slugs (`notepad`, `explorer`) are cross-platform via `cfg`
+/// (macOS `open`, Windows native binaries, Linux `xdg-open`). URI-based
+/// editors (`vscode` / `cursor`) use the OS opener and stay unchanged.
 pub(crate) fn launch_editor(editor: &str, abs_path: &Path) -> Result<(), String> {
     use std::process::Command;
 
@@ -2111,13 +2160,17 @@ pub(crate) fn launch_editor(editor: &str, abs_path: &Path) -> Result<(), String>
 
     match editor {
         "notepad" => {
-            // Single argv entry — no shell, no interpolation.
-            let mut cmd = Command::new("notepad");
-            cmd.arg(abs_path);
+            // Semantic: open in a plain text editor. Platform argv from
+            // `notepad_argv` (macOS `open -t`, Windows notepad, Linux xdg-open).
+            let (program, args) = notepad_argv(abs_path);
+            let mut cmd = Command::new(program);
+            for a in args {
+                cmd.arg(a);
+            }
             spawn(cmd)
         }
         "explorer" => {
-            // Reveal-in-folder. `/select,<path>` selects the file in Explorer.
+            // Semantic: reveal in the OS file manager.
             //
             // FIX 5 (Windows, spaced paths): Rust's normal `arg` quotes the WHOLE
             // argument (`"/select,C:\...\Devboule\x.ts"`), which explorer.exe
@@ -2126,19 +2179,24 @@ pub(crate) fn launch_editor(editor: &str, abs_path: &Path) -> Result<(), String>
             // (this machine's root is "Devboule"). The documented-correct
             // invocation quotes ONLY the path: `/select,"<path>"`. We build that exact
             // command-line fragment with `raw_arg` so libstd does not re-quote it.
-            let mut cmd = Command::new("explorer");
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
+                let mut cmd = Command::new("explorer");
                 cmd.raw_arg(format!("/select,\"{}\"", abs_path.display()));
+                // Explorer returns a non-zero exit code even on success; spawning is
+                // enough — we don't wait on it.
+                return spawn(cmd);
             }
             #[cfg(not(windows))]
             {
-                cmd.arg(format!("/select,{}", abs_path.display()));
+                let (program, args) = explorer_argv(abs_path);
+                let mut cmd = Command::new(program);
+                for a in args {
+                    cmd.arg(a);
+                }
+                spawn(cmd)
             }
-            // Explorer returns a non-zero exit code even on success; spawning is
-            // enough — we don't wait on it.
-            spawn(cmd)
         }
         "vscode" | "vscode-insiders" | "cursor" => {
             // URI-based open via the OS opener (mirrors how open_external_url uses
@@ -2613,6 +2671,43 @@ mod tests {
         assert!(!is_supported_editor("sh"));
         assert!(!is_supported_editor(""));
         assert!(!is_supported_editor("VSCode")); // case-sensitive on purpose
+    }
+
+    /// Cross-platform open-in-editor argv (F68). Pure — does NOT spawn.
+    #[test]
+    fn native_editor_argv_is_platform_aware() {
+        let path = Path::new("/tmp/polis_f68_sample.ts");
+        let path_s = path.display().to_string();
+
+        let (np_prog, np_args) = notepad_argv(path);
+        let (ex_prog, ex_args) = explorer_argv(path);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(np_prog, "open");
+            assert_eq!(np_args, vec!["-t".to_string(), path_s.clone()]);
+            assert_eq!(ex_prog, "open");
+            assert_eq!(ex_args, vec!["-R".to_string(), path_s]);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(np_prog, "notepad");
+            assert_eq!(np_args, vec![path_s.clone()]);
+            assert_eq!(ex_prog, "explorer");
+            assert_eq!(ex_args, vec![format!("/select,\"{path_s}\"")]);
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            assert_eq!(np_prog, "xdg-open");
+            assert_eq!(np_args, vec![path_s]);
+            assert_eq!(ex_prog, "xdg-open");
+            // Linux reveal fallback: open the containing folder.
+            let parent = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            assert_eq!(ex_args, vec![parent]);
+        }
     }
 
     #[test]

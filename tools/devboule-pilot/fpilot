@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Devboule UI Pilot — executable wrapper (works from zsh).
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$HERE/env.sh"
+exec "${TAURI_PILOT_BIN}" --socket "$TAURI_PILOT_SOCKET" --window "$TAURI_PILOT_WINDOW" "$@"

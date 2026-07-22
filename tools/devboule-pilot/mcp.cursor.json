@@ -1,10 +1,15 @@
 {
   "mcpServers": {
     "devboule-pilot": {
-      "command": "tauri-pilot",
-      "args": ["mcp"],
+      "command": "python3",
+      "args": [
+        "/Users/user/Projects/devboule/tools/devboule-pilot/mcp_proxy_for_grok.py"
+      ],
       "env": {
-        "PATH": "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+        "PATH": "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+        "DEVBOULE_APP_IDENTIFIER": "com.devboule.app",
+        "DEVBOULE_PRODUCT_NAME": "Devboule",
+        "TAURI_PILOT_WINDOW": "main"
       }
     }
   }

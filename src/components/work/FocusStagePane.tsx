@@ -142,6 +142,7 @@ export function FocusStagePane({
       <FocusStage
         node={node}
         activity={activity}
+        agentRole={session?.role ?? node.type}
         view={view}
         onViewChange={setView}
         onSendMessage={onSendMessage}

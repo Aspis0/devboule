@@ -43,6 +43,7 @@ import {
 	actionStatus,
 	isEmptyActivity,
 } from "./agentConsoleModel";
+import { roleChipLabel } from "./roleDisplay";
 
 // ---- safe inline-marker parsing --------------------------------------------
 //
@@ -582,12 +583,15 @@ function TimelineRow({
 	entry,
 	first,
 	last,
+	agentRoleLabel,
 }: {
 	// Kairion `question` entries are rendered in the planner Plan panel, not this raw
 	// timeline (filtered out by the caller), so this row never narrows over a doubt.
 	entry: Exclude<ConsoleEntry, QuestionEntry>;
 	first: boolean;
 	last: boolean;
+	/** Presentational chip for tool/milestone rows (session role). */
+	agentRoleLabel: string;
 }) {
 	// Part A: a `thinking` entry renders as its own (per-row, expandable) row.
 	if (entry.type === "thinking") {
@@ -638,7 +642,7 @@ function TimelineRow({
 					) : (
 						<span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-teal/40 bg-teal/15 px-2.5 text-[10.5px] font-semibold text-teal-dark">
 							<span className="h-[5px] w-[5px] rounded-full bg-current" />
-							Coder
+							{agentRoleLabel}
 						</span>
 					)}
 					{entry.type === "webSearch" ? (
@@ -688,10 +692,14 @@ function EmptyState() {
 export interface AgentConsoleProps {
 	/** The console state for the selected agent (from useAgentConsole). */
 	activity: ConsoleActivity;
+	/** Session role for tool/milestone chips (e.g. orchestrator → "Orchestrator"). */
+	agentRole?: string | null;
 }
 
 /** The structured agent-activity timeline. PURE + prop-driven. */
-export function AgentConsole({ activity }: AgentConsoleProps) {
+export function AgentConsole({ activity, agentRole }: AgentConsoleProps) {
+	const agentRoleLabel = roleChipLabel(agentRole);
+
 	if (isEmptyActivity(activity)) {
 		return (
 			<div className="flex min-h-[256px] flex-1 flex-col">
@@ -725,6 +733,7 @@ export function AgentConsole({ activity }: AgentConsoleProps) {
 					entry={entry}
 					first={i === 0}
 					last={i === entries.length - 1}
+					agentRoleLabel={agentRoleLabel}
 				/>
 			))}
 		</div>

@@ -1,0 +1,14 @@
+# Devboule UI Pilot — Grok MCP (Devboule only)
+# Add as separate server; do not replace Figlyph / multi-app pilots.
+
+# [mcp_servers.devboule_pilot]
+# command = "python3"
+# args = ["/Users/user/Projects/devboule/tools/devboule-pilot/mcp_proxy_for_grok.py"]
+# enabled = true
+# startup_timeout_sec = 30
+#
+# [mcp_servers.devboule_pilot.env]
+# PATH = "/Users/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+# DEVBOULE_PRODUCT_NAME = "Devboule"
+# DEVBOULE_APP_IDENTIFIER = "com.devboule.app"
+# TAURI_PILOT_WINDOW = "main"

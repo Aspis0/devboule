@@ -61,7 +61,7 @@ export function OracleView() {
     async (nextQuery: string) => {
       const trimmed = nextQuery.trim();
       if (trimmed.length < 3) return;
-      if (!providerConfigured) return;
+      // Backend supports extractive (retrieval-only) answers without a provider key.
       setQuery(trimmed);
       setQuerying(true);
       setAnswer(null);
@@ -78,7 +78,7 @@ export function OracleView() {
         if (mountedRef.current) setQuerying(false);
       }
     },
-    [askOracle, providerConfigured],
+    [askOracle],
   );
 
   // The Oracle LLM settings now live on THIS page inside the OracleAdminPanel
@@ -130,7 +130,7 @@ export function OracleView() {
           />
           <button
             onClick={() => void runQuery(query)}
-            disabled={querying || query.trim().length < 3 || !providerConfigured}
+            disabled={querying || query.trim().length < 3}
             className="inline-flex items-center gap-1.5 rounded-xl bg-terracotta px-3 py-2 text-[12px] font-semibold text-white hover:bg-terracotta-500 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <Sparkles className="h-3.5 w-3.5" />
@@ -138,10 +138,11 @@ export function OracleView() {
           </button>
         </div>
 
-        {/* Provider-not-configured gate */}
+        {/* No-provider hint: ask still works; answers are extractive until a key is set. */}
         {!providerConfigured && (
           <p className="mt-2 text-[11px] text-cream-500">
-            Oracle answers require a provider.{" "}
+            Answers are extractive (citations only) until a provider key is
+            added.{" "}
             <button
               onClick={goToProviderSettings}
               className="font-semibold text-terracotta-500 underline hover:text-terracotta-600"
@@ -157,7 +158,7 @@ export function OracleView() {
             <button
               key={s}
               onClick={() => void runQuery(s)}
-              disabled={querying || !providerConfigured}
+              disabled={querying}
               className="rounded-lg border border-cream-200 bg-white px-2.5 py-1 text-[11px] font-medium text-cream-500 hover:bg-cream-100 hover:text-cream-700 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {s}

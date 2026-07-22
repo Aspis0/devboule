@@ -33,6 +33,43 @@ import { Type } from "typebox";
 // JSONL record) would otherwise accumulate unbounded and OOM the process.
 const MAX_BUFFER_LEN = 10 * 1024 * 1024; // 10MB
 
+// F60: rate-limit identical extension-error lines so a broken extension cannot
+// flood the app log. Dependency-free: Map of message → count.
+// F60/A-15: cap map size so unbounded distinct errors cannot grow memory forever.
+const extensionErrorCounts = new Map();
+const EXTENSION_ERROR_SUMMARY_EVERY = 100;
+const EXTENSION_ERROR_MAP_MAX_KEYS = 500;
+const EXTENSION_ERROR_PREVIEW_LEN = 200;
+
+/** Print first occurrence; suppress repeats; every 100th print a summary. */
+function logExtensionErrorRateLimited(msg) {
+	// A-15: on overflow, clear and emit one reset line (best-effort bound).
+	if (
+		!extensionErrorCounts.has(msg) &&
+		extensionErrorCounts.size >= EXTENSION_ERROR_MAP_MAX_KEYS
+	) {
+		extensionErrorCounts.clear();
+		console.error("[pi-sidecar] (error-suppression table reset)");
+	}
+	const n = (extensionErrorCounts.get(msg) ?? 0) + 1;
+	extensionErrorCounts.set(msg, n);
+	if (n === 1) {
+		console.error(msg);
+		return;
+	}
+	if (n % EXTENSION_ERROR_SUMMARY_EVERY === 0) {
+		// A-16: preview length raised 80 → 200 for diagnosability.
+		const preview =
+			msg.length > EXTENSION_ERROR_PREVIEW_LEN
+				? msg.slice(0, EXTENSION_ERROR_PREVIEW_LEN)
+				: msg;
+		// n-1 repeats after the first print (total n, one was the original).
+		console.error(
+			`[pi-sidecar] (suppressed ${n - 1} repeats of: ${preview})`,
+		);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Devboule enrichment metadata (Task 1: enrichment layer)
 // ---------------------------------------------------------------------------
@@ -555,9 +592,11 @@ async function main() {
 				},
 			},
 			onError: (err) => {
-				console.error(
-					`[pi-sidecar] Extension error (${err.extensionPath}): ${err.error}`,
-				);
+				// F60: identical extension errors (e.g. "Theme not initialized") used
+				// to flood the app log thousands of times. Rate-limit by message key:
+				// print first, suppress repeats, summarize every 100th.
+				const msg = `[pi-sidecar] Extension error (${err.extensionPath}): ${err.error}`;
+				logExtensionErrorRateLimited(msg);
 			},
 		});
 	} catch (err) {

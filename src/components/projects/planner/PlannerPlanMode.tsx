@@ -451,14 +451,12 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 								})}
 							</div>
 
-							{/* Auto Toggle */}
+							{/* Auto Toggle — real button; minimal reset keeps focus-visible outline */}
 							<div
-								onClick={toggleAuto}
 								className="pp-mono"
 								style={{
 									marginLeft: "auto",
 									fontSize: 9,
-									cursor: "pointer",
 									padding: "3px 8px",
 									borderRadius: 7,
 									display: "flex",
@@ -473,15 +471,48 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 											}),
 								}}
 							>
-								<div
+								<button
+									type="button"
+									onClick={toggleAuto}
+									title={
+										auto
+											? "Pause stage auto-rotation"
+											: "Resume stage auto-rotation"
+									}
 									style={{
-										width: 5,
-										height: 5,
-										borderRadius: "50%",
-										background: auto ? "#B3AB9C" : "#C0894F",
+										background: "none",
+										border: "none",
+										padding: 0,
+										margin: 0,
+										font: "inherit",
+										color: "inherit",
+										cursor: "pointer",
+										display: "inline-flex",
+										alignItems: "center",
+										gap: 5,
 									}}
-								/>
-								<span>{auto ? "auto" : "paused · resume"}</span>
+								>
+									<span
+										aria-hidden
+										style={{
+											width: 5,
+											height: 5,
+											borderRadius: "50%",
+											background: auto ? "#B3AB9C" : "#C0894F",
+											flexShrink: 0,
+										}}
+									/>
+									{auto ? (
+										"auto"
+									) : (
+										<>
+											<span>paused · </span>
+											<span style={{ textDecoration: "underline" }}>
+												resume
+											</span>
+										</>
+									)}
+								</button>
 							</div>
 
 							{/* Collapse chevron */}
@@ -654,14 +685,12 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 							</button>
 						</div>
 
-						{/* Auto Toggle */}
+						{/* Auto Toggle — real button; minimal reset keeps focus-visible outline */}
 						<div
-							onClick={toggleAuto}
 							className="pp-mono"
 							style={{
 								marginLeft: "auto",
 								fontSize: 9,
-								cursor: "pointer",
 								padding: "3px 8px",
 								borderRadius: 7,
 								display: "flex",
@@ -676,15 +705,48 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 										}),
 							}}
 						>
-							<div
+							<button
+								type="button"
+								onClick={toggleAuto}
+								title={
+									auto
+										? "Pause stage auto-rotation"
+										: "Resume stage auto-rotation"
+								}
 								style={{
-									width: 5,
-									height: 5,
-									borderRadius: "50%",
-									background: auto ? "#B3AB9C" : "#C0894F",
+									background: "none",
+									border: "none",
+									padding: 0,
+									margin: 0,
+									font: "inherit",
+									color: "inherit",
+									cursor: "pointer",
+									display: "inline-flex",
+									alignItems: "center",
+									gap: 5,
 								}}
-							/>
-							<span>{auto ? "auto" : "paused · resume"}</span>
+							>
+								<span
+									aria-hidden
+									style={{
+										width: 5,
+										height: 5,
+										borderRadius: "50%",
+										background: auto ? "#B3AB9C" : "#C0894F",
+										flexShrink: 0,
+									}}
+								/>
+								{auto ? (
+									"auto"
+								) : (
+									<>
+										<span>paused · </span>
+										<span style={{ textDecoration: "underline" }}>
+											resume
+										</span>
+									</>
+								)}
+							</button>
 						</div>
 
 						{/* Expand chevron */}

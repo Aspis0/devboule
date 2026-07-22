@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# DEV ONLY — launch Devboule with ui-pilot for **devboule-pilot** agent drive.
-# Requires FE on :1420. (Upstream plugin/CLI package name remains tauri-pilot.)
+# DEV ONLY — launch Devboule with ui-pilot for Devboule UI Pilot agent drive.
+# Requires FE on :1420. DEVBOULE_DEV_UNLOCK=1 by default (no lock screen).
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TAURI="$ROOT/src-tauri"
+# shellcheck disable=SC1091
+source "$HERE/env.sh"
+# shellcheck disable=SC1091
+source "$HERE/ensure-devurl.sh"
+
+TAURI="$DEVBOULE_REPO_ROOT/src-tauri"
 CAP_SRC="$HERE/host-glue/pilot.capability.json"
 CAP_DST="$TAURI/capabilities/pilot.json"
-
-# shellcheck source=ensure-devurl.sh
-source "$HERE/ensure-devurl.sh"
 
 if [[ "${START_FRONTEND:-0}" == "1" ]]; then
   devboule_ensure_devurl --start || true
@@ -25,9 +26,10 @@ trap cleanup EXIT
 
 export TAURI_CONFIG
 TAURI_CONFIG="$(cat "$TAURI/tauri.pilot.conf.json")"
-# Stay unlocked overnight for agent drive (no Touch ID / idle soft-lock).
-# Set DEVBOULE_DEV_UNLOCK=0 to exercise the real lock screen.
 export DEVBOULE_DEV_UNLOCK="${DEVBOULE_DEV_UNLOCK:-1}"
-echo "launching: cargo run --features ui-pilot (capability pilot.json staged, DEVBOULE_DEV_UNLOCK=$DEVBOULE_DEV_UNLOCK)"
+echo "launching: cargo run --features ui-pilot (DEVBOULE_DEV_UNLOCK=$DEVBOULE_DEV_UNLOCK socket=$TAURI_PILOT_SOCKET)"
 cd "$TAURI"
+# `cargo run` builds only the main bin — the Claude consent hook is a separate bin
+# and without it cloud-claude launches fall back to acceptEdits (no PreToolUse gate).
+cargo build --bin claude_consent_hook --features ui-pilot
 exec cargo run --features ui-pilot

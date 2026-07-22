@@ -126,9 +126,12 @@ pub(crate) const EXCLUDED_DIRS: &[&str] = &[
 /// FOLDER-AGNOSTIC GOAL: Polis must yield a real city when pointed at ANY repo,
 /// not just a TS/Rust/Python one. So beyond the original `ts/tsx/rs/toml/py` we
 /// keep the mainstream source languages (JS family, Go, Java/Kotlin, C/C++, C#,
-/// Ruby, PHP, Swift, Scala, and Vue/Svelte single-file components). The junk-dir
+/// Ruby, PHP, Swift, Scala, Vue/Svelte, and plain HTML/CSS). The junk-dir
 /// excludes above (`node_modules`/`target`/`vendor`/build outputs/etc.) keep the
 /// scan clean across all of these.
+///
+/// F61: plain HTML/CSS sites map to 0 buildings without `html`/`css`/preprocessors
+/// in this set — they are first-class web code files.
 ///
 /// NOTE on roads: `extract_imports` only understands TS/JS, Rust and Python
 /// import syntax. Files in the newly-kept languages still become BUILDINGS, but
@@ -145,7 +148,9 @@ pub(crate) const DEFAULT_KEPT_EXTENSIONS: &[&str] = &[
     // C / C++ / C# / Objective-C headers
     "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "cs", //
     // Scripting / web / others
-    "rb", "php", "swift", "vue", "svelte",
+    "rb", "php", "swift", "vue", "svelte", //
+    // HTML / CSS (and common CSS preprocessors) — F61
+    "html", "css", "scss", "sass", "less",
 ];
 
 /// The default kept-extension set as owned lowercase `String`s — the source of
@@ -8590,6 +8595,12 @@ import { cdn } from 'https://cdn.example.com/x';
         assert!(should_keep_file("server.go"));
         assert!(should_keep_file("App.java"));
         assert!(should_keep_file("main.rs"));
+        // F61: plain HTML/CSS sites must map to buildings.
+        assert!(should_keep_file("index.html"));
+        assert!(should_keep_file("styles.css"));
+        assert!(should_keep_file("theme.scss"));
+        assert!(should_keep_file("_vars.sass"));
+        assert!(should_keep_file("mixins.less"));
         // A restricted set keeps ONLY what it lists; critical json + always-excluded
         // patterns ignore the set.
         let only_rs = ["rs".to_string()];

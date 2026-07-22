@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayRole } from "./roleDisplay";
+import { displayRole, roleChipLabel } from "./roleDisplay";
 import { ROLE_OPTIONS } from "./SpawnPanel";
 
 // ROLE UNTANGLE (2026-07): displayRole is a PASS-THROUGH of the stored role for
@@ -67,6 +67,22 @@ describe("displayRole", () => {
       role: "verifier",
       orchestratorBadge: false,
     });
+  });
+});
+
+describe("roleChipLabel", () => {
+  it("maps known roles to human chip titles", () => {
+    expect(roleChipLabel("orchestrator")).toBe("Orchestrator");
+    expect(roleChipLabel("coder")).toBe("Coder");
+    expect(roleChipLabel("verifier")).toBe("Verifier");
+    expect(roleChipLabel("mini")).toBe("Mini");
+  });
+
+  it("falls back to Agent for empty/unknown roles", () => {
+    expect(roleChipLabel(null)).toBe("Agent");
+    expect(roleChipLabel(undefined)).toBe("Agent");
+    expect(roleChipLabel("")).toBe("Agent");
+    expect(roleChipLabel("augur")).toBe("Agent");
   });
 });
 

@@ -90,6 +90,7 @@ const KinSection = React.lazy(() => import("./KinSection"));
 import type { OracleAnswer } from "../../types/backend";
 import { purposeLabel, agentTypeLabel } from "../../types/city";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
+import { isAppleHost } from "../../lib/platform";
 import { getProfile } from "./palette";
 import { MONUMENT_META } from "./kitcd/monuments";
 
@@ -213,13 +214,33 @@ function providerLabel(slug: string): string {
   return titleCase(slug);
 }
 
-// Editors offered in the action footer. Slug matches the backend allowlist
-// (notepad | vscode | code | cursor | explorer | reveal).
+// Editors offered in the action footer. Slugs match the backend allowlist
+// (notepad | vscode | cursor | explorer) — platform-stable contract. Labels
+// are OS-aware so macOS doesn't advertise Windows-only binaries (F68).
+function isWindowsHost(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const haystack =
+    `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`.toLowerCase();
+  return haystack.includes("win");
+}
+
+function nativeEditorLabels(): { notepad: string; explorer: string } {
+  if (isAppleHost()) {
+    return { notepad: "TextEdit", explorer: "Reveal in Finder" };
+  }
+  if (isWindowsHost()) {
+    return { notepad: "Notepad", explorer: "Reveal in Explorer" };
+  }
+  return { notepad: "Text editor", explorer: "Reveal in file manager" };
+}
+
+const NATIVE_EDITOR_LABELS = nativeEditorLabels();
+
 const EDITORS: { slug: string; label: string; icon: LucideIcon }[] = [
-  { slug: "notepad", label: "Notepad", icon: FileCode },
+  { slug: "notepad", label: NATIVE_EDITOR_LABELS.notepad, icon: FileCode },
   { slug: "vscode", label: "VS Code", icon: Code2 },
   { slug: "cursor", label: "Cursor", icon: Code2 },
-  { slug: "explorer", label: "Reveal in Explorer", icon: FolderTree },
+  { slug: "explorer", label: NATIVE_EDITOR_LABELS.explorer, icon: FolderTree },
 ];
 
 // How many connections to show before collapsing the rest behind "+N more".

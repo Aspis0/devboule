@@ -26,13 +26,15 @@ import {
   globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
 ).IS_REACT_ACT_ENVIRONMENT = true;
 
-function markup(activity: ConsoleActivity): string {
-  return renderToStaticMarkup(createElement(AgentConsole, { activity }));
+function markup(activity: ConsoleActivity, agentRole?: string | null): string {
+  return renderToStaticMarkup(
+    createElement(AgentConsole, { activity, agentRole }),
+  );
 }
 
 describe("AgentConsole — A: Running", () => {
   it("renders the coder chip, mini card, round marker, and working shimmer", () => {
-    const html = markup(STATE_RUNNING);
+    const html = markup(STATE_RUNNING, "coder");
     expect(html).toContain("Coder");
     expect(html).toContain("Mini");
     expect(html).toContain("mini · sonnet-4");
@@ -48,6 +50,15 @@ describe("AgentConsole — A: Running", () => {
     // a coder milestone with a <span class="mono"> marker → mono text, NOT raw HTML
     expect(html).toContain("T-12 · harden auth flow");
     expect(html).not.toContain('<span class="mono">');
+  });
+
+  it("labels tool rows with the session role (not always Coder)", () => {
+    expect(markup(STATE_RUNNING, "orchestrator")).toContain("Orchestrator");
+    expect(markup(STATE_RUNNING, "verifier")).toContain("Verifier");
+    expect(markup(STATE_RUNNING, "mini")).toContain("Mini");
+    // Unknown / missing role → generic Agent (never a false "Coder").
+    expect(markup(STATE_RUNNING)).toContain("Agent");
+    expect(markup(STATE_RUNNING)).not.toContain("Coder");
   });
 });
 

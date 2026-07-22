@@ -924,11 +924,13 @@ export function PolisView() {
           onSelectBuilding={selectBuilding}
         />
 
-        {/* Videogame-style bottom control bar (Guide + Legend). Lives inside the
-            map area; its wrapper is pointer-events-none so pan/zoom pass through
-            everywhere except over the bar + its panels. Only when a city is
-            loaded with buildings (no point over the empty/loading states). */}
-        {cityState && buildings.length > 0 && (
+        {/* Videogame-style bottom control bar (Guide + Legend + File types…).
+            Lives inside the map area; its wrapper is pointer-events-none so
+            pan/zoom pass through everywhere except over the bar + its panels.
+            Shown whenever a city is loaded — including the mapped-but-empty
+            case (0 buildings), so File types stays reachable to undo a filter
+            that emptied the city (F69). Pre-mapping empty state is unchanged. */}
+        {cityState && (
           <PolisBottomBar
             buildingCount={buildings.length}
             roadCount={roads.length}

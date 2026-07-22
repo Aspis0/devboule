@@ -63,7 +63,8 @@ export const ROLE_OPTIONS: { id: SpawnRole; label: string; summary: string }[] =
 export const BUILTIN_CLIENTS: { id: string; label: string }[] = [
 	{ id: "codex", label: "codex" },
 	{ id: "claude", label: "claude" },
-	{ id: "openai", label: "openai" },
+	// OpenAI has no agent CLI — Settings already removed the stub (owner decision).
+	// Custom registered CLIs still append dynamically via `customClients`.
 	{ id: "orchestrator", label: "Local (Devboule)" },
 ];
 

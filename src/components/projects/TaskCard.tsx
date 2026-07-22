@@ -1,5 +1,5 @@
 import { Bot } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ColumnId, MoveTarget } from "./taskBoard";
 import type { WorkerBadge } from "./agentBadge";
 import { MiniMenu, type MiniMenuItem } from "./MiniMenu";
@@ -50,6 +50,10 @@ export function TaskCard({
 	verifierTitle,
 	manualDisabled,
 	onMove,
+	canDelete = false,
+	deleteDisabled = true,
+	deleteTitle = "",
+	onDelete,
 	onLaunchCoder,
 	onLaunchVerifier,
 	onCopyManualPrompt,
@@ -71,6 +75,12 @@ export function TaskCard({
 	verifierTitle: string;
 	manualDisabled: boolean;
 	onMove: (status: ColumnId) => void;
+	/** Parent-gated: todo/blocked, no open claim, not archived. */
+	canDelete?: boolean;
+	deleteDisabled?: boolean;
+	deleteTitle?: string;
+	/** Resolves when the backend delete finishes; rejects/throws on failure so the card can re-arm confirm. */
+	onDelete?: () => void | Promise<void>;
 	onLaunchCoder: () => void;
 	onLaunchVerifier: () => void;
 	onCopyManualPrompt: () => void;
@@ -85,6 +95,22 @@ export function TaskCard({
 	const metaParts: string[] = [];
 	if (task.assignee) metaParts.push(task.assignee);
 	if (task.due) metaParts.push(task.due);
+
+	// Two-step delete confirm (Delete → Confirm delete). Resets when the card
+	// becomes non-deletable (status change / claim) so a half-armed confirm
+	// cannot fire after the parent revokes canDelete. Stays armed while the
+	// delete is in flight so a failure can re-show Confirm without a re-arm click.
+	const [deleteArmed, setDeleteArmed] = useState(false);
+	const mountedRef = useRef(true);
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+		};
+	}, []);
+	useEffect(() => {
+		if (!canDelete || deleteDisabled) setDeleteArmed(false);
+	}, [canDelete, deleteDisabled, task.id, task.status]);
 
 	// Memoize the menu item arrays (and the onSelect closures they carry) so the
 	// 5s/10s poll-driven board re-renders don't hand MiniMenu a fresh `items`
@@ -236,7 +262,7 @@ export function TaskCard({
 				</div>
 			)}
 
-			{(moveTargets.length > 0 || showLaunch) && (
+			{(moveTargets.length > 0 || showLaunch || canDelete) && (
 				<div className="mt-3 flex gap-1">
 					{moveTargets.length > 0 && (
 						<div className="flex-1">
@@ -258,6 +284,45 @@ export function TaskCard({
 								align="right"
 								aria-label={`Launch agent for task ${task.id}`}
 							/>
+						</div>
+					)}
+					{canDelete && onDelete && (
+						<div className="flex-1">
+							<button
+								type="button"
+								disabled={deleteDisabled}
+								title={deleteTitle}
+								aria-label={
+									deleteArmed
+										? `Confirm delete task ${task.id}`
+										: `Delete task ${task.id}`
+								}
+								data-help-title="This permanently deletes the task."
+								data-help-lines="Only Todo and Blocked tasks with no open agent claim can be deleted.|Click once to arm, again to confirm.|WIP, Review, and Done tasks cannot be removed this way.|The board refreshes from the project file after the mutation."
+								onClick={() => {
+									if (deleteDisabled) return;
+									if (!deleteArmed) {
+										setDeleteArmed(true);
+										return;
+									}
+									// Keep armed until the delete resolves. On success the
+									// card unmounts; on failure re-arm so the user can retry.
+									void (async () => {
+										try {
+											await onDelete();
+										} catch {
+											if (mountedRef.current) setDeleteArmed(true);
+										}
+									})();
+								}}
+								className={`inline-flex w-full items-center justify-center rounded-md border px-2 py-1.5 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+									deleteArmed
+										? "border-coral/40 bg-coral/10 text-coral-dark hover:bg-coral/15"
+										: "border-cream-200 bg-white text-cream-600 hover:border-coral/30 hover:text-coral-dark"
+								}`}
+							>
+								{deleteArmed ? "Confirm delete" : "Delete"}
+							</button>
 						</div>
 					)}
 				</div>

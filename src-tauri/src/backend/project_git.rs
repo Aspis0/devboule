@@ -107,20 +107,15 @@ pub(crate) fn project_git_status(root_value: Option<&str>) -> ProjectGitStatus {
 
     let porcelain =
         git_output_timeout(&repo_root, &["status", "--porcelain=v1"]).unwrap_or_default();
-    for line in porcelain.lines().filter(|line| !line.trim().is_empty()) {
-        status.dirty_count += 1;
-        let bytes = line.as_bytes();
-        if line.starts_with("??") {
-            status.untracked_count += 1;
-            continue;
-        }
-        if bytes.first().is_some_and(|value| *value != b' ') {
-            status.staged_count += 1;
-        }
-        if bytes.get(1).is_some_and(|value| *value != b' ') {
-            status.unstaged_count += 1;
-        }
-    }
+    // F57: skip product-internal dirs (same set as F13 .gitignore seed) so
+    // pre-seed roots do not inflate dirty/untracked card counts.
+    super::projects::accumulate_porcelain_counts(
+        &porcelain,
+        &mut status.dirty_count,
+        &mut status.untracked_count,
+        &mut status.staged_count,
+        &mut status.unstaged_count,
+    );
 
     if status.upstream.is_some() {
         if let Some(raw) = git_output_timeout(

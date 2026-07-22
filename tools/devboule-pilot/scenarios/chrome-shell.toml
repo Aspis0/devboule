@@ -1,0 +1,33 @@
+# DEPRECATED for direct use when XDG_RUNTIME_DIR is private.
+# Prefer: ./tools/devboule-pilot/scenarios/run-chrome-shell.sh
+# which injects TAURI_PILOT_SOCKET from env.sh.
+
+[connect]
+socket = "/tmp/tauri-pilot-com.devboule.app.sock"
+timeout_ms = 5000
+
+[scenario]
+name = "devboule-chrome-shell-tmp-only"
+fail_fast = true
+global_timeout_ms = 60000
+
+[[step]]
+name = "wait-app"
+action = "wait"
+selector = "[data-testid=\"devboule-app\"]"
+timeout_ms = 20000
+
+[[step]]
+name = "assert-app"
+action = "assert-visible"
+target = "[data-testid=\"devboule-app\"]"
+
+[[step]]
+name = "assert-sidebar"
+action = "assert-visible"
+target = "[data-testid=\"sidebar\"]"
+
+[[step]]
+name = "assert-header"
+action = "assert-visible"
+target = "[data-testid=\"header\"]"

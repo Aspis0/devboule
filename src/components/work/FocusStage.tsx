@@ -14,6 +14,8 @@ import { Send } from "lucide-react";
 export interface FocusStageProps {
 	node: WorkNode;
 	activity: ConsoleActivity;
+	/** Session role for Activity stream chips (orchestrator/coder/…). */
+	agentRole?: string | null;
 	view: "activity" | "raw";
 	onViewChange: (v: "activity" | "raw") => void;
 	onSendMessage: (text: string) => void;
@@ -31,6 +33,7 @@ export function FocusStage(props: FocusStageProps) {
 	const {
 		node,
 		activity,
+		agentRole = null,
 		view,
 		onViewChange,
 		onSendMessage,
@@ -253,7 +256,7 @@ export function FocusStage(props: FocusStageProps) {
 							overflowY: "auto",
 						}}
 					>
-						<AgentConsole activity={activity} />
+						<AgentConsole activity={activity} agentRole={agentRole} />
 					</div>
 				)}
 				{view === "raw" && (

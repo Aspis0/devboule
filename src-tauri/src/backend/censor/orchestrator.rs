@@ -649,7 +649,7 @@ fn run_fine_batch_inner(
     } else {
         None
     };
-    let changed = fine_batch_collect(root, files, gemma);
+    let changed = fine_batch_collect(root, files, gemma, running);
     // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
     // and write a steer file so the main coder sees them next turn.
     // Phase A already delivers fine findings synchronously. Write the steer
@@ -702,7 +702,15 @@ fn should_record_rail(record_rail: bool, running: bool, changed_empty: bool) -> 
 /// clears stale gemma findings when the tier is offline (BLOCKER 3). If `gemma` is
 /// `None` the pass is byte-for-byte the deterministic-only A3 behaviour: the "gemma"
 /// source is never refreshed, so a pure-A3 caller never touches gemma findings.
-fn fine_batch_collect(root: &Path, files: &[String], gemma: Option<GemmaCtx<'_>>) -> Vec<String> {
+///
+/// F56/A-6: `running` is checked before each file; when cleared mid-batch, returns
+/// the files already processed (bail with partial work).
+fn fine_batch_collect(
+    root: &Path,
+    files: &[String],
+    gemma: Option<GemmaCtx<'_>>,
+    running: &AtomicBool,
+) -> Vec<String> {
     let kinds = detect_project_kinds(root);
     let plan = plan_fine(&kinds, files);
     let now = super::now_stamp();
@@ -713,6 +721,10 @@ fn fine_batch_collect(root: &Path, files: &[String], gemma: Option<GemmaCtx<'_>>
     let gemma_active = gemma.map(|g| g.available).unwrap_or(false);
 
     for fp in plan {
+        // F56/A-6: stop flag inside the fine batch — bail returning what's done so far.
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         // SECURITY: validate every watcher-derived relative path before it can
         // target a runner argv or a shard outside `.aspis-censor/`. A malformed
         // path (`..`, absolute, `-`-leading component) is SKIPPED, not crashed —
@@ -908,15 +920,16 @@ fn coarse_pass_collect(root: &Path) -> Vec<String> {
 
 /// On-demand pass bypassing debounce. `file = Some(rel)` runs that one file's FINE
 /// runners (a quick single-file recheck); `file = None` runs the whole-project
-/// COARSE sweep (clippy/cargo-*/tsc/knip/gitleaks/jscpd).
+/// COARSE sweep plus a FINE re-batch over files whose shards still carry open
+/// fine-source findings (F56).
 ///
-/// KNOWN A3 LIMITATION (for Phase E / final review): a `None` whole-project review
-/// runs only the COARSE tools — the FINE per-file tools (eslint/ruff/bandit/
-/// vulture/lizard/semgrep) are NOT re-run across every file, because that would
-/// require enumerating the whole tree and the A2 fine runners require a per-file
-/// target. The fine layer stays fresh via the live watcher (each edited file is
-/// fine-reviewed on settle). A future "deep review" could walk the tree and fan
-/// fine runners per file; deliberately out of A3 scope. Both arms emit the event.
+/// F56: a `None` whole-project review used to run only COARSE tools, so per-file
+/// FINE findings (tidy/eslint/ruff/…) stayed immortal after the file was fixed or
+/// the runner config changed. Review-now now also re-runs FINE over the subset of
+/// files that already have fine-source findings in shards (not a full tree walk).
+/// `run_fine_batch` rewrites each file's shard with a scoped merge, clearing
+/// findings when a runner reports clean. Gemma is threaded through when present
+/// (same as single-file recheck). Both arms emit the event via the batch helpers.
 ///
 /// SERIALIZATION: this is run on the per-project worker thread (enqueued by
 /// `censor_review_now`), NEVER inline on the command thread, so an on-demand review
@@ -934,14 +947,21 @@ pub fn run_review_now(
     match file {
         // A single-file recheck IS a fine pass, so it runs Gemma too (additive).
         Some(rel) => run_fine_batch(app, project_id, root, &[rel.to_string()], gemma, running),
-        // The whole-project sweep is COARSE-only (Gemma is per-file fine, see the
-        // module doc); the Gemma ctx is intentionally not threaded here.
         None => {
             run_coarse_pass(app, project_id, root, running);
-            // Stamp last_coarse_run the same way the auto coarse path does so the
-            // UI's lastCoarseRun is not stuck at null after a manual whole-project
-            // review. Single-file rechecks intentionally leave the stamp alone.
+            // F56/A-8: only stamp when the coarse pass completed without abort —
+            // writing last_coarse_run after a mid-coarse stop would lie to the UI.
+            // Single-file rechecks intentionally leave the stamp alone.
+            if !running.load(Ordering::SeqCst) {
+                return;
+            }
             stamp_last_coarse_run(root);
+            // F56: refresh FINE findings for files that still carry them. Stop gate
+            // between files is inside fine_batch_collect (per-file running check).
+            let fine_paths = existing_files_with_fine_findings(root);
+            if !fine_paths.is_empty() {
+                run_fine_batch(app, project_id, root, &fine_paths, gemma, running);
+            }
         }
     }
 }
@@ -976,6 +996,38 @@ fn files_with_sources(root: &Path, sources: &BTreeSet<String>) -> Vec<String> {
             !s.file_rel_path.is_empty() && s.findings.iter().any(|f| sources.contains(&f.source))
         })
         .map(|s| s.file_rel_path)
+        .collect()
+}
+
+/// Source names stamped by every FINE-granularity runner, plus Gemma (fine-only).
+/// Derived from the runner registry via [`RunnerId::ALL`] + [`RunnerId::granularity`]
+/// + [`runner_source`] — never a hand-picked subset of source strings (F56).
+/// [`RunnerId::ALL`] is exhaustiveness-pinned (audit A-5) so a new Fine variant
+/// cannot silently miss the review-now fine refresh set.
+fn fine_runner_sources() -> BTreeSet<String> {
+    let mut sources: BTreeSet<String> = RunnerId::ALL
+        .iter()
+        .filter(|r| r.granularity() == Granularity::Fine)
+        .map(|r| runner_source(*r).to_string())
+        .collect();
+    sources.insert(GEMMA_SOURCE.to_string());
+    sources
+}
+
+/// Rel paths of files whose shards carry any FINE-source finding AND still exist
+/// on disk under `root`. Pure-ish (shard + exists probes only): unit-tested with
+/// a temp shards dir (F56). Invalid rel paths are dropped.
+fn existing_files_with_fine_findings(root: &Path) -> Vec<String> {
+    let fine_sources = fine_runner_sources();
+    files_with_sources(root, &fine_sources)
+        .into_iter()
+        .filter(|rel| {
+            if super::ledger::validate_rel_path(rel).is_err() {
+                return false;
+            }
+            let abs = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            abs.is_file()
+        })
         .collect()
 }
 
@@ -1570,6 +1622,123 @@ mod tests {
         }
     }
 
+    // ---- F56: existing_files_with_fine_findings (Review now fine re-batch) ----
+
+    #[test]
+    fn fine_runner_sources_includes_fine_not_coarse() {
+        let s = fine_runner_sources();
+        assert!(s.contains("tidy"), "tidy is FINE");
+        assert!(s.contains("eslint"), "eslint is FINE");
+        assert!(s.contains("gemma"), "gemma attaches on fine passes");
+        assert!(!s.contains("clippy"), "clippy is COARSE");
+        assert!(!s.contains("cargo-check"), "cargo-check is COARSE");
+        assert!(!s.contains("gitleaks"), "gitleaks is COARSE");
+    }
+
+    #[test]
+    fn existing_files_with_fine_findings_filters_missing_and_coarse_only() {
+        use crate::backend::censor::ledger::write_shard;
+        use crate::backend::censor::schema::{
+            Category, CensorShard, Disposition, Finding, Severity, Verdict,
+        };
+
+        let dir = unique_temp_root("f56-exist");
+        let root = dir.as_path();
+
+        // Live file with a tidy (FINE) finding → must be returned.
+        fs::write(root.join("index.html"), "<html></html>\n").unwrap();
+        let tidy_finding = Finding {
+            id: "tidy-1".into(),
+            file: "index.html".into(),
+            content_hash: "h1".into(),
+            line: Some(1),
+            severity: Severity::Medium,
+            category: Category::Correctness,
+            source: "tidy".into(),
+            title: "missing doctype".into(),
+            body: "b".into(),
+            verdict: Verdict::Suspected,
+            disposition: Disposition::Open,
+            provenance: vec![],
+            created_at: "t0".into(),
+            commit: None,
+        };
+        write_shard(
+            root,
+            &CensorShard {
+                file_rel_path: "index.html".into(),
+                content_hash: "h1".into(),
+                updated_at: "t0".into(),
+                findings: vec![tidy_finding],
+            },
+        )
+        .unwrap();
+
+        // Deleted file still has a fine shard → must NOT be returned.
+        write_shard(
+            root,
+            &CensorShard {
+                file_rel_path: "gone.html".into(),
+                content_hash: "h2".into(),
+                updated_at: "t0".into(),
+                findings: vec![Finding {
+                    id: "tidy-gone".into(),
+                    file: "gone.html".into(),
+                    content_hash: "h2".into(),
+                    line: Some(1),
+                    severity: Severity::Low,
+                    category: Category::Correctness,
+                    source: "tidy".into(),
+                    title: "gone".into(),
+                    body: "b".into(),
+                    verdict: Verdict::Suspected,
+                    disposition: Disposition::Open,
+                    provenance: vec![],
+                    created_at: "t0".into(),
+                    commit: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        // Live file with only COARSE findings → must NOT be returned.
+        fs::write(root.join("lib.rs"), "fn main() {}\n").unwrap();
+        write_shard(
+            root,
+            &CensorShard {
+                file_rel_path: "lib.rs".into(),
+                content_hash: "h3".into(),
+                updated_at: "t0".into(),
+                findings: vec![Finding {
+                    id: "clippy-1".into(),
+                    file: "lib.rs".into(),
+                    content_hash: "h3".into(),
+                    line: Some(1),
+                    severity: Severity::Medium,
+                    category: Category::Correctness,
+                    source: "clippy".into(),
+                    title: "warn".into(),
+                    body: "b".into(),
+                    verdict: Verdict::Suspected,
+                    disposition: Disposition::Open,
+                    provenance: vec![],
+                    created_at: "t0".into(),
+                    commit: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let paths = existing_files_with_fine_findings(root);
+        assert_eq!(
+            paths,
+            vec!["index.html".to_string()],
+            "only live files with fine-source findings"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fine_batch_collect_runs_cleanly_and_writes_well_formed_shards() {
         // A Node project with a .ts file. The fine pass must complete without panic
@@ -1581,7 +1750,7 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/app.ts"), "export const x = 1;\n").unwrap();
 
-        let _changed = fine_batch_collect(root, &["src/app.ts".to_string()], None);
+        let _changed = fine_batch_collect(root, &["src/app.ts".to_string()], None, &AtomicBool::new(true));
         assert_shards_well_formed(root);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1608,7 +1777,7 @@ mod tests {
         let dir = unique_temp_root("empty");
         let root = dir.as_path();
         fs::write(root.join("package.json"), "{}").unwrap();
-        let changed = fine_batch_collect(root, &[], None);
+        let changed = fine_batch_collect(root, &[], None, &AtomicBool::new(true));
         assert!(changed.is_empty());
         // No shard dir is created for an empty batch.
         assert!(!root.join(super::super::CENSOR_DIR).exists());
@@ -1751,7 +1920,8 @@ mod tests {
         let dir = unique_temp_root("fine-badpath");
         let root = dir.as_path();
         fs::write(root.join("package.json"), "{}").unwrap();
-        let changed = fine_batch_collect(root, &["../escape.ts".to_string()], None);
+        let changed =
+            fine_batch_collect(root, &["../escape.ts".to_string()], None, &AtomicBool::new(true));
         assert!(changed.is_empty(), "invalid path produces no shard change");
         // No shard dir created from the rejected path.
         assert!(!root.join(super::super::CENSOR_DIR).exists());
@@ -1837,7 +2007,12 @@ mod tests {
             available: true,
             params: gemma::GemmaReviewParams::default(),
         };
-        let changed = fine_batch_collect(root, &["src/app.ts".to_string()], Some(ctx));
+        let changed = fine_batch_collect(
+            root,
+            &["src/app.ts".to_string()],
+            Some(ctx),
+            &AtomicBool::new(true),
+        );
         assert!(
             changed.contains(&"src/app.ts".to_string()),
             "the shard changed"
@@ -1888,7 +2063,12 @@ mod tests {
             available: false,
             params: gemma::GemmaReviewParams::default(),
         };
-        let _ = fine_batch_collect(root, &["src/app.ts".to_string()], Some(ctx));
+        let _ = fine_batch_collect(
+            root,
+            &["src/app.ts".to_string()],
+            Some(ctx),
+            &AtomicBool::new(true),
+        );
         let shard = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
             .unwrap();
@@ -1928,6 +2108,7 @@ mod tests {
                 available: true,
                 params: gemma::GemmaReviewParams::default(),
             }),
+            &AtomicBool::new(true),
         );
         let mid = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
@@ -1950,6 +2131,7 @@ mod tests {
                 available: true,
                 params: gemma::GemmaReviewParams::default(),
             }),
+            &AtomicBool::new(true),
         );
         let after = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
@@ -1998,6 +2180,7 @@ mod tests {
                 available: true,
                 params: gemma::GemmaReviewParams::default(),
             }),
+            &AtomicBool::new(true),
         );
         let mid = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
@@ -2020,6 +2203,7 @@ mod tests {
                 available: false,
                 params: gemma::GemmaReviewParams::default(),
             }),
+            &AtomicBool::new(true),
         );
         let after = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
@@ -2054,7 +2238,7 @@ mod tests {
         fs::write(root.join("src/app.ts"), "export const x = 1;\n").unwrap();
         seed_foreign_source_finding(root, "src/app.ts", "gemma");
 
-        let _ = fine_batch_collect(root, &["src/app.ts".to_string()], None);
+        let _ = fine_batch_collect(root, &["src/app.ts".to_string()], None, &AtomicBool::new(true));
         let after = super::super::ledger::read_shard(root, "src/app.ts")
             .unwrap()
             .unwrap();
