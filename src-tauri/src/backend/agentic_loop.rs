@@ -108,11 +108,11 @@ pub fn run_agent_loop(
         match llm.next_turn(&messages) {
             Err(e) => return LoopOutcome::Aborted { reason: format!("llm error: {e}"), rounds },
             Ok(LlmTurn::Message(content)) => {
-                // A blank final message before ANY tool call = the model produced nothing
-                // useful → abort (escalate), don't report a false success.
-                if content.trim().is_empty() && !made_progress {
+                // An empty final message is never a success — even after tool progress.
+                // (A non-empty text message with no tool calls is the legitimate Done path.)
+                if content.trim().is_empty() {
                     return LoopOutcome::Aborted {
-                        reason: "model returned no content and made no tool calls".to_string(),
+                        reason: "model returned an empty final message".to_string(),
                         rounds,
                     };
                 }
@@ -293,9 +293,44 @@ mod tests {
             None,
         );
         match outcome {
-            LoopOutcome::Aborted { reason, .. } => assert!(reason.contains("no content")),
+            LoopOutcome::Aborted { reason, .. } => {
+                assert!(reason.contains("empty final message"), "reason={reason}")
+            }
             other => panic!("expected Aborted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_message_after_progress_aborts_not_false_done() {
+        // Tool call succeeded, then the model returns a blank "final" message —
+        // must not look like Done with empty output.
+        let mut llm = MockLlm {
+            turns: VecDeque::from(vec![
+                Ok(LlmTurn::ToolCalls(vec![call("read_file")])),
+                Ok(LlmTurn::Message(String::new())),
+            ]),
+        };
+        let mut tools = MockTools {
+            calls: vec![],
+            response: "file content".to_string(),
+        };
+        let outcome = run_agent_loop(
+            &mut llm,
+            &mut tools,
+            "sys",
+            "task",
+            5,
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        );
+        assert_eq!(
+            outcome,
+            LoopOutcome::Aborted {
+                reason: "model returned an empty final message".to_string(),
+                rounds: 2,
+            }
+        );
+        assert_eq!(tools.calls.len(), 1);
     }
 
     #[test]

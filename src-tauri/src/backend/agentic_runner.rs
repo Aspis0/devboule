@@ -229,10 +229,25 @@ pub fn run_agentic_coder(
     Ok((outcome, touched, net_blocked, out_of_scope_write))
 }
 
+/// Classify an `LoopOutcome::Aborted` reason into a MiniCoderResult status string.
+/// Genuine LLM/transport/HTTP failures → `"failed"` (so the executor does not treat
+/// them as soft `needs_clarification`). Benign aborts (max rounds, empty message,
+/// cancel, …) stay `"needs_clarification"`.
+fn aborted_status(reason: &str) -> &'static str {
+    // agentic_loop formats transport errors as `llm error: …`; HTTP status errors
+    // from the transport also include `HTTP` in the message.
+    if reason.contains("llm error") || reason.contains("HTTP") {
+        "failed"
+    } else {
+        "needs_clarification"
+    }
+}
+
 /// Serialize an agentic run into the MiniCoderResult wire JSON the executor's finalize path
 /// reads. A finished loop → status "done" + the files the tools wrote (NO `edits` key — the
-/// tools already applied them on disk). An aborted loop (runaway / LLM error) →
-/// "needs_clarification" so it ESCALATES rather than falsely claiming success.
+/// tools already applied them on disk). A benign abort (runaway / empty message / cancel) →
+/// "needs_clarification" so it ESCALATES rather than falsely claiming success. A hard
+/// LLM/transport failure → "failed" so it does not masquerade as soft clarification.
 /// `net_blocked` is set to true when `ScopedAgentTools::net_blocked()` fired during the run
 /// (net=None + network-blocked heuristic matched); omitted (NO-CHURN) when false.
 /// `out_of_scope_write` is set to the canonicalized parent folder when a write attempt
@@ -249,11 +264,26 @@ pub fn agentic_result_json(
             "output": if output.is_empty() { "agentic loop complete" } else { output.as_str() },
             "filesTouched": touched,
         }),
-        LoopOutcome::Aborted { reason, .. } => json!({
-            "status": "needs_clarification",
-            "question": format!("agentic coder did not finish: {reason}"),
-            "filesTouched": touched,
-        }),
+        LoopOutcome::Aborted { reason, .. } => {
+            let status = aborted_status(reason);
+            let detail = format!("agentic coder did not finish: {reason}");
+            if status == "failed" {
+                // `read_result_file` maps any non-done/non-needs_clarification status to
+                // MiniCoderOutcome::failed(...). Carry the reason as `error` for the wire
+                // file / human readers (serde ignores unknown MiniCoderResult fields).
+                json!({
+                    "status": "failed",
+                    "error": detail,
+                    "filesTouched": touched,
+                })
+            } else {
+                json!({
+                    "status": "needs_clarification",
+                    "question": detail,
+                    "filesTouched": touched,
+                })
+            }
+        }
     };
     // NO-CHURN: only inject the field when true so existing result files that pre-date
     // this feature continue to deserialize cleanly (serde default = false).
@@ -337,6 +367,55 @@ mod tests {
         let v2: Value = serde_json::from_str(&aborted).unwrap();
         assert_eq!(v2["status"], "needs_clarification");
         assert!(v2["question"].as_str().unwrap().contains("max rounds"));
+    }
+
+    #[test]
+    fn aborted_status_maps_llm_and_http_to_failed() {
+        assert_eq!(
+            aborted_status("llm error: agentic LLM HTTP 404: No endpoints found"),
+            "failed"
+        );
+        assert_eq!(aborted_status("llm error: api down"), "failed");
+        assert_eq!(
+            aborted_status("transport blew up with HTTP 500"),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn aborted_status_maps_benign_to_needs_clarification() {
+        assert_eq!(
+            aborted_status("max rounds (8) exceeded"),
+            "needs_clarification"
+        );
+        assert_eq!(
+            aborted_status("model returned an empty final message"),
+            "needs_clarification"
+        );
+        assert_eq!(aborted_status("cancelled"), "needs_clarification");
+    }
+
+    #[test]
+    fn agentic_result_json_llm_error_is_failed() {
+        let json = agentic_result_json(
+            &LoopOutcome::Aborted {
+                reason: "llm error: agentic LLM HTTP 404: No endpoints found".into(),
+                rounds: 1,
+            },
+            &[],
+            false,
+            None,
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("No endpoints found"),
+            "error field carries reason: {}",
+            v
+        );
     }
 
     #[test]

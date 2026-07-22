@@ -136,8 +136,9 @@ pub fn parse_llm_turn(resp: &Value) -> Result<LlmTurn, String> {
         }
     }
 
-    // A null/absent content with no VALID tool calls = an empty final message (graceful),
-    // NOT an abort — a malformed turn from a quantized local model shouldn't kill the loop.
+    // A null/absent content with no VALID tool calls → Message(""). The agentic loop
+    // treats an empty final assistant message (no tool calls) as an abort; parse still
+    // returns Message("") rather than inventing an abort here.
     let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
     Ok(LlmTurn::Message(content.to_string()))
 }
@@ -194,6 +195,34 @@ impl HttpAgentLlm {
     }
 }
 
+/// Build a clear non-2xx error string from an HTTP status + body. Prefers the
+/// provider's `error.message` when the body is JSON; otherwise truncates the raw body.
+fn http_error_message(status_code: u16, body: &str) -> String {
+    let msg = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "(empty body)".to_string()
+            } else if trimmed.len() > 300 {
+                let mut end = 300.min(trimmed.len());
+                while end > 0 && !trimmed.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &trimmed[..end])
+            } else {
+                trimmed.to_string()
+            }
+        });
+    format!("agentic LLM HTTP {status_code}: {msg}")
+}
+
 impl AgentLlm for HttpAgentLlm {
     fn next_turn(&mut self, messages: &[ChatMsg]) -> Result<LlmTurn, String> {
         let body = build_chat_request(
@@ -210,10 +239,17 @@ impl AgentLlm for HttpAgentLlm {
         }
         let resp = req
             .send()
-            .map_err(|e| format!("agentic LLM request failed: {e}"))?
-            .json::<Value>()
+            .map_err(|e| format!("agentic LLM request failed: {e}"))?;
+        let status = resp.status();
+        let body_text = resp
+            .text()
+            .map_err(|e| format!("agentic LLM response body unreadable: {e}"))?;
+        if !status.is_success() {
+            return Err(http_error_message(status.as_u16(), &body_text));
+        }
+        let resp_json: Value = serde_json::from_str(&body_text)
             .map_err(|e| format!("agentic LLM response was not JSON: {e}"))?;
-        parse_llm_turn(&resp)
+        parse_llm_turn(&resp_json)
     }
 }
 
@@ -259,6 +295,28 @@ mod tests {
     #[test]
     fn parse_garbage_is_err() {
         assert!(parse_llm_turn(&json!({})).is_err());
+    }
+
+    #[test]
+    fn http_error_message_extracts_provider_message() {
+        let body = r#"{"error":{"message":"No endpoints found for X"}}"#;
+        let msg = http_error_message(404, body);
+        assert!(msg.contains("404"), "status in message: {msg}");
+        assert!(
+            msg.contains("No endpoints found"),
+            "provider message in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_error_message_falls_back_to_raw_body() {
+        let body = "upstream gateway timeout — please retry later (plain text)";
+        let msg = http_error_message(502, body);
+        assert!(msg.contains("502"), "status in message: {msg}");
+        assert!(
+            msg.contains("upstream gateway timeout"),
+            "raw body fragment in error: {msg}"
+        );
     }
 
     #[test]

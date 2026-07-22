@@ -227,9 +227,11 @@ pub struct MiniEdit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniCoderResult {
-    /// "done" | "needs_clarification" (any other value is treated as invalid by
-    /// `read_result_file`). Kept as a raw string here (not the enum) so a typo'd
-    /// status degrades to `failed` in the reader rather than failing the parse.
+    /// "done" | "needs_clarification" | "failed" (any other value is treated as
+    /// invalid by `read_result_file`). Kept as a raw string here (not the enum) so
+    /// a typo'd status degrades to `failed` in the reader rather than failing the
+    /// parse. `"failed"` is a first-class mini self-report (e.g. agentic LLM
+    /// transport/HTTP hard failure) and is mapped via `failed_from_result`.
     #[serde(default)]
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +246,12 @@ pub struct MiniCoderResult {
     pub question: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<String>,
+    /// Hard-failure detail when `status == "failed"`. Written by the agentic
+    /// runner for LLM/transport failures so `read_result_file` can surface the
+    /// real provider error instead of a generic "unrecognized status" message.
+    /// NO-CHURN: omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// SANDBOX broker: set by the agentic worker when `looks_network_blocked` fired
     /// during a `run` call while `net == NetPolicy::None`. Propagated into
     /// `MiniCoderOutcome` so `finalize_finished_mini` can emit the consent-request
@@ -324,6 +332,28 @@ impl MiniCoderOutcome {
             censor_findings: None,
         }
     }
+
+    /// Outcome synthesized from a valid mini-written `MiniCoderResult` reporting
+    /// `failed`. Preserves filesTouched / net_blocked / folder_write_blocked and
+    /// surfaces the mini's `error` (or a generic fallback when absent).
+    pub fn failed_from_result(result: MiniCoderResult) -> Self {
+        let error = result
+            .error
+            .unwrap_or_else(|| "agentic coder failed (no detail in result file)".to_string());
+        Self {
+            status: MiniCoderStatus::Failed,
+            output: result.output,
+            files_touched: result.files_touched,
+            edits: result.edits,
+            question: None,
+            partial: result.partial,
+            error: Some(error),
+            net_blocked: result.net_blocked,
+            folder_write_blocked: result.folder_write_blocked,
+            censor_findings: None,
+        }
+    }
+
     /// App-synthesized `failed` (no/invalid result file, parent gone, etc).
     pub fn failed(error: impl Into<String>) -> Self {
         Self {
@@ -1304,6 +1334,7 @@ pub fn read_result_file(scratch_root: &Path, result_rel_path: &str) -> MiniCoder
     match parsed.status.as_str() {
         "done" => MiniCoderOutcome::done(parsed),
         "needs_clarification" => MiniCoderOutcome::needs_clarification(parsed),
+        "failed" => MiniCoderOutcome::failed_from_result(parsed),
         other => {
             MiniCoderOutcome::failed(format!("result file has unrecognized status: {other:?}"))
         }
@@ -3304,6 +3335,47 @@ mod tests {
     }
 
     #[test]
+    fn read_result_valid_failed_preserves_error_and_files_touched() {
+        // First-class "failed" from the agentic runner must keep the provider
+        // error and filesTouched (not fall into unrecognized-status + default).
+        let dir = std::env::temp_dir().join(format!("mc_failed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_scratch(
+            &dir,
+            "f.json",
+            r#"{"status":"failed","error":"agentic LLM HTTP 404: No endpoints found","filesTouched":["a.py"]}"#,
+        );
+        let outcome = read_result_file(&dir, "f.json");
+        assert_eq!(outcome.status, MiniCoderStatus::Failed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("No endpoints found"),
+            "error: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.files_touched, vec!["a.py".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_result_failed_without_error_uses_generic_fallback() {
+        let dir = std::env::temp_dir().join(format!("mc_failed_noerr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_scratch(&dir, "f.json", r#"{"status":"failed","filesTouched":["b.rs"]}"#);
+        let outcome = read_result_file(&dir, "f.json");
+        assert_eq!(outcome.status, MiniCoderStatus::Failed);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("agentic coder failed (no detail in result file)")
+        );
+        assert_eq!(outcome.files_touched, vec!["b.rs".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn read_result_missing_is_failed() {
         let dir = std::env::temp_dir().join(format!("mc_missing_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4184,6 +4256,7 @@ mod tests {
             edits: vec![],
             question: None,
             partial: None,
+            error: None,
             net_blocked: false,
             folder_write_blocked: None,
         };
@@ -4207,6 +4280,7 @@ mod tests {
             edits: vec![],
             question: None,
             partial: None,
+            error: None,
             net_blocked: true,
             folder_write_blocked: None,
         };

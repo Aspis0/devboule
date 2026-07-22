@@ -575,8 +575,9 @@ pub(crate) fn spawn_agentic_worker(
                         out_of_scope_write.as_deref(),
                     )
                 }
-                // Transport/init failure → escalate (NOT a false "done"); net_blocked=false,
-                // out_of_scope_write=None (the LLM never got to run a tool).
+                // Transport/init failure → hard `"failed"` (NOT soft needs_clarification).
+                // Prefix with `llm error:` so `aborted_status` classifies as failed;
+                // net_blocked=false, out_of_scope_write=None (LLM never ran a tool).
                 Err(e) => {
                     append_agentic_activity(
                         activity_file.as_deref(),
@@ -587,7 +588,7 @@ pub(crate) fn spawn_agentic_worker(
                     );
                     crate::backend::agentic_runner::agentic_result_json(
                         &crate::backend::agentic_loop::LoopOutcome::Aborted {
-                            reason: e,
+                            reason: format!("llm error: coder init failed: {e}"),
                             rounds: 0,
                         },
                         &[],

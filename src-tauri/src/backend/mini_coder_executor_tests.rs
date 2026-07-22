@@ -762,6 +762,7 @@ fn p4_done_with_edits(edits: Vec<mini_coder::MiniEdit>) -> MiniCoderOutcome {
         edits,
         question: None,
         partial: None,
+        error: None,
         net_blocked: false,
         folder_write_blocked: None,
     })
