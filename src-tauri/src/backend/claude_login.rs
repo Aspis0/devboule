@@ -1,9 +1,13 @@
 //! F51: in-app "Login with Claude" — run `claude setup-token` on a PTY, capture the
 //! printed OAuth token, save via vault. Never returns or logs the token.
+//!
+//! Reap invariant: `claude setup-token` ignores soft kill (SIGTERM / ChildKiller);
+//! never use a bare blocking `child.wait()` on the hot path — only bounded poll +
+//! SIGKILL escalation, then a detached reaper as last resort.
 
 use crate::backend::projects::command_exists;
 use crate::backend::vault;
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::{Child, CommandBuilder, PtySize};
 use regex::Regex;
 use serde::Serialize;
 use std::io::Read;
@@ -12,6 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const KILL_GRACE: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const READ_BUF: usize = 4096;
 const TAIL_CHARS: usize = 300;
 
@@ -28,6 +34,24 @@ pub struct ClaudeLoginResult {
     /// Last ~300 chars of output with any token-like substrings redacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+}
+
+/// Pure escalation stages after soft kill fails to reap (for unit tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillEscalation {
+    /// Soft kill already tried; next is hard kill (SIGKILL / hard ChildKiller).
+    HardKill,
+    /// Hard kill already tried; next is detach a background reaper and return.
+    DetachReaper,
+}
+
+/// Pure: after `already_hard` kill attempt still didn't reap, what next?
+pub fn next_kill_escalation(already_hard: bool) -> KillEscalation {
+    if already_hard {
+        KillEscalation::DetachReaper
+    } else {
+        KillEscalation::HardKill
+    }
 }
 
 fn token_regex() -> &'static Regex {
@@ -95,12 +119,78 @@ fn store_killer(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) {
     }
 }
 
-fn kill_stored_child() {
+/// Soft-kill via the stored ChildKiller (if any). Does not wait.
+fn kill_stored_child_soft() {
     if let Ok(mut g) = LOGIN_KILLER.lock() {
         if let Some(mut k) = g.take() {
             let _ = k.kill();
         }
     }
+}
+
+/// Poll `try_wait` every 100ms until reaped or `grace` elapses. Never blocks on `wait()`.
+fn poll_reaped(child: &mut Box<dyn Child + Send + Sync>, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => {
+                // Unknown status — treat as not reaped so caller can escalate.
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+/// Soft kill → poll → SIGKILL → poll → detach reaper. Never a bare blocking `wait()`
+/// on the calling thread. Outcome of the login flow must never hang on reap.
+fn kill_and_reap_bounded(mut child: Box<dyn Child + Send + Sync>, grace: Duration) {
+    // Soft: ChildKiller + Child::kill (often SIGTERM — may be ignored by setup-token).
+    kill_stored_child_soft();
+    let _ = child.kill();
+
+    if poll_reaped(&mut child, grace) {
+        return;
+    }
+
+    // Hard kill (unix SIGKILL by pid; Windows ChildKiller kill is already hard).
+    debug_assert_eq!(next_kill_escalation(false), KillEscalation::HardKill);
+    if let Some(pid) = child.process_id() {
+        #[cfg(unix)]
+        {
+            // SIGKILL cannot be ignored — the only signal that worked live on setup-token.
+            unsafe {
+                let _ = libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+            let _ = pid;
+        }
+    } else {
+        let _ = child.kill();
+    }
+
+    if poll_reaped(&mut child, grace) {
+        return;
+    }
+
+    // Still alive: detach a reaper so we never block the command return path.
+    debug_assert_eq!(next_kill_escalation(true), KillEscalation::DetachReaper);
+    std::thread::spawn(move || {
+        // Detached last-resort wait — only allowed off the request path.
+        let _ = child.wait();
+    });
 }
 
 fn try_save_token(token: &str) -> ClaudeLoginResult {
@@ -136,7 +226,9 @@ pub fn cancel_claude_login() -> ClaudeLoginResult {
             stderr_tail: None,
         };
     }
-    kill_stored_child();
+    // Soft poke only — the start thread owns the Child and will escalate via
+    // kill_and_reap_bounded when it observes EOF / next loop iteration.
+    kill_stored_child_soft();
     ClaudeLoginResult {
         ok: true,
         reason: Some("cancel requested".into()),
@@ -181,6 +273,48 @@ pub fn run_claude_setup_token() -> ClaudeLoginResult {
     }
 }
 
+/// Watchdog that soft-kills on deadline; always stopped+joined via Drop.
+struct LoginWatchdog {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoginWatchdog {
+    fn start(deadline: Instant) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Relaxed) {
+                if Instant::now() >= deadline {
+                    kill_stored_child_soft();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for LoginWatchdog {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 fn run_claude_setup_token_inner() -> ClaudeLoginResult {
     // Owner's normal env — do NOT set CLAUDE_CONFIG_DIR (mirrors terminal run).
     let mut cmd = CommandBuilder::new("claude");
@@ -219,8 +353,7 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
     let mut reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
-            kill_stored_child();
-            let _ = child.wait();
+            kill_and_reap_bounded(child, KILL_GRACE);
             return ClaudeLoginResult {
                 ok: false,
                 reason: Some(format!("Could not read Claude login output: {e}")),
@@ -233,26 +366,15 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
     drop(pair.slave);
     let _master = pair.master;
 
-    // Watchdog: kill child after LOGIN_TIMEOUT so a blocking read unblocks.
     let deadline = Instant::now() + LOGIN_TIMEOUT;
-    let stop_watchdog = Arc::new(AtomicBool::new(false));
-    let stop_w = Arc::clone(&stop_watchdog);
-    let watchdog = std::thread::spawn(move || {
-        while !stop_w.load(Ordering::Relaxed) {
-            if Instant::now() >= deadline {
-                kill_stored_child();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    });
+    let watchdog = LoginWatchdog::start(deadline);
 
     let mut accumulated = String::new();
     let mut buf = [0u8; READ_BUF];
+
     let outcome = loop {
         if Instant::now() >= deadline {
-            kill_stored_child();
-            let _ = child.wait();
+            kill_and_reap_bounded(child, KILL_GRACE);
             break ClaudeLoginResult {
                 ok: false,
                 reason: Some("timeout".into()),
@@ -262,16 +384,19 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
 
         match reader.read(&mut buf) {
             Ok(0) => {
-                // EOF — child closed PTY.
-                let _ = child.wait();
-                if let Some(token) = extract_setup_token(&accumulated) {
-                    break try_save_token(&token);
-                }
-                break ClaudeLoginResult {
-                    ok: false,
-                    reason: Some("no token in output".into()),
-                    stderr_tail: Some(tail_redacted(&accumulated)),
+                // EOF — PTY closed. Child may still ignore soft kill; reap bounded.
+                // Prefer save-if-token first so hang on kill never loses a good login.
+                let result = if let Some(token) = extract_setup_token(&accumulated) {
+                    try_save_token(&token)
+                } else {
+                    ClaudeLoginResult {
+                        ok: false,
+                        reason: Some("no token in output".into()),
+                        stderr_tail: Some(tail_redacted(&accumulated)),
+                    }
                 };
+                kill_and_reap_bounded(child, KILL_GRACE);
+                break result;
             }
             Ok(n) => {
                 accumulated.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -279,14 +404,15 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
                     accumulated = accumulated[accumulated.len() - 32_768..].to_string();
                 }
                 if let Some(token) = extract_setup_token(&accumulated) {
+                    // Success path: save FIRST, then bounded kill — return save result even
+                    // if kill escalates / detaches.
                     let saved = try_save_token(&token);
-                    kill_stored_child();
-                    let _ = child.wait();
+                    kill_and_reap_bounded(child, KILL_GRACE);
                     break saved;
                 }
-                // Child may have exited without EOF yet.
+                // Child may have exited without us noticing yet.
                 if let Ok(Some(_)) = child.try_wait() {
-                    // Drain a bit more.
+                    // Already reaped via try_wait — drain a bit more from the PTY.
                     for _ in 0..10 {
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
@@ -295,6 +421,8 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
                             }
                         }
                     }
+                    // Drop reaped child (no wait).
+                    drop(child);
                     if let Some(token) = extract_setup_token(&accumulated) {
                         break try_save_token(&token);
                     }
@@ -307,26 +435,27 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                kill_stored_child();
-                let _ = child.wait();
-                if Instant::now() >= deadline {
-                    break ClaudeLoginResult {
+                let timed_out = Instant::now() >= deadline;
+                kill_and_reap_bounded(child, KILL_GRACE);
+                break if timed_out {
+                    ClaudeLoginResult {
                         ok: false,
                         reason: Some("timeout".into()),
                         stderr_tail: Some(tail_redacted(&accumulated)),
-                    };
-                }
-                break ClaudeLoginResult {
-                    ok: false,
-                    reason: Some(format!("Error reading Claude login output: {e}")),
-                    stderr_tail: Some(tail_redacted(&accumulated)),
+                    }
+                } else {
+                    ClaudeLoginResult {
+                        ok: false,
+                        reason: Some(format!("Error reading Claude login output: {e}")),
+                        stderr_tail: Some(tail_redacted(&accumulated)),
+                    }
                 };
             }
         }
     };
 
-    stop_watchdog.store(true, Ordering::Relaxed);
-    let _ = watchdog.join();
+    // Explicit stop so join is done before return (Drop is backup).
+    watchdog.stop();
     outcome
 }
 
@@ -379,5 +508,11 @@ mod tests {
         let t = tail_redacted(&big);
         assert!(!t.contains("LEAKEDTOKEN"));
         assert!(t.contains("[redacted-token]") || !t.contains("sk-ant-oat"));
+    }
+
+    #[test]
+    fn kill_escalation_soft_then_hard_then_detach() {
+        assert_eq!(next_kill_escalation(false), KillEscalation::HardKill);
+        assert_eq!(next_kill_escalation(true), KillEscalation::DetachReaper);
     }
 }
