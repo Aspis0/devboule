@@ -1359,6 +1359,11 @@ export function RolesTableCard() {
 	const [claudeLoginBusy, setClaudeLoginBusy] = useState(false);
 	const [claudeLoginMsg, setClaudeLoginMsg] = useState<string | null>(null);
 	const [claudeLoginOk, setClaudeLoginOk] = useState(false);
+	const [claudeLoginPhase, setClaudeLoginPhase] = useState<
+		"idle" | "running" | "awaiting_code"
+	>("idle");
+	const [claudeOAuthCode, setClaudeOAuthCode] = useState("");
+	const [claudeCodeBusy, setClaudeCodeBusy] = useState(false);
 	const refreshClaudeOauthStatus = useCallback(async () => {
 		try {
 			const next = await invokeBackendCommand<AuxCredentialStatus>(
@@ -1418,6 +1423,9 @@ export function RolesTableCard() {
 		setClaudeLoginMsg(null);
 		setClaudeLoginOk(false);
 		setClaudeOauthError(null);
+		setClaudeLoginPhase("running");
+		setClaudeOAuthCode("");
+		const hadPriorToken = claudeOauthStatus?.configured === true;
 		try {
 			const result = await invokeBackendCommand<{
 				ok: boolean;
@@ -1433,19 +1441,30 @@ export function RolesTableCard() {
 				setClaudeLoginOk(false);
 				const r = result.reason ?? "Login failed";
 				const tail = result.stderrTail?.trim();
-				setClaudeLoginMsg(tail ? `${r}${tail ? ` — ${tail}` : ""}` : r);
+				let msg = tail ? `${r} — ${tail}` : r;
+				if (hadPriorToken) {
+					msg += " Il token salvato in precedenza resta attivo.";
+				}
+				setClaudeLoginMsg(msg);
 			}
 		} catch (e) {
 			if (mountedRef.current) {
 				setClaudeLoginOk(false);
-				setClaudeLoginMsg(
-					typeof e === "string" ? e : "Login with Claude failed.",
-				);
+				let msg =
+					typeof e === "string" ? e : "Login with Claude failed.";
+				if (hadPriorToken) {
+					msg += " Il token salvato in precedenza resta attivo.";
+				}
+				setClaudeLoginMsg(msg);
 			}
 		} finally {
-			if (mountedRef.current) setClaudeLoginBusy(false);
+			if (mountedRef.current) {
+				setClaudeLoginBusy(false);
+				setClaudeLoginPhase("idle");
+				setClaudeOAuthCode("");
+			}
 		}
-	}, [claudeLoginBusy, refreshClaudeOauthStatus]);
+	}, [claudeLoginBusy, claudeOauthStatus?.configured, refreshClaudeOauthStatus]);
 	const cancelClaudeLogin = useCallback(async () => {
 		try {
 			await invokeBackendCommand("claude_login_cancel");
@@ -1453,6 +1472,49 @@ export function RolesTableCard() {
 			// best-effort
 		}
 	}, []);
+	// Poll login phase while busy (manual-code OAuth variant).
+	useEffect(() => {
+		if (!claudeLoginBusy) return;
+		let cancelled = false;
+		const tick = async () => {
+			try {
+				const st = await invokeBackendCommand<{
+					phase: "idle" | "running" | "awaiting_code";
+				}>("claude_login_state");
+				if (!cancelled && mountedRef.current) {
+					setClaudeLoginPhase(st.phase);
+				}
+			} catch {
+				// ignore poll errors
+			}
+		};
+		void tick();
+		const id = window.setInterval(() => void tick(), 1000);
+		return () => {
+			cancelled = true;
+			window.clearInterval(id);
+		};
+	}, [claudeLoginBusy]);
+	const submitClaudeLoginCode = useCallback(async () => {
+		const code = claudeOAuthCode.trim();
+		if (!code || claudeCodeBusy) return;
+		setClaudeCodeBusy(true);
+		setClaudeOauthError(null);
+		try {
+			await invokeBackendCommand("claude_login_submit_code", { code });
+			if (mountedRef.current) {
+				setClaudeOAuthCode("");
+				setClaudeLoginPhase("running");
+			}
+		} catch (e) {
+			if (mountedRef.current)
+				setClaudeOauthError(
+					typeof e === "string" ? e : "Could not submit code.",
+				);
+		} finally {
+			if (mountedRef.current) setClaudeCodeBusy(false);
+		}
+	}, [claudeOAuthCode, claudeCodeBusy]);
 	useEffect(() => {
 		mountedRef.current = true;
 		return () => {
@@ -2139,6 +2201,40 @@ export function RolesTableCard() {
 									>
 										{claudeLoginMsg}
 									</p>
+								) : null}
+								{claudeLoginBusy &&
+								claudeLoginPhase === "awaiting_code" ? (
+									<div
+										className="space-y-2 rounded-md border border-cream-200 bg-white p-2"
+										data-testid="claude-login-code-panel"
+									>
+										<p className="text-[11px] leading-4 text-cream-600">
+											Il browser mostra un codice — incollalo qui:
+										</p>
+										<div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+											<input
+												type="text"
+												value={claudeOAuthCode}
+												onChange={(e) => setClaudeOAuthCode(e.target.value)}
+												placeholder="Codice dal browser"
+												autoComplete="off"
+												spellCheck={false}
+												className="min-w-0 flex-1 rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] text-cream-700 outline-none focus:border-teal/30"
+												data-testid="claude-login-code-input"
+											/>
+											<button
+												type="button"
+												onClick={() => void submitClaudeLoginCode()}
+												disabled={
+													claudeCodeBusy || claudeOAuthCode.trim().length === 0
+												}
+												className="inline-flex items-center justify-center rounded-md bg-teal px-3 py-2 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
+												data-testid="claude-login-code-submit"
+											>
+												Submit code
+											</button>
+										</div>
+									</div>
 								) : null}
 								<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 									or paste a token manually

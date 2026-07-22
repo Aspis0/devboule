@@ -10,7 +10,7 @@ use crate::backend::vault;
 use portable_pty::{Child, CommandBuilder, PtySize};
 use regex::Regex;
 use serde::Serialize;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,10 +20,27 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const READ_BUF: usize = 4096;
 const TAIL_CHARS: usize = 300;
+const CODE_MAX_LEN: usize = 512;
 
 static LOGIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LOGIN_KILLER: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>> =
     Mutex::new(None);
+static LOGIN_WRITER: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(None);
+static LOGIN_PHASE: Mutex<LoginPhase> = Mutex::new(LoginPhase::Idle);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginPhase {
+    Idle,
+    Running,
+    AwaitingCode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeLoginState {
+    pub phase: LoginPhase,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +106,34 @@ pub fn redact_token_patterns(s: &str) -> String {
         .into_owned()
 }
 
+fn paste_code_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)paste\s*code\s*here").expect("paste-code regex")
+    })
+}
+
+/// Pure: true when CLI output is asking the user to paste a browser OAuth code.
+pub fn detects_paste_code_prompt(output: &str) -> bool {
+    let clean = strip_ansi(output);
+    paste_code_regex().is_match(&clean)
+}
+
+/// Pure: validate a manual OAuth code before writing it to the PTY.
+pub fn validate_login_code(code: &str) -> Result<String, String> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Err("Code is empty.".into());
+    }
+    if trimmed.len() > CODE_MAX_LEN {
+        return Err(format!("Code is too long (max {CODE_MAX_LEN} characters)."));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("Code must not contain control characters.".into());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn tail_redacted(buf: &str) -> String {
     let clean = strip_ansi(buf);
     let slice = if clean.chars().count() > TAIL_CHARS {
@@ -106,9 +151,19 @@ fn tail_redacted(buf: &str) -> String {
     redact_token_patterns(&slice)
 }
 
+fn set_login_phase(phase: LoginPhase) {
+    if let Ok(mut g) = LOGIN_PHASE.lock() {
+        *g = phase;
+    }
+}
+
 fn clear_login_slot() {
     LOGIN_IN_PROGRESS.store(false, Ordering::Release);
+    set_login_phase(LoginPhase::Idle);
     if let Ok(mut g) = LOGIN_KILLER.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = LOGIN_WRITER.lock() {
         *g = None;
     }
 }
@@ -119,6 +174,12 @@ fn store_killer(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) {
     }
 }
 
+fn store_writer(writer: Box<dyn Write + Send>) {
+    if let Ok(mut g) = LOGIN_WRITER.lock() {
+        *g = Some(writer);
+    }
+}
+
 /// Soft-kill via the stored ChildKiller (if any). Does not wait.
 fn kill_stored_child_soft() {
     if let Ok(mut g) = LOGIN_KILLER.lock() {
@@ -126,6 +187,33 @@ fn kill_stored_child_soft() {
             let _ = k.kill();
         }
     }
+}
+
+/// Cheap poll of the shared login phase (idle / running / awaiting_code).
+pub fn login_state() -> ClaudeLoginState {
+    let phase = LOGIN_PHASE
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(LoginPhase::Idle);
+    ClaudeLoginState { phase }
+}
+
+/// Write a browser OAuth code into the live PTY (code + `\r`), then flush.
+pub fn submit_login_code(code: String) -> Result<(), String> {
+    let code = validate_login_code(&code)?;
+    let mut guard = LOGIN_WRITER
+        .lock()
+        .map_err(|_| "Claude login writer lock is poisoned.".to_string())?;
+    let writer = guard
+        .as_mut()
+        .ok_or_else(|| "No Claude login session is waiting for a code.".to_string())?;
+    writer
+        .write_all(format!("{code}\r").as_bytes())
+        .map_err(|e| format!("Could not write code to Claude login: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Could not flush code to Claude login: {e}"))?;
+    Ok(())
 }
 
 /// Poll `try_wait` every 100ms until reaped or `grace` elapses. Never blocks on `wait()`.
@@ -259,9 +347,11 @@ pub fn run_claude_setup_token() -> ClaudeLoginResult {
             stderr_tail: None,
         };
     }
+    set_login_phase(LoginPhase::Running);
 
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_claude_setup_token_inner));
+    // Reset phase + killer + writer on EVERY exit (success/failure/panic).
     clear_login_slot();
     match result {
         Ok(r) => r,
@@ -350,6 +440,19 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
 
     store_killer(child.clone_killer());
 
+    // Writer for interactive "Paste code here" submission (shared with submit_login_code).
+    match pair.master.take_writer() {
+        Ok(w) => store_writer(w),
+        Err(e) => {
+            kill_and_reap_bounded(child, KILL_GRACE);
+            return ClaudeLoginResult {
+                ok: false,
+                reason: Some(format!("Could not attach Claude login writer: {e}")),
+                stderr_tail: None,
+            };
+        }
+    }
+
     let mut reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
@@ -409,6 +512,10 @@ fn run_claude_setup_token_inner() -> ClaudeLoginResult {
                     let saved = try_save_token(&token);
                     kill_and_reap_bounded(child, KILL_GRACE);
                     break saved;
+                }
+                // Manual-code OAuth variant: prompt for browser code on stdin.
+                if detects_paste_code_prompt(&accumulated) {
+                    set_login_phase(LoginPhase::AwaitingCode);
                 }
                 // Child may have exited without us noticing yet.
                 if let Ok(Some(_)) = child.try_wait() {
@@ -514,5 +621,27 @@ mod tests {
     fn kill_escalation_soft_then_hard_then_detach() {
         assert_eq!(next_kill_escalation(false), KillEscalation::HardKill);
         assert_eq!(next_kill_escalation(true), KillEscalation::DetachReaper);
+    }
+
+    #[test]
+    fn detects_paste_code_prompt_plain_and_ansi() {
+        assert!(detects_paste_code_prompt(
+            "Open the URL…\nPaste code here if prompted > "
+        ));
+        assert!(detects_paste_code_prompt(
+            "\x1b[1mPaste code here\x1b[0m if prompted >"
+        ));
+        assert!(detects_paste_code_prompt("PASTE   CODE   HERE:"));
+        assert!(!detects_paste_code_prompt("You're all set up — close this window"));
+        assert!(!detects_paste_code_prompt("sk-ant-oat01AbCdEfGhIjKlMnOp"));
+    }
+
+    #[test]
+    fn validate_login_code_accepts_and_rejects() {
+        assert_eq!(validate_login_code("  abcd-1234  ").unwrap(), "abcd-1234");
+        assert!(validate_login_code("").is_err());
+        assert!(validate_login_code("   ").is_err());
+        assert!(validate_login_code("has\nnewline").is_err());
+        assert!(validate_login_code(&"x".repeat(CODE_MAX_LEN + 1)).is_err());
     }
 }

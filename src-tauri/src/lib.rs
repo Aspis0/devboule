@@ -538,6 +538,8 @@ pub fn run() {
             backend::commands::delete_claude_oauth_token,
             backend::commands::claude_login_start,
             backend::commands::claude_login_cancel,
+            backend::commands::claude_login_state,
+            backend::commands::claude_login_submit_code,
             backend::commands::get_cloud_llm_key_status_for_role,
             backend::commands::save_cloud_llm_key_for_role,
             backend::commands::delete_cloud_llm_key_for_role,

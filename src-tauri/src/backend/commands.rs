@@ -1741,6 +1741,29 @@ pub async fn claude_login_cancel(
         .map_err(|e| format!("task join error: {e}"))
 }
 
+#[tauri::command]
+pub async fn claude_login_state(
+    state: State<'_, BackendState>,
+) -> Result<crate::backend::claude_login::ClaudeLoginState, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(crate::backend::claude_login::login_state)
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+#[tauri::command]
+pub async fn claude_login_submit_code(
+    state: State<'_, BackendState>,
+    code: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::backend::claude_login::submit_login_code(code)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
 // F50: per-role Cloud LLM keys (fallback to shared). F47: keyring off the main thread.
 
 #[tauri::command]
