@@ -1349,6 +1349,66 @@ export function RolesTableCard() {
 	useEffect(() => {
 		void refreshAllCloudKeyStatus();
 	}, [refreshAllCloudKeyStatus]);
+
+	// F46-close: shared Claude setup-token (orchestrator Agent CLI section only).
+	const [claudeOauthStatus, setClaudeOauthStatus] =
+		useState<AuxCredentialStatus | null>(null);
+	const [claudeOauthDraft, setClaudeOauthDraft] = useState("");
+	const [claudeOauthBusy, setClaudeOauthBusy] = useState(false);
+	const [claudeOauthError, setClaudeOauthError] = useState<string | null>(null);
+	const refreshClaudeOauthStatus = useCallback(async () => {
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>(
+				"get_claude_oauth_token_status",
+			);
+			if (mountedRef.current) setClaudeOauthStatus(next);
+		} catch {
+			// Degrade silently.
+		}
+	}, []);
+	useEffect(() => {
+		void refreshClaudeOauthStatus();
+	}, [refreshClaudeOauthStatus]);
+	const saveClaudeOauth = useCallback(async () => {
+		const token = claudeOauthDraft.trim();
+		if (!token || claudeOauthBusy) return;
+		setClaudeOauthBusy(true);
+		setClaudeOauthError(null);
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>(
+				"save_claude_oauth_token",
+				{ token },
+			);
+			if (!mountedRef.current) return;
+			if (next.configured) setClaudeOauthDraft("");
+			else setClaudeOauthError(next.message ?? "Token not accepted.");
+			await refreshClaudeOauthStatus();
+		} catch (e) {
+			if (mountedRef.current)
+				setClaudeOauthError(
+					typeof e === "string" ? e : "Saving Claude setup-token failed.",
+				);
+		} finally {
+			if (mountedRef.current) setClaudeOauthBusy(false);
+		}
+	}, [claudeOauthDraft, claudeOauthBusy, refreshClaudeOauthStatus]);
+	const clearClaudeOauth = useCallback(async () => {
+		if (claudeOauthBusy) return;
+		setClaudeOauthBusy(true);
+		setClaudeOauthError(null);
+		try {
+			await invokeBackendCommand<AuxCredentialStatus>("delete_claude_oauth_token");
+			if (mountedRef.current) setClaudeOauthDraft("");
+			await refreshClaudeOauthStatus();
+		} catch (e) {
+			if (mountedRef.current)
+				setClaudeOauthError(
+					typeof e === "string" ? e : "Removing Claude setup-token failed.",
+				);
+		} finally {
+			if (mountedRef.current) setClaudeOauthBusy(false);
+		}
+	}, [claudeOauthBusy, refreshClaudeOauthStatus]);
 	useEffect(() => {
 		mountedRef.current = true;
 		return () => {
@@ -1917,65 +1977,135 @@ export function RolesTableCard() {
 					)
 				) : (
 					// Agent CLI: uses the CLI's own login (e.g. Claude subscription).
-					<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-						Agent CLI
-						<select
-							value={
-								CLOUD_CLIENTS.includes(client as (typeof CLOUD_CLIENTS)[number])
-									? client
-									: client === UNSUPPORTED_AGENT_CLI
-										? UNSUPPORTED_AGENT_CLI
-										: "claude"
-							}
-							onChange={(e) => {
-								const v = e.target.value;
-								if (v === UNSUPPORTED_AGENT_CLI) return;
-								setRoleClient(role, v);
-							}}
-							className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
-						>
-							<option value="claude">Claude</option>
-							<option value="codex">Codex</option>
+					<div className="space-y-3">
+						<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+							Agent CLI
+							<select
+								value={
+									CLOUD_CLIENTS.includes(
+										client as (typeof CLOUD_CLIENTS)[number],
+									)
+										? client
+										: client === UNSUPPORTED_AGENT_CLI
+											? UNSUPPORTED_AGENT_CLI
+											: "claude"
+								}
+								onChange={(e) => {
+									const v = e.target.value;
+									if (v === UNSUPPORTED_AGENT_CLI) return;
+									setRoleClient(role, v);
+								}}
+								className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+							>
+								<option value="claude">Claude</option>
+								<option value="codex">Codex</option>
+								{client === UNSUPPORTED_AGENT_CLI ? (
+									<option value={UNSUPPORTED_AGENT_CLI}>
+										OpenAI (unsupported)
+									</option>
+								) : null}
+							</select>
 							{client === UNSUPPORTED_AGENT_CLI ? (
-								<option value={UNSUPPORTED_AGENT_CLI}>
-									OpenAI (unsupported)
-								</option>
+								<span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
+									This saved client is unsupported (protocol stub). Pick Claude
+									or Codex.
+								</span>
 							) : null}
-						</select>
-						{client === UNSUPPORTED_AGENT_CLI ? (
-							<span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
-								This saved client is unsupported (protocol stub). Pick Claude
-								or Codex.
-							</span>
-						) : null}
-						{(() => {
-							const cliId =
-								CLOUD_CLIENTS.includes(
+							{(() => {
+								const cliId = CLOUD_CLIENTS.includes(
 									client as (typeof CLOUD_CLIENTS)[number],
 								)
 									? client
 									: "claude";
-							const st =
-								cliId === "claude" || cliId === "codex"
-									? statusMap[cliId]
-									: null;
-							const installed = st?.available === true;
-							return (
-								<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
-									Uses the CLI&apos;s own login (e.g. your Claude subscription).
-									Status:{" "}
-									<span
-										className={
-											installed ? "text-emerald-700" : "text-coral-dark"
-										}
-									>
-										{installed ? "installed" : "not installed"}
+								const st =
+									cliId === "claude" || cliId === "codex"
+										? statusMap[cliId]
+										: null;
+								const installed = st?.available === true;
+								return (
+									<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+										Uses the CLI&apos;s own login (e.g. your Claude
+										subscription). Status:{" "}
+										<span
+											className={
+												installed ? "text-emerald-700" : "text-coral-dark"
+											}
+										>
+											{installed ? "installed" : "not installed"}
+										</span>
+										{st?.detail ? ` (${st.detail})` : ""}.
 									</span>
-									{st?.detail ? ` (${st.detail})` : ""}.
-								</span>
-							);
-						})()}
-					</label>
+								);
+							})()}
+						</label>
+						{/* F46-close: shared setup-token — only on orchestrator Agent CLI. */}
+						{role === "orchestrator" ? (
+							<div
+								className="space-y-2 rounded-lg border border-cream-200 bg-cream-50/50 p-3"
+								data-testid="claude-setup-token-field"
+							>
+								<p className="text-[11px] leading-4 text-cream-400">
+									Shared by every role using the Claude CLI. Generate with:{" "}
+									<code className="font-mono text-[10px]">claude setup-token</code>
+								</p>
+								<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+									Claude setup-token (optional)
+									<span
+										className={`ml-2 text-[9px] font-semibold normal-case tracking-normal ${
+											claudeOauthStatus?.configured
+												? "text-emerald-700"
+												: "text-cream-400"
+										}`}
+									>
+										{claudeOauthStatus?.configured
+											? "configured"
+											: "missing"}
+									</span>
+									<div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
+										<input
+											type="password"
+											value={claudeOauthDraft}
+											onChange={(e) => {
+												setClaudeOauthError(null);
+												setClaudeOauthDraft(e.target.value);
+											}}
+											placeholder={
+												claudeOauthStatus?.configured
+													? "Paste a new token to replace the saved one"
+													: "Paste output of claude setup-token"
+											}
+											autoComplete="off"
+											spellCheck={false}
+											className="min-w-0 flex-1 rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+										/>
+										<button
+											type="button"
+											onClick={() => void saveClaudeOauth()}
+											disabled={
+												claudeOauthBusy || claudeOauthDraft.trim().length === 0
+											}
+											className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
+										>
+											Save
+										</button>
+										{claudeOauthStatus?.configured ? (
+											<button
+												type="button"
+												onClick={() => void clearClaudeOauth()}
+												disabled={claudeOauthBusy}
+												className="inline-flex items-center justify-center rounded-md border border-cream-200 bg-white px-3 py-2 text-[11px] font-semibold normal-case tracking-normal text-cream-500 hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
+											>
+												Clear
+											</button>
+										) : null}
+									</div>
+								</label>
+								{claudeOauthError ? (
+									<p className="text-[10px] text-coral-dark">{claudeOauthError}</p>
+								) : null}
+							</div>
+						) : null}
+					</div>
 				)}
 			</div>
 		);

@@ -335,3 +335,10 @@ Open after round-5: F46 owner decision; F37/F38 DoubtPanel live proof (needs a w
 | **Orchestrator loop** | HEALTHY | Answer received → `project_append_note` + heartbeat + status done + chat ack. MCP lane green end-to-end. |
 
 Suites at close: cargo 3535/0 (`--features ui-pilot`), oracle-core 26/0, vitest default 2233/0 (199 files). Residuals: F46 owner decision (claude cloud auth under CLAUDE_CONFIG_DIR isolation: `claude setup-token` → env, or approve oauthAccount seeding); F30 live censor re-run on an agentic write (code fix probe-proven); F40c vitest DesignView hang root-cause.
+
+### F46 addendum (2026-07-22 sera)
+- Setup-token wired end-to-end: vault `provider:claude_oauth_token` (write-only) + async commands + `CLAUDE_CODE_OAUTH_TOKEN` injected on every claude spawn (PTY + duplex) + Settings field under the orchestrator's Agent CLI section.
+- **oauthAccount seed hypothesis REFUTED live**: with `oauthAccount`+`userID` seeded into the isolated `.claude.json` (0600, atomic), a fresh spawn still reports "Not logged in" — macOS keychain credentials are not reachable from the isolated config dir. The seed stays (harmless; would work where credentials are file-based). On macOS the setup-token is THE path.
+
+### F46/F33 CLOSED LIVE (2026-07-22 sera)
+Owner generated `claude setup-token` (new flow: browser auth auto-returns, token printed in terminal) and saved it in the new Settings field. Fresh spawn: `CLAUDE_CODE_OAUTH_TOKEN` present on the child env (verified, value never read), claude authenticated headless, `f33-proof.txt` written via the Write tool with exact content. **F33 behavioral proof complete; F46 closed** (token path; oauthAccount seed remains as harmless fallback for file-based-credential machines).

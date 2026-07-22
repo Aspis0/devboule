@@ -1966,6 +1966,14 @@ fn prepare_or_launch_project_agent(
     // write token like any coder-like role. The local binary's own secrets (launch
     // token + Exa key) are appended below.
     let mut provider_env = cloudflare_agent_provider_env_for_role(&role)?;
+    // F46-close: inject Claude setup-token for Claude CLI launches (never logged).
+    if client == "claude" {
+        if let Some((name, value)) =
+            crate::backend::cloud_claude_config::claude_oauth_token_env_from_vault()
+        {
+            provider_env.push(AgentLaunchEnv { name, value });
+        }
+    }
     record_launch_pending(
         &app,
         &project.metadata.id,
@@ -4891,6 +4899,12 @@ fn build_cloud_duplex_launch(
                      ({e}); launch continues but may inherit owner ~/.claude (F36 degraded)."
                 );
             }
+        }
+        // F46-close: setup-token for headless auth (never log the value).
+        if let Some(pair) =
+            crate::backend::cloud_claude_config::claude_oauth_token_env_from_vault()
+        {
+            envs.push(pair);
         }
         // KAIRION (orchestrator-only, always-on): force adaptive SUMMARIZED thinking for the
         // cloud orchestrator duplex so the doubt sensor has a (summarized) reasoning trace

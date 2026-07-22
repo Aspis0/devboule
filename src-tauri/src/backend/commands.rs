@@ -1685,6 +1685,39 @@ pub async fn delete_cloud_llm_key(
         .map_err(|e| format!("task join error: {e}"))?
 }
 
+// F46-close: Claude setup-token (shared). F47: keyring off the main thread.
+
+#[tauri::command]
+pub async fn get_claude_oauth_token_status(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(vault::claude_oauth_token_status)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn save_claude_oauth_token(
+    state: State<'_, BackendState>,
+    token: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || vault::save_claude_oauth_token(&token))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn delete_claude_oauth_token(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(vault::delete_claude_oauth_token)
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
 // F50: per-role Cloud LLM keys (fallback to shared). F47: keyring off the main thread.
 
 #[tauri::command]

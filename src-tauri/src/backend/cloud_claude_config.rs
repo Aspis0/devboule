@@ -126,6 +126,23 @@ pub fn claude_config_dir_env(config_dir: &Path) -> (String, String) {
     )
 }
 
+/// Pure: env pair for a Claude setup-token (never logs the value).
+pub fn claude_oauth_token_env_pair(token: &str) -> (String, String) {
+    (
+        "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        token.to_string(),
+    )
+}
+
+/// If a setup-token is in the vault, return the env pair to inject into a Claude child.
+/// Empty/missing/error → None (no injection; CLI may still use credentials.json seed).
+pub fn claude_oauth_token_env_from_vault() -> Option<(String, String)> {
+    match crate::backend::vault::read_claude_oauth_token() {
+        Ok(Some(t)) if !t.trim().is_empty() => Some(claude_oauth_token_env_pair(&t)),
+        _ => None,
+    }
+}
+
 /// Home directory via env (same idiom as `saved_workflows` / `pi_extensions` — no extra crate).
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -184,18 +201,122 @@ fn seed_owner_credentials(config_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write JSON atomically to `path` with mode 0600 (unix). Never logs contents.
+fn write_json_atomic_0600(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("claude.json"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        // rename may not preserve mode across filesystems — re-assert 0600 on dest.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// F46-auto: reuse the machine's Claude CLI login *state* in the isolated config dir.
+///
+/// The keychain credential item is already shared at the OS level; only the login STATE
+/// (who is logged in) was missing from empty isolated dirs — that lives in
+/// `$HOME/.claude.json` (home root, **not** inside `~/.claude/`). When source has
+/// `oauthAccount` and dest lacks it, merge `oauthAccount` (+ `userID` if present) into
+/// `<config_dir>/.claude.json` without overwriting an existing logged-in dest or other
+/// dest fields. Silent no-op if source is missing/unparseable. NEVER logs field values.
+///
+/// The setup-token env path (`CLAUDE_CODE_OAUTH_TOKEN` via vault) remains the explicit
+/// override for machines without a local interactive login.
+fn seed_owner_login_state(config_dir: &Path) -> std::io::Result<()> {
+    let Some(home) = home_dir() else {
+        return Ok(());
+    };
+    // Owner login state: ~/.claude.json at HOME ROOT (not ~/.claude/.claude.json).
+    let src = home.join(".claude.json");
+    if !src.is_file() {
+        return Ok(());
+    }
+    let src_raw = match std::fs::read_to_string(&src) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let src_json: serde_json::Value = match serde_json::from_str(&src_raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // unparseable → silent no-op
+    };
+    let Some(oauth_account) = src_json.get("oauthAccount").cloned() else {
+        return Ok(());
+    };
+    // Require a real object (or at least present non-null) — null/empty skips.
+    if oauth_account.is_null() {
+        return Ok(());
+    }
+
+    let dest = config_dir.join(".claude.json");
+    let mut dest_json = if dest.is_file() {
+        match std::fs::read_to_string(&dest)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+            Some(_) | None => {
+                // Unparseable dest: do not clobber — leave alone.
+                return Ok(());
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let dest_obj = match dest_json.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    // Never overwrite an existing logged-in state.
+    if dest_obj.contains_key("oauthAccount") {
+        return Ok(());
+    }
+    dest_obj.insert("oauthAccount".to_string(), oauth_account);
+    if let Some(user_id) = src_json.get("userID").cloned() {
+        if !user_id.is_null() && !dest_obj.contains_key("userID") {
+            dest_obj.insert("userID".to_string(), user_id);
+        }
+    }
+    write_json_atomic_0600(&dest, &dest_json)
+}
+
 /// Create the isolated config dir (idempotent). Returns the path for `CLAUDE_CONFIG_DIR`.
 ///
 /// F46: isolation targets CLAUDE.md / skills / permissions — **not** authentication.
 /// Credentials are deliberately shared from the owner install by seeding
 /// `~/.claude/.credentials.json` into the isolated dir when missing or stale.
-/// macOS keychain-stored credentials cannot be seeded this way; if `.credentials.json`
-/// is absent the CLI will still report logged-out and the app surface should show that
-/// auth error (out of scope here).
+///
+/// F46-auto: also reuses the machine login *state* from `$HOME/.claude.json`
+/// (`oauthAccount` / `userID`) into the isolated dir's `.claude.json` when dest is not
+/// already logged in — the keychain credential item is already shared; only the login
+/// state was missing. The setup-token env path remains the explicit override.
+///
+/// macOS keychain-stored credentials cannot be fully synthesized if neither file nor
+/// token is available; if still logged-out the CLI will report that and the app surface
+/// should show the auth error (out of scope here).
 pub fn ensure_claude_product_config_dir(base: &Path, agent_id: &str) -> std::io::Result<PathBuf> {
     let dir = claude_product_config_dir(base, agent_id);
     std::fs::create_dir_all(&dir)?;
     seed_owner_credentials(&dir)?;
+    seed_owner_login_state(&dir)?;
     Ok(dir)
 }
 
@@ -377,6 +498,17 @@ mod tests {
     }
 
     #[test]
+    fn f46_claude_oauth_token_env_pair_is_pure_and_never_logs() {
+        let (k, v) = claude_oauth_token_env_pair("sk-ant-oat-test-token");
+        assert_eq!(k, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(v, "sk-ant-oat-test-token");
+        // Pure helper: empty string still yields a pair (callers filter empties).
+        let (k2, v2) = claude_oauth_token_env_pair("");
+        assert_eq!(k2, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(v2, "");
+    }
+
+    #[test]
     fn f36_product_config_dir_is_not_home_dot_claude() {
         let base = PathBuf::from("/tmp/devboule-app-state");
         let dir = claude_product_config_dir(&base, "orch/../evil");
@@ -520,6 +652,121 @@ mod tests {
                 r#"{"token":"newer-dest"}"#,
                 "newer dest must not be overwritten by older source"
             );
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- F46-auto: seed oauthAccount login state from $HOME/.claude.json ---------
+
+    #[test]
+    fn f46_auto_seeds_login_state_when_dest_missing() {
+        let home = f46_temp("home-login-seed");
+        let base = f46_temp("base-login-seed");
+        // Owner login state at HOME ROOT (not inside ~/.claude/).
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"email":"owner@example.com"},"userID":"user-abc","theme":"dark"}"#,
+        )
+        .unwrap();
+
+        with_fake_home(&home, || {
+            let dir = ensure_claude_product_config_dir(&base, "agent-login").unwrap();
+            let dest = dir.join(".claude.json");
+            assert!(dest.is_file(), "login state should be seeded");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+            assert!(v.get("oauthAccount").is_some());
+            assert_eq!(v["userID"], "user-abc");
+            // Must not copy unrelated owner fields (theme).
+            assert!(v.get("theme").is_none());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = dest.metadata().unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "seeded .claude.json must be 0600");
+            }
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f46_auto_leaves_existing_oauth_account_untouched() {
+        let home = f46_temp("home-login-keep");
+        let base = f46_temp("base-login-keep");
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"email":"owner@example.com"},"userID":"owner-id"}"#,
+        )
+        .unwrap();
+        let dir = claude_product_config_dir(&base, "agent-keep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join(".claude.json");
+        std::fs::write(
+            &dest,
+            r#"{"oauthAccount":{"email":"already@isolated.local"},"userID":"dest-id","keepMe":true}"#,
+        )
+        .unwrap();
+
+        with_fake_home(&home, || {
+            ensure_claude_product_config_dir(&base, "agent-keep").unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+            assert_eq!(v["oauthAccount"]["email"], "already@isolated.local");
+            assert_eq!(v["userID"], "dest-id");
+            assert_eq!(v["keepMe"], true);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f46_auto_source_absent_or_garbage_is_noop() {
+        let home = f46_temp("home-login-absent");
+        let base = f46_temp("base-login-absent");
+        // No .claude.json under home.
+        with_fake_home(&home, || {
+            let dir = ensure_claude_product_config_dir(&base, "agent-absent-login").unwrap();
+            assert!(!dir.join(".claude.json").exists());
+        });
+        // Garbage JSON → still no-op.
+        std::fs::write(home.join(".claude.json"), b"not-json{{{{").unwrap();
+        with_fake_home(&home, || {
+            let dir = ensure_claude_product_config_dir(&base, "agent-garbage-login").unwrap();
+            assert!(!dir.join(".claude.json").exists());
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f46_auto_merge_preserves_other_dest_fields() {
+        let home = f46_temp("home-login-merge");
+        let base = f46_temp("base-login-merge");
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"email":"owner@example.com"},"userID":"uid-1"}"#,
+        )
+        .unwrap();
+        let dir = claude_product_config_dir(&base, "agent-merge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join(".claude.json");
+        // Dest has other fields but NO oauthAccount → merge in login, keep fields.
+        std::fs::write(&dest, r#"{"theme":"dark","numStartups":3}"#).unwrap();
+
+        with_fake_home(&home, || {
+            ensure_claude_product_config_dir(&base, "agent-merge").unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+            assert!(v.get("oauthAccount").is_some());
+            assert_eq!(v["userID"], "uid-1");
+            assert_eq!(v["theme"], "dark");
+            assert_eq!(v["numStartups"], 3);
         });
 
         let _ = std::fs::remove_dir_all(&home);

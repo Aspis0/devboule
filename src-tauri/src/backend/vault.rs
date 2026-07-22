@@ -105,6 +105,11 @@ fn cloud_llm_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "provider:cloud_llm").map_err(|_| vault_error("open"))
 }
 
+/// F46-close: Claude CLI setup-token (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`).
+fn claude_oauth_token_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, "provider:claude_oauth_token").map_err(|_| vault_error("open"))
+}
+
 /// Canonical role ids for per-role Cloud LLM keys (F50).
 pub const CLOUD_LLM_ROLES: &[&str] = &["orchestrator", "main", "mini", "verifier", "coder"];
 
@@ -563,6 +568,93 @@ pub fn cloud_llm_key_status() -> Result<AuxCredentialStatus, String> {
         Err(e) => Ok(AuxCredentialStatus {
             id: CLOUD_LLM_KEY_ID.into(),
             label: CLOUD_LLM_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(e),
+        }),
+    }
+}
+
+// --- F46-close: Claude setup-token (`CLAUDE_CODE_OAUTH_TOKEN`) --------------------
+//
+// Same shape as the shared Cloud LLM key: write-only from the UI, backend-internal
+// read for spawn injection. Value is NEVER returned by status and NEVER logged.
+
+const CLAUDE_OAUTH_TOKEN_ID: &str = "claude_oauth_token";
+const CLAUDE_OAUTH_TOKEN_LABEL: &str = "Claude setup-token";
+
+pub fn save_claude_oauth_token(token: &str) -> Result<AuxCredentialStatus, String> {
+    let cleaned = token.trim();
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Ok(AuxCredentialStatus {
+            id: CLAUDE_OAUTH_TOKEN_ID.into(),
+            label: CLAUDE_OAUTH_TOKEN_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Claude setup-token is too short or contains whitespace.".into()),
+        });
+    }
+    if cleaned.chars().any(|c| c.is_control()) {
+        return Ok(AuxCredentialStatus {
+            id: CLAUDE_OAUTH_TOKEN_ID.into(),
+            label: CLAUDE_OAUTH_TOKEN_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Claude setup-token must not contain control characters.".into()),
+        });
+    }
+    claude_oauth_token_entry()?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    claude_oauth_token_status()
+}
+
+pub fn delete_claude_oauth_token() -> Result<AuxCredentialStatus, String> {
+    match claude_oauth_token_entry()?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    claude_oauth_token_status()
+}
+
+/// Backend-INTERNAL reader for spawn injection (`CLAUDE_CODE_OAUTH_TOKEN`). Not a command.
+pub fn read_claude_oauth_token() -> Result<Option<String>, String> {
+    match claude_oauth_token_entry()?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent status ONLY — never the value.
+pub fn claude_oauth_token_status() -> Result<AuxCredentialStatus, String> {
+    match read_claude_oauth_token() {
+        Ok(Some(_)) => Ok(AuxCredentialStatus {
+            id: CLAUDE_OAUTH_TOKEN_ID.into(),
+            label: CLAUDE_OAUTH_TOKEN_LABEL.into(),
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Ok(None) => Ok(AuxCredentialStatus {
+            id: CLAUDE_OAUTH_TOKEN_ID.into(),
+            label: CLAUDE_OAUTH_TOKEN_LABEL.into(),
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some(
+                "Optional. Generate with `claude setup-token` and save here so product Claude \
+                 launches authenticate without the owner interactive /login."
+                    .into(),
+            ),
+        }),
+        Err(e) => Ok(AuxCredentialStatus {
+            id: CLAUDE_OAUTH_TOKEN_ID.into(),
+            label: CLAUDE_OAUTH_TOKEN_LABEL.into(),
             configured: false,
             status: "error".into(),
             last_checked_at: Some(now()),
@@ -3012,6 +3104,39 @@ mod tests {
         assert!(json.contains("\"configured\""));
         assert!(!json.contains("\"value\""));
         assert!(!json.contains("\"key\""));
+    }
+
+    // --- F46-close: Claude setup-token ----------------------------------------
+
+    #[test]
+    fn claude_oauth_token_save_rejects_too_short_whitespace_control_without_leaking() {
+        let short = save_claude_oauth_token("abc").expect("status");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        assert_eq!(short.id, "claude_oauth_token");
+        assert_eq!(short.label, "Claude setup-token");
+        let whitespace = save_claude_oauth_token("has space inside it").expect("status");
+        assert!(!whitespace.configured);
+        let with_ctrl = save_claude_oauth_token("sk-claude\u{0001}token12").expect("status");
+        assert!(!with_ctrl.configured);
+        for status in [&short, &whitespace, &with_ctrl] {
+            let json = serde_json::to_string(status).unwrap();
+            assert!(!json.contains("has space inside it"));
+            assert!(!json.contains("sk-claude"));
+            assert!(!json.contains('\u{0001}'));
+        }
+    }
+
+    #[test]
+    fn claude_oauth_token_status_never_carries_the_value() {
+        let status = claude_oauth_token_status().expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"configured\""));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
+        assert!(!json.contains("\"token\""));
+        assert_eq!(status.id, "claude_oauth_token");
+        assert_eq!(status.label, "Claude setup-token");
     }
 
     // --- F50: per-role Cloud LLM keys -----------------------------------------
