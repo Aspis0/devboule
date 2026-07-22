@@ -56,6 +56,9 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
                 key={i}
                 className="pp-mono"
                 style={{
+                  // F49: flex column + overflowY:auto shrinks rows by default — keep
+                  // natural height so the thread scrolls instead of crushing to 0.
+                  flexShrink: 0,
                   display: "flex",
                   alignItems: "center",
                   gap: 6,
@@ -86,6 +89,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
             <div
               key={i}
               style={{
+                flexShrink: 0,
                 display: "flex",
                 justifyContent: msg.role === "user" ? "flex-end" : "flex-start",
               }}
@@ -130,6 +134,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
             messages[messages.length - 1]?.role === "user" && (
               <div
                 style={{
+                  flexShrink: 0,
                   alignSelf: "flex-start",
                   marginTop: 9,
                   fontSize: 11,
@@ -155,6 +160,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
           {awaitingReply && (
             <div
               style={{
+                flexShrink: 0,
                 alignSelf: "center",
                 marginTop: 9,
                 fontSize: 11,
