@@ -98,8 +98,34 @@ fn censor_cloud_key_entry() -> Result<Entry, String> {
 /// `DEVBOULE_CLOUD_API_KEY` ONLY when present + the configured backend is `cloud`, so a
 /// missing key keeps the orchestrator on its safe Mock path (the binary refuses to send an
 /// unauthenticated request off-machine).
+///
+/// F50: per-role keys live at `provider:cloud_llm:<role>` and fall back to this shared
+/// entry when absent (see [`read_cloud_llm_key_for_role`]).
 fn cloud_llm_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "provider:cloud_llm").map_err(|_| vault_error("open"))
+}
+
+/// Canonical role ids for per-role Cloud LLM keys (F50).
+pub const CLOUD_LLM_ROLES: &[&str] = &["orchestrator", "main", "mini", "verifier", "coder"];
+
+/// Map spawn-path role aliases onto the F50 vault set. Unknown strings fail loud.
+pub fn canonicalize_cloud_llm_role(role: &str) -> Result<&'static str, String> {
+    match role.trim() {
+        "orchestrator" => Ok("orchestrator"),
+        "main" | "main-coder" => Ok("main"),
+        "mini" | "mini-coder" => Ok("mini"),
+        "verifier" => Ok("verifier"),
+        "coder" | "local" => Ok("coder"),
+        other => Err(format!(
+            "Unknown cloud LLM role {other:?}. Allowed: {}",
+            CLOUD_LLM_ROLES.join(", ")
+        )),
+    }
+}
+
+fn cloud_llm_key_entry_for_role(role: &str) -> Result<Entry, String> {
+    let role = canonicalize_cloud_llm_role(role)?;
+    Entry::new(SERVICE, &format!("provider:cloud_llm:{role}")).map_err(|_| vault_error("open"))
 }
 
 fn device_private_key_entry() -> Result<Entry, String> {
@@ -541,6 +567,119 @@ pub fn cloud_llm_key_status() -> Result<AuxCredentialStatus, String> {
             status: "error".into(),
             last_checked_at: Some(now()),
             message: Some(e),
+        }),
+    }
+}
+
+// --- F50: per-role Cloud LLM keys (fallback to shared `provider:cloud_llm`) --------
+
+fn cloud_llm_role_key_id(role: &str) -> String {
+    format!("cloud_llm_api_key:{role}")
+}
+
+fn cloud_llm_role_key_label(role: &str) -> String {
+    format!("Cloud API key ({role})")
+}
+
+/// Validate a cloud LLM key paste the same way as [`save_cloud_llm_key`].
+/// Returns `Err(status)` when rejected (caller returns that status without keyring I/O).
+fn validate_cloud_llm_key_paste(
+    cleaned: &str,
+    id: String,
+    label: String,
+) -> Result<(), AuxCredentialStatus> {
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Err(AuxCredentialStatus {
+            id,
+            label,
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Cloud API key is too short or contains whitespace.".into()),
+        });
+    }
+    if cleaned.chars().any(|c| c.is_control()) {
+        return Err(AuxCredentialStatus {
+            id,
+            label,
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Cloud API key must not contain control characters.".into()),
+        });
+    }
+    Ok(())
+}
+
+/// Save a per-role Cloud LLM key (`provider:cloud_llm:<role>`). Same validation as the
+/// shared key. Status NEVER returns the raw value.
+pub fn save_cloud_llm_key_for_role(role: &str, key: &str) -> Result<AuxCredentialStatus, String> {
+    let role = canonicalize_cloud_llm_role(role)?;
+    let id = cloud_llm_role_key_id(role);
+    let label = cloud_llm_role_key_label(role);
+    let cleaned = key.trim();
+    if let Err(status) = validate_cloud_llm_key_paste(cleaned, id, label) {
+        return Ok(status);
+    }
+    cloud_llm_key_entry_for_role(role)?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    cloud_llm_key_status_for_role(role)
+}
+
+/// Delete the per-role Cloud LLM key (does not touch the shared fallback).
+pub fn delete_cloud_llm_key_for_role(role: &str) -> Result<AuxCredentialStatus, String> {
+    let role = canonicalize_cloud_llm_role(role)?;
+    match cloud_llm_key_entry_for_role(role)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    cloud_llm_key_status_for_role(role)
+}
+
+/// Backend-INTERNAL reader: role entry first, else shared [`read_cloud_llm_key`].
+/// Unknown roles error (no silent fallback for typos).
+pub fn read_cloud_llm_key_for_role(role: &str) -> Result<Option<String>, String> {
+    let role = canonicalize_cloud_llm_role(role)?;
+    match cloud_llm_key_entry_for_role(role)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => read_cloud_llm_key(),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent for the **role-specific** slot only (not the shared fallback).
+/// Never returns the raw value. `configured: true` only when the role entry itself is set.
+pub fn cloud_llm_key_status_for_role(role: &str) -> Result<AuxCredentialStatus, String> {
+    let role = canonicalize_cloud_llm_role(role)?;
+    let id = cloud_llm_role_key_id(role);
+    let label = cloud_llm_role_key_label(role);
+    match cloud_llm_key_entry_for_role(role)?.get_password() {
+        Ok(_) => Ok(AuxCredentialStatus {
+            id,
+            label,
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Err(KeyringError::NoEntry) => Ok(AuxCredentialStatus {
+            id,
+            label,
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some(
+                "No per-role key — launches fall back to the shared Cloud API key.".into(),
+            ),
+        }),
+        Err(_) => Ok(AuxCredentialStatus {
+            id,
+            label,
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(vault_error("read")),
         }),
     }
 }
@@ -2873,6 +3012,87 @@ mod tests {
         assert!(json.contains("\"configured\""));
         assert!(!json.contains("\"value\""));
         assert!(!json.contains("\"key\""));
+    }
+
+    // --- F50: per-role Cloud LLM keys -----------------------------------------
+
+    #[test]
+    fn cloud_llm_role_canonicalize_accepts_aliases_rejects_unknown() {
+        assert_eq!(canonicalize_cloud_llm_role("orchestrator").unwrap(), "orchestrator");
+        assert_eq!(canonicalize_cloud_llm_role("main-coder").unwrap(), "main");
+        assert_eq!(canonicalize_cloud_llm_role("mini-coder").unwrap(), "mini");
+        assert_eq!(canonicalize_cloud_llm_role("local").unwrap(), "coder");
+        let err = canonicalize_cloud_llm_role("typo-role").unwrap_err();
+        assert!(err.contains("typo-role"));
+        assert!(err.contains("Allowed"));
+    }
+
+    #[test]
+    fn cloud_llm_key_for_role_unknown_role_errors_before_keyring() {
+        let err = read_cloud_llm_key_for_role("not-a-role").unwrap_err();
+        assert!(err.contains("not-a-role"));
+        assert!(save_cloud_llm_key_for_role("not-a-role", "sk-long-enough-key").is_err());
+        assert!(delete_cloud_llm_key_for_role("???").is_err());
+        assert!(cloud_llm_key_status_for_role("bogus").is_err());
+    }
+
+    #[test]
+    fn cloud_llm_key_for_role_save_rejects_bad_paste_without_leaking() {
+        let short = save_cloud_llm_key_for_role("verifier", "abc").expect("status not Err");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        assert_eq!(short.id, "cloud_llm_api_key:verifier");
+        let whitespace = save_cloud_llm_key_for_role("mini", "has space inside it").expect("status");
+        assert!(!whitespace.configured);
+        let with_ctrl = save_cloud_llm_key_for_role("main", "sk-cloud\u{0001}key-1234").expect("status");
+        assert!(!with_ctrl.configured);
+        for status in [&short, &whitespace, &with_ctrl] {
+            let json = serde_json::to_string(status).unwrap();
+            assert!(!json.contains("has space inside it"));
+            assert!(!json.contains("sk-cloud"));
+            assert!(!json.contains('\u{0001}'));
+        }
+    }
+
+    #[test]
+    fn cloud_llm_key_status_for_role_never_carries_the_value() {
+        // Missing slot is safe without keyring write; status must be present/absent only.
+        let status = cloud_llm_key_status_for_role("orchestrator").expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"configured\""));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
+        assert_eq!(status.id, "cloud_llm_api_key:orchestrator");
+    }
+
+    #[test]
+    #[ignore = "mutates the real OS credential store; run with --ignored to verify per-role Cloud key override/fallback"]
+    fn cloud_llm_key_for_role_overrides_shared_and_falls_back() {
+        let shared = "sk-shared-fallback-key-abcdef1234";
+        let role_key = "sk-role-override-key-xyz78901234";
+        let _ = delete_cloud_llm_key_for_role("verifier");
+        let _ = delete_cloud_llm_key();
+        let _ = save_cloud_llm_key(shared).unwrap();
+        // Role slot absent → fall back to shared.
+        assert_eq!(
+            read_cloud_llm_key_for_role("verifier").unwrap().as_deref(),
+            Some(shared)
+        );
+        assert!(!cloud_llm_key_status_for_role("verifier").unwrap().configured);
+        // Role slot present → overrides shared.
+        let after = save_cloud_llm_key_for_role("verifier", role_key).unwrap();
+        assert!(after.configured);
+        assert!(!serde_json::to_string(&after).unwrap().contains(role_key));
+        assert_eq!(
+            read_cloud_llm_key_for_role("verifier").unwrap().as_deref(),
+            Some(role_key)
+        );
+        let _ = delete_cloud_llm_key_for_role("verifier").unwrap();
+        assert_eq!(
+            read_cloud_llm_key_for_role("verifier").unwrap().as_deref(),
+            Some(shared)
+        );
+        let _ = delete_cloud_llm_key().unwrap();
     }
 
     #[test]

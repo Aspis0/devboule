@@ -1502,8 +1502,13 @@ fn claim_and_launch(
     // Cloud (OpenRouter): agentic HTTP path with Bearer from the shared vault.
     // Previously hard-failed ("pi engine only") even though agentic_transport now
     // supports Authorization — that blocked mini on OpenRouter while orch worked.
+    // F50: Main tier → "main", Mini tier → "mini"; falls back to shared key when absent.
     let cloud_api_key: Option<String> = if backend.kind == MiniCoderBackendKind::Cloud {
-        match super::vault::read_cloud_llm_key() {
+        let vault_role = match directive.tier {
+            super::mini_coder::DirectiveTier::Main => "main",
+            _ => "mini",
+        };
+        match super::vault::read_cloud_llm_key_for_role(vault_role) {
             Ok(Some(k)) if !k.trim().is_empty() => Some(k),
             Ok(_) => {
                 fail_launching(

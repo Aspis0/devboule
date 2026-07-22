@@ -41,6 +41,21 @@ import {
 	type ProviderStatusMap,
 } from "../design/designProviderDetection";
 import type { AuxCredentialStatus } from "../../types/backend";
+import {
+	baseUrlForProviderPreset,
+	CLOUD_PROVIDER_PRESETS,
+	keyLabelForBaseUrl,
+	providerPresetFromBaseUrl,
+	type CloudProviderPresetId,
+} from "./cloudProviderPreset";
+import {
+	miniEngineLabel,
+	miniEnginesForPlacement,
+	miniKindAfterPlacementSwitch,
+	miniKindIsUnsupported,
+	miniPlacementFromKind,
+	type MiniPlacement,
+} from "./miniPlacementMap";
 import type {
 	DetectedProvider,
 	EffectiveRolesConfig,
@@ -214,7 +229,10 @@ function localDraftFromBackend(
 
 // The cloud CLIs a role can hand off to. Kept in sync with mainCoderClient's union
 // + the Rust validate_client_id built-ins.
-const CLOUD_CLIENTS = ["claude", "codex", "openai"] as const;
+// F50 follow-up: Agent CLI chips are Claude + Codex only ("openai" is an unimplemented
+// protocol stub). Backend still accepts "openai"; UI shows it with "(unsupported)".
+const CLOUD_CLIENTS = ["claude", "codex"] as const;
+const UNSUPPORTED_AGENT_CLI = "openai" as const;
 
 // The local placement marker per role (what the client id becomes when a row is
 // switched to "Local"): the orchestrator runs as the Devboule binary; the Main
@@ -227,18 +245,23 @@ function isLocalClient(role: RoleKey, client: string): boolean {
 	return client === localMarker(role);
 }
 
-// A cloud CLI client (an external CLI the row hands off to).
+// A cloud CLI client (an external CLI the row hands off to). Includes legacy "openai"
+// so a saved unsupported client still lands in the Agent CLI placement.
 function isCloudCli(client: string): boolean {
-	return (CLOUD_CLIENTS as readonly string[]).includes(client);
+	return (
+		(CLOUD_CLIENTS as readonly string[]).includes(
+			client as (typeof CLOUD_CLIENTS)[number],
+		) || client === UNSUPPORTED_AGENT_CLI
+	);
 }
 
-// The three segmented positions a CLI-capable role can occupy.
-type Placement = "Local" | "Cloud API" | "Cloud CLI";
+// The three segmented positions a CLI-capable role can occupy (F50 labels).
+type Placement = "On this Mac" | "Cloud API" | "Agent CLI";
 
 // The segmented control position DERIVES from state, never stored as a separate field:
-//   - a cloud CLI client (claude/codex/openai)            → "Cloud CLI"
+//   - a cloud CLI client (claude/codex/openai)            → "Agent CLI"
 //   - a LOCAL client + a "cloud" backend kind            → "Cloud API"
-//   - otherwise (local client + an on-device backend)     → "Local"
+//   - otherwise (local client + an on-device backend)     → "On this Mac"
 // Switching to a position STAGES only the minimal edits (client + kind coercion); nothing
 // saves until the row's existing Save flow runs.
 function placementFor(
@@ -246,12 +269,18 @@ function placementFor(
 	client: string,
 	draftKind: MiniCoderBackendKind,
 ): Placement {
-	if (isCloudCli(client)) return "Cloud CLI";
+	if (isCloudCli(client)) return "Agent CLI";
 	if (isLocalClient(role, client) && draftKind === "cloud") return "Cloud API";
-	return "Local";
+	return "On this Mac";
 }
 
 type RoleKey = "orchestrator" | "coder" | "mini" | "verifier";
+
+/** Map UI role row → vault F50 role id (main coder row stores under "main"). */
+function vaultCloudRole(role: RoleKey): string {
+	if (role === "coder") return "main";
+	return role;
+}
 
 interface RoleMeta {
 	key: RoleKey;
@@ -393,9 +422,10 @@ function MiniBackendFields(props: {
 	// Called when the user explicitly picks a new kind from the select (allows the parent
 	// to clear staged placement overrides).
 	onKindPicked?: () => void;
-	// Hoisted cloud key status: the parent fetches once, passes down.
+	// F50: per-role cloud key (Mini).
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshCloudKey?: () => Promise<void>;
+	vaultRole?: string;
 }) {
 	const {
 		idPrefix,
@@ -407,6 +437,7 @@ function MiniBackendFields(props: {
 		onKindPicked,
 		cloudKeyStatus,
 		onRefreshCloudKey,
+		vaultRole = "mini",
 	} = props;
 	// B1/M1/M4/M8: NEVER auto-coerce persisted state. When the current draft kind
 	// isn't in the offered kinds list, render a disabled "foreign" option so the user
@@ -483,11 +514,32 @@ function MiniBackendFields(props: {
 			{kind === "cloud" ? (
 				<>
 					<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+						Provider
+						<select
+							value={providerPresetFromBaseUrl(draft.baseUrl)}
+							onChange={(e) => {
+								const v = e.target.value;
+								if (!v) return;
+								set({
+									baseUrl: baseUrlForProviderPreset(v as CloudProviderPresetId),
+								});
+							}}
+							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+						>
+							<option value="">—</option>
+							{CLOUD_PROVIDER_PRESETS.map((p) => (
+								<option key={p.id} value={p.id}>
+									{p.label}
+								</option>
+							))}
+						</select>
+					</label>
+					<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 						Model tag (required)
 						<input
 							value={draft.model}
 							onChange={(e) => set({ model: e.target.value })}
-							placeholder="gpt-4o"
+							placeholder="model id, e.g. openrouter/auto"
 							maxLength={MINI_MODEL_MAX_LENGTH}
 							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 						/>
@@ -540,7 +592,7 @@ function MiniBackendFields(props: {
 					<input
 						value={draft.model}
 						onChange={(e) => set({ model: e.target.value })}
-						placeholder="gpt-4o"
+						placeholder="model id, e.g. openrouter/auto"
 						maxLength={MINI_MODEL_MAX_LENGTH}
 						className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 					/>
@@ -564,15 +616,17 @@ function MiniBackendFields(props: {
 				<>
 					<LocalCloudKeyFields
 						hideConsent
-						helperText="One key shared by every role's Cloud API placement (the same key the orchestrator editor manages)."
+						helperText="Leave empty to use the shared key below/above."
 						cloudKeyStatus={cloudKeyStatus}
 						onRefreshKey={onRefreshCloudKey}
+						vaultRole={vaultRole}
+						label={keyLabelForBaseUrl(draft.baseUrl)}
 					/>
 					{/* m7: honest surfacing of the mini cloud consent asymmetry */}
 					<p className="md:col-span-2 text-[10px] leading-4 text-cream-400">
 						Cloud mode sends the mini&apos;s prompts to the remote provider. The
-						consent checkbox lives on the Orchestrator/Coder rows; the shared
-						key and this notice apply here too.
+						consent checkbox lives on the Orchestrator/Coder rows; this notice
+						applies here too.
 					</p>
 				</>
 			) : null}
@@ -638,10 +692,11 @@ function LocalBackendFields(props: {
 	kinds?: readonly LocalCoderBackendKind[];
 	// Called when the user explicitly picks a new kind from the select.
 	onKindPicked?: () => void;
-	// Hoisted cloud key status.
+	// F50: per-role cloud key status (orchestrator vault role).
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshCloudKey?: () => Promise<void>;
 	consentHighlight?: boolean;
+	vaultRole?: string;
 }) {
 	const {
 		idPrefix,
@@ -654,6 +709,7 @@ function LocalBackendFields(props: {
 		cloudKeyStatus,
 		onRefreshCloudKey,
 		consentHighlight,
+		vaultRole = "orchestrator",
 	} = props;
 	const validation = useMemo(
 		() =>
@@ -731,7 +787,11 @@ function LocalBackendFields(props: {
 				<input
 					value={draft.model}
 					onChange={(e) => set({ model: e.target.value })}
-					placeholder="qwen2.5-coder"
+					placeholder={
+						draft.kind === "cloud"
+							? "model id, e.g. openrouter/auto"
+							: "qwen2.5-coder"
+					}
 					maxLength={LOCAL_MODEL_MAX_LENGTH}
 					list={detectedModels.length ? listId : undefined}
 					className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
@@ -744,6 +804,30 @@ function LocalBackendFields(props: {
 					</datalist>
 				) : null}
 			</label>
+
+			{draft.kind === "cloud" ? (
+				<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+					Provider
+					<select
+						value={providerPresetFromBaseUrl(draft.baseUrl)}
+						onChange={(e) => {
+							const v = e.target.value;
+							if (!v) return;
+							set({
+								baseUrl: baseUrlForProviderPreset(v as CloudProviderPresetId),
+							});
+						}}
+						className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+					>
+						<option value="">—</option>
+						{CLOUD_PROVIDER_PRESETS.map((p) => (
+							<option key={p.id} value={p.id}>
+								{p.label}
+							</option>
+						))}
+					</select>
+				</label>
+			) : null}
 
 			{draft.kind === "omlx" || draft.kind === "cloud" ? (
 				<label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
@@ -768,6 +852,9 @@ function LocalBackendFields(props: {
 					cloudKeyStatus={cloudKeyStatus}
 					onRefreshKey={onRefreshCloudKey}
 					consentHighlight={consentHighlight}
+					vaultRole={vaultRole}
+					helperText="Leave empty to use the shared key below/above."
+					label={keyLabelForBaseUrl(draft.baseUrl)}
 				/>
 			) : null}
 
@@ -786,10 +873,9 @@ function LocalBackendFields(props: {
 	);
 }
 
-// Cloud API key management for the Orchestrator row's inline Local editor.
-// Ported from the deleted LocalCoderBackendCard: write-only key surface (status/
-// save/delete) + active consent gate. The key lives in the OS vault; `get_cloud_llm_key_status`
-// reports present/absent ONLY. Saves through `save_cloud_llm_key` / `delete_cloud_llm_key`.
+// Cloud API key management: write-only status/save/delete + optional consent.
+// F50: pass `vaultRole` for per-role keys (`provider:cloud_llm:<role>`); omit for the
+// shared fallback (`provider:cloud_llm`). Status NEVER includes the raw value.
 function LocalCloudKeyFields({
 	onConsentChange,
 	helperText,
@@ -797,6 +883,8 @@ function LocalCloudKeyFields({
 	cloudKeyStatus,
 	onRefreshKey,
 	consentHighlight,
+	vaultRole,
+	label,
 }: {
 	onConsentChange?: (consented: boolean) => void;
 	helperText?: string;
@@ -806,6 +894,10 @@ function LocalCloudKeyFields({
 	onRefreshKey?: () => Promise<void>;
 	/** When true, ring the consent checkbox (top Save blocked without ack). */
 	consentHighlight?: boolean;
+	/** F50: when set, save/delete/status target the per-role vault entry. */
+	vaultRole?: string;
+	/** Field label (default: Cloud API key / API key for this role / Shared key). */
+	label?: string;
 }) {
 	const [cloudKeyDraft, setCloudKeyDraft] = useState("");
 	const [busy, setBusy] = useState(false);
@@ -846,10 +938,14 @@ function LocalCloudKeyFields({
 		setError(null);
 		setJustSaved(false);
 		try {
-			const next = await invokeBackendCommand<AuxCredentialStatus>(
-				"save_cloud_llm_key",
-				{ key },
-			);
+			const next = vaultRole
+				? await invokeBackendCommand<AuxCredentialStatus>(
+						"save_cloud_llm_key_for_role",
+						{ role: vaultRole, key },
+					)
+				: await invokeBackendCommand<AuxCredentialStatus>("save_cloud_llm_key", {
+						key,
+					});
 			if (!mountedRef.current) return;
 			// ONLY clear the paste field after a confirmed vault write. Clearing on
 			// configured:false looked like "Save deleted my key" when validation rejected.
@@ -873,7 +969,7 @@ function LocalCloudKeyFields({
 			inflightRef.current = false;
 			if (mountedRef.current) setBusy(false);
 		}
-	}, [cloudKeyDraft, onRefreshKey]);
+	}, [cloudKeyDraft, onRefreshKey, vaultRole]);
 
 	const clearCloudKey = useCallback(async () => {
 		if (inflightRef.current) return;
@@ -882,7 +978,14 @@ function LocalCloudKeyFields({
 		setError(null);
 		setJustSaved(false);
 		try {
-			await invokeBackendCommand<AuxCredentialStatus>("delete_cloud_llm_key");
+			if (vaultRole) {
+				await invokeBackendCommand<AuxCredentialStatus>(
+					"delete_cloud_llm_key_for_role",
+					{ role: vaultRole },
+				);
+			} else {
+				await invokeBackendCommand<AuxCredentialStatus>("delete_cloud_llm_key");
+			}
 			if (mountedRef.current) {
 				setCloudKeyDraft("");
 			}
@@ -895,16 +998,22 @@ function LocalCloudKeyFields({
 			inflightRef.current = false;
 			if (mountedRef.current) setBusy(false);
 		}
-	}, [onRefreshKey]);
+	}, [onRefreshKey, vaultRole]);
+
+	const fieldLabel =
+		label ??
+		(vaultRole ? "API key for this role" : "Shared key (fallback)");
 
 	return (
 		<div className="md:col-span-2 space-y-2">
 			<p className="text-[11px] leading-4 text-cream-400">
 				{helperText ??
-					"This keeps the LOCAL Devboule binary as the agent and only sources its model from a remote API — it is not the Claude/Codex CLI (that is the row's Cloud placement)."}
+					(vaultRole
+						? "Leave empty to use the shared key below/above."
+						: "Shared fallback when a role has no own key. Used by every Cloud API placement that does not override.")}
 			</p>
 			<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-				Cloud API key
+				{fieldLabel}
 				<div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
 					<input
 						type="password"
@@ -1034,21 +1143,19 @@ function validateMiniCloudDraft(draft: BackendDraft): MiniBackendValidation {
 	};
 }
 
-// The shared "Cloud API" editor for a MiniCoderBackend-shaped draft (coder / verifier /
-// Mini rows): a model input, an https base URL input, the shared-vault key manager (the
-// SAME `provider:cloud_llm` key the orchestrator cloud editor manages), and the consent
-// gate (shown unless `hideConsent`). Consent is REQUIRED to SAVE — identical to today's
-// orchestrator Local→cloud path — and is surfaced by the parent's save gate.
+// Cloud API editor for a MiniCoderBackend-shaped draft (coder / verifier / Mini):
+// provider preset, model, base URL, per-role key, consent (unless hideConsent).
 function CloudApiFields(props: {
 	idPrefix: string;
 	draft: BackendDraft;
 	onChange: (next: BackendDraft) => void;
 	onConsentChange?: (consented: boolean) => void;
 	hideConsent?: boolean;
-	// M5: hoisted cloud key status.
+	// F50: per-role key status + refresh.
 	cloudKeyStatus: AuxCredentialStatus | null;
 	onRefreshCloudKey?: () => Promise<void>;
 	consentHighlight?: boolean;
+	vaultRole: string;
 }) {
 	const {
 		idPrefix,
@@ -1059,6 +1166,7 @@ function CloudApiFields(props: {
 		cloudKeyStatus,
 		onRefreshCloudKey,
 		consentHighlight,
+		vaultRole,
 	} = props;
 	const set = (patch: Partial<BackendDraft>) =>
 		onChange({ ...draft, ...patch });
@@ -1067,17 +1175,39 @@ function CloudApiFields(props: {
 		[draft.kind, draft.model, draft.baseUrl],
 	);
 	const firstError = validation.errors.model ?? validation.errors.baseUrl;
+	const preset = providerPresetFromBaseUrl(draft.baseUrl);
 	return (
 		<div
 			className="grid gap-3 md:grid-cols-2"
 			data-testid={`${idPrefix}-cloud-fields`}
 		>
 			<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+				Provider
+				<select
+					value={preset}
+					onChange={(e) => {
+						const v = e.target.value;
+						if (!v) return;
+						set({
+							baseUrl: baseUrlForProviderPreset(v as CloudProviderPresetId),
+						});
+					}}
+					className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+				>
+					<option value="">—</option>
+					{CLOUD_PROVIDER_PRESETS.map((p) => (
+						<option key={p.id} value={p.id}>
+							{p.label}
+						</option>
+					))}
+				</select>
+			</label>
+			<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 				Model tag (required)
 				<input
 					value={draft.model}
 					onChange={(e) => set({ model: e.target.value })}
-					placeholder="gpt-4o"
+					placeholder="model id, e.g. openrouter/auto"
 					maxLength={MINI_MODEL_MAX_LENGTH}
 					className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 				/>
@@ -1095,10 +1225,12 @@ function CloudApiFields(props: {
 			<LocalCloudKeyFields
 				onConsentChange={onConsentChange}
 				hideConsent={hideConsent}
-				helperText="One key shared by every role's Cloud API placement (the same key the orchestrator editor manages)."
+				helperText="Leave empty to use the shared key below/above."
 				cloudKeyStatus={cloudKeyStatus}
 				onRefreshKey={onRefreshCloudKey}
 				consentHighlight={consentHighlight}
+				vaultRole={vaultRole}
+				label={keyLabelForBaseUrl(draft.baseUrl)}
 			/>
 			{firstError ? (
 				<p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
@@ -1177,22 +1309,46 @@ export function RolesTableCard() {
 	// M2: tracks whether the user changed anything verifier-related in this session.
 	// Only when true does a coder save mirror the verifier (clear backend + adopt client).
 	const verifierChangedRef = useRef(false);
-	// M5: hoisted cloud key status — one fetch shared by all LocalCloudKeyFields instances.
-	const [cloudKeyStatus, setCloudKeyStatus] =
+	// F50: shared fallback status + per-role statuses (never the raw keys).
+	const [sharedCloudKeyStatus, setSharedCloudKeyStatus] =
 		useState<AuxCredentialStatus | null>(null);
-	const refreshCloudKeyStatus = useCallback(async () => {
+	const [roleCloudKeyStatus, setRoleCloudKeyStatus] = useState<
+		Partial<Record<RoleKey, AuxCredentialStatus | null>>
+	>({});
+	const refreshSharedCloudKeyStatus = useCallback(async () => {
 		try {
 			const next = await invokeBackendCommand<AuxCredentialStatus>(
 				"get_cloud_llm_key_status",
 			);
-			if (mountedRef.current) setCloudKeyStatus(next);
+			if (mountedRef.current) setSharedCloudKeyStatus(next);
 		} catch {
 			// Degrade silently.
 		}
 	}, []);
+	const refreshRoleCloudKeyStatus = useCallback(async (role: RoleKey) => {
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>(
+				"get_cloud_llm_key_status_for_role",
+				{ role: vaultCloudRole(role) },
+			);
+			if (mountedRef.current) {
+				setRoleCloudKeyStatus((prev) => ({ ...prev, [role]: next }));
+			}
+		} catch {
+			// Degrade silently.
+		}
+	}, []);
+	const refreshAllCloudKeyStatus = useCallback(async () => {
+		await refreshSharedCloudKeyStatus();
+		await Promise.all(
+			(["orchestrator", "coder", "mini", "verifier"] as RoleKey[]).map((r) =>
+				refreshRoleCloudKeyStatus(r),
+			),
+		);
+	}, [refreshSharedCloudKeyStatus, refreshRoleCloudKeyStatus]);
 	useEffect(() => {
-		void refreshCloudKeyStatus();
-	}, [refreshCloudKeyStatus]);
+		void refreshAllCloudKeyStatus();
+	}, [refreshAllCloudKeyStatus]);
 	useEffect(() => {
 		mountedRef.current = true;
 		return () => {
@@ -1392,13 +1548,16 @@ export function RolesTableCard() {
 								"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
 							);
 						}
-						if (cloudKeyStatus?.configured !== true) {
+						if (
+							roleCloudKeyStatus.orchestrator?.configured !== true &&
+							sharedCloudKeyStatus?.configured !== true
+						) {
 							throw new Error(
-								"Cloud API key is not saved yet. Paste the key and click Save next to the key field — the top Save only stores model + base URL.",
+								"Cloud API key is not saved yet. Paste a per-role or shared key and click Save next to the key field — the top Save only stores model + base URL.",
 							);
 						}
 						await saveLocalCoderBackend(orchestratorDraft);
-					} else if (placement === "Local") {
+					} else if (placement === "On this Mac") {
 						await saveLocalCoderBackend(orchestratorDraft);
 					}
 					// Cloud CLI: no backend; just persist the client.
@@ -1417,13 +1576,16 @@ export function RolesTableCard() {
 								"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
 							);
 						}
-						if (cloudKeyStatus?.configured !== true) {
+						if (
+							roleCloudKeyStatus.coder?.configured !== true &&
+							sharedCloudKeyStatus?.configured !== true
+						) {
 							throw new Error(
-								"Cloud API key is not saved yet. Paste the key and click Save next to the key field.",
+								"Cloud API key is not saved yet. Paste a per-role or shared key and click Save next to the key field.",
 							);
 						}
 						await saveMiniBackend("set_main_coder_backend_cmd", mainDraft);
-					} else if (placement === "Local") {
+					} else if (placement === "On this Mac") {
 						await saveMiniBackend("set_main_coder_backend_cmd", mainDraft);
 					}
 					// Cloud CLI: no backend; just persist the client.
@@ -1469,13 +1631,16 @@ export function RolesTableCard() {
 									"Consent required: tick the checkbox below (“I understand that my code and prompts will be sent…”) before saving Cloud API settings.",
 								);
 							}
-							if (cloudKeyStatus?.configured !== true) {
+							if (
+								roleCloudKeyStatus.verifier?.configured !== true &&
+								sharedCloudKeyStatus?.configured !== true
+							) {
 								throw new Error(
-									"Cloud API key is not saved yet. Paste the key and click Save next to the key field.",
+									"Cloud API key is not saved yet. Paste a per-role or shared key and click Save next to the key field.",
 								);
 							}
 							await saveMiniBackend("set_verifier_backend_cmd", verifierDraft);
-						} else if (placement === "Local") {
+						} else if (placement === "On this Mac") {
 							await saveMiniBackend("set_verifier_backend_cmd", verifierDraft);
 						}
 						// Cloud CLI: no backend; just persist the client.
@@ -1512,7 +1677,8 @@ export function RolesTableCard() {
 			orchestratorCloudConsent,
 			coderCloudConsent,
 			verifierCloudConsent,
-			cloudKeyStatus,
+			roleCloudKeyStatus,
+			sharedCloudKeyStatus,
 			verifierSameAsMain,
 			stagedPlacement,
 			saveClients,
@@ -1580,7 +1746,7 @@ export function RolesTableCard() {
 					command: "",
 				});
 			}
-			setStagedPlacement((prev) => ({ ...prev, [role]: "Local" }));
+			setStagedPlacement((prev) => ({ ...prev, [role]: "On this Mac" }));
 		};
 		// Clicking Cloud API IS an explicit user action into a single-kind placement —
 		// stage kind='cloud'. Drop loopback/http baseUrls carried over from omlx/Local —
@@ -1612,7 +1778,7 @@ export function RolesTableCard() {
 			// Keep the current cloud CLI if there is one, else default to Claude.
 			const current = clientFor(role);
 			setRoleClient(role, isCloudCli(current) ? current : "claude");
-			setStagedPlacement((prev) => ({ ...prev, [role]: "Cloud CLI" }));
+			setStagedPlacement((prev) => ({ ...prev, [role]: "Agent CLI" }));
 		};
 		const handleKindPicked = () => {
 			setStagedPlacement((prev) => {
@@ -1629,9 +1795,9 @@ export function RolesTableCard() {
 					<button
 						type="button"
 						onClick={setLocal}
-						className={seg(displayPlacement === "Local")}
+						className={seg(displayPlacement === "On this Mac")}
 					>
-						Local
+						On this Mac
 					</button>
 					<button
 						type="button"
@@ -1643,13 +1809,13 @@ export function RolesTableCard() {
 					<button
 						type="button"
 						onClick={setCloudCli}
-						className={seg(displayPlacement === "Cloud CLI")}
+						className={seg(displayPlacement === "Agent CLI")}
 					>
-						Cloud CLI
+						Agent CLI
 					</button>
 				</div>
 
-				{displayPlacement === "Local" ? (
+				{displayPlacement === "On this Mac" ? (
 					role === "orchestrator" ? (
 						<LocalBackendFields
 							idPrefix="roles-orchestrator"
@@ -1673,8 +1839,9 @@ export function RolesTableCard() {
 									return n;
 								});
 							}}
-							cloudKeyStatus={cloudKeyStatus}
-							onRefreshCloudKey={refreshCloudKeyStatus}
+							cloudKeyStatus={roleCloudKeyStatus.orchestrator ?? null}
+							onRefreshCloudKey={() => refreshRoleCloudKeyStatus("orchestrator")}
+							vaultRole="orchestrator"
 							consentHighlight={Boolean(
 								roleError.orchestrator?.toLowerCase().includes("consent"),
 							)}
@@ -1687,15 +1854,14 @@ export function RolesTableCard() {
 							statusMap={statusMap}
 							kinds={LOCAL_KINDS}
 							onKindPicked={handleKindPicked}
-							cloudKeyStatus={cloudKeyStatus}
-							onRefreshCloudKey={refreshCloudKeyStatus}
+							cloudKeyStatus={roleCloudKeyStatus[role] ?? null}
+							onRefreshCloudKey={() => refreshRoleCloudKeyStatus(role)}
+							vaultRole={vaultCloudRole(role)}
 						/>
 					)
 				) : displayPlacement === "Cloud API" ? (
 					role === "orchestrator" ? (
-						// The Orchestrator's Cloud API placement reuses LocalBackendFields with the
-						// single "cloud" kind — it already renders model + base URL + the shared key
-						// manager + the consent gate.
+						// Cloud API: model + base URL + per-role key + consent.
 						<LocalBackendFields
 							idPrefix="roles-orchestrator"
 							draft={orchestratorDraft}
@@ -1718,15 +1884,15 @@ export function RolesTableCard() {
 									return n;
 								});
 							}}
-							cloudKeyStatus={cloudKeyStatus}
-							onRefreshCloudKey={refreshCloudKeyStatus}
+							cloudKeyStatus={roleCloudKeyStatus.orchestrator ?? null}
+							onRefreshCloudKey={() => refreshRoleCloudKeyStatus("orchestrator")}
+							vaultRole="orchestrator"
 							consentHighlight={Boolean(
 								roleError.orchestrator?.toLowerCase().includes("consent"),
 							)}
 						/>
 					) : (
-						// Coder / Verifier Cloud API: the shared MiniCoderBackend-shaped cloud editor
-						// (model + https base URL + shared-vault key manager + consent gate).
+						// Coder / Verifier Cloud API: per-role key + provider preset.
 						<CloudApiFields
 							idPrefix={`roles-${role}`}
 							draft={draft}
@@ -1741,143 +1907,307 @@ export function RolesTableCard() {
 										return n;
 									});
 							}}
-							cloudKeyStatus={cloudKeyStatus}
-							onRefreshCloudKey={refreshCloudKeyStatus}
+							cloudKeyStatus={roleCloudKeyStatus[role] ?? null}
+							onRefreshCloudKey={() => refreshRoleCloudKeyStatus(role)}
+							vaultRole={vaultCloudRole(role)}
 							consentHighlight={Boolean(
 								roleError[role]?.toLowerCase().includes("consent"),
 							)}
 						/>
 					)
 				) : (
-					// Cloud CLI: hand off to an external CLI (today's Cloud branch). Its own
-					// login/API key comes from the shell environment, not this form.
+					// Agent CLI: uses the CLI's own login (e.g. Claude subscription).
 					<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-						Cloud CLI
+						Agent CLI
 						<select
 							value={
 								CLOUD_CLIENTS.includes(client as (typeof CLOUD_CLIENTS)[number])
 									? client
-									: "claude"
+									: client === UNSUPPORTED_AGENT_CLI
+										? UNSUPPORTED_AGENT_CLI
+										: "claude"
 							}
-							onChange={(e) => setRoleClient(role, e.target.value)}
+							onChange={(e) => {
+								const v = e.target.value;
+								if (v === UNSUPPORTED_AGENT_CLI) return;
+								setRoleClient(role, v);
+							}}
 							className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 						>
 							<option value="claude">Claude</option>
 							<option value="codex">Codex</option>
-							<option value="openai">OpenAI</option>
+							{client === UNSUPPORTED_AGENT_CLI ? (
+								<option value={UNSUPPORTED_AGENT_CLI}>
+									OpenAI (unsupported)
+								</option>
+							) : null}
 						</select>
-						<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
-							Uses the CLI&apos;s own login / API key from your shell
-							environment — configure it in that tool, not here.
-						</span>
+						{client === UNSUPPORTED_AGENT_CLI ? (
+							<span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
+								This saved client is unsupported (protocol stub). Pick Claude
+								or Codex.
+							</span>
+						) : null}
+						{(() => {
+							const cliId =
+								CLOUD_CLIENTS.includes(
+									client as (typeof CLOUD_CLIENTS)[number],
+								)
+									? client
+									: "claude";
+							const st =
+								cliId === "claude" || cliId === "codex"
+									? statusMap[cliId]
+									: null;
+							const installed = st?.available === true;
+							return (
+								<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+									Uses the CLI&apos;s own login (e.g. your Claude subscription).
+									Status:{" "}
+									<span
+										className={
+											installed ? "text-emerald-700" : "text-coral-dark"
+										}
+									>
+										{installed ? "installed" : "not installed"}
+									</span>
+									{st?.detail ? ` (${st.detail})` : ""}.
+								</span>
+							);
+						})()}
 					</label>
 				)}
 			</div>
 		);
 	};
 
-	// The Mini has no client concept — its Local⇄Cloud toggle just filters its own
-	// backend kinds (on-device vs Codex/API), so it is kind-based, not client-based.
+	// Mini: same On this Mac / Cloud API / Agent CLI triad as other roles (kind→placement
+	// via miniPlacementMap). maxConcurrent + fallback chain sit BELOW the uniform block.
 	const renderMiniPlacement = (
 		draft: BackendDraft,
 		setDraft: (d: BackendDraft) => void,
 	) => {
-		// B1/M1/M4/M8: use stagedPlacement for display when set; derive otherwise.
-		const effectiveMiniPlacement =
-			stagedPlacement.mini ?? (isCloudKind(draft.kind) ? "Cloud" : "Local");
-		const local = effectiveMiniPlacement === "Local";
-		// B1/M1/M4/M8: do NOT mutate draft.kind — stage the placement only.
-		const setMiniLocal = (wantLocal: boolean) => {
-			setStagedPlacement((prev) => ({
-				...prev,
-				// Mini uses "Local" / "Cloud" (not "Cloud API" / "Cloud CLI");
-				// cast is safe — Mini never stores CLI-style placement values.
-				mini: (wantLocal ? "Local" : "Cloud") as Placement,
-			}));
+		// Prefer staged triad click; otherwise derive from the persisted kind so load is lossless.
+		const displayPlacement: MiniPlacement =
+			(stagedPlacement.mini as MiniPlacement | undefined) ??
+			miniPlacementFromKind(draft.kind);
+		const engines = miniEnginesForPlacement(displayPlacement);
+		// draft.kind is always the config source of truth for fields.
+		const kind = draft.kind;
+
+		const setPlacement = (placement: MiniPlacement) => {
+			const nextKind = miniKindAfterPlacementSwitch(draft.kind, placement);
+			setDraft(cleanDraftForMiniKind(draft, nextKind));
+			setStagedPlacement((prev) => ({ ...prev, mini: placement }));
 		};
-		const handleKindPicked = () => {
+		const setEngine = (next: MiniCoderBackendKind) => {
+			setDraft(cleanDraftForMiniKind(draft, next));
 			setStagedPlacement((prev) => {
 				const n = { ...prev };
 				delete n.mini;
 				return n;
 			});
 		};
+		const set = (patch: Partial<BackendDraft>) =>
+			setDraft({ ...draft, ...patch });
+
+		const detectedModels =
+			kind === "ollama" || kind === "omlx" ? statusMap[kind].models : [];
+		const listId = "roles-mini-models";
+		const seg = (active: boolean) =>
+			`px-3 py-1.5 ${active ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`;
+
 		return (
-			<div className="mt-2 space-y-3">
+			<div className="mt-2 space-y-3" data-testid="roles-mini-placement">
 				<p className="text-[11px] leading-4 text-cream-400">
-					The delegated worker a coder spawns. One backend, on-device (Ollama /
-					oMLX / Apple) or a remote Cloud API — or the external OpenAI/Codex
-					CLIs and a custom command.
+					The delegated worker a coder spawns. Same placements as the other
+					roles — on-device engine, remote Cloud API, or Agent CLI.
 				</p>
 				<div className="inline-flex overflow-hidden rounded-lg border border-cream-200 text-[11px] font-semibold">
-					<button
-						type="button"
-						onClick={() => setMiniLocal(true)}
-						className={`px-3 py-1.5 ${local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
-					>
-						Local
-					</button>
-					<button
-						type="button"
-						onClick={() => setMiniLocal(false)}
-						className={`px-3 py-1.5 ${!local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
-					>
-						Cloud
-					</button>
+					{(
+						["On this Mac", "Cloud API", "Agent CLI"] as MiniPlacement[]
+					).map((p) => (
+						<button
+							key={p}
+							type="button"
+							onClick={() => setPlacement(p)}
+							className={seg(displayPlacement === p)}
+						>
+							{p}
+						</button>
+					))}
 				</div>
-				<MiniBackendFields
-					idPrefix="roles-mini"
-					draft={draft}
-					onChange={setDraft}
-					statusMap={statusMap}
-					kinds={local ? LOCAL_KINDS : MINI_CLOUD_KINDS}
-					showMaxConcurrent
-					onKindPicked={handleKindPicked}
-					cloudKeyStatus={cloudKeyStatus}
-					onRefreshCloudKey={refreshCloudKeyStatus}
-				/>
+
+				{/* Engine sub-select (uniform across placements). Unsupported kinds
+				    (e.g. openai) appear only when already saved — not as new picks. */}
+				<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+					Engine
+					<select
+						value={kind}
+						onChange={(e) => {
+							const v = e.target.value as MiniCoderBackendKind;
+							if (miniKindIsUnsupported(v)) return;
+							setEngine(v);
+						}}
+						className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+						aria-label="Mini engine"
+					>
+						{engines.map((k) => (
+							<option key={k} value={k}>
+								{miniEngineLabel(k)}
+							</option>
+						))}
+						{miniKindIsUnsupported(kind) || !engines.includes(kind) ? (
+							<option value={kind}>
+								{miniEngineLabel(kind)}
+								{miniKindIsUnsupported(kind) ? "" : " (current — switch engine)"}
+							</option>
+						) : null}
+					</select>
+					{miniKindIsUnsupported(kind) ? (
+						<span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
+							This saved engine is unsupported. Pick Codex (or another
+							placement) to change it.
+						</span>
+					) : null}
+				</label>
+
+				{/* Placement-specific fields — same config values as before. */}
+				{displayPlacement === "On this Mac" ? (
+					<div className="grid gap-3 md:grid-cols-2">
+						<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+							Model {kind === "appleFm" ? "(optional)" : "tag"}
+							<input
+								value={draft.model}
+								onChange={(e) => set({ model: e.target.value })}
+								placeholder={kind === "appleFm" ? "default" : "qwen2.5-coder"}
+								maxLength={MINI_MODEL_MAX_LENGTH}
+								list={detectedModels.length ? listId : undefined}
+								className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+							/>
+							{detectedModels.length ? (
+								<datalist id={listId}>
+									{detectedModels.map((m) => (
+										<option key={m} value={m} />
+									))}
+								</datalist>
+							) : null}
+						</label>
+						{kind === "omlx" ? (
+							<label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+								Base URL
+								<input
+									value={draft.baseUrl}
+									onChange={(e) => set({ baseUrl: e.target.value })}
+									placeholder="http://localhost:8000/v1"
+									maxLength={MINI_BASE_URL_MAX_LENGTH}
+									className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+								/>
+							</label>
+						) : null}
+					</div>
+				) : null}
+
+				{displayPlacement === "Cloud API" && kind === "cloud" ? (
+					<CloudApiFields
+						idPrefix="roles-mini"
+						draft={draft}
+						onChange={setDraft}
+						hideConsent
+						cloudKeyStatus={roleCloudKeyStatus.mini ?? null}
+						onRefreshCloudKey={() => refreshRoleCloudKeyStatus("mini")}
+						vaultRole="mini"
+					/>
+				) : null}
+
+				{displayPlacement === "Cloud API" && kind === "api" ? (
+					<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+						Command line
+						<input
+							value={draft.command}
+							onChange={(e) => set({ command: e.target.value })}
+							placeholder="mycli chat --json"
+							maxLength={MINI_COMMAND_MAX_LENGTH}
+							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+						/>
+					</label>
+				) : null}
+
+				{displayPlacement === "Agent CLI" ? (
+					<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+						Model (optional)
+						<input
+							value={draft.model}
+							onChange={(e) => set({ model: e.target.value })}
+							placeholder="model id, e.g. openrouter/auto"
+							maxLength={MINI_MODEL_MAX_LENGTH}
+							className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+						/>
+						<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+							{kind === "codex"
+								? "Uses the Codex CLI login on this machine."
+								: miniKindIsUnsupported(kind)
+									? "Legacy OpenAI mini engine (stub) — not offered for new configs."
+									: "Agent CLI engine on this machine."}
+						</span>
+					</label>
+				) : null}
+
+				{/* Mini-specific extras BELOW the uniform block. */}
+				<label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+					Max concurrent slots
+					<select
+						value={draft.maxConcurrent}
+						onChange={(e) => set({ maxConcurrent: Number(e.target.value) })}
+						className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+						aria-label="Maximum concurrent mini-coder slots"
+					>
+						<option value={1}>1</option>
+						<option value={2}>2 (default)</option>
+						<option value={3}>3</option>
+						<option value={4}>4</option>
+					</select>
+				</label>
+				{(kind === "cloud" || kind === "ollama" || kind === "omlx") && (
+					<FallbackChainEditor
+						fallbacks={draft.fallbacks}
+						onChange={(fb) => set({ fallbacks: fb })}
+					/>
+				)}
 			</div>
 		);
 	};
 
+	// Live draft badge (not saved config) so placement/engine/model edits update immediately.
 	const summaryFor = (role: RoleKey): string => {
 		if (role === "mini") {
-			const b = config.miniCoderBackend;
-			return b
-				? `${b.kind}${b.model ? ` · ${b.model}` : ""}`
-				: "not configured";
+			const d = miniDraft;
+			const place =
+				(stagedPlacement.mini as MiniPlacement | undefined) ??
+				miniPlacementFromKind(d.kind);
+			const model = d.model.trim();
+			return `${place} · ${miniEngineLabel(d.kind)}${model ? ` · ${model}` : ""}`;
 		}
 		if (role === "verifier" && verifierSameAsMain) {
 			// Mirrors the coder until the user unchecks "Same as Main coder".
 			return "Same as Main coder";
 		}
 		const client = clientFor(role);
-		const draftKind =
-			role === "orchestrator"
-				? orchestratorDraft.kind
-				: role === "coder"
-					? mainDraft.kind
-					: verifierDraft.kind;
-		const placement =
-			stagedPlacement[role] ?? placementFor(role, client, draftKind);
-		if (placement === "Cloud CLI") return `Cloud · ${client}`;
-		if (placement === "Cloud API") {
-			const b =
-				role === "orchestrator"
-					? config.localCoderBackend
-					: role === "coder"
-						? config.mainCoderBackend
-						: config.verifierBackend;
-			return `Cloud API · ${b ? b.kind : "cloud"}`;
+		if (role === "orchestrator") {
+			const d = orchestratorDraft;
+			const placement =
+				stagedPlacement.orchestrator ??
+				placementFor("orchestrator", client, d.kind);
+			if (placement === "Agent CLI") return `Agent CLI · ${client}`;
+			const model = d.model.trim();
+			return `${placement} · ${d.kind}${model ? ` · ${model}` : ""}`;
 		}
-		// Local
-		const b =
-			role === "orchestrator"
-				? config.localCoderBackend
-				: role === "coder"
-					? config.mainCoderBackend
-					: config.verifierBackend;
-		return `Local · ${b ? b.kind : "unset"}`;
+		const d = role === "coder" ? mainDraft : verifierDraft;
+		const placement =
+			stagedPlacement[role] ?? placementFor(role, client, d.kind);
+		if (placement === "Agent CLI") return `Agent CLI · ${client}`;
+		const model = d.model.trim();
+		return `${placement} · ${d.kind}${model ? ` · ${model}` : ""}`;
 	};
 
 	return (
@@ -1891,6 +2221,22 @@ export function RolesTableCard() {
 				<h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
 					Roles
 				</h3>
+			</div>
+			{/* F50: one clearly-marked shared fallback key (roles have their own fields). */}
+			<div
+				className="mb-4 rounded-xl border border-cream-200 bg-cream-50/60 p-3"
+				data-testid="shared-cloud-key-fallback"
+			>
+				<p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-cream-500">
+					Shared key (fallback)
+				</p>
+				<LocalCloudKeyFields
+					hideConsent
+					helperText="Used when a role has no own API key. Leave role keys empty to use this."
+					cloudKeyStatus={sharedCloudKeyStatus}
+					onRefreshKey={refreshSharedCloudKeyStatus}
+					label="Shared key (fallback)"
+				/>
 			</div>
 			<p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
 				One place for who runs each agent role, and on what. Pick Local or Cloud
@@ -1930,8 +2276,8 @@ export function RolesTableCard() {
 					// disabled even for a valid local ollama backend.
 					const effectivePlacement =
 						meta.key === "mini"
-							? (stagedPlacement.mini ??
-								(isCloudKind(draft.kind) ? "Cloud" : "Local"))
+							? ((stagedPlacement.mini as MiniPlacement | undefined) ??
+								miniPlacementFromKind(draft.kind))
 							: (stagedPlacement[meta.key] ??
 								placementFor(
 									meta.key,
@@ -1942,14 +2288,12 @@ export function RolesTableCard() {
 								));
 					const foreignKindsForRole =
 						meta.key === "mini"
-							? effectivePlacement === "Local"
-								? LOCAL_KINDS
-								: MINI_CLOUD_KINDS
+							? [...miniEnginesForPlacement(effectivePlacement as MiniPlacement)]
 							: meta.key === "orchestrator"
-								? effectivePlacement === "Local"
+								? effectivePlacement === "On this Mac"
 									? ORCHESTRATOR_LOCAL_KINDS
 									: CLOUD_API_KIND
-								: effectivePlacement === "Local"
+								: effectivePlacement === "On this Mac"
 									? LOCAL_KINDS
 									: effectivePlacement === "Cloud API"
 										? MINI_CLOUD_KINDS

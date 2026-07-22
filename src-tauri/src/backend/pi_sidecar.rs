@@ -763,7 +763,10 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                 // (the SAME vault entry the orchestrator's Cloud kind uses).
                 // B4 (BLOCKER): match the Result explicitly so "no key" and "vault locked/error"
                 // are both surfaced as a user-visible Banner (via vault_key_warning).
-                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key() {
+                // F50: per-role key first, shared fallback. Role aliases canonicalize in vault.
+                let vault_role = role.unwrap_or("coder");
+                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(vault_role)
+                {
                     Ok(Some(key)) => (Some(key), None),
                     Ok(None) => {
                         eprintln!(
@@ -867,7 +870,10 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                 };
                 // B4 (BLOCKER): match the Result explicitly so "no key" and "vault locked/error"
                 // are both surfaced as a user-visible Banner (via vault_key_warning).
-                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key() {
+                // F50: cross-role localCoderBackend Cloud uses role if known, else "coder".
+                let vault_role = role.unwrap_or("coder");
+                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(vault_role)
+                {
                     Ok(Some(key)) => (Some(key), None),
                     Ok(None) => {
                         eprintln!(

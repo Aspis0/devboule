@@ -2093,8 +2093,9 @@ fn prepare_or_launch_project_agent(
         // never logged. A `cloud` backend with NO key stored => no DEVBOULE_CLOUD_API_KEY
         // => the binary's CloudModel::new fails the empty-key check and falls back to the
         // safe Mock (it refuses to send an unauthenticated request off-machine).
+        // F50: orchestrator Cloud uses the orchestrator per-role key, shared fallback.
         if !cloud_base_url.trim().is_empty() {
-            if let Some(cloud_key) = vault::read_cloud_llm_key()? {
+            if let Some(cloud_key) = vault::read_cloud_llm_key_for_role("orchestrator")? {
                 provider_env.push(AgentLaunchEnv {
                     name: "DEVBOULE_CLOUD_API_KEY".into(),
                     value: cloud_key,

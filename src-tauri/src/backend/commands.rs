@@ -1685,6 +1685,42 @@ pub async fn delete_cloud_llm_key(
         .map_err(|e| format!("task join error: {e}"))?
 }
 
+// F50: per-role Cloud LLM keys (fallback to shared). F47: keyring off the main thread.
+
+#[tauri::command]
+pub async fn get_cloud_llm_key_status_for_role(
+    state: State<'_, BackendState>,
+    role: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || vault::cloud_llm_key_status_for_role(&role))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn save_cloud_llm_key_for_role(
+    state: State<'_, BackendState>,
+    role: String,
+    key: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || vault::save_cloud_llm_key_for_role(&role, &key))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn delete_cloud_llm_key_for_role(
+    state: State<'_, BackendState>,
+    role: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    tauri::async_runtime::spawn_blocking(move || vault::delete_cloud_llm_key_for_role(&role))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
 // --- Web-search key commands (parameterized, 5 providers) ---------------------
 //
 // Three-parameterized set replaces the per-provider triples. The vault layer

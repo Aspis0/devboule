@@ -4128,11 +4128,7 @@ export function ProjectsView() {
 								label: "Codex",
 								disabled: cloudCliAvailability.codex === false,
 							},
-							{
-								id: "openai",
-								label: "OpenAI",
-								disabled: cloudCliAvailability.openai === false,
-							},
+							// F50: OpenAI agent-CLI chip removed (unimplemented protocol stub).
 						]}
 						orchestratorId={plannerOrchestratorClient}
 						onOrchestratorChange={setPlannerOrchestratorClient}
@@ -4145,7 +4141,6 @@ export function ProjectsView() {
 							},
 							{ id: "claude", label: "Claude" },
 							{ id: "codex", label: "Codex" },
-							{ id: "openai", label: "OpenAI" },
 							...(config.customAgentClients ?? []).map((c) => ({
 								id: c.id,
 								label: c.label,
