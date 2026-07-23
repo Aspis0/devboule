@@ -114,3 +114,22 @@ src-tauri/capabilities/pilot.json
 # Local/model benches (not product)
 /bench/
 /prodbench/
+
+# --- Root-level design-generation artifacts (leak into the repo root; never product) ---
+/_workspace/
+/components/
+/manifest.json
+/project.json
+/tokens.json
+/generations.jsonl
+/export-absolute.html
+/devboule logo*.jpeg
+*.tsbuildinfo
+
+# --- Local docs / decks / slides (kept out of the public tree) ---
+*.pptx
+*.ppt
+*.key
+*.docx
+*.doc
+*.pdf
