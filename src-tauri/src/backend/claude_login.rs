@@ -71,9 +71,33 @@ pub fn next_kill_escalation(already_hard: bool) -> KillEscalation {
     }
 }
 
-fn token_regex() -> &'static Regex {
+/// STRICT — only OAuth setup-token shapes, used to EXTRACT the token to save.
+///
+/// Current `claude setup-token` (v2.1+) prints the OAuth access_token as `sk-ant-si-…`
+/// (the old code only accepted `sk-ant-oat…`, so nothing was captured → login "did
+/// nothing"). We require a KNOWN OAuth marker (`oat`|`si`) right after `sk-ant-` — NOT a
+/// bare `sk-ant-` — so we never capture a STATIC API key (`sk-ant-api03-…`) that the CLI
+/// may print in a startup warning ("ANTHROPIC_API_KEY is set…") BEFORE the real token:
+/// `extract_setup_token` takes the FIRST match and the read loop saves+kills on it, so a
+/// foreign `sk-ant-api…` in a preamble would be saved as the OAuth token and the login
+/// would falsely report success (the Rust regex crate has no lookahead, hence an explicit
+/// marker allowlist rather than a negative `(?!api)`). 12+ body chars + optional dotted
+/// (JWT-like) segments. Add new OAuth markers here if a future CLI introduces them.
+fn token_extract_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"sk-ant-oat[A-Za-z0-9\-_]{8,}").expect("token regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"sk-ant-(?:oat|si)[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]+)*")
+            .expect("token extract regex")
+    })
+}
+
+/// BROAD — any `sk-ant-*` credential shape (incl. static API keys), used ONLY to REDACT
+/// tokens from log tails. Over-matching is strictly SAFER for redaction (redacts more).
+fn token_redact_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"sk-ant-[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]+)*").expect("token redact regex")
+    })
 }
 
 fn ansi_regex() -> &'static Regex {
@@ -94,14 +118,14 @@ pub fn strip_ansi(s: &str) -> String {
 /// Extract the first Claude setup-token from (possibly ANSI-laden) CLI output. Pure.
 pub fn extract_setup_token(output: &str) -> Option<String> {
     let clean = strip_ansi(output);
-    token_regex()
+    token_extract_regex()
         .find(&clean)
         .map(|m| m.as_str().to_string())
 }
 
 /// Redact any token-shaped substrings from a log tail. Pure.
 pub fn redact_token_patterns(s: &str) -> String {
-    token_regex()
+    token_redact_regex()
         .replace_all(s, "[redacted-token]")
         .into_owned()
 }
@@ -593,6 +617,83 @@ mod tests {
     fn extract_token_missing() {
         assert!(extract_setup_token("no token here, just words").is_none());
         assert!(extract_setup_token("sk-ant-oatSHORT").is_none());
+        // A bare prefix or too-short body must NOT be captured.
+        assert!(extract_setup_token("sk-ant-").is_none());
+        assert!(extract_setup_token("sk-ant-si-abc").is_none());
+    }
+
+    #[test]
+    fn extract_token_new_setup_token_format_sk_ant_si() {
+        // Regression for the stale `-oat`-only regex: current `claude setup-token` prints
+        // an OAuth access_token as `sk-ant-si-…`, which the old regex dropped entirely.
+        let out = "Long-lived authentication token created successfully\n\n\
+                   Your OAuth token (valid for 1 year):\n\
+                   sk-ant-si-01AbCdEfGhIjKlMnOpQrStUvWx_1234567890\n";
+        assert_eq!(
+            extract_setup_token(out).as_deref(),
+            Some("sk-ant-si-01AbCdEfGhIjKlMnOpQrStUvWx_1234567890")
+        );
+    }
+
+    #[test]
+    fn extract_token_jwt_like_dotted_segments() {
+        // Some token values carry `.`-separated segments (JWT-like); capture the whole run.
+        let tok = "sk-ant-si-01AbCdEfGhIjKlMnOpQr.eyJhbGciOiJIUzI1NiJ9.SflKxwRJSMeKKF2QT4";
+        let out = format!("Here is your token:\n{tok}\ndone");
+        assert_eq!(extract_setup_token(&out).as_deref(), Some(tok));
+    }
+
+    #[test]
+    fn extract_token_si_strips_ansi() {
+        let out = "\x1b[1msk-ant-si-01ZzYyXxWwVvUuTtSsRrQq_0987654321\x1b[0m\n";
+        assert_eq!(
+            extract_setup_token(out).as_deref(),
+            Some("sk-ant-si-01ZzYyXxWwVvUuTtSsRrQq_0987654321")
+        );
+    }
+
+    #[test]
+    fn redact_covers_new_token_format() {
+        let s = "log tail sk-ant-si-01AbCdEfGhIjKlMnOpQrStUv_XYZ end";
+        let red = redact_token_patterns(s);
+        assert!(!red.contains("sk-ant-si-01AbCdEfGhIjKlMnOpQrStUv_XYZ"), "{red}");
+        assert!(red.contains("[redacted-token]"), "{red}");
+    }
+
+    #[test]
+    fn extract_ignores_api_key_preamble_and_takes_real_oauth_token() {
+        // SECURITY (audit BLOCKER): the CLI may print a startup warning that echoes a static
+        // ANTHROPIC_API_KEY (`sk-ant-api03-…`) BEFORE the real OAuth token. extract takes the
+        // FIRST match + saves/kills on it, so a bare `sk-ant-` regex would save the WRONG
+        // credential. The strict extract regex must SKIP the api key and capture the si token.
+        let out = "Warning: ANTHROPIC_API_KEY is set: sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUV\n\n\
+                   Your OAuth token (valid for 1 year):\n\
+                   sk-ant-si-01RealTokenHereXYZ1234567890\n";
+        assert_eq!(
+            extract_setup_token(out).as_deref(),
+            Some("sk-ant-si-01RealTokenHereXYZ1234567890"),
+            "must skip the sk-ant-api03 key and capture the sk-ant-si OAuth token"
+        );
+    }
+
+    #[test]
+    fn extract_never_captures_a_static_api_key() {
+        // An api key alone (no OAuth token) must NOT be captured as a setup-token.
+        let out = "ANTHROPIC_API_KEY=sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+        assert!(
+            extract_setup_token(out).is_none(),
+            "sk-ant-api03 (static API key) must never be saved as the Claude OAuth token"
+        );
+    }
+
+    #[test]
+    fn redact_still_covers_api_key_shape() {
+        // Redaction stays BROAD (safer): an api key in a log tail must still be redacted,
+        // even though extract deliberately ignores it.
+        let s = "leak sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 tail";
+        let red = redact_token_patterns(s);
+        assert!(!red.contains("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), "{red}");
+        assert!(red.contains("[redacted-token]"), "{red}");
     }
 
     #[test]
