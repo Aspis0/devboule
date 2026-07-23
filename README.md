@@ -6,6 +6,18 @@ Built with **Tauri + React + Rust**.
 
 > Pre-production. APIs and UX will change. Do not treat this as a finished product.
 
+## AI disclosure
+
+Devboule was built with heavy AI assistance. Frontier coding models — Claude, Grok, DeepSeek,
+Qwen and others — wrote and hostile-reviewed large parts of this codebase, while a human led the
+ideas, the architecture decisions, the testing, and the debugging. We say this plainly because it
+genuinely shaped how the project was built, not only how quickly. If shipping and running
+AI-written code is something you're not comfortable with, this project isn't for you.
+
+And none of it would exist without the open-source work it stands on — above all Tauri, React, and
+the wider Rust ecosystem, much of it written by hand by the people who came before. The full
+inventory and attributions are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
 ## Requirements
 
 - Node.js 20+
@@ -26,10 +38,9 @@ Secrets stay in the OS keyring. Do not put API keys in project Markdown, prompts
 
 ## License
 
-Devboule is licensed under Apache-2.0 — see [LICENSE](./LICENSE). Copied/adapted source
-snippets are attributed in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md); the full
-open-source dependency inventory (npm + Rust crates) is in
-[THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md).
+Devboule is licensed under Apache-2.0 — see [LICENSE](./LICENSE). All third-party open source
+(adapted/vendored code plus the full npm + Rust dependency inventory) is attributed in
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
 ## Status
 
