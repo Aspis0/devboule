@@ -8,11 +8,11 @@ Built with **Tauri + React + Rust**.
 
 ## AI disclosure
 
-Devboule was built with heavy AI assistance. Frontier coding models — Claude, Grok, DeepSeek,
-Qwen and others — wrote and hostile-reviewed large parts of this codebase, while a human led the
-ideas, the architecture decisions, the testing, and the debugging. We say this plainly because it
-genuinely shaped how the project was built, not only how quickly. If shipping and running
-AI-written code is something you're not comfortable with, this project isn't for you.
+Devboule was built with heavy AI assistance. Claude (Anthropic) wrote and hostile-reviewed large
+parts of this codebase, while a human led the ideas, the architecture decisions, the testing, and
+the debugging. We say this plainly because it genuinely shaped how the project was built, not only
+how quickly. If shipping and running AI-written code is something you're not comfortable with, this
+project isn't for you.
 
 And none of it would exist without the open-source work it stands on — above all Tauri, React, and
 the wider Rust ecosystem, much of it written by hand by the people who came before. The full
@@ -22,7 +22,12 @@ inventory and attributions are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES
 
 - Node.js 20+
 - Rust (stable), for Tauri
-- macOS / Windows / Linux (desktop WebView)
+
+### Platforms
+
+- **macOS** — primary target, actively developed and tested.
+- **Windows** — supported; being tested shortly.
+- **Linux** — should build on the desktop WebView, but is not tested yet (no near-term plans).
 
 ## Develop
 

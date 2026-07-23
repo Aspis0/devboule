@@ -598,18 +598,18 @@ describe("pullProjectCall (GH-P3)", () => {
 describe("isLikelyGithubRepoUrl (clone dialog gate)", () => {
 	it("accepts the common GitHub remote shapes", () => {
 		expect(
-			isLikelyGithubRepoUrl("https://github.com/Saurias92/Aspis-bio"),
+			isLikelyGithubRepoUrl("https://github.com/octocat/Aspis-bio"),
 		).toBe(true);
 		expect(
-			isLikelyGithubRepoUrl("https://github.com/Saurias92/Aspis-bio.git"),
+			isLikelyGithubRepoUrl("https://github.com/octocat/Aspis-bio.git"),
 		).toBe(true);
 		expect(
-			isLikelyGithubRepoUrl("git@github.com:Saurias92/Aspis-bio.git"),
+			isLikelyGithubRepoUrl("git@github.com:octocat/Aspis-bio.git"),
 		).toBe(true);
 		expect(
-			isLikelyGithubRepoUrl("ssh://git@github.com/Saurias92/Aspis-bio.git"),
+			isLikelyGithubRepoUrl("ssh://git@github.com/octocat/Aspis-bio.git"),
 		).toBe(true);
-		expect(isLikelyGithubRepoUrl("http://github.com/Saurias92/Aspis-bio")).toBe(
+		expect(isLikelyGithubRepoUrl("http://github.com/octocat/Aspis-bio")).toBe(
 			true,
 		);
 	});

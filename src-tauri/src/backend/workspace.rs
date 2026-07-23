@@ -3030,15 +3030,15 @@ mod tests {
         let root = temp_root("git-scan");
         init_git_repo(
             &root.join("aspis-lab"),
-            "https://github.com/Saurias92/aspis-lab.git",
+            "https://github.com/octocat/aspis-lab.git",
         );
         init_git_repo(
             &root.join(".claude").join("worktrees").join("shadow"),
-            "https://github.com/Saurias92/shadow.git",
+            "https://github.com/octocat/shadow.git",
         );
         init_git_repo(
             &root.join("nested").join(".codex").join("scratch"),
-            "https://github.com/Saurias92/scratch.git",
+            "https://github.com/octocat/scratch.git",
         );
 
         let repos = scan_git_repos(&root).expect("git repo scan");

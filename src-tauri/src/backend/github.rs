@@ -377,18 +377,18 @@ mod tests {
     #[test]
     fn github_repo_parser_accepts_common_remote_shapes() {
         assert_eq!(
-            parse_github_repo("https://github.com/Saurias92/Aspis-bio.git"),
-            Some(("Saurias92".into(), "Aspis-bio".into()))
+            parse_github_repo("https://github.com/octocat/Aspis-bio.git"),
+            Some(("octocat".into(), "Aspis-bio".into()))
         );
         assert_eq!(
-            parse_github_repo("git@github.com:Saurias92/Aspis-bio.git"),
-            Some(("Saurias92".into(), "Aspis-bio".into()))
+            parse_github_repo("git@github.com:octocat/Aspis-bio.git"),
+            Some(("octocat".into(), "Aspis-bio".into()))
         );
         assert_eq!(
-            parse_github_repo("ssh://git@github.com/Saurias92/Aspis-bio.git"),
-            Some(("Saurias92".into(), "Aspis-bio".into()))
+            parse_github_repo("ssh://git@github.com/octocat/Aspis-bio.git"),
+            Some(("octocat".into(), "Aspis-bio".into()))
         );
-        assert!(parse_github_repo("https://evil.example/Saurias92/Aspis-bio").is_none());
+        assert!(parse_github_repo("https://evil.example/octocat/Aspis-bio").is_none());
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn github_error_sanitizer_preserves_non_token_text() {
         // Plain prose and github.com URLs without a token survive intact.
-        let msg = "Could not reach https://github.com/Saurias92/Aspis-bio.git (timeout)";
+        let msg = "Could not reach https://github.com/octocat/Aspis-bio.git (timeout)";
         assert_eq!(sanitize_error(msg), msg);
     }
 }

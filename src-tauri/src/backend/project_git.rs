@@ -2658,8 +2658,8 @@ mod tests {
         assert!(super::super::github::parse_github_repo("ftp://github.com/o/r").is_none());
         assert!(super::super::github::parse_github_repo("not a url").is_none());
         assert_eq!(
-            super::super::github::parse_github_repo("https://github.com/Saurias92/Aspis-bio.git"),
-            Some(("Saurias92".into(), "Aspis-bio".into()))
+            super::super::github::parse_github_repo("https://github.com/octocat/Aspis-bio.git"),
+            Some(("octocat".into(), "Aspis-bio".into()))
         );
     }
 
@@ -2667,8 +2667,8 @@ mod tests {
     fn plain_clone_url_carries_no_credentials() {
         // The URL handed to `git clone` is rebuilt from validated segments and must
         // NEVER contain userinfo (no `user:token@`) — the PAT goes via GIT_ASKPASS.
-        let url = plain_clone_url("Saurias92", "Aspis-bio");
-        assert_eq!(url, "https://github.com/Saurias92/Aspis-bio.git");
+        let url = plain_clone_url("octocat", "Aspis-bio");
+        assert_eq!(url, "https://github.com/octocat/Aspis-bio.git");
         assert!(
             !url.contains('@'),
             "clone URL must not embed userinfo: {url}"
@@ -3101,16 +3101,16 @@ mod tests {
     #[test]
     fn github_origin_parser_accepts_common_remote_shapes() {
         assert_eq!(
-            github_web_url_from_origin("https://github.com/Saurias92/Aspis-bio.git"),
-            Some("https://github.com/Saurias92/Aspis-bio".into())
+            github_web_url_from_origin("https://github.com/octocat/Aspis-bio.git"),
+            Some("https://github.com/octocat/Aspis-bio".into())
         );
         assert_eq!(
-            github_web_url_from_origin("git@github.com:Saurias92/Aspis-bio.git"),
-            Some("https://github.com/Saurias92/Aspis-bio".into())
+            github_web_url_from_origin("git@github.com:octocat/Aspis-bio.git"),
+            Some("https://github.com/octocat/Aspis-bio".into())
         );
         assert_eq!(
-            github_web_url_from_origin("ssh://git@github.com/Saurias92/Aspis-bio.git"),
-            Some("https://github.com/Saurias92/Aspis-bio".into())
+            github_web_url_from_origin("ssh://git@github.com/octocat/Aspis-bio.git"),
+            Some("https://github.com/octocat/Aspis-bio".into())
         );
     }
 
@@ -3123,9 +3123,9 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         fs::write(
             inventory.join("git-repos.csv"),
-            "\"Path\",\"Name\",\"Branch\",\"Origin\",\"DirtyCount\",\"GitSize\"\n\"C:\\\\outside\",\"outside\",\"main\",\"https://github.com/Saurias92/outside.git\",\"0\",\"\"\n\"".to_string()
+            "\"Path\",\"Name\",\"Branch\",\"Origin\",\"DirtyCount\",\"GitSize\"\n\"C:\\\\outside\",\"outside\",\"main\",\"https://github.com/octocat/outside.git\",\"0\",\"\"\n\"".to_string()
                 + &repo.to_string_lossy().replace('"', "\"\"")
-                + "\",\"aspis-lab\",\"feature/work\",\"https://github.com/Saurias92/Aspis-bio.git\",\"3\",\"\"\n",
+                + "\",\"aspis-lab\",\"feature/work\",\"https://github.com/octocat/Aspis-bio.git\",\"3\",\"\"\n",
         )
         .unwrap();
 
@@ -3158,7 +3158,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/Saurias92/Aspis-bio.git",
+                "https://github.com/octocat/Aspis-bio.git",
             ])
             .current_dir(&root)
             .status();
@@ -3172,7 +3172,7 @@ mod tests {
         assert!(status.is_github);
         assert_eq!(
             status.github_url.as_deref(),
-            Some("https://github.com/Saurias92/Aspis-bio")
+            Some("https://github.com/octocat/Aspis-bio")
         );
         assert_eq!(status.dirty_count, 1);
         assert_eq!(status.untracked_count, 1);
