@@ -65,6 +65,7 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "censor_dispose",
     "visual_check",
     "design_request",
+    "design_result",
 ];
 
 #[derive(Clone)]
@@ -542,6 +543,23 @@ pub struct DesignRequestArgs {
     /// Iterate: refine the project's CURRENT design. Ignored when `refine_from` is set.
     #[serde(default)]
     pub refine: Option<bool>,
+    /// wait=false returns {directiveId, status} immediately (poll design_result). Default
+    /// (true) blocks a bounded grace then returns the result OR a running body to poll.
+    #[serde(default)]
+    pub wait: Option<bool>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DesignResultArgs {
+    pub agent_id: String,
+    pub role: String,
+    /// The directiveId returned by design_request.
+    pub directive_id: String,
+    /// wait=true (default) blocks a bounded grace for the terminal result; wait=false reads once.
+    #[serde(default)]
+    pub wait: Option<bool>,
     #[serde(default)]
     pub session_token: Option<String>,
 }
@@ -1452,7 +1470,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Orchestrator/coder: ask the DESIGNER AI to generate OR iterate a UI screen. To ITERATE on an existing design, pass refine_from=<registryId from a prior result> (or refine=true for the project's current design) with the change to apply. Returns design path + registry id. Outcome paths validated (relative only, F-02-013). Fail-closed if designer offline."
+        description = "Orchestrator/coder: ask the DESIGNER AI to generate OR iterate a UI screen. Generation takes ~1min: this returns the finished design (designProjectPath + registryId) if it completes within a short grace, otherwise a NON-error {directiveId, status:'running'} — then call design_result(directive_id) to collect the registryId (do NOT re-call design_request, that makes a NEW design). To ITERATE on an existing design, pass refine_from=<registryId> (or refine=true for the project's current design) with the change to apply. wait=false returns the directiveId immediately. Outcome paths validated (relative only, F-02-013)."
     )]
     pub async fn design_request(
         &self,
@@ -1471,10 +1489,37 @@ impl DevbouleMcp {
                 args.frame.as_deref(),
                 args.refine_from.as_deref(),
                 args.refine,
+                args.wait,
             )
         })
         .await
         .map_err(|e| internal(format!("design_request join: {e}")))?
+        .map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Collect the outcome of a design_request by its directiveId (mirrors mini_coder_result). Returns designProjectPath + registryId once the design is generated, or {directiveId, status:'running'} to poll again. Use this after design_request returns status:'running'/'pending' to obtain the registryId, then call design_request(refine_from=<registryId>) to iterate."
+    )]
+    pub async fn design_result(
+        &self,
+        Parameters(args): Parameters<DesignResultArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = tokio::task::spawn_blocking(move || {
+            let projects = resolve_projects_dir();
+            design_visual::design_result(
+                &projects,
+                &args.agent_id,
+                &args.role,
+                args.session_token.as_deref(),
+                &args.directive_id,
+                args.wait,
+            )
+        })
+        .await
+        .map_err(|e| internal(format!("design_result join: {e}")))?
         .map_err(tool_err)?;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),

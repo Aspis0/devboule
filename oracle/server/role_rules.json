@@ -49,6 +49,7 @@
         "censor_dispose",
         "visual_check",
         "design_request",
+        "design_result",
         "spawn_mini_coder",
         "steer_mini_coder",
         "mini_coder_result",
@@ -118,7 +119,8 @@
         "plan_submit",
         "plan_status",
         "ask_user",
-        "design_request"
+        "design_request",
+        "design_result"
       ],
       "forbidden": [
         "NEVER writes files directly: it has NO filesystem write/mutation tool; EVERY code change goes through spawn_main_coder (the Main coder). NEVER call spawn_mini_coder, steer_mini_coder, or mini_coder_result \u2014 those tools are Main-coder-only (the Main coder owns minis).",

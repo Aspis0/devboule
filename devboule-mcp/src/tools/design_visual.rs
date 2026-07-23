@@ -35,6 +35,24 @@ const VISUAL_CHECK_MAX_HTML_PATH_CHARS: usize = 1024;
 const DESIGN_REQUEST_POLL_TIMEOUT_SECS: f64 = 300.0;
 const DESIGN_REQUEST_POLL_INTERVAL_SECS: f64 = 2.0;
 
+/// Synchronous grace: the MOST a single `design_request` / `design_result` call blocks
+/// before returning a non-error `{directiveId, status:"running"}` body. Kept well under
+/// the agent's MCP client request timeout (~60s for pi) so a slow design generation never
+/// surfaces as a transport `-32001 Request timed out` that loses the directiveId. On expiry
+/// we DO NOT stamp the directive — the frontend watcher is still generating; the agent
+/// collects the outcome later with `design_result`. Env-overridable (tests set 0).
+/// 20s stays under common MCP client request timeouts (pi ~30s) with margin for the
+/// last poll read + lock contention.
+const DESIGN_SYNC_GRACE_SECS: f64 = 20.0;
+
+/// Absolute abandonment ceiling: if a directive has aged past this since `createdAt`
+/// WITHOUT completing, `design_result` / `design_request` stamp a synthesized `timeout`
+/// so the agent gets a definitive terminal result instead of polling `running` forever.
+/// This is the backstop the frontend watcher can't guarantee (app closed / model stall /
+/// generation hang mid-flight). Mirrors mini_coder's timeout stamp, but time-based rather
+/// than tied to a single blocking call. Env-overridable.
+const DESIGN_ABANDON_CEILING_SECS: f64 = 300.0;
+
 const VISUAL_TERMINAL: &[&str] = &["done", "failed", "timeout"];
 
 fn env_f64(keys: &[&str], default: f64) -> f64 {
@@ -69,17 +87,6 @@ fn visual_poll_interval() -> f64 {
     )
 }
 
-fn design_poll_timeout() -> f64 {
-    env_f64(
-        &[
-            "DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS",
-            "ASPIS_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS",
-        ],
-        DESIGN_REQUEST_POLL_TIMEOUT_SECS,
-    )
-    .min(DESIGN_REQUEST_POLL_TIMEOUT_SECS)
-}
-
 fn design_poll_interval() -> f64 {
     env_f64(
         &[
@@ -88,6 +95,165 @@ fn design_poll_interval() -> f64 {
         ],
         DESIGN_REQUEST_POLL_INTERVAL_SECS,
     )
+}
+
+fn design_sync_grace() -> f64 {
+    env_f64(
+        &[
+            "DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS",
+            "ASPIS_MCP_DESIGN_SYNC_GRACE_SECS",
+        ],
+        DESIGN_SYNC_GRACE_SECS,
+    )
+    .min(DESIGN_REQUEST_POLL_TIMEOUT_SECS)
+}
+
+fn design_abandon_ceiling() -> f64 {
+    env_f64(
+        &[
+            "DEVBOULE_MCP_DESIGN_ABANDON_CEILING_SECS",
+            "ASPIS_MCP_DESIGN_ABANDON_CEILING_SECS",
+        ],
+        DESIGN_ABANDON_CEILING_SECS,
+    )
+}
+
+/// Read the full design directive object by id (or None if absent). Used for ownership +
+/// age checks that `directive_result` (status/result only) does not expose.
+fn read_design_directive(projects_dir: &Path, directive_id: &str) -> Option<Value> {
+    let read: ToolResult<Option<Value>> = with_agents_lock(projects_dir, || {
+        let state = read_agents_state(projects_dir)?;
+        let list = state
+            .get("designRequestDirectives")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list
+            .into_iter()
+            .find(|d| d.get("id").and_then(|v| v.as_str()) == Some(directive_id)))
+    });
+    read.unwrap_or(None)
+}
+
+/// True when the directive was created more than `ceiling_secs` ago (RFC3339 `createdAt`).
+/// Fails safe to `false` on a missing/unparseable timestamp (never falsely abandons).
+fn directive_age_exceeds(directive: &Value, ceiling_secs: f64) -> bool {
+    let created = directive
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match chrono::DateTime::parse_from_rfc3339(created) {
+        Ok(dt) => {
+            let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+            age.num_seconds() as f64 > ceiling_secs
+        }
+        Err(_) => false,
+    }
+}
+
+/// After the sync grace expires without a terminal result: if the directive has aged past
+/// the abandonment ceiling, stamp a synthesized `timeout` (so a hung/abandoned generation
+/// resolves definitively instead of polling `running` forever) and return that terminal
+/// body; otherwise return the non-error "still working" body to poll again.
+fn finalize_or_running(projects_dir: &Path, directive_id: &str) -> Value {
+    if let Some(dir) = read_design_directive(projects_dir, directive_id) {
+        let terminal_status = dir
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "done" | "failed" | "timeout"))
+            .unwrap_or(false);
+        if !terminal_status && directive_age_exceeds(&dir, design_abandon_ceiling()) {
+            let synthesized = json!({
+                "status": "timeout",
+                "error": "design generation did not complete within the expected window (the app may have closed or the model stalled). Re-issue design_request.",
+            });
+            stamp_terminal_if_needed(
+                projects_dir,
+                "designRequestDirectives",
+                directive_id,
+                &synthesized,
+            );
+            // The watcher may have raced us to a real result; prefer it.
+            let (_, _, result) =
+                directive_result(projects_dir, "designRequestDirectives", directive_id);
+            return design_tool_result(directive_id, result.as_ref().unwrap_or(&synthesized))
+                .unwrap_or_else(|_| {
+                    json!({ "directiveId": directive_id, "error": "design generation timed out." })
+                });
+        }
+    }
+    design_running_body(projects_dir, directive_id)
+}
+
+/// Poll the design directive until it reaches a terminal outcome or `deadline` passes.
+/// Returns `Some(terminal tool result)` when the directive is done/failed/timeout (or
+/// vanished after being seen); `None` if still pending/running at the deadline. NEVER
+/// stamps the directive — the frontend watcher owns completion; the agent re-polls via
+/// `design_result`. Runs inside `spawn_blocking` at the call sites.
+fn poll_design_terminal(
+    projects_dir: &Path,
+    directive_id: &str,
+    deadline: Instant,
+) -> ToolResult<Option<Value>> {
+    let mut seen = false;
+    loop {
+        let (present, status, result) =
+            directive_result(projects_dir, "designRequestDirectives", directive_id);
+        if let Some(result) = result {
+            return Ok(Some(design_tool_result(directive_id, &result)?));
+        }
+        if present {
+            seen = true;
+            let st = status.trim().to_ascii_lowercase();
+            if matches!(st.as_str(), "done" | "failed" | "timeout") {
+                // Terminal status without a result payload — synthesize a terminal body.
+                let syn = json!({
+                    "status": st,
+                    "error": format!("design ended with status '{st}' without a result payload."),
+                });
+                return Ok(Some(design_tool_result(directive_id, &syn)?));
+            }
+        } else if seen {
+            return Ok(Some(json!({
+                "directiveId": directive_id,
+                "error": "design directive vanished before producing a result.",
+            })));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_secs_f64(design_poll_interval()));
+    }
+}
+
+/// Non-terminal "still working" body returned when the sync grace expires. Distinguishes
+/// a not-yet-claimed directive (app maybe offline) from one actively generating, and tells
+/// the agent to collect the outcome via `design_result` (which carries the registryId).
+fn design_running_body(projects_dir: &Path, directive_id: &str) -> Value {
+    let (present, status, _) =
+        directive_result(projects_dir, "designRequestDirectives", directive_id);
+    let st = status.trim().to_ascii_lowercase();
+    let (report, note) = if !present {
+        (
+            "not_found".to_string(),
+            "design directive not found (evicted?) — re-issue design_request.".to_string(),
+        )
+    } else if st == "pending" {
+        (
+            "pending".to_string(),
+            "design not yet claimed by the app — if this persists the Devboule design executor may be offline. Call design_result to keep polling.".to_string(),
+        )
+    } else {
+        (
+            "running".to_string(),
+            "design still generating — call design_result with this directiveId to collect the registryId, then design_request(refine_from=<registryId>) to iterate.".to_string(),
+        )
+    };
+    json!({
+        "directiveId": directive_id,
+        "status": report,
+        "note": note,
+    })
 }
 
 /// F-02-013 — design outcome path must be relative project path only.
@@ -557,6 +723,7 @@ pub fn design_request(
     frame: Option<&str>,
     refine_from: Option<&str>,
     refine: Option<bool>,
+    wait: Option<bool>,
 ) -> ToolResult<Value> {
     let (agent_id, role) =
         require_agent_tool(projects_dir, agent_id, role, "design_request", session_token)?;
@@ -649,54 +816,81 @@ pub fn design_request(
         Ok(())
     })?;
 
-    let deadline = Instant::now() + Duration::from_secs_f64(design_poll_timeout());
-    let mut seen = false;
-    let mut ever_ran = false;
-    loop {
-        let (present, status, result) =
-            directive_result(projects_dir, "designRequestDirectives", &directive_id);
-        if let Some(result) = result {
-            return design_tool_result(&directive_id, &result);
-        }
-        if present {
-            seen = true;
-            if status == "running" {
-                ever_ran = true;
-            }
-        } else if seen {
-            return Ok(json!({
-                "directiveId": directive_id,
-                "error": "directive vanished",
-            }));
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_secs_f64(design_poll_interval()));
+    // wait=false → return the directiveId immediately (poll with design_result). Interactive
+    // designs take ~1min to generate; blocking the whole tool call for that long trips the
+    // agent's MCP client request timeout (-32001) and LOSES the directiveId, which blocks the
+    // iterate loop (the agent can't get the registryId to refine). Mirrors spawn_mini_coder.
+    if wait == Some(false) {
+        return Ok(json!({
+            "directiveId": directive_id,
+            "status": "pending",
+            "note": "design queued — call design_result with this directiveId to collect the registryId, then design_request(refine_from=<registryId>) to iterate.",
+        }));
     }
+    // wait=true: block only a bounded grace (well under the client timeout). If the design
+    // finishes in time, return the full result; otherwise return a non-error running body so
+    // the agent collects the outcome via design_result. NEVER stamp the directive here.
+    let deadline = Instant::now() + Duration::from_secs_f64(design_sync_grace());
+    if let Some(terminal) = poll_design_terminal(projects_dir, &directive_id, deadline)? {
+        return Ok(terminal);
+    }
+    Ok(finalize_or_running(projects_dir, &directive_id))
+}
 
-    let synthesized = if ever_ran {
-        json!({
-            "status": "timeout",
-            "error": "design_request timed out waiting for the designer.",
-        })
+/// Collect the outcome of a `design_request` by its directiveId (mirrors
+/// `mini_coder_result`). `wait=true` (default) blocks a bounded grace then returns the
+/// terminal result (`designProjectPath` + `registryId`, or an error) or a non-error
+/// `{directiveId, status:"running"}` body to poll again. `wait=false` does a single read.
+/// NEVER stamps the directive — the frontend watcher owns completion.
+pub fn design_result(
+    projects_dir: &Path,
+    agent_id: &str,
+    role: &str,
+    session_token: Option<&str>,
+    directive_id: &str,
+    wait: Option<bool>,
+) -> ToolResult<Value> {
+    let (agent_id, _role) =
+        require_agent_tool(projects_dir, agent_id, role, "design_result", session_token)?;
+    // require_agent_tool does not reject a `closed` session (only launch_pending); mirror the
+    // explicit live-session gate design_request applies so a stale-but-tokened session can't read.
+    require_live_session(projects_dir, &agent_id, "design_result")?;
+    let directive_id = directive_id.trim();
+    if directive_id.is_empty() {
+        return Err(ToolError::new("design_result requires a directiveId."));
+    }
+    if directive_id.len() > 128 || directive_id.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return Err(ToolError::new("design_result directiveId is malformed."));
+    }
+    // Ownership fail-closed (mirrors mini_coder_result HIGH #3): only the agent that queued
+    // the directive may collect its result (registryId / designProjectPath). A missing owner
+    // or a foreign owner is denied; an unknown id reports not_found (no leak).
+    match read_design_directive(projects_dir, directive_id) {
+        None => {
+            return Ok(json!({ "directiveId": directive_id, "status": "not_found" }));
+        }
+        Some(dir) => {
+            let owner = dir
+                .get("parentAgentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if owner.is_empty() || owner != agent_id {
+                return Err(ToolError::new(
+                    "design directive is not owned by this agent.",
+                ));
+            }
+        }
+    }
+    let deadline = if wait == Some(false) {
+        Instant::now()
     } else {
-        json!({
-            "status": "failed",
-            "error": "design executor did not start this request within the poll window.",
-        })
+        Instant::now() + Duration::from_secs_f64(design_sync_grace())
     };
-    stamp_terminal_if_needed(
-        projects_dir,
-        "designRequestDirectives",
-        &directive_id,
-        &synthesized,
-    );
-    let (_, _, result) = directive_result(projects_dir, "designRequestDirectives", &directive_id);
-    design_tool_result(
-        &directive_id,
-        result.as_ref().unwrap_or(&synthesized),
-    )
+    if let Some(terminal) = poll_design_terminal(projects_dir, directive_id, deadline)? {
+        return Ok(terminal);
+    }
+    Ok(finalize_or_running(projects_dir, directive_id))
 }
 
 // silence unused helper in some builds
@@ -808,9 +1002,12 @@ mod tests {
     }
 
     #[test]
-    fn design_request_fail_closed_without_executor() {
+    fn design_request_returns_pending_without_executor() {
+        // With no app executor claiming the directive, the bounded grace expires and the
+        // tool returns a NON-error {directiveId, status:"pending"} body (never a transport
+        // timeout that loses the id). The agent polls design_result to collect the outcome.
         let _g = env_lock();
-        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS", "0");
+        std::env::set_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS", "0");
         std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS", "0");
         let (_tmp, projects) = temp_projects();
         let tok = register(&projects, "orch-des", "orchestrator");
@@ -825,11 +1022,151 @@ mod tests {
             Some("web"),
             None,
             None,
+            None,
         )
         .unwrap();
-        assert!(out.get("error").is_some(), "{out}");
-        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS");
+        assert!(out.get("error").is_none(), "should not error: {out}");
+        assert_eq!(out.get("status").and_then(|v| v.as_str()), Some("pending"), "{out}");
+        assert!(out.get("directiveId").and_then(|v| v.as_str()).is_some(), "{out}");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS");
         std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS");
+    }
+
+    #[test]
+    fn design_request_wait_false_returns_directive_id_immediately() {
+        let _g = env_lock();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "orch-nowait", "orchestrator");
+        let out = design_request(
+            &projects,
+            "orch-nowait",
+            "orchestrator",
+            Some(&tok),
+            "A landing page",
+            None,
+            Some("interactive"),
+            None,
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(out.get("status").and_then(|v| v.as_str()), Some("pending"), "{out}");
+        let id = out.get("directiveId").and_then(|v| v.as_str()).expect("directiveId");
+        // The directive is queued and collectable via design_result (single read → running/pending).
+        let res = design_result(&projects, "orch-nowait", "orchestrator", Some(&tok), id, Some(false)).unwrap();
+        assert!(
+            res.get("status").and_then(|v| v.as_str()).is_some(),
+            "design_result should report a status: {res}"
+        );
+    }
+
+    #[test]
+    fn design_result_reads_completed_directive() {
+        // Simulate the watcher completing the design: stamp a done result on the directive,
+        // then design_result must return the registryId (the payload the agent needs to refine).
+        let _g = env_lock();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "orch-res", "orchestrator");
+        let out = design_request(
+            &projects, "orch-res", "orchestrator", Some(&tok),
+            "A hero", None, Some("interactive"), None, None, None, Some(false),
+        )
+        .unwrap();
+        let id = out["directiveId"].as_str().unwrap().to_string();
+        // Frontend watcher completes it: set status=done + result on the directive.
+        with_agents_lock(&projects, || {
+            let mut state = read_agents_state(&projects)?;
+            let list = state
+                .as_object_mut()
+                .and_then(|o| o.get_mut("designRequestDirectives"))
+                .and_then(|v| v.as_array_mut())
+                .unwrap();
+            for d in list.iter_mut() {
+                if d.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+                    let obj = d.as_object_mut().unwrap();
+                    obj.insert("status".into(), json!("done"));
+                    obj.insert(
+                        "result".into(),
+                        json!({"status":"done","designProjectPath":".aspis-design/x","registryId":"reg-99"}),
+                    );
+                }
+            }
+            write_agents_state(&projects, state)?;
+            Ok::<(), ToolError>(())
+        })
+        .unwrap();
+        let res = design_result(&projects, "orch-res", "orchestrator", Some(&tok), &id, Some(false)).unwrap();
+        assert_eq!(res.get("registryId").and_then(|v| v.as_str()), Some("reg-99"), "{res}");
+        assert_eq!(res.get("designProjectPath").and_then(|v| v.as_str()), Some(".aspis-design/x"), "{res}");
+    }
+
+    #[test]
+    fn design_result_stamps_timeout_after_abandon_ceiling() {
+        // A directive that never completes and has aged past the abandonment ceiling must
+        // resolve to a definitive `timeout` (not poll `running` forever).
+        let _g = env_lock();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "orch-old", "orchestrator");
+        let out = design_request(
+            &projects, "orch-old", "orchestrator", Some(&tok),
+            "A hero", None, Some("interactive"), None, None, None, Some(false),
+        )
+        .unwrap();
+        let id = out["directiveId"].as_str().unwrap().to_string();
+        // Backdate createdAt so it is well past the ceiling, and mark it running (claimed but
+        // never completed — simulating a hung generation / closed app).
+        with_agents_lock(&projects, || {
+            let mut state = read_agents_state(&projects)?;
+            let list = state
+                .as_object_mut()
+                .and_then(|o| o.get_mut("designRequestDirectives"))
+                .and_then(|v| v.as_array_mut())
+                .unwrap();
+            for d in list.iter_mut() {
+                if d.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+                    let obj = d.as_object_mut().unwrap();
+                    obj.insert("createdAt".into(), json!("2020-01-01T00:00:00Z"));
+                    obj.insert("status".into(), json!("running"));
+                }
+            }
+            write_agents_state(&projects, state)?;
+            Ok::<(), ToolError>(())
+        })
+        .unwrap();
+        // wait=false → grace deadline is now; finalize_or_running sees the aged directive.
+        let res = design_result(&projects, "orch-old", "orchestrator", Some(&tok), &id, Some(false)).unwrap();
+        assert_eq!(res.get("error").is_some() || res.get("status").and_then(|v| v.as_str()) == Some("timeout") || res.get("status").is_none(), true, "should be terminal: {res}");
+        // The directive must now carry a terminal result on disk (no longer stuck running).
+        let dir = read_design_directive(&projects, &id).unwrap();
+        let st = dir.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(matches!(st, "timeout" | "failed" | "done"), "stamped terminal, got {st}");
+    }
+
+    #[test]
+    fn design_result_rejects_foreign_owner() {
+        let _g = env_lock();
+        let (_tmp, projects) = temp_projects();
+        let tok_a = register(&projects, "orch-a", "orchestrator");
+        let tok_b = register(&projects, "orch-b", "orchestrator");
+        let out = design_request(
+            &projects, "orch-a", "orchestrator", Some(&tok_a),
+            "A hero", None, Some("interactive"), None, None, None, Some(false),
+        )
+        .unwrap();
+        let id = out["directiveId"].as_str().unwrap();
+        // orch-b must NOT be able to collect orch-a's design result.
+        let err = design_result(&projects, "orch-b", "orchestrator", Some(&tok_b), id, Some(false)).unwrap_err();
+        assert!(err.message.contains("not owned"), "{}", err.message);
+    }
+
+    #[test]
+    fn design_result_rejected_for_verifier() {
+        let _g = env_lock();
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "ver-res", "verifier");
+        let err = design_result(&projects, "ver-res", "verifier", Some(&tok), "abc123", Some(false)).unwrap_err();
+        assert!(err.message.contains("cannot use"), "{}", err.message);
     }
 
     #[test]
@@ -858,6 +1195,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.message.contains("cannot use"), "{}", err.message);
@@ -879,6 +1217,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(err.message.contains("cannot use"), "{}", err.message);
@@ -887,7 +1226,7 @@ mod tests {
     #[test]
     fn design_request_directive_carries_refine_from() {
         let _g = env_lock();
-        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS", "0");
+        std::env::set_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS", "0");
         std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS", "0");
         let (_tmp, projects) = temp_projects();
         let tok = register(&projects, "orch-ref", "orchestrator");
@@ -903,6 +1242,7 @@ mod tests {
             None,
             Some("reg-abc"),
             Some(true),
+            None,
         )
         .unwrap();
         let state = read_agents_state(&projects).unwrap();
@@ -914,14 +1254,14 @@ mod tests {
         let d = dirs.last().expect("one directive queued");
         assert_eq!(d.get("refineFrom").and_then(|v| v.as_str()), Some("reg-abc"));
         assert!(d.get("refine").is_none(), "refineFrom must suppress bare refine");
-        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS");
         std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS");
     }
 
     #[test]
     fn design_request_directive_carries_bare_refine() {
         let _g = env_lock();
-        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS", "0");
+        std::env::set_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS", "0");
         std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS", "0");
         let (_tmp, projects) = temp_projects();
         let tok = register(&projects, "orch-ref2", "orchestrator");
@@ -936,6 +1276,7 @@ mod tests {
             None,
             None,
             Some(true),
+            None,
         )
         .unwrap();
         let state = read_agents_state(&projects).unwrap();
@@ -947,7 +1288,7 @@ mod tests {
         let d = dirs.last().expect("one directive queued");
         assert_eq!(d.get("refine").and_then(|v| v.as_bool()), Some(true));
         assert!(d.get("refineFrom").is_none());
-        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_SYNC_GRACE_SECS");
         std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS");
     }
 }
