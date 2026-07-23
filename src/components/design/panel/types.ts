@@ -42,21 +42,21 @@ export interface AssistantMessage {
 export const MAX_MESSAGES = 200;
 
 /** One design provider's display metadata, keyed by the REAL backend kind. Mirrors
- *  the prototype's DESIGN_PROVIDERS shape (data.jsx) but covers all FIVE kinds the
- *  Rust boundary accepts (the prototype only mocked four). */
+ *  the prototype's DESIGN_PROVIDERS shape (data.jsx) and covers the kinds the Rust
+ *  boundary accepts for interactive pick. */
 export interface DesignProviderMeta {
   id: DesignLlmBackendKind;
   name: string;
   desc: string;
-  badge: "MCP" | "LOCAL" | "API";
+  badge: "MCP" | "LOCAL" | "API" | "CLOUD";
   icon: LucideIcon;
   /** Fields this kind REQUIRES to form a valid backend (validated by validateDesignBackend).
    *  Used to detect "switching to a kind the saved config can't satisfy yet". */
   needs: Array<"model" | "command" | "baseUrl">;
 }
 
-/** All five design providers, in popover order. Labels/descriptions match the
- *  Settings card copy + the prototype's badges (CLI=MCP, HTTP=LOCAL, api=API). */
+/** Design providers in popover order. Labels/descriptions match the Settings card
+ *  copy + badges (CLI=MCP, HTTP local=LOCAL, api=API, cloud=CLOUD). */
 export const DESIGN_PROVIDERS: readonly DesignProviderMeta[] = [
   {
     id: "claude",
@@ -88,6 +88,14 @@ export const DESIGN_PROVIDERS: readonly DesignProviderMeta[] = [
     desc: "Local HTTP · streams live",
     badge: "LOCAL",
     icon: Cpu,
+    needs: ["model", "baseUrl"],
+  },
+  {
+    id: "cloud",
+    name: "Cloud (OpenRouter)",
+    desc: "HTTPS cloud · streams live",
+    badge: "CLOUD",
+    icon: Sparkles,
     needs: ["model", "baseUrl"],
   },
   {

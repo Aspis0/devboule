@@ -336,7 +336,7 @@ describe("validateDesignBackend", () => {
 		});
 	});
 
-	it("exposes exactly the six backend kinds (incl. claude + openai)", () => {
+	it("exposes exactly the seven backend kinds (incl. claude + openai + cloud)", () => {
 		expect([...DESIGN_BACKEND_KINDS]).toEqual([
 			"ollama",
 			"api",
@@ -344,6 +344,7 @@ describe("validateDesignBackend", () => {
 			"openai",
 			"claude",
 			"omlx",
+			"cloud",
 		]);
 	});
 
@@ -494,6 +495,52 @@ describe("validateDesignBackend", () => {
 					omlxDraft("qwen coder", "http://localhost:8000/v1"),
 				).errors.model,
 			).toBeTruthy();
+		});
+	});
+
+	// -- Cloud (OpenRouter / public https) --------------------------------
+	describe("cloud", () => {
+		function cloudDraft(model: string, baseUrl: string) {
+			return { kind: "cloud" as const, model, command: "dropped", baseUrl };
+		}
+
+		it("accepts valid model + https public base and drops command", () => {
+			const v = validateDesignBackend(
+				cloudDraft("  openrouter/auto  ", "  https://openrouter.ai/api/v1/  "),
+			);
+			expect(v.ok).toBe(true);
+			expect(v.value).toEqual({
+				kind: "cloud",
+				model: "openrouter/auto",
+				baseUrl: "https://openrouter.ai/api/v1",
+			});
+		});
+
+		it("requires a model", () => {
+			expect(
+				validateDesignBackend(cloudDraft("", "https://openrouter.ai/api/v1"))
+					.errors.model,
+			).toBeTruthy();
+		});
+
+		it("requires a base URL", () => {
+			expect(
+				validateDesignBackend(cloudDraft("openrouter/auto", "")).errors.baseUrl,
+			).toBeTruthy();
+		});
+
+		it("rejects loopback and http base URLs", () => {
+			for (const bad of [
+				"http://openrouter.ai/api/v1",
+				"http://localhost:8000/v1",
+				"https://localhost:8000/v1",
+				"https://127.0.0.1:8000/v1",
+			]) {
+				expect(
+					validateDesignBackend(cloudDraft("openrouter/auto", bad)).errors
+						.baseUrl,
+				).toBeTruthy();
+			}
 		});
 	});
 });

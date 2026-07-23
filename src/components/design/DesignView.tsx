@@ -102,7 +102,7 @@ const MANIFEST_WRITE_THROTTLE_MS = 400;
  * MCP config; they must NEVER receive a pre-fetched Oracle grounding BLOCK in the
  * prompt, because the chunk text is untrusted target source and a CLI provider
  * could be steered by an injected instruction into `codex exec` etc. Grounding is
- * pre-fetched ONLY for the in-process HTTP providers (ollama/omlx). This is the
+ * pre-fetched ONLY for the in-process HTTP providers (ollama/omlx/cloud). This is the
  * authoritative gate, applied at EVERY point a prompt is built (generate + repair).
  */
 const CLI_BACKEND_KINDS = new Set(["claude", "codex", "api"]);
@@ -237,7 +237,34 @@ const SPOT_PREFIX = "Spot edit (region selection): ";
 const SPOT_AUTODETECT =
   "Fix off-token colors, contrast and spacing inconsistencies in this section; return the same element.";
 
-export function DesignView() {
+/** localStorage key for a one-shot "open this folder" intent (set by ProjectsView
+ * "Open in Design", consumed once on DesignView mount). Separate from lastFolder
+ * so a failed open does not permanently clobber the user's last project. */
+const FOLDER_TO_OPEN_KEY = "devboule.design.folderToOpen";
+
+/**
+ * One-shot in-memory intent: open this working-folder path when DesignView next mounts.
+ * Prefer `setDesignFolderToOpen` from same-bundle callers; ProjectsView uses the
+ * localStorage key above so it does not eagerly import this lazy module.
+ */
+let pendingDesignFolderToOpen: string | null = null;
+
+/** Request that DesignView load `path` on its next mount / prop update. */
+export function setDesignFolderToOpen(path: string | null): void {
+  const trimmed = path?.trim() ?? "";
+  pendingDesignFolderToOpen = trimmed || null;
+}
+
+export type DesignViewProps = {
+  /**
+   * When set, load THIS working folder instead of the cold-start last-folder restore.
+   * Takes precedence over module-level pending intent and localStorage intents.
+   * Leave unset/null for normal cold-start restore behaviour.
+   */
+  folderToOpen?: string | null;
+};
+
+export function DesignView({ folderToOpen = null }: DesignViewProps = {}) {
   const [project, setProject] = useState<DesignProject>(() => buildDemoProject());
   const [folder, setFolder] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -1095,12 +1122,52 @@ export function DesignView() {
     [loadFolder],
   );
 
-  // BUGFIX (P0): restore the LAST-OPENED project on cold start so Design isn't empty every launch.
-  // Keyed on a persisted last-folder (written by loadFolder on a successful open), NOT on "the
-  // registry has entries" — so merely having known projects never force-opens one. Guarded by
-  // folderRef so it can't clobber a project the user already opened (or a deep-link).
+  // Open-intent + cold-start restore.
+  // 1) Explicit request wins (prop `folderToOpen` → in-memory pending → localStorage
+  //    one-shot key). This is the "Open in Design" path from the planner StageDesign panel.
+  // 2) Otherwise restore the LAST-OPENED project from localStorage so Design isn't empty
+  //    every launch. Keyed on a persisted last-folder (written by loadFolder), NOT on "the
+  //    registry has entries". Guarded by folderRef so it can't clobber a project the user
+  //    already opened — except when an explicit request targets a different folder.
   useEffect(() => {
-    if (!tauri || folderRef.current) return;
+    if (!tauri) return;
+
+    let requested =
+      (folderToOpen && folderToOpen.trim()) || pendingDesignFolderToOpen || null;
+    if (!requested) {
+      try {
+        requested = localStorage.getItem(FOLDER_TO_OPEN_KEY);
+        if (requested) localStorage.removeItem(FOLDER_TO_OPEN_KEY);
+      } catch {
+        requested = null;
+      }
+    } else {
+      // Consume the in-memory intent; also clear any stale one-shot key.
+      pendingDesignFolderToOpen = null;
+      try {
+        localStorage.removeItem(FOLDER_TO_OPEN_KEY);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (requested) {
+      const path = requested.trim();
+      if (path) {
+        // Skip only if we already have THIS folder open (avoid reload loops).
+        if (
+          folderRef.current &&
+          normFolderKey(folderRef.current) === normFolderKey(path)
+        ) {
+          return;
+        }
+        void loadFolder(path);
+        return;
+      }
+      // Empty intent — fall through to last-folder restore.
+    }
+
+    if (folderRef.current) return;
     let saved: string | null = null;
     try {
       saved = localStorage.getItem("devboule.design.lastFolder");
@@ -1108,9 +1175,9 @@ export function DesignView() {
       saved = null;
     }
     if (saved) void loadFolder(saved);
-    // Run once on mount; loadFolder is a stable useCallback.
+    // loadFolder is a stable useCallback; re-run when an explicit folderToOpen arrives.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tauri]);
+  }, [tauri, folderToOpen]);
 
   // Consolidate the whole design project to disk. Returns TRUE on a successful save,
   // FALSE on any failure (no folder or backend error). The hand-off packaging flow
@@ -1525,7 +1592,10 @@ export function DesignView() {
       try {
         const backendKind = await readBackendKind();
         const folderPath = folderRef.current.trim();
-        const isHttpProvider = backendKind === "ollama" || backendKind === "omlx";
+        const isHttpProvider =
+          backendKind === "ollama" ||
+          backendKind === "omlx" ||
+          backendKind === "cloud";
         const cli = isCliBackend(backendKind);
 
         const tokenNames = cli ? [] : tokenNamesForPrompt(tokensRef.current);

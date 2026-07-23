@@ -126,26 +126,29 @@ export interface MiniCoderBackend {
 // with (Settings → Workspace). A SUPERSET of MiniCoderBackend's non-Apple kinds plus
 // "claude" (the user's Claude Code subscription via
 // `claude -p --output-format text`, one-shot, rides local auth — no API key). "claude"
-// mirrors "codex": optional model, no command/baseUrl. Persisted in config.json under
-// `designLlmBackend`; absent means no design provider is configured. See the mini-coder
-// validator notes for the shared per-kind rules; "claude" is validated like "codex".
+// mirrors "codex": optional model, no command/baseUrl. "cloud" is the OpenRouter-style
+// HTTPS OpenAI-compatible endpoint (model + public https baseUrl required; key in vault).
+// Persisted in config.json under `designLlmBackend`; absent means no design provider is
+// configured. See the mini-coder validator notes for the shared per-kind rules.
 export type DesignLlmBackendKind =
 	| "ollama"
 	| "api"
 	| "codex"
 	| "openai"
 	| "claude"
-	| "omlx";
+	| "omlx"
+	| "cloud";
 
 export interface DesignLlmBackend {
 	kind: DesignLlmBackendKind;
-	// Model tag/name. Required for "ollama"/"omlx", optional for "codex", unused for "api".
+	// Model tag/name. Required for "ollama"/"omlx"/"cloud", optional for "codex", unused for "api".
 	model?: string;
-	// The CLI command line. Required for "api"; unused for "ollama"/"codex"/"omlx".
+	// The CLI command line. Required for "api"; unused for "ollama"/"codex"/"omlx"/"cloud".
 	command?: string;
-	// The oMLX server base URL (loopback http only, e.g. http://localhost:8000/v1).
-	// Required for "omlx"; unused for the other kinds. Stored normalized (no trailing
-	// slash) so `<baseUrl>/chat/completions` never double-slashes.
+	// HTTP base URL. For "omlx": loopback http only (e.g. http://localhost:8000/v1).
+	// For "cloud": public https host (e.g. https://openrouter.ai/api/v1). Required for
+	// those kinds; unused otherwise. Stored normalized (no trailing slash) so
+	// `<baseUrl>/chat/completions` never double-slashes.
 	baseUrl?: string;
 	// Reasoning-effort knob ("low" | "medium" | "high"), owned by the composer's model
 	// popover (NOT the Settings card). Only the codex path maps it to a CLI flag; other

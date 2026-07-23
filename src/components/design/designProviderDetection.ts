@@ -120,8 +120,10 @@ export function buildProviderStatusMap(
 		}
 	}
 
-	// `api` is always configurable — never gate it on detection.
+	// `api` and `cloud` are always configurable — never gate them on local detection
+	// (cloud needs a vault key + model/URL, not a CLI/server on PATH).
 	map.api = { ...map.api, available: true };
+	map.cloud = { ...map.cloud, available: true };
 	return map;
 }
 
@@ -134,6 +136,7 @@ const BASE_LABELS: Record<DesignLlmBackendKind, string> = {
 	ollama: "Ollama (local model)",
 	omlx: "oMLX (local MLX server)",
 	api: "API CLI (your command)",
+	cloud: "Cloud (OpenRouter)",
 };
 
 export function baseLabel(kind: DesignLlmBackendKind): string {
@@ -145,6 +148,7 @@ export function baseLabel(kind: DesignLlmBackendKind): string {
 // it is always "configurable". Pure; never throws.
 export function availabilityLabel(status: ProviderStatus): string {
 	if (status.kind === "api") return "configure a command";
+	if (status.kind === "cloud") return "configure model + API key";
 	if (!status.available) return "not found";
 	// HTTP providers: prefer a model-count hint when models were discovered.
 	if (status.kind === "ollama" || status.kind === "omlx") {

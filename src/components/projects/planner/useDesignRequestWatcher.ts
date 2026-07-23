@@ -48,7 +48,13 @@ export function useDesignRequestWatcher(
             continue;
           }
 
+          // Absolute folder for generation + registry (on-disk writes need a real path).
           const workingFolderPath = `${projectRoot}/.aspis-design/${d.id}`;
+          // Outcome path must be RELATIVE to the project root: `validate_design_outcome_path`
+          // rejects absolute paths (security: stored outcome must stay under the project).
+          // Passing the absolute `workingFolderPath` here used to fail validation → complete
+          // was swallowed → directive never Done → orchestrator MCP poll timed out (-32001).
+          const designProjectPath = `.aspis-design/${d.id}`;
           const name = (d.prompt || 'Design').slice(0, 60);
           // Legacy directives without a `mode` field default to 'static' (backward compat).
           const mode = d.mode ?? 'static';
@@ -64,7 +70,12 @@ export function useDesignRequestWatcher(
             // The design is SAVED + REGISTERED now. Stamp the directive done (best-effort:
             // may race with the Python timeout write-back — harmless) and ALWAYS refresh the
             // Stage, because the design exists in the registry regardless of the directive.
-            await invokeBackendCommand('design_request_complete', { directiveId: d.id, designProjectPath: workingFolderPath, registryId, error: null }).catch(() => {});
+            await invokeBackendCommand('design_request_complete', {
+              directiveId: d.id,
+              designProjectPath,
+              registryId,
+              error: null,
+            }).catch(() => {});
             if (!aborted) onCompletedRef.current();
           } catch (e) {
             await invokeBackendCommand('design_request_complete', {

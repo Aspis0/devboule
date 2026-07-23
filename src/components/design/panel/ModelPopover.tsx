@@ -2,10 +2,10 @@
 //
 // Mirrors panel.jsx's ModelPopover but wired to the REAL global design-LLM backend
 // (get/set_design_llm_backend). It edits three things:
-//   - PROVIDER (kind): all five backend kinds. Picking a kind PRESERVES any
-//     model/command/baseUrl already saved for that kind, then validates the result;
-//     an invalid backend (kind needs a field the saved config lacks) is NOT saved —
-//     the selection shows visually + an inline note links to Settings.
+//   - PROVIDER (kind): design backend kinds (incl. Cloud/OpenRouter). Picking a kind
+//     PRESERVES any model/command/baseUrl already saved for that kind, then validates
+//     the result; an invalid backend (kind needs a field the saved config lacks) is NOT
+//     saved — the selection shows visually + an inline note links to Settings.
 //   - EFFORT: Low|Medium|High, persisted lowercase.
 //   - TIMEOUT: 60–600s slider, persisted on release (change-end), not every tick.
 //

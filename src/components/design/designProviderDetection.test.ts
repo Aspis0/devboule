@@ -21,14 +21,15 @@ const status = (over: Partial<ProviderStatus>): ProviderStatus => ({
 });
 
 describe("buildProviderStatusMap", () => {
-	it("returns an all-unavailable map (except api) for null/undefined input", () => {
+	it("returns an all-unavailable map (except api + cloud) for null/undefined input", () => {
 		const map = buildProviderStatusMap(null);
 		expect(map.claude.available).toBe(false);
 		expect(map.codex.available).toBe(false);
 		expect(map.ollama.available).toBe(false);
 		expect(map.omlx.available).toBe(false);
-		// api is always configurable.
+		// api + cloud are always configurable (no local CLI/server to detect).
 		expect(map.api.available).toBe(true);
+		expect(map.cloud.available).toBe(true);
 		expect(buildProviderStatusMap(undefined).codex.available).toBe(false);
 	});
 
@@ -102,11 +103,18 @@ describe("labels", () => {
 		expect(baseLabel("claude")).toBe("Claude (subscription)");
 		expect(baseLabel("codex")).toBe("Codex (subscription)");
 		expect(baseLabel("openai")).toBe("OpenAI (API)");
+		expect(baseLabel("cloud")).toBe("Cloud (OpenRouter)");
 	});
 
 	it("availabilityLabel: api is always configurable", () => {
 		expect(availabilityLabel(status({ kind: "api", available: true }))).toBe(
 			"configure a command",
+		);
+	});
+
+	it("availabilityLabel: cloud is always configurable", () => {
+		expect(availabilityLabel(status({ kind: "cloud", available: true }))).toBe(
+			"configure model + API key",
 		);
 	});
 

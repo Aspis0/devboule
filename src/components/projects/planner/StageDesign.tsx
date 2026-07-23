@@ -4,7 +4,9 @@ import { generateAndRegisterDesign } from '../../design/generation/generateAndRe
 import { ArtifactView } from '../artifact/ArtifactView';
 import { ArtifactFrame } from '../artifact/ArtifactFrame';
 import { inferFrameKind } from '../artifact/frameHeuristic';
-import type { ArtifactKind, ArtifactFrameKind } from '../../../types/design';
+import { sanitizeNodeMarkup } from '../../design/sanitize';
+import { invokeBackendCommand } from '../../../context/AppContext';
+import type { ArtifactKind, ArtifactFrameKind, DesignProject } from '../../../types/design';
 
 interface StageDesignProps {
   design: {
@@ -20,6 +22,8 @@ interface StageDesignProps {
     artifactId?: string;
     /** Phase 4: device-frame skin stored on the registry entry. Absent ⇒ inferred. */
     frame?: ArtifactFrameKind;
+    /** Absolute working-folder path — used for the static inline preview (design_load_project). */
+    workingFolderPath?: string;
   } | null;
   linkedTask: number | null;
   onOpenInDesign: () => void;
@@ -55,6 +59,9 @@ const FRAME_OPTIONS: { value: ArtifactFrameKind | ''; label: string }[] = [
   { value: 'web', label: 'Browser' },
   { value: 'component', label: 'Component' },
 ];
+
+/** Virtual design width used to lay out static preview markup before fit-to-panel scale. */
+const DESIGN_PREVIEW_WIDTH = 1280;
 
 export const StageDesign: React.FC<StageDesignProps> = ({
   design,
@@ -100,6 +107,83 @@ export const StageDesign: React.FC<StageDesignProps> = ({
     localArtifactId ??
     (design?.kind === 'interactive' ? design.artifactId : undefined) ??
     null;
+
+  // Static-design inline preview: load component markup when we have a working
+  // folder but no interactive artifact and no thumbnail (orchestrator default is
+  // static; preview.png is never written for those). Best-effort — any load/parse
+  // error falls through to the empty state; never throws.
+  const [staticPreviewSrcDoc, setStaticPreviewSrcDoc] = useState<string | null>(null);
+  // Preview panel size for fit-to-width scaling of the static design iframe.
+  const [previewBox, setPreviewBox] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const previewBodyRef = useRef<HTMLDivElement>(null);
+  const staticPreviewFolder = design?.workingFolderPath ?? null;
+  // Need preview when: design present, no interactive artifact open-path, no thumbnail.
+  const needsStaticPreview =
+    !!design &&
+    !artifactId &&
+    !design.thumbnailUri &&
+    !!staticPreviewFolder;
+
+  useEffect(() => {
+    if (!needsStaticPreview || !staticPreviewFolder) {
+      setStaticPreviewSrcDoc(null);
+      return;
+    }
+    let mounted = true;
+    void (async () => {
+      try {
+        const loaded = await invokeBackendCommand<DesignProject>('design_load_project', {
+          workingFolderPath: staticPreviewFolder,
+        });
+        if (!mounted || !loaded?.components) return;
+        // Prefer meta.nodeOrder; fall back to object key order of components.
+        const order =
+          loaded.meta?.nodeOrder?.length > 0
+            ? loaded.meta.nodeOrder
+            : Object.keys(loaded.components);
+        const parts: string[] = [];
+        for (const id of order) {
+          const raw = loaded.components[id];
+          if (!raw) continue;
+          const clean = sanitizeNodeMarkup(raw);
+          if (clean.trim()) parts.push(clean);
+        }
+        if (!mounted) return;
+        if (parts.length === 0) {
+          setStaticPreviewSrcDoc(null);
+          return;
+        }
+        // Minimal document: markup already carries inline styles. Sandboxed iframe
+        // (no allow-scripts) so this stays a read-only preview.
+        const body = parts.join('\n');
+        setStaticPreviewSrcDoc(
+          `<!doctype html><html><head><meta charset="utf-8"/><style>
+html,body{margin:0;padding:8px;background:#fff;font-family:system-ui,sans-serif}
+body{box-sizing:border-box}
+*{box-sizing:border-box}
+</style></head><body>${body}</body></html>`,
+        );
+      } catch {
+        if (mounted) setStaticPreviewSrcDoc(null);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [needsStaticPreview, staticPreviewFolder]);
+
+  // Measure the body panel so the static preview can be scaled to fit width.
+  useEffect(() => {
+    const el = previewBodyRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const measure = () => {
+      setPreviewBox({ w: el.clientWidth, h: el.clientHeight });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Effective frame kind for ArtifactFrame:
   //   1. Explicit user pick from the frame selector dropdown (frameInput !== '')
@@ -438,6 +522,12 @@ export const StageDesign: React.FC<StageDesignProps> = ({
     wordBreak: 'break-word',
   };
 
+  // Fit-to-width scale for the static design preview (never upscale).
+  const previewScale =
+    previewBox.w > 0 ? Math.min(1, previewBox.w / DESIGN_PREVIEW_WIDTH) : 1;
+  const previewIframeHeight =
+    previewBox.h > 0 && previewScale > 0 ? previewBox.h / previewScale : 900;
+
   return (
     <div className="pp-view-enter" style={rootStyle}>
       {/* TOP ROW — Generate affordance (Phase 3) */}
@@ -541,7 +631,7 @@ export const StageDesign: React.FC<StageDesignProps> = ({
           </div>
 
           {/* BODY */}
-          <div style={bodyStyle}>
+          <div ref={previewBodyRef} style={bodyStyle}>
             {showArtifact && artifactId ? (
               <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
                 {/* Phase 4: wrap in the correct device-frame skin. Fixed-dimension skins
@@ -563,6 +653,34 @@ export const StageDesign: React.FC<StageDesignProps> = ({
                 alt={design.name}
                 style={imgStyle}
               />
+            ) : staticPreviewSrcDoc ? (
+              // Static design: live sanitized markup preview (orchestrator default).
+              // Rendered at DESIGN_PREVIEW_WIDTH then scale()-d to fit the panel width.
+              // Sandbox with NO allow-scripts — read-only preview of node HTML.
+              <div
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  overflowX: 'hidden',
+                  overflowY: 'auto',
+                  position: 'relative',
+                }}
+              >
+                <iframe
+                  title={`Preview: ${design?.name ?? 'design'}`}
+                  srcDoc={staticPreviewSrcDoc}
+                  sandbox=""
+                  style={{
+                    width: DESIGN_PREVIEW_WIDTH + 'px',
+                    height: previewIframeHeight + 'px',
+                    transform: 'scale(' + previewScale + ')',
+                    transformOrigin: 'top left',
+                    border: 'none',
+                    background: '#fff',
+                    display: 'block',
+                  }}
+                />
+              </div>
             ) : (
               <div style={emptyStateStyle}>
                 <ImageOff size={28} color="#C9BEA9" />

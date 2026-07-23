@@ -230,6 +230,19 @@ mod tests {
     #[test]
     fn validate_design_outcome_path_rejects_escapes() {
         assert!(validate_design_outcome_path("designs/foo").is_ok());
+        // Watcher / complete path: relative under project root (the real completion path).
+        assert!(
+            validate_design_outcome_path(".aspis-design/req-abc123").is_ok(),
+            "in-root .aspis-design/<id> relative path must be accepted"
+        );
+        assert!(
+            validate_design_outcome_path(".aspis-design/../escape").is_err(),
+            "traversal via .. under .aspis-design must be rejected"
+        );
+        assert!(
+            validate_design_outcome_path("/Users/me/proj/.aspis-design/req-1").is_err(),
+            "absolute paths must still be rejected (caller must pass project-relative)"
+        );
         assert!(validate_design_outcome_path("/etc/passwd").is_err());
         assert!(validate_design_outcome_path("~/secrets").is_err());
         assert!(validate_design_outcome_path("a/../../b").is_err());

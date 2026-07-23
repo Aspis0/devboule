@@ -356,6 +356,9 @@ export function ProjectsView() {
 		frame?: import("../../types/design").ArtifactFrameKind;
 		/** OPTIONAL linked plan-task number (1-based). Absent ⇒ unlinked. */
 		linkedTaskN?: number;
+		/** Absolute working-folder path of the registry entry — used by "Open in Design"
+		 *  (loadFolder) and by StageDesign's static inline preview. */
+		workingFolderPath?: string;
 	} | null>(null);
 	// Bumped when a design-request the watcher fulfilled completes, to re-run the design
 	// load effect so the freshly-generated design surfaces in the Stage Design view (P-B L5).
@@ -1494,6 +1497,8 @@ export function ProjectsView() {
 						frame: entry.frame,
 						// OPTIONAL link to a plan task (1-based number). Absent ⇒ unlinked.
 						linkedTaskN: entry.linkedTaskN,
+						// Absolute on-disk working folder — "Open in Design" + static StageDesign preview.
+						workingFolderPath: entry.workingFolderPath,
 					});
 				}
 			} catch {
@@ -3962,7 +3967,28 @@ export function ProjectsView() {
 						linkedTask={plannerDesign?.linkedTaskN ?? null}
 						projectRoot={currentProject?.metadata.rootPath ?? null}
 						onGenerated={onPlannerDesignGenerated}
-						onOpenInDesign={() => requestView("design")}
+						onOpenInDesign={() => {
+							// Hand the generated design's working folder to DesignView so it
+							// loads THAT project instead of the last-folder / demo default.
+							// One-shot key (preferred) + lastFolder (StrictMode/remount-safe
+							// fallback) — avoids eagerly importing the lazy DesignView module.
+							const folder = plannerDesign?.workingFolderPath?.trim();
+							if (folder) {
+								try {
+									localStorage.setItem(
+										"devboule.design.folderToOpen",
+										folder,
+									);
+									localStorage.setItem(
+										"devboule.design.lastFolder",
+										folder,
+									);
+								} catch {
+									/* localStorage unavailable — DesignView cold-start has nothing */
+								}
+							}
+							requestView("design");
+						}}
 						messages={plannerConvoLive}
 						awaitingReply={plannerAwaitingReply}
 						banner={plannerBanner}

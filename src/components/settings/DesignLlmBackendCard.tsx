@@ -166,14 +166,16 @@ export function DesignLlmBackendCard() {
 	const showModelError =
 		(kind === "ollama" ||
 			kind === "omlx" ||
-			((kind === "codex" || kind === "openai") && model.length > 0)) &&
+			kind === "cloud" ||
+			((kind === "codex" || kind === "openai" || kind === "claude") &&
+				model.length > 0)) &&
 		Boolean(validation.errors.model);
 	// The api command is REQUIRED, so surface its error even when empty (mirroring the
 	// required ollama model) — otherwise an empty command just greys Save with no reason.
 	const showCommandError = kind === "api" && Boolean(validation.errors.command);
-	// The omlx base URL is REQUIRED, so surface its error even when empty.
+	// The omlx/cloud base URL is REQUIRED, so surface its error even when empty.
 	const showBaseUrlError =
-		kind === "omlx" && Boolean(validation.errors.baseUrl);
+		(kind === "omlx" || kind === "cloud") && Boolean(validation.errors.baseUrl);
 
 	const save = useCallback(
 		async (next: DesignLlmBackend | null) => {
@@ -350,7 +352,8 @@ export function DesignLlmBackendCard() {
 				kind === "codex" ||
 				kind === "openai" ||
 				kind === "claude" ||
-				kind === "omlx" ? (
+				kind === "omlx" ||
+				kind === "cloud" ? (
 					<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 						Model{" "}
 						{kind === "codex" || kind === "openai" || kind === "claude"
@@ -374,7 +377,9 @@ export function DesignLlmBackendCard() {
 										? "gpt-5-codex"
 										: kind === "claude"
 											? "claude-sonnet-4-5"
-											: "qwen2.5-coder"
+											: kind === "cloud"
+												? "openrouter/auto"
+												: "qwen2.5-coder"
 							}
 							maxLength={DESIGN_MODEL_MAX_LENGTH}
 							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
@@ -410,13 +415,17 @@ export function DesignLlmBackendCard() {
 					</label>
 				)}
 
-				{kind === "omlx" ? (
+				{kind === "omlx" || kind === "cloud" ? (
 					<label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 						Base URL
 						<input
 							value={baseUrl}
 							onChange={(event) => setBaseUrl(event.target.value)}
-							placeholder="http://localhost:8000/v1"
+							placeholder={
+								kind === "cloud"
+									? "https://openrouter.ai/api/v1"
+									: "http://localhost:8000/v1"
+							}
 							maxLength={DESIGN_BASE_URL_MAX_LENGTH}
 							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 						/>
@@ -434,6 +443,15 @@ export function DesignLlmBackendCard() {
 						127.0.0.1 or [::1]). The design module POSTs the prompt — which may
 						carry file context — to this server, so a non-loopback host is
 						refused to keep your code on this machine.
+					</p>
+				) : null}
+
+				{kind === "cloud" ? (
+					<p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
+						HTTPS OpenAI-compatible cloud endpoint (OpenRouter). The design
+						module streams the prompt off this machine — that is intentional.
+						The API key is read from the vault (Settings → Providers); it is
+						never stored in this config.
 					</p>
 				) : null}
 

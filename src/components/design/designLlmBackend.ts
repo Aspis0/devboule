@@ -15,6 +15,7 @@ import {
 	MINI_COMMAND_MAX_LENGTH,
 	MINI_MODEL_MAX_LENGTH,
 	MODEL_PATTERN,
+	validateCloudBaseUrl,
 	validateMiniBackend,
 	validateOmlxBaseUrl,
 	type MiniBackendDraft,
@@ -83,13 +84,15 @@ export function validateDesignTimeoutSecs(
 export {
 	MODEL_PATTERN,
 	validateOmlxBaseUrl,
+	validateCloudBaseUrl,
 	MINI_MODEL_MAX_LENGTH as DESIGN_MODEL_MAX_LENGTH,
 	MINI_COMMAND_MAX_LENGTH as DESIGN_COMMAND_MAX_LENGTH,
 	MINI_BASE_URL_MAX_LENGTH as DESIGN_BASE_URL_MAX_LENGTH,
 };
 
-// The design backend kinds. SUPERSET of MINI_BACKEND_KINDS: adds "claude" (validated like
-// "codex" — optional model only). The mini-coder card does NOT offer "claude".
+// The design backend kinds. SUPERSET of the mini shared kinds: adds "claude" (validated
+// like "codex" — optional model only) and "cloud" (HTTPS OpenRouter-style; model + public
+// baseUrl required). The mini-coder card does NOT offer "claude".
 export const DESIGN_BACKEND_KINDS: readonly DesignLlmBackendKind[] = [
 	"ollama",
 	"api",
@@ -97,14 +100,15 @@ export const DESIGN_BACKEND_KINDS: readonly DesignLlmBackendKind[] = [
 	"openai",
 	"claude",
 	"omlx",
+	"cloud",
 ] as const;
 
 export interface DesignBackendDraft {
 	kind: DesignLlmBackendKind;
 	model: string;
 	command: string;
-	// The oMLX base URL field. Required+validated only for kind "omlx"; treated as "" when
-	// absent.
+	// HTTP base URL. Required+validated for "omlx" (loopback http) and "cloud" (public
+	// https); treated as "" when absent.
 	baseUrl?: string;
 	// OPTIONAL generation knobs owned by the composer's model popover (NOT the Settings
 	// card). When present they are validated + carried through to the normalized value;
@@ -203,11 +207,44 @@ export function validateDesignBackend(
 		};
 	}
 
-	if ((draft.kind as string) === "cloud") {
+	// Cloud (OpenRouter-style HTTPS): model + public https baseUrl required. API key is
+	// vault-only (not part of this draft). Mirrors local_coder/mini cloud validation.
+	if (draft.kind === "cloud") {
+		const errors: DesignBackendValidation["errors"] = {};
+		const model = (draft.model ?? "").trim();
+		const baseUrl = (draft.baseUrl ?? "").trim();
+		let normalizedBaseUrl: string | null = null;
+
+		if (model.length === 0) {
+			errors.model = "Enter the Cloud model tag (e.g. openrouter/auto).";
+		} else if (model.length > MINI_MODEL_MAX_LENGTH) {
+			errors.model = `Model must be at most ${MINI_MODEL_MAX_LENGTH} characters.`;
+		} else if (!MODEL_PATTERN.test(model)) {
+			errors.model = "Model must be a bare tag (letters, digits, . _ : / -).";
+		}
+
+		if (baseUrl.length === 0) {
+			errors.baseUrl =
+				"Enter the Cloud base URL (e.g. https://openrouter.ai/api/v1).";
+		} else if (baseUrl.length > MINI_BASE_URL_MAX_LENGTH) {
+			errors.baseUrl = `Base URL must be at most ${MINI_BASE_URL_MAX_LENGTH} characters.`;
+		} else {
+			normalizedBaseUrl = validateCloudBaseUrl(baseUrl);
+			if (normalizedBaseUrl === null) {
+				errors.baseUrl =
+					"Base URL must be an https public host (e.g. https://openrouter.ai/api/v1) — not loopback, not an IP.";
+			}
+		}
+
+		const baseValue: DesignLlmBackend | null =
+			Object.keys(errors).length === 0 && normalizedBaseUrl !== null
+				? { kind: "cloud", model, baseUrl: normalizedBaseUrl }
+				: null;
+		const knobs = applyEffortAndTimeout(draft, baseValue);
 		return {
-			ok: false,
-			errors: { kind: "Cloud API is not supported for Design LLM." },
-			value: null,
+			ok: Object.keys(errors).length === 0 && knobs.ok && knobs.value !== null,
+			errors: { ...errors, ...knobs.errors },
+			value: knobs.value,
 		};
 	}
 

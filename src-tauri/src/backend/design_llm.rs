@@ -1,16 +1,18 @@
 //! Design-LLM backend config (Phase 2 STEP 1) — the single global LLM provider the
 //! generative-design module generates node markup with.
 //!
-//! This is a 1:1 MIRROR of the mini-coder backend (`backend::mini_coder::MiniCoderBackend`):
-//! the SAME four provider kinds (`ollama`/`api`/`codex`/`omlx`), the SAME per-field shape
+//! This is a 1:1 MIRROR of the mini-coder backend (`backend::mini_coder::MiniCoderBackend`)
+//! for the shared kinds (`ollama`/`api`/`codex`/`omlx`/`cloud`), the SAME per-field shape
 //! (camelCase `kind`/`model?`/`command?`/`baseUrl?`), and the SAME per-kind validation
 //! rules. To guarantee the two NEVER drift, the validator here does NOT re-implement any
 //! primitive: it reuses the mini-coder's `pub(crate)` helpers
 //! ([`is_valid_model`](super::mini_coder::is_valid_model),
 //! [`is_forbidden_command_char`](super::mini_coder::is_forbidden_command_char),
 //! [`validate_omlx_base_url`](super::mini_coder::validate_omlx_base_url)) and the shared
-//! length caps. The ONLY thing that differs is the user-facing error wording ("design"
-//! instead of "mini-coder"); the accept/reject SET is byte-for-byte identical.
+//! cloud URL validator
+//! ([`validate_cloud_base_url`](super::local_coder::validate_cloud_base_url)). The ONLY
+//! thing that differs is the user-facing error wording ("design" instead of "mini-coder");
+//! the accept/reject SET is byte-for-byte identical for the shared kinds.
 //!
 //! Persisted in config.json under `designLlmBackend`; absent means no design provider is
 //! configured (later generation steps then fail cleanly). NOTHING here streams or
@@ -25,8 +27,9 @@ use super::mini_coder::{
 use serde::{Deserialize, Serialize};
 
 /// The kind of runtime the design LLM runs on. A 1:1 mirror of
-/// [`super::mini_coder::MiniCoderBackendKind`]; snake/lower over the wire to match the TS
-/// `DesignLlmBackendKind` and the config.json discriminator exactly.
+/// [`super::mini_coder::MiniCoderBackendKind`] for the shared kinds, plus design-only
+/// `claude`/`openai`; snake/lower over the wire to match the TS `DesignLlmBackendKind`
+/// and the config.json discriminator exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DesignLlmBackendKind {
@@ -51,6 +54,12 @@ pub enum DesignLlmBackendKind {
     /// `base_url` REQUIRED; `command` is unused. The base URL is constrained to a LOOPBACK
     /// http origin (http only; privacy: the prompt never leaves the device).
     Omlx,
+    /// An HTTPS OpenAI-compatible cloud endpoint (OpenRouter). `model` AND `base_url`
+    /// REQUIRED; `command` is unused. The base URL must be a PUBLIC https host (validated
+    /// by [`super::local_coder::validate_cloud_base_url`]). The API key lives in the vault
+    /// (`provider:cloud_llm` / per-role), never on this config struct — it is read at
+    /// stream time and sent as `Authorization: Bearer`.
+    Cloud,
 }
 
 /// The single, global design-LLM backend config persisted in config.json under
@@ -65,16 +74,17 @@ pub enum DesignLlmBackendKind {
 #[serde(rename_all = "camelCase")]
 pub struct DesignLlmBackend {
     pub kind: DesignLlmBackendKind,
-    /// Model tag/name. Required for `ollama`/`omlx`, optional for `codex`, unused for `api`.
+    /// Model tag/name. Required for `ollama`/`omlx`/`cloud`, optional for `codex`, unused for `api`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The CLI command line. Required for `api`; unused for `ollama`/`codex`/`omlx`.
+    /// The CLI command line. Required for `api`; unused for `ollama`/`codex`/`omlx`/`cloud`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// The oMLX server base URL (e.g. `http://localhost:8000/v1`). Required for `omlx`;
-    /// unused for the other kinds. Validated to a LOOPBACK http origin (http only) and
-    /// STORED NORMALIZED (no trailing slash) via the shared
-    /// [`super::mini_coder::validate_omlx_base_url`].
+    /// HTTP base URL. For `omlx`: a LOOPBACK http origin (e.g. `http://localhost:8000/v1`),
+    /// validated via [`super::mini_coder::validate_omlx_base_url`]. For `cloud`: a PUBLIC
+    /// https host (e.g. `https://openrouter.ai/api/v1`), validated via
+    /// [`super::local_coder::validate_cloud_base_url`]. Required for those kinds; unused
+    /// otherwise. Always STORED NORMALIZED (no trailing slash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Reasoning-effort knob applied to a generation. Accepts `"low"`/`"medium"`/`"high"`
@@ -321,6 +331,42 @@ pub fn validate_design_llm_backend(backend: &DesignLlmBackend) -> Result<DesignL
                 timeout_secs,
             })
         }
+        DesignLlmBackendKind::Cloud => {
+            // Cloud requires BOTH a model (bare tag, same rule as ollama/omlx) and a
+            // PUBLIC https base URL. `command` is ignored/dropped. API key is NOT a field
+            // here — it lives only in the vault and is read at stream time.
+            if model.is_empty() {
+                return Err("Cloud design backend requires a model tag.".into());
+            }
+            if model.len() > MINI_MODEL_MAX_LEN {
+                return Err(format!(
+                    "Design model must be at most {MINI_MODEL_MAX_LEN} characters."
+                ));
+            }
+            if !is_valid_model(&model) {
+                return Err("Design model must be a bare tag (letters, digits, . _ : / -).".into());
+            }
+            let base_url = backend
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if base_url.is_empty() {
+                return Err("Cloud design backend requires a base URL.".into());
+            }
+            // REUSE — not duplicate — the coder-side cloud URL validator (https public host,
+            // no loopback/IP/userinfo). Accept/reject set must match the other cloud surfaces.
+            let normalized_base = super::local_coder::validate_cloud_base_url(&base_url)?;
+            Ok(DesignLlmBackend {
+                kind: DesignLlmBackendKind::Cloud,
+                model: Some(model),
+                command: None,
+                base_url: Some(normalized_base),
+                effort,
+                timeout_secs,
+            })
+        }
     }
 }
 
@@ -342,6 +388,7 @@ mod tests {
             (DesignLlmBackendKind::Openai, "openai"),
             (DesignLlmBackendKind::Claude, "claude"),
             (DesignLlmBackendKind::Omlx, "omlx"),
+            (DesignLlmBackendKind::Cloud, "cloud"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));
             let back: DesignLlmBackendKind = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
@@ -772,6 +819,99 @@ mod tests {
             timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&overlong).is_err());
+    }
+
+    // -- Cloud (OpenRouter / public https) ----------------------------------
+
+    #[test]
+    fn cloud_accepts_valid_model_and_https_base_and_drops_command() {
+        let ok = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("  openrouter/auto  ".into()),
+            command: Some("dropped".into()),
+            base_url: Some("  https://openrouter.ai/api/v1/  ".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        let n = validate_design_llm_backend(&ok).unwrap();
+        assert_eq!(n.kind, DesignLlmBackendKind::Cloud);
+        assert_eq!(n.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(n.command, None); // command dropped for cloud
+        assert_eq!(
+            n.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1") // trailing slash normalized
+        );
+    }
+
+    #[test]
+    fn cloud_requires_model() {
+        let no_model = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: None,
+            command: None,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        assert!(validate_design_llm_backend(&no_model).is_err());
+
+        let empty_model = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("   ".into()),
+            command: None,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        assert!(validate_design_llm_backend(&empty_model).is_err());
+    }
+
+    #[test]
+    fn cloud_requires_base_url() {
+        let no_base = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            command: None,
+            base_url: None,
+            effort: None,
+            timeout_secs: None,
+        };
+        assert!(validate_design_llm_backend(&no_base).is_err());
+
+        let empty_base = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            command: None,
+            base_url: Some("   ".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        assert!(validate_design_llm_backend(&empty_base).is_err());
+    }
+
+    #[test]
+    fn cloud_rejects_loopback_and_http_base() {
+        // validate_cloud_base_url rejects loopback + cleartext http (TLS required).
+        for bad in [
+            "http://openrouter.ai/api/v1",   // http, not https
+            "http://localhost:8000/v1",      // loopback + http
+            "https://localhost:8000/v1",     // loopback even with https
+            "https://127.0.0.1:8000/v1",     // IP literal
+            "https://openrouter.ai@evil.com/v1", // userinfo trick
+        ] {
+            let b = DesignLlmBackend {
+                kind: DesignLlmBackendKind::Cloud,
+                model: Some("openrouter/auto".into()),
+                command: None,
+                base_url: Some(bad.into()),
+                effort: None,
+                timeout_secs: None,
+            };
+            assert!(
+                validate_design_llm_backend(&b).is_err(),
+                "Cloud base URL {bad:?} must be rejected"
+            );
+        }
     }
 
     // -- effort + timeout (A2) ----------------------------------------------

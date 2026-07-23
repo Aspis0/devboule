@@ -5,6 +5,7 @@ describe("providerMeta", () => {
   it("returns the matching provider metadata for a known kind", () => {
     expect(providerMeta("ollama").name).toBe("Ollama");
     expect(providerMeta("claude").name).toBe("Claude Code");
+    expect(providerMeta("cloud").name).toBe("Cloud (OpenRouter)");
   });
 
   it("returns an explicit 'Unknown provider' for an unknown/legacy kind (not the first entry)", () => {

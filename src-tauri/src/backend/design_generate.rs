@@ -495,9 +495,14 @@ pub async fn design_generate(
     let channel = design_stream_channel(&gen_id);
 
     let result = match backend.kind {
-        DesignLlmBackendKind::Ollama | DesignLlmBackendKind::Omlx => {
-            // Use the DEDICATED redirect-free, loopback-only client (NOT the shared
-            // BackendState.http which follows redirects) to keep the prompt on-box.
+        DesignLlmBackendKind::Ollama
+        | DesignLlmBackendKind::Omlx
+        | DesignLlmBackendKind::Cloud => {
+            // Use the DEDICATED redirect-free client (NOT the shared BackendState.http
+            // which follows redirects). For Ollama/Omlx this keeps the prompt on-box
+            // (loopback-only by config). For Cloud the user opted into off-box OpenRouter;
+            // redirects stay disabled so a 3xx cannot exfil the Bearer-auth'd prompt to
+            // a different host.
             run_http_stream(
                 &app,
                 gen_state.http_client(),
@@ -571,9 +576,10 @@ enum Outcome {
 // ---------------------------------------------------------------------------
 
 /// Resolve the OpenAI-compatible base URL for an HTTP backend. ollama uses the fixed
-/// loopback default; oMLX uses the config's already-validated (loopback+http, normalized)
-/// base. The returned base has NO trailing slash (the validator normalized oMLX; the
-/// ollama constant has none), so callers append `/chat/completions`.
+/// loopback default; oMLX and Cloud use the config's already-validated, normalized base
+/// (loopback+http for oMLX; public https for Cloud). The returned base has NO trailing
+/// slash (validators normalize; the ollama constant has none), so callers append
+/// `/chat/completions`.
 fn http_base_url(backend: &DesignLlmBackend) -> Result<String, String> {
     match backend.kind {
         DesignLlmBackendKind::Ollama => Ok(OLLAMA_OPENAI_BASE.to_string()),
@@ -581,17 +587,27 @@ fn http_base_url(backend: &DesignLlmBackend) -> Result<String, String> {
             .base_url
             .clone()
             .ok_or_else(|| "oMLX backend is missing its base URL.".to_string()),
+        DesignLlmBackendKind::Cloud => backend
+            .base_url
+            .clone()
+            .ok_or_else(|| "Cloud backend is missing its base URL.".to_string()),
         _ => Err("Not an HTTP backend.".into()),
     }
 }
 
-/// A clear "the local server isn't reachable" message for an HTTP backend. Names the
-/// provider and its loopback host:port (WITHOUT the `http://` scheme, so it survives
-/// `redact_error`'s URL scrub at the terminal-emit boundary). For ollama this is the fixed
-/// daemon address; for oMLX it is the configured base's authority.
+/// Whether the HTTP stream request must carry a Cloud API Bearer token from the vault.
+/// Pure: unit-tested so Ollama/Omlx never get a vault key attached by accident.
+fn http_stream_uses_cloud_auth(kind: DesignLlmBackendKind) -> bool {
+    matches!(kind, DesignLlmBackendKind::Cloud)
+}
+
+/// A clear "the server isn't reachable" message for an HTTP backend. Names the provider
+/// and its host:port (WITHOUT the scheme, so it survives `redact_error`'s URL scrub at the
+/// terminal-emit boundary). For ollama this is the fixed daemon address; for oMLX it is
+/// the configured loopback authority; for Cloud it is the user-chosen public host
+/// (expected — the user opted into cloud).
 fn http_unreachable_message(backend: &DesignLlmBackend, base: &str) -> String {
-    // Strip scheme + path, leaving host:port (e.g. "127.0.0.1:11434"). Loopback-only by
-    // config, so this never leaks an off-box host.
+    // Strip scheme + path, leaving host:port (e.g. "127.0.0.1:11434" or "openrouter.ai").
     let authority = base
         .split("://")
         .nth(1)
@@ -605,6 +621,9 @@ fn http_unreachable_message(backend: &DesignLlmBackend, base: &str) -> String {
         }
         DesignLlmBackendKind::Omlx => {
             format!("The oMLX server is not reachable at {authority} — is it running?")
+        }
+        DesignLlmBackendKind::Cloud => {
+            format!("Could not reach the cloud design provider at {authority}.")
         }
         _ => "Could not reach the design LLM server.".to_string(),
     }
@@ -642,21 +661,41 @@ async fn run_http_stream(
         stream: true,
     };
 
-    // `http` is the DEDICATED design client: redirects disabled (no off-box prompt exfil
-    // via a 3xx) and loopback-only by config. We do NOT use reqwest's per-request
-    // `.timeout()` here: in reqwest it bounds the WHOLE request INCLUDING the streamed body
-    // read, so it would kill a legitimate long generation. Instead we bound the headers
-    // wait with an explicit `tokio::time::timeout` (the client's connect_timeout covers the
-    // TCP connect), and bound the body with the per-chunk inactivity + overall wall-clock
-    // caps in the loop below.
-    let response = match tokio::time::timeout(
-        HTTP_INACTIVITY_TIMEOUT,
-        http.post(&url).json(&body).send(),
-    )
-    .await
-    {
-        // A connection error here is almost always "the local server isn't running" — name
-        // the provider + its loopback address so the user knows exactly what to start.
+    // `http` is the DEDICATED design client: redirects disabled (no 3xx exfil of the prompt
+    // — and for Cloud, of the Bearer token — to a different host). Ollama/Omlx are
+    // loopback-only by config; Cloud is an explicit public https host. We do NOT use
+    // reqwest's per-request `.timeout()` here: in reqwest it bounds the WHOLE request
+    // INCLUDING the streamed body read, so it would kill a legitimate long generation.
+    // Instead we bound the headers wait with an explicit `tokio::time::timeout` (the
+    // client's connect_timeout covers the TCP connect), and bound the body with the
+    // per-chunk inactivity + overall wall-clock caps in the loop below.
+    let mut request = http.post(&url).json(&body);
+    if http_stream_uses_cloud_auth(backend.kind) {
+        // Cloud only: vault Bearer key. Never log the key. Ollama/Omlx stay unauthenticated.
+        let key = match super::vault::read_cloud_llm_key_for_role("main") {
+            Ok(Some(k)) => {
+                let trimmed = k.trim();
+                if trimmed.is_empty() {
+                    return Err(
+                        "Cloud design backend needs a Cloud API key — set one in Settings → Providers."
+                            .into(),
+                    );
+                }
+                trimmed.to_string()
+            }
+            Ok(None) => {
+                return Err(
+                    "Cloud design backend needs a Cloud API key — set one in Settings → Providers."
+                        .into(),
+                );
+            }
+            Err(e) => return Err(e),
+        };
+        request = request.bearer_auth(key);
+    }
+    let response = match tokio::time::timeout(HTTP_INACTIVITY_TIMEOUT, request.send()).await {
+        // A connection error — name the provider + authority so the user knows what to start
+        // (local server) or check (cloud host/network).
         Ok(r) => r.map_err(|_| http_unreachable_message(backend, &base))?,
         Err(_) => return Err("The design LLM server did not respond.".into()),
     };
@@ -1827,12 +1866,20 @@ mod tests {
 
     #[test]
     fn build_cli_rejects_http_backends() {
-        for kind in [DesignLlmBackendKind::Ollama, DesignLlmBackendKind::Omlx] {
+        for kind in [
+            DesignLlmBackendKind::Ollama,
+            DesignLlmBackendKind::Omlx,
+            DesignLlmBackendKind::Cloud,
+        ] {
             let b = DesignLlmBackend {
                 kind,
                 model: Some("m".into()),
                 command: None,
-                base_url: Some("http://127.0.0.1:8000/v1".into()),
+                base_url: Some(if kind == DesignLlmBackendKind::Cloud {
+                    "https://openrouter.ai/api/v1".into()
+                } else {
+                    "http://127.0.0.1:8000/v1".into()
+                }),
                 effort: None,
                 timeout_secs: None,
             };
@@ -2004,6 +2051,43 @@ mod tests {
             timeout_secs: None,
         };
         assert_eq!(http_base_url(&b).unwrap(), "http://localhost:8000/v1");
+    }
+
+    #[test]
+    fn http_base_url_cloud_uses_configured_base() {
+        let b = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            command: None,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        assert_eq!(http_base_url(&b).unwrap(), "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn http_base_url_cloud_missing_base_errors() {
+        let b = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            command: None,
+            base_url: None,
+            effort: None,
+            timeout_secs: None,
+        };
+        assert!(http_base_url(&b).is_err());
+    }
+
+    #[test]
+    fn http_stream_uses_cloud_auth_only_for_cloud() {
+        assert!(http_stream_uses_cloud_auth(DesignLlmBackendKind::Cloud));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Ollama));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Omlx));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Api));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Codex));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Claude));
+        assert!(!http_stream_uses_cloud_auth(DesignLlmBackendKind::Openai));
     }
 
     // -- Cancellation registry --------------------------------------------------
@@ -2180,6 +2264,20 @@ mod tests {
         assert!(m.contains("oMLX server is not reachable"), "{m}");
         assert!(m.contains("127.0.0.1:8000"), "{m}");
         assert!(!m.contains("://"), "{m}");
+
+        let cloud = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            command: None,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            effort: None,
+            timeout_secs: None,
+        };
+        let m = http_unreachable_message(&cloud, "https://openrouter.ai/api/v1");
+        assert!(m.contains("cloud design provider"), "{m}");
+        assert!(m.contains("openrouter.ai"), "{m}");
+        // No scheme/userinfo -> survives the terminal redact_error scrub.
+        assert!(!m.contains("://") && !m.contains('@'), "{m}");
     }
 
     #[test]
