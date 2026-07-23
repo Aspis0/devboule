@@ -193,6 +193,44 @@ export function buildEditPrompt(
   ].join("\n");
 }
 
+/** Options for a full-design refine (multi-node static markup). Same injects as generate. */
+export interface RefinePromptOptions {
+  context?: string;
+  designContract?: string;
+}
+
+/**
+ * Build a FULL-DESIGN REFINE prompt: the model is given the CURRENT multi-node
+ * markup and must return the full updated fragment of sibling top-level components
+ * (same output contract as {@link buildGeneratePrompt}). PURE.
+ *
+ * Use this when iterating the same design ("make it darker", "bigger CTA") so
+ * the generator overwrites the same working folder instead of starting blank.
+ */
+export function buildRefineFullPrompt(
+  currentMarkup: string,
+  userInstruction: string,
+  opts: RefinePromptOptions = {},
+): string {
+  const parts = [DESIGN_SYSTEM_PROMPT_V1, ""];
+  parts.push(...designContractBlock(opts.designContract));
+  const context = (opts.context ?? "").trim();
+  if (context.length > 0) {
+    parts.push("CONTEXT (use to stay coherent with the product):");
+    parts.push(context);
+    parts.push("");
+  }
+  parts.push(
+    "REFINE — here is the CURRENT design markup (sibling top-level components).",
+    "Apply this change and return the FULL updated markup fragment:",
+    userInstruction.trim(),
+    "",
+    "CURRENT MARKUP:",
+    currentMarkup.trim(),
+  );
+  return parts.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // INTERACTIVE mode (Phase 2) — a SEPARATE artifact, NOT a canvas DesignNode.
 // ---------------------------------------------------------------------------
@@ -269,5 +307,34 @@ export function buildInteractivePrompt(
   }
   parts.push("TASK — generate ONE complete interactive HTML document for:");
   parts.push(userInstruction.trim());
+  return parts.join("\n");
+}
+
+/**
+ * Build an INTERACTIVE REFINE prompt: CURRENT full HTML document + instruction →
+ * ONE complete updated document (same output contract as {@link buildInteractivePrompt}).
+ * PURE.
+ */
+export function buildInteractiveRefinePrompt(
+  currentMarkup: string,
+  userInstruction: string,
+  opts: InteractivePromptOptions = {},
+): string {
+  const parts = [DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1, ""];
+  parts.push(...designContractBlock(opts.designContract));
+  const context = (opts.context ?? "").trim();
+  if (context.length > 0) {
+    parts.push("CONTEXT (use to stay coherent with the product):");
+    parts.push(context);
+    parts.push("");
+  }
+  parts.push(
+    "REFINE — here is the CURRENT interactive HTML document.",
+    "Apply this change and return ONE complete updated document (start with <!DOCTYPE html>):",
+    userInstruction.trim(),
+    "",
+    "CURRENT DOCUMENT:",
+    currentMarkup.trim(),
+  );
   return parts.join("\n");
 }

@@ -27,7 +27,11 @@ trap cleanup EXIT
 export TAURI_CONFIG
 TAURI_CONFIG="$(cat "$TAURI/tauri.pilot.conf.json")"
 export DEVBOULE_DEV_UNLOCK="${DEVBOULE_DEV_UNLOCK:-1}"
-echo "launching: cargo run --features ui-pilot (DEVBOULE_DEV_UNLOCK=$DEVBOULE_DEV_UNLOCK socket=$TAURI_PILOT_SOCKET)"
+# All-Rust MCP: force the Rust devboule-mcp agent MCP (fail-closed if the binary
+# is missing) instead of the legacy Python aspis_mcp. Build it first via
+# `cargo build --manifest-path devboule-mcp/Cargo.toml` so resolve_devboule_mcp_bin finds it.
+export DEVBOULE_MCP_BACKEND="${DEVBOULE_MCP_BACKEND:-rust}"
+echo "launching: cargo run --features ui-pilot (DEVBOULE_DEV_UNLOCK=$DEVBOULE_DEV_UNLOCK MCP=$DEVBOULE_MCP_BACKEND socket=$TAURI_PILOT_SOCKET)"
 cd "$TAURI"
 # `cargo run` builds only the main bin — the Claude consent hook is a separate bin
 # and without it cloud-claude launches fall back to acceptEdits (no PreToolUse gate).

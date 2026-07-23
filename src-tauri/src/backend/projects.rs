@@ -3692,25 +3692,235 @@ fn validate_custom_agent_clients(
     Ok(out)
 }
 
-/// Resolve `config.json` the same way `lib.rs::resolve_config_path` /
-/// `roles::config_path` do, so the launch flow reads the same config the frontend
-/// sees. Returns None when no config can be located (custom clients then resolve
-/// to "unknown client").
-pub(crate) fn locate_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    if let Ok(dir) = app.path().resource_dir() {
-        let path = dir.join("config.json");
-        if path.exists() {
-            return Some(path);
-        }
+/// Where to bootstrap a missing `config.json`: the PARENT of `cwd` when it is
+/// recognizably the management root (it carries an **on-disk** MCP package marker
+/// relative to that parent), else `cwd` itself (standalone/unusual layouts keep
+/// the old behavior). Pure (filesystem-read only) so it is unit-testable. Marker
+/// set is shared with [`super::agents::has_mcp_package_marker`] (path-specific;
+/// never promoted by a global env var alone).
+pub(crate) fn bootstrap_config_dir(cwd: &Path) -> PathBuf {
+    cwd.parent()
+        .filter(|parent| super::agents::has_mcp_package_marker(parent))
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Pure precedence for the canonical `config.json` path (unit-testable).
+///
+/// Callers must pre-filter candidates; this only picks among ready options:
+///
+/// 1. `existing_writable_repo` — repo-layout file that already exists and is
+///    writable (`cwd/../config.json` or `cwd/config.json`). Prefer even when the
+///    create-probe on the parent flakes (existing open-for-append is enough).
+/// 2. `dev_layout_target` — management-root / on-disk MCP-package checkout whose
+///    **parent is writable**, even when the file is still absent (preserves
+///    `cargo run` / `tauri dev` bootstrap at the repo root). Unwritable
+///    dev-layout must be filtered out before calling this (falls through to 3).
+/// 3. `app_data_target` — per-user writable path for packaged builds
+///    (`<app_data_dir>/config.json`); returned even if the file does not exist yet.
+/// 4. `cwd_fallback` — last resort when `app_data_dir` is unavailable (same family
+///    as today's cwd/management-root bootstrap).
+///
+/// Precedence: existing+writable repo file → writable dev-layout (repo-shaped) →
+/// app_data → cwd fallback. Never prefers a read-only `resource_dir` path.
+pub(crate) fn choose_config_path(
+    existing_writable_repo: Option<PathBuf>,
+    dev_layout_target: Option<PathBuf>,
+    app_data_target: Option<PathBuf>,
+    cwd_fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    existing_writable_repo
+        .or(dev_layout_target)
+        .or(app_data_target)
+        .or(cwd_fallback)
+}
+
+/// Minimal default `config.json` body (empty JSON object + trailing newline).
+/// Same seed as `lib.rs` `bootstrap_default_config` / first-run bootstrap.
+pub(crate) const DEFAULT_CONFIG_JSON: &str = "{}\n";
+
+/// Whether the parent directory of `path` accepts create/write (probe file).
+/// Used to reject read-only locations such as a macOS `.app` resource bundle.
+fn parent_dir_is_writable(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if !dir.is_dir() {
+        return false;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        for candidate in [cwd.join("../config.json"), cwd.join("config.json")] {
-            if candidate.exists() {
-                return Some(candidate);
-            }
+    let probe = dir.join(format!(
+        ".aspis-cfg-probe-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Open-for-append probe on an **existing** config file. Used when the parent
+/// create-probe flakes (false negative) so we do not silently abandon a config
+/// we can already write to.
+fn existing_config_file_is_writable(path: &Path) -> bool {
+    OpenOptions::new().append(true).open(path).is_ok()
+}
+
+/// Step 1: existing repo-layout `config.json` that is writable enough.
+/// Parent first (`cwd/../config.json`), then `cwd/config.json`.
+///
+/// Accepts the candidate when the parent create-probe succeeds **or** (when the
+/// file already exists) an append open on the file itself succeeds — so a flaky
+/// create-probe cannot orphan a working checkout config.
+pub(crate) fn select_existing_writable_repo(cwd: &Path) -> Option<PathBuf> {
+    let parent_cfg = cwd.parent().map(|p| p.join("config.json"));
+    let cwd_cfg = Some(cwd.join("config.json"));
+    for candidate in [parent_cfg, cwd_cfg].into_iter().flatten() {
+        if !candidate.is_file() {
+            continue;
+        }
+        if parent_dir_is_writable(&candidate) || existing_config_file_is_writable(&candidate) {
+            return Some(candidate);
         }
     }
     None
+}
+
+/// Step 2: writable dev / management-root target when the checkout has an
+/// **on-disk** MCP package marker relative to the bootstrap dir (never from a
+/// global env alone). Returns `None` when the marker is absent **or** the
+/// target's parent is not writable (falls through to app_data).
+pub(crate) fn select_dev_layout_target(cwd: &Path) -> Option<PathBuf> {
+    let boot = bootstrap_config_dir(cwd);
+    if !super::agents::has_mcp_package_marker(&boot) {
+        return None;
+    }
+    let target = boot.join("config.json");
+    if parent_dir_is_writable(&target) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Canonical path for `config.json` — shared by read (`resolve_config_path`) and
+/// write (`locate_config_path` / Settings savers via [`ensure_config_file`]).
+/// Prefer a writable repo checkout config when present; otherwise a per-user
+/// `app_data_dir` path (same family as projects/oracle).
+///
+/// The returned path may not exist yet; the write path self-heals via
+/// [`ensure_config_file`] (seeds `{}`). Never returns a read-only
+/// `resource_dir()` path. If `app_data_dir()` fails, falls back to the cwd /
+/// management-root location (does not panic).
+pub(crate) fn resolved_config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().ok();
+
+    // 1. Existing + writable repo-layout config (parent first, then cwd).
+    let existing_writable_repo = cwd.as_ref().and_then(|c| select_existing_writable_repo(c));
+
+    // 2. Dev / repo checkout with on-disk MCP package marker AND writable parent:
+    // keep bootstrap at the repo even when config.json is still missing (fresh
+    // clone). Unwritable management roots fall through to app_data.
+    let dev_layout_target = cwd.as_ref().and_then(|c| select_dev_layout_target(c));
+
+    // 3. Packaged / else: per-user app data (create dir with default umask perms).
+    let app_data_target = match app.path().app_data_dir() {
+        Ok(dir) => match fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir.join("config.json")),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    // 4. Last resort when app_data is unavailable: cwd / management-root.
+    let cwd_fallback = cwd
+        .as_ref()
+        .map(|cwd| bootstrap_config_dir(cwd).join("config.json"));
+
+    choose_config_path(
+        existing_writable_repo,
+        dev_layout_target,
+        app_data_target,
+        cwd_fallback,
+    )
+    .ok_or_else(|| {
+        "config.json path could not be resolved (no repo config, app data dir, or CWD)".into()
+    })
+}
+
+/// Ensure the canonical `config.json` exists at the resolved path: create the
+/// parent directory if needed, and if the file is still absent seed the minimal
+/// default (`{}`) — same content as first-run bootstrap.
+///
+/// Self-healing write path: Settings / RMW savers go through
+/// [`locate_config_path`] so a brand-new packaged install (bootstrap Err swallowed
+/// at setup) can still persist the first save. Safe to call while holding
+/// [`config_write_lock`] (seed uses exclusive `create_new`, not the mutex — so
+/// lock-then-locate callers cannot deadlock). RMW savers keep lock + temp+rename
+/// for the real mutation.
+pub(crate) fn ensure_config_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let path = resolved_config_path(app)?;
+    ensure_config_file_at(&path)
+}
+
+/// Temp-dir / path seam for [`ensure_config_file`]: seed `DEFAULT_CONFIG_JSON`
+/// at `path` when missing. Returns the path on success.
+///
+/// Uses `create_new` so a concurrent writer that already created the file is
+/// never overwritten with `{}` (unlike a blind write). Does **not** take
+/// [`config_write_lock`] — callers may already hold it.
+pub(crate) fn ensure_config_file_at(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    let dir = path.parent().ok_or_else(|| {
+        format!(
+            "config.json path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "Could not create config directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    // Race: another writer may have created the file while we created the dir.
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(DEFAULT_CONFIG_JSON.as_bytes()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(format!(
+                    "Could not write a default config.json in {}: {e}",
+                    dir.display()
+                ));
+            }
+            Ok(path.to_path_buf())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path.to_path_buf()),
+        Err(e) => Err(format!(
+            "Could not write a default config.json in {}: {e}",
+            dir.display()
+        )),
+    }
+}
+
+/// Locate the writable canonical `config.json` path for Settings / RMW savers.
+///
+/// Self-healing: resolves the path and ensures the file exists (seeds `{}` when
+/// absent) so the first Settings save on a fresh install succeeds. Never returns
+/// a read-only `resource_dir` path. Returns `None` only when no writable location
+/// can be resolved or the default file cannot be created.
+pub(crate) fn locate_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    ensure_config_file(app).ok()
 }
 
 /// Read the configured custom agent clients from config.json. A missing key /
@@ -12563,5 +12773,282 @@ mod grant_consent_persist_tests {
         ];
         resolve_folder_grant(&mut q, "proj", "/a/b/c", ConsentDecision::AllowOnce);
         assert_eq!(q[0].status, ConsentBridgeStatus::Denied, "terminal verdict preserved");
+    }
+}
+
+#[cfg(test)]
+mod config_path_resolution_tests {
+    use super::{
+        bootstrap_config_dir, choose_config_path, ensure_config_file_at, select_dev_layout_target,
+        select_existing_writable_repo, DEFAULT_CONFIG_JSON,
+    };
+    use super::super::agents::has_mcp_package_marker;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn choose_prefers_existing_writable_repo_over_app_data() {
+        let repo = PathBuf::from("/repo/config.json");
+        let app_data = PathBuf::from("/Library/Application Support/app/config.json");
+        assert_eq!(
+            choose_config_path(Some(repo.clone()), None, Some(app_data), None),
+            Some(repo),
+            "repo-layout config that is present+writable must win"
+        );
+    }
+
+    #[test]
+    fn choose_uses_app_data_when_no_repo_config() {
+        let app_data = PathBuf::from("/Library/Application Support/app/config.json");
+        assert_eq!(
+            choose_config_path(None, None, Some(app_data.clone()), None),
+            Some(app_data),
+            "packaged / else path is app_data when no writable repo config"
+        );
+    }
+
+    #[test]
+    fn choose_returns_app_data_even_when_file_does_not_exist_yet() {
+        // choose_config_path pure helper returns the writable target path
+        // regardless of existence (existence is not an input). The impure
+        // resolve only checks is_file() for the *repo* branch; ensure seeds later.
+        let app_data = PathBuf::from(
+            "/Users/x/Library/Application Support/com.aspis.devboule/config.json",
+        );
+        let chosen = choose_config_path(None, None, Some(app_data.clone()), None);
+        assert_eq!(chosen, Some(app_data));
+        // Path may point at a non-existent file — that is intentional for save.
+        assert!(
+            chosen.as_ref().is_some_and(|p| !p.exists()),
+            "synthetic app_data path must not need to exist on disk"
+        );
+    }
+
+    #[test]
+    fn choose_dev_layout_beats_app_data_when_repo_file_absent() {
+        // Fresh checkout: no config.json yet, but management-root / MCP marker
+        // + writable parent means we still bootstrap at the repo (not app data).
+        let dev = PathBuf::from("/repo/config.json");
+        let app_data = PathBuf::from("/app-data/config.json");
+        assert_eq!(
+            choose_config_path(None, Some(dev.clone()), Some(app_data), None),
+            Some(dev)
+        );
+    }
+
+    #[test]
+    fn choose_falls_through_to_app_data_when_dev_layout_filtered_out() {
+        // resolved_config_path filters non-writable / non-repo-shaped dev targets
+        // to None before choose; pure precedence must then pick app_data.
+        let app_data = PathBuf::from("/app-data/config.json");
+        assert_eq!(
+            choose_config_path(None, None, Some(app_data.clone()), None),
+            Some(app_data),
+            "unwritable or env-only 'dev layout' must not outrank app_data"
+        );
+    }
+
+    #[test]
+    fn choose_falls_back_to_cwd_when_app_data_unavailable() {
+        let cwd = PathBuf::from("/tmp/fallback/config.json");
+        assert_eq!(
+            choose_config_path(None, None, None, Some(cwd.clone())),
+            Some(cwd),
+            "when app_data_dir errors, fall back to cwd/management-root behavior"
+        );
+    }
+
+    #[test]
+    fn choose_returns_none_when_no_candidates() {
+        assert_eq!(choose_config_path(None, None, None, None), None);
+    }
+
+    /// Same behavior as the historical `lib.rs` unit test: from `src-tauri` cwd,
+    /// bootstrap prefers the management-root parent when it carries the MCP marker.
+    #[test]
+    fn bootstrap_config_dir_prefers_the_management_root_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-config-bootstrap-projects-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let src_tauri = root.join("src-tauri");
+        fs::create_dir_all(&src_tauri).unwrap();
+        // Parent without the oracle marker ⇒ old behavior (cwd itself).
+        assert_eq!(bootstrap_config_dir(&src_tauri), src_tauri);
+        // Parent WITH the oracle marker ⇒ bootstrap at the root.
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        assert_eq!(bootstrap_config_dir(&src_tauri), root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FIX #1: unwritable management-root (on-disk marker present) must NOT win
+    /// over app_data — select_dev_layout_target returns None so choose falls through.
+    #[test]
+    fn select_dev_layout_non_writable_falls_through() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-cfg-unwritable-dev-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let src_tauri = root.join("src-tauri");
+        fs::create_dir_all(&src_tauri).unwrap();
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        // Sanity: with a writable root the dev-layout target is claimed.
+        assert_eq!(
+            select_dev_layout_target(&src_tauri),
+            Some(root.join("config.json")),
+            "writable repo-shaped layout must still pick repo config.json"
+        );
+        // Make the management root non-writable (no create probe).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&root).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&root, perms).unwrap();
+            assert_eq!(
+                select_dev_layout_target(&src_tauri),
+                None,
+                "unwritable dev-layout must fall through (caller uses app_data)"
+            );
+            // Pure choose: filtered-out dev + app_data → app_data.
+            let app_data = PathBuf::from("/app-data/config.json");
+            assert_eq!(
+                choose_config_path(None, select_dev_layout_target(&src_tauri), Some(app_data.clone()), None),
+                Some(app_data)
+            );
+            // Restore so cleanup can remove.
+            let mut perms = fs::metadata(&root).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&root, perms).unwrap();
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FIX #1: ENV_BIN / global marker must not turn an arbitrary non-repo path
+    /// into a chosen dev-layout (marker is path-specific on-disk only).
+    #[test]
+    fn env_bin_does_not_make_arbitrary_path_a_dev_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-cfg-env-bin-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cwd = root.join("some-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        // No oracle / devboule-mcp under parent or cwd.
+        assert!(
+            !has_mcp_package_marker(&root),
+            "empty temp tree has no on-disk MCP marker"
+        );
+        assert!(
+            !has_mcp_package_marker(&cwd),
+            "cwd without package tree is not a marker path"
+        );
+        // Even if a leftover shell exported DEVBOULE_MCP_BIN, the marker check
+        // must stay path-specific (has_mcp_package_marker ignores env).
+        // We do not set the env here (parallel-test safety); the function under
+        // test no longer reads it. Assert select_dev_layout stays None.
+        assert_eq!(
+            select_dev_layout_target(&cwd),
+            None,
+            "non-repo path must not become a dev-layout config target"
+        );
+        assert_eq!(bootstrap_config_dir(&cwd), cwd);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FIX #1 monorepo preserve: real on-disk marker + writable root → repo path.
+    #[test]
+    fn select_dev_layout_uses_repo_when_marker_present_and_writable() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-cfg-dev-ok-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let src_tauri = root.join("src-tauri");
+        fs::create_dir_all(&src_tauri).unwrap();
+        fs::create_dir_all(root.join("devboule-mcp")).unwrap();
+        fs::write(root.join("devboule-mcp").join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            select_dev_layout_target(&src_tauri),
+            Some(root.join("config.json"))
+        );
+        // Existing writable repo file still wins in pure choose.
+        let repo_cfg = root.join("config.json");
+        fs::write(&repo_cfg, "{}\n").unwrap();
+        assert_eq!(
+            select_existing_writable_repo(&src_tauri),
+            Some(repo_cfg.clone())
+        );
+        let app_data = PathBuf::from("/app-data/config.json");
+        assert_eq!(
+            choose_config_path(
+                select_existing_writable_repo(&src_tauri),
+                select_dev_layout_target(&src_tauri),
+                Some(app_data),
+                None
+            ),
+            Some(repo_cfg)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FIX #2: missing file → ensure seeds `{}` (self-healing save path).
+    #[test]
+    fn ensure_config_file_at_seeds_empty_object_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-cfg-ensure-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("config.json");
+        assert!(!path.exists());
+        let got = ensure_config_file_at(&path).expect("ensure should create");
+        assert_eq!(got, path);
+        assert!(path.is_file());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, DEFAULT_CONFIG_JSON);
+        // Idempotent: second call leaves content alone if already a file.
+        fs::write(&path, "{\"kept\":true}\n").unwrap();
+        ensure_config_file_at(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"kept\":true}\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FIX #4: existing config is preferred when present+writable (append open).
+    #[test]
+    fn select_existing_writable_repo_prefers_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-cfg-existing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cwd = root.join("src-tauri");
+        fs::create_dir_all(&cwd).unwrap();
+        let parent_cfg = root.join("config.json");
+        fs::write(&parent_cfg, "{\"x\":1}\n").unwrap();
+        assert_eq!(
+            select_existing_writable_repo(&cwd),
+            Some(parent_cfg)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

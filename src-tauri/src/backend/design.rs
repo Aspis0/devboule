@@ -1706,6 +1706,287 @@ pub(crate) fn registry_working_folder_for_id(app: &tauri::AppHandle, id: &str) -
         .map(|e| e.working_folder_path)
 }
 
+// ---------------------------------------------------------------------------
+// design_read_current — orchestrator can SEE the project's current design
+// ---------------------------------------------------------------------------
+
+/// Hard cap (bytes) on markup returned by `design_read_current` / folder markup reads so
+/// an LLM tool result cannot blow the agent context window. 48 KiB is enough for a
+/// typical multi-node mockup while staying well under common context budgets.
+pub const DESIGN_READ_MARKUP_CAP_BYTES: usize = 48 * 1024;
+
+/// PURE: select the most-recently opened registry entry matching `root_path`.
+/// Mirrors the TS `pickProjectDesign` in `plannerModel.ts`: exact path or
+/// `root_path + '/'` prefix — never a bare sibling like `/proj2` for root `/proj`.
+/// Tie-break: lexicographically greater `last_opened_at` wins (ISO-8601 strings).
+pub fn pick_project_design<'a>(
+    entries: &'a [DesignProjectEntry],
+    root_path: &str,
+) -> Option<&'a DesignProjectEntry> {
+    if root_path.is_empty() || entries.is_empty() {
+        return None;
+    }
+    let prefix = format!("{root_path}/");
+    let mut best: Option<&DesignProjectEntry> = None;
+    for entry in entries {
+        let path = entry.working_folder_path.as_str();
+        if path == root_path || path.starts_with(&prefix) {
+            match best {
+                None => best = Some(entry),
+                Some(prev) if entry.last_opened_at > prev.last_opened_at => best = Some(entry),
+                _ => {}
+            }
+        }
+    }
+    best
+}
+
+/// PURE: does this registry entry's working folder live at or under `root_path`?
+/// Same matching `pick_project_design` uses (exact path or `root_path + '/'` prefix —
+/// never a bare sibling like `/proj2` for root `/proj`). Used to confine an
+/// explicit-registry-id design read to the requesting project (privacy / isolation).
+pub fn entry_under_root(entry: &DesignProjectEntry, root_path: &str) -> bool {
+    if root_path.is_empty() {
+        return false;
+    }
+    let path = entry.working_folder_path.as_str();
+    path == root_path || path.starts_with(&format!("{root_path}/"))
+}
+
+/// PURE: concatenate component HTML (node_order first, then remaining keys) and cap at
+/// `max_bytes`. Returns `(markup, truncated)`. When truncated, the string ends at a
+/// character boundary and does not claim to be complete.
+pub fn join_components_markup_capped(
+    components: &BTreeMap<String, String>,
+    node_order: &[String],
+    max_bytes: usize,
+) -> (String, bool) {
+    let mut pieces: Vec<&str> = Vec::with_capacity(components.len());
+    let mut seen = std::collections::HashSet::new();
+    for id in node_order {
+        if let Some(html) = components.get(id) {
+            pieces.push(html.as_str());
+            seen.insert(id.as_str());
+        }
+    }
+    for (id, html) in components {
+        if !seen.contains(id.as_str()) {
+            pieces.push(html.as_str());
+        }
+    }
+    cap_joined_markup(&pieces, max_bytes)
+}
+
+/// PURE: join string pieces with `\n\n` and hard-cap the result at `max_bytes` (UTF-8
+/// safe — never splits a multi-byte character). Returns `(joined, truncated)`.
+pub fn cap_joined_markup(pieces: &[&str], max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 {
+        return (String::new(), !pieces.is_empty() && pieces.iter().any(|p| !p.is_empty()));
+    }
+    let mut out = String::new();
+    let mut first = true;
+    for piece in pieces {
+        if piece.is_empty() {
+            continue;
+        }
+        let sep = if first { "" } else { "\n\n" };
+        first = false;
+        let needed = sep.len() + piece.len();
+        if out.len() + needed <= max_bytes {
+            out.push_str(sep);
+            out.push_str(piece);
+            continue;
+        }
+        // Cap: fit as much of this piece as possible after the separator.
+        let room = max_bytes.saturating_sub(out.len() + sep.len());
+        if room == 0 {
+            return (out, true);
+        }
+        out.push_str(sep);
+        let take = floor_char_boundary(piece, room);
+        out.push_str(&piece[..take]);
+        return (out, true);
+    }
+    (out, false)
+}
+
+/// Largest byte index ≤ `max` that is a char boundary in `s` (or 0).
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Read a design working folder's markup (interactive artifact preferred, else
+/// components), capped. PURE-ish (filesystem only; no AppHandle / registry).
+fn read_folder_markup_capped(
+    canonical: &Path,
+    max_bytes: usize,
+) -> Result<(String, bool), String> {
+    // Prefer interactive artifact when present.
+    if let Ok(artifact_path) = crate::backend::artifact_protocol::confined_artifact_index(canonical)
+    {
+        if artifact_path.is_file() {
+            let text = read_design_file(&artifact_path)?.unwrap_or_default();
+            return Ok(cap_joined_markup(&[text.as_str()], max_bytes));
+        }
+    }
+
+    // Static path: project.json nodeOrder + components/*.html
+    let meta_raw = read_design_file(&canonical.join(PROJECT_FILE))?
+        .ok_or_else(|| format!("{PROJECT_FILE} is missing"))?;
+    let meta: DesignProjectMeta = serde_json::from_str(&meta_raw)
+        .map_err(|e| format!("{PROJECT_FILE} is not valid: {e}"))?;
+
+    let mut components = BTreeMap::new();
+    let components_dir = canonical.join(COMPONENTS_DIR);
+    if components_dir.is_dir() {
+        if let Ok(rd) = fs::read_dir(&components_dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if validate_node_id(stem).is_err() {
+                    continue;
+                }
+                if let Ok(Some(html)) = read_design_file(&path) {
+                    components.insert(stem.to_string(), html);
+                }
+            }
+        }
+    }
+    Ok(join_components_markup_capped(
+        &components,
+        &meta.node_order,
+        max_bytes,
+    ))
+}
+
+/// Result of `design_read_current` / `design_read_folder_markup` (camelCase over IPC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignReadMarkupResult {
+    pub registry_id: String,
+    pub design_project_path: String,
+    pub name: String,
+    pub markup: String,
+    pub truncated: bool,
+    /// Output mode of the base design ("static" | "interactive"), so the refine path can
+    /// pick the matching refine prompt. Absent ⇒ treat as "static" (legacy default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Read the project's CURRENT design markup for the orchestrator (`design_read` MCP).
+/// Resolves the registry entry under `project_root` with the latest `lastOpenedAt`
+/// (or the entry matching optional `registry_id`), then returns capped component /
+/// artifact markup. Fail-closed when no design matches.
+#[tauri::command]
+pub fn design_read_current(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    project_root: String,
+    registry_id: Option<String>,
+) -> Result<DesignReadMarkupResult, String> {
+    state.ensure_unlocked()?;
+    let root = project_root.trim();
+    if root.is_empty() {
+        return Err("project_root must not be empty".to_string());
+    }
+    let entries = read_design_registry(&app);
+    let entry = match registry_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| format!("no design registry entry with id '{id}'"))?;
+            // PRIVACY / project isolation: an explicit registry id must still belong to THIS
+            // project root. Without this, an agent on project A could pass project B's
+            // registry id and read B's design markup into A's context (the registry is a
+            // GLOBAL index spanning every project the app ever opened). Mirror the exact
+            // match `pick_project_design` uses (equal or nested under `root/`).
+            if !entry_under_root(entry, root) {
+                return Err(format!(
+                    "design registry entry '{id}' does not belong to this project root"
+                ));
+            }
+            entry
+        }
+        None => pick_project_design(&entries, root)
+            .ok_or_else(|| "no design registered under this project root".to_string())?,
+    };
+
+    let _guard = design_read_guard()?;
+    let canonical = canonical_working_folder(&entry.working_folder_path)?;
+    let (markup, truncated) = read_folder_markup_capped(&canonical, DESIGN_READ_MARKUP_CAP_BYTES)?;
+    // Contract (see DesignReadMarkupResult.kind): ABSENT entry.kind ⇒ "static" (legacy +
+    // every static design, which never records a kind). Default here so the refine caller
+    // never has to guess — an unknown kind must deterministically pick the static pipeline.
+    let kind = match entry.kind {
+        Some(ArtifactKind::Interactive) => Some("interactive".to_string()),
+        Some(ArtifactKind::Static) | None => Some("static".to_string()),
+    };
+    Ok(DesignReadMarkupResult {
+        registry_id: entry.id.clone(),
+        design_project_path: entry.working_folder_path.clone(),
+        name: entry.name.clone(),
+        markup,
+        truncated,
+        kind,
+    })
+}
+
+/// Read capped markup from an existing design working folder by ABSOLUTE path — no
+/// registry lookup, so it applies NO project-root confinement (the caller must already
+/// have resolved a trusted folder). NOTE: currently unused by the frontend refine path
+/// (which goes through `design_read_current` for the registry lookup + project confinement);
+/// kept as a lower-level helper. Do NOT wire an agent-supplied path into this without
+/// adding confinement first.
+#[tauri::command]
+pub fn design_read_folder_markup(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+) -> Result<DesignReadMarkupResult, String> {
+    state.ensure_unlocked()?;
+    let _guard = design_read_guard()?;
+    let canonical = canonical_working_folder(&working_folder_path)?;
+    let (markup, truncated) = read_folder_markup_capped(&canonical, DESIGN_READ_MARKUP_CAP_BYTES)?;
+    // Best-effort name/id from project.json when present.
+    let (registry_id, name) = match read_design_file(&canonical.join(PROJECT_FILE))? {
+        Some(raw) => match serde_json::from_str::<DesignProjectMeta>(&raw) {
+            Ok(meta) => (meta.id, meta.name),
+            Err(_) => (String::new(), String::new()),
+        },
+        None => (String::new(), String::new()),
+    };
+    // Infer the base kind from what the folder actually holds (artifact ⇒ interactive).
+    let kind = if crate::backend::artifact_protocol::confined_artifact_index(&canonical)
+        .map(|p| p.is_file())
+        .unwrap_or(false)
+    {
+        Some("interactive".to_string())
+    } else {
+        Some("static".to_string())
+    };
+    Ok(DesignReadMarkupResult {
+        registry_id,
+        design_project_path: working_folder_path.trim().to_string(),
+        name,
+        markup,
+        truncated,
+        kind,
+    })
+}
+
 /// PURE: sort a registry list by `lastOpenedAt` descending (most-recent first), tie-
 /// broken by name ascending (mirrors `list_projects`' updated_at-desc-then-title sort).
 /// Sorts in place.
@@ -3202,6 +3483,108 @@ mod tests {
                 "should reject {bad:?}"
             );
         }
+    }
+
+    // ---- design_read: pick_project_design + markup cap (pure) ------------
+
+    #[test]
+    fn pick_project_design_mirrors_ts_rules() {
+        assert!(pick_project_design(&[], "/proj").is_none());
+        assert!(pick_project_design(&[entry("a", "A", "/proj", "t")], "").is_none());
+
+        let at_root = entry("root", "R", "/proj", "2026-01-01T00:00:00Z");
+        let under = entry("under", "U", "/proj/design", "2026-02-01T00:00:00Z");
+        let other = entry("other", "O", "/elsewhere", "2026-03-01T00:00:00Z");
+        let sibling = entry("sib", "S", "/proj2", "2026-04-01T00:00:00Z");
+
+        assert_eq!(
+            pick_project_design(&[other.clone(), at_root.clone()], "/proj")
+                .map(|e| e.id.as_str()),
+            Some("root")
+        );
+        assert_eq!(
+            pick_project_design(&[other.clone(), under.clone()], "/proj")
+                .map(|e| e.id.as_str()),
+            Some("under")
+        );
+        assert!(pick_project_design(&[other.clone()], "/proj").is_none());
+        // Sibling prefix trap: '/proj2' must NOT match root '/proj'.
+        assert!(pick_project_design(&[sibling], "/proj").is_none());
+
+        let older = entry("older", "Old", "/proj", "2026-01-01T00:00:00Z");
+        let newer = entry("newer", "New", "/proj", "2026-06-01T00:00:00Z");
+        assert_eq!(
+            pick_project_design(&[older.clone(), newer.clone()], "/proj")
+                .map(|e| e.id.as_str()),
+            Some("newer")
+        );
+        assert_eq!(
+            pick_project_design(&[newer, older], "/proj").map(|e| e.id.as_str()),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn entry_under_root_confines_like_pick_project_design() {
+        // Privacy: an explicit registry-id read must still belong to THIS project root.
+        let at_root = entry("a", "A", "/proj", "t");
+        let nested = entry("b", "B", "/proj/.aspis-design/x", "t");
+        let sibling = entry("c", "C", "/proj2", "t"); // shares a prefix but is NOT nested
+        let elsewhere = entry("d", "D", "/other/project", "t");
+        assert!(entry_under_root(&at_root, "/proj"));
+        assert!(entry_under_root(&nested, "/proj"));
+        // `/proj2` must NOT match root `/proj` (bare-prefix trap the `/` guards against).
+        assert!(!entry_under_root(&sibling, "/proj"));
+        assert!(!entry_under_root(&elsewhere, "/proj"));
+        // Empty root never matches (fail-closed).
+        assert!(!entry_under_root(&at_root, ""));
+    }
+
+    #[test]
+    fn design_read_kind_defaults_absent_to_static() {
+        // Mirrors the kind mapping in design_read_current: interactive stays interactive,
+        // everything else (static entries record NO kind, plus explicit Static) => "static".
+        let kind_of = |k: Option<ArtifactKind>| match k {
+            Some(ArtifactKind::Interactive) => Some("interactive".to_string()),
+            Some(ArtifactKind::Static) | None => Some("static".to_string()),
+        };
+        assert_eq!(kind_of(Some(ArtifactKind::Interactive)).as_deref(), Some("interactive"));
+        assert_eq!(kind_of(Some(ArtifactKind::Static)).as_deref(), Some("static"));
+        assert_eq!(kind_of(None).as_deref(), Some("static"));
+    }
+
+    #[test]
+    fn join_components_markup_capped_orders_and_truncates() {
+        let mut comps = BTreeMap::new();
+        comps.insert("b".into(), "<div>B</div>".into());
+        comps.insert("a".into(), "<div>A</div>".into());
+        // node_order prefers a then b.
+        let (full, trunc) =
+            join_components_markup_capped(&comps, &["a".into(), "b".into()], 10_000);
+        assert!(!trunc);
+        assert_eq!(full, "<div>A</div>\n\n<div>B</div>");
+
+        // Cap mid-string (room for first piece only partially if tiny).
+        let (capped, was_trunc) =
+            join_components_markup_capped(&comps, &["a".into(), "b".into()], 10);
+        assert!(was_trunc);
+        assert!(capped.len() <= 10);
+        assert!(capped.starts_with("<div>"));
+
+        // Zero cap with content ⇒ empty + truncated.
+        let (empty, empty_trunc) =
+            join_components_markup_capped(&comps, &["a".into()], 0);
+        assert_eq!(empty, "");
+        assert!(empty_trunc);
+    }
+
+    #[test]
+    fn cap_joined_markup_utf8_safe() {
+        // Multi-byte chars: "é" is 2 bytes. Cap of 1 must not panic / split.
+        let (s, t) = cap_joined_markup(&["hé"], 1);
+        assert!(t);
+        assert!(s.is_empty() || s.is_char_boundary(s.len()));
+        assert!(!s.contains('\u{FFFD}'));
     }
 
     // ---- STEP 4: tokens.json must be valid JSON ---------------------------

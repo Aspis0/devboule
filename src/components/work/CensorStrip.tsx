@@ -47,7 +47,7 @@ export function CensorStrip(props: CensorStripProps) {
         >
           <span style={{ color: "#C98A3B", animation: "wc-blink 1.2s ease-in-out infinite" }}>●</span>
           <span className="pp-mono" style={{ color: "#C98A3B" }}>
-            {scannedFiles > 0 ? `linters running… ${scannedFiles} files` : "linters running…"}
+            {scannedFiles > 0 ? `review running… ${scannedFiles} files` : "review running…"}
           </span>
         </span>
       )}

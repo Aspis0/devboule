@@ -35,7 +35,7 @@ describe("CensorFindingRow", () => {
     );
     expect(html).toContain("high"); // severity badge
     expect(html).toContain("Security"); // category badge
-    expect(html).toContain("gitleaks"); // source badge
+    expect(html).toContain("Linter · gitleaks"); // source badge (Layer 1)
     expect(html).toContain("Hardcoded secret"); // title
   });
 

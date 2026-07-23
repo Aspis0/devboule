@@ -180,6 +180,17 @@ export function PlannerChat({
 						{orchestrators.map((o) => {
 							const isActive = o.id === orchestratorId;
 							const disabled = o.disabled === true;
+							// Glossary for new users (native title always on hover; data-help for Alt).
+							const glossaryTitle =
+								o.id === "orchestrator"
+									? "Devboule's own coder engine (uses your configured cloud model)"
+									: o.id === "claude"
+										? "Run the agent through your Claude CLI subscription (must be installed)"
+										: o.id === "codex"
+											? "Run the agent through your Codex CLI subscription (must be installed)"
+											: o.id === "openai"
+												? "Run the agent through your OpenAI CLI subscription (must be installed)"
+												: undefined;
 							return (
 								<button
 									type="button"
@@ -192,7 +203,15 @@ export function PlannerChat({
 									title={
 										disabled
 											? `${o.label} CLI is not installed on this machine`
-											: undefined
+											: glossaryTitle
+									}
+									data-help-title={glossaryTitle ?? o.label}
+									data-help-lines={
+										o.id === "orchestrator"
+											? "Local is Devboule's built-in orchestrator engine.|It uses the model and placement you set under Settings → Roles for the Orchestrator."
+											: o.id === "claude" || o.id === "codex" || o.id === "openai"
+												? `Runs the agent through the ${o.label} CLI on your machine.|You need that CLI installed and logged in — Devboule does not manage its subscription key.`
+												: undefined
 									}
 									style={{
 										display: "flex",

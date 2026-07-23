@@ -1,18 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppContext } from "../../context/AppContext";
 
-type HelpItem = {
-	id: string;
+type HelpTooltip = {
 	top: number;
 	left: number;
 	title: string;
 	lines: string[];
 };
 
-const MAX_HELP_ITEMS = 120;
 const HELP_WIDTH = 380;
 const HELP_HEIGHT = 238;
 const HELP_MAX_LINES = 8;
+
+/** Only author-annotated elements are help targets (no generic button/input fallback). */
+export const HELP_TARGET_SELECTOR =
+	"[data-help-title], [data-help-lines]";
 
 const pageUseLines: Record<string, string> = {
 	cloudflare:
@@ -33,7 +35,44 @@ const pageUseLines: Record<string, string> = {
 		"For Devboule, Budget is the cost-warning layer before GPU, VM, storage, or Worker usage becomes invisible spend.",
 	graph:
 		"For Devboule, Graph is a structural map of code relationships; Oracle is the stronger source for semantic answers.",
+	design:
+		"For Devboule, Design is the generative UI lab: preview layouts, tokens, and component variants before they land in product views.",
+	polis:
+		"For Devboule, Polis is the spatial map of the product surface — orientation for humans and agents navigating the app structure.",
+	skills:
+		"For Devboule, Skills is the per-project skill catalog agents and humans use to stay aligned on how work should be done.",
+	labs:
+		"For Devboule, Labs holds experimental feature toggles (Pigeon, Oracle gates, etc.) so risky switches stay explicit.",
+	help:
+		"For Devboule, Help is the getting-started / how-it-works page for humans onboarding onto the control plane.",
+	settings:
+		"For Devboule, Settings is where workspace roots, roles, models, and app preferences are configured safely.",
+	devices:
+		"For Devboule, Devices tracks local endpoints and machine context so agent and sync actions know where they run.",
+	workspace:
+		"For Devboule, Workspace is the indexed project root and file memory agents and Oracle share for reliable retrieval.",
 };
+
+/** Page-context line for the active view (exported for tests). */
+export function pageUseLineFor(activeView: string): string {
+	return (
+		pageUseLines[activeView] ??
+		"For Devboule, use this only when it makes the local project, agents, cloud state, or Oracle memory more reliable."
+	);
+}
+
+/**
+ * Walk up from `el` to the nearest author-annotated help element.
+ * Returns null when there is no `[data-help-title]` / `[data-help-lines]` ancestor,
+ * or when that target is under `[data-help-skip='true']`.
+ */
+export function findHelpTarget(el: Element | null): HTMLElement | null {
+	if (!el || !(el instanceof Element)) return null;
+	const target = el.closest(HELP_TARGET_SELECTOR);
+	if (!(target instanceof HTMLElement)) return null;
+	if (target.closest("[data-help-skip='true']")) return null;
+	return target;
+}
 
 function cleanText(value: string | null | undefined) {
 	return (value ?? "").replace(/\s+/g, " ").trim();
@@ -238,7 +277,7 @@ function uniqueLines(lines: string[]) {
 	return result;
 }
 
-function readHelp(element: HTMLElement, activeView: string) {
+export function readHelp(element: HTMLElement, activeView: string) {
 	const title = cleanText(element.dataset.helpTitle) || fallbackTitle(element);
 	const rawLines = element.dataset.helpLines;
 	const baseLines = rawLines
@@ -250,70 +289,52 @@ function readHelp(element: HTMLElement, activeView: string) {
 	const lines = uniqueLines([
 		...baseLines,
 		...semanticLines(element, title),
-		pageUseLines[activeView] ??
-			"For Devboule, use this only when it makes the local project, agents, cloud state, or Oracle memory more reliable.",
+		pageUseLineFor(activeView),
 	]);
 	return { title, lines: lines.slice(0, HELP_MAX_LINES) };
 }
 
-function collectHelpItems(activeView: string) {
-	const selector =
-		"[data-help-title], [data-help-lines], button, input, select, textarea, [role='button'], a[href]";
-	const elements = Array.from(document.querySelectorAll<HTMLElement>(selector));
+/** Place the tooltip next to `rect`, clamped to the viewport. */
+function positionTooltip(rect: DOMRect): { top: number; left: number } {
 	const viewportWidth = window.innerWidth;
 	const viewportHeight = window.innerHeight;
-	const items: HelpItem[] = [];
-
-	for (const element of elements) {
-		if (items.length >= MAX_HELP_ITEMS) break;
-		if (element.closest("[data-help-skip='true']")) continue;
-		const rect = element.getBoundingClientRect();
-		if (rect.width < 3 || rect.height < 3) continue;
-		if (
-			rect.bottom < 0 ||
-			rect.top > viewportHeight ||
-			rect.right < 0 ||
-			rect.left > viewportWidth
-		) {
-			continue;
-		}
-
-		const { title, lines } = readHelp(element, activeView);
-		const canPlaceRight = rect.right + HELP_WIDTH + 12 < viewportWidth;
-		const canPlaceLeft = rect.left - HELP_WIDTH - 12 > 0;
-		const left = canPlaceRight
-			? rect.right + 8
-			: canPlaceLeft
-				? rect.left - HELP_WIDTH - 8
-				: Math.min(
-						Math.max(8, rect.left),
-						Math.max(8, viewportWidth - HELP_WIDTH - 8),
-					);
-		const below =
-			rect.bottom + HELP_HEIGHT < viewportHeight || rect.top < HELP_HEIGHT;
-		const top =
-			canPlaceRight || canPlaceLeft
+	const canPlaceRight = rect.right + HELP_WIDTH + 12 < viewportWidth;
+	const canPlaceLeft = rect.left - HELP_WIDTH - 12 > 0;
+	const left = canPlaceRight
+		? rect.right + 8
+		: canPlaceLeft
+			? rect.left - HELP_WIDTH - 8
+			: Math.min(
+					Math.max(8, rect.left),
+					Math.max(8, viewportWidth - HELP_WIDTH - 8),
+				);
+	const below =
+		rect.bottom + HELP_HEIGHT < viewportHeight || rect.top < HELP_HEIGHT;
+	const top =
+		canPlaceRight || canPlaceLeft
+			? Math.min(
+					Math.max(8, rect.top),
+					Math.max(8, viewportHeight - HELP_HEIGHT - 8),
+				)
+			: below
 				? Math.min(
-						Math.max(8, rect.top),
+						rect.bottom + 6,
 						Math.max(8, viewportHeight - HELP_HEIGHT - 8),
 					)
-				: below
-					? Math.min(
-							rect.bottom + 6,
-							Math.max(8, viewportHeight - HELP_HEIGHT - 8),
-						)
-					: Math.max(8, rect.top - HELP_HEIGHT - 6);
+				: Math.max(8, rect.top - HELP_HEIGHT - 6);
+	return { top, left };
+}
 
-		items.push({
-			id: `${items.length}:${Math.round(rect.left)}:${Math.round(rect.top)}:${title}`,
-			top,
-			left,
-			title,
-			lines,
-		});
-	}
-
-	return items;
+function buildTooltip(
+	element: HTMLElement | null,
+	activeView: string,
+): HelpTooltip | null {
+	if (!element) return null;
+	const rect = element.getBoundingClientRect();
+	if (rect.width < 3 || rect.height < 3) return null;
+	const { title, lines } = readHelp(element, activeView);
+	const { top, left } = positionTooltip(rect);
+	return { top, left, title, lines };
 }
 
 /**
@@ -339,7 +360,16 @@ export function HelpModeOverlay() {
 	// helpMode lives here, not in the global AppContext: holding/releasing Alt
 	// would otherwise re-render the whole app. Only this overlay needs it.
 	const [helpMode, setHelpMode] = useState(false);
-	const [items, setItems] = useState<HelpItem[]>([]);
+	const [tooltip, setTooltip] = useState<HelpTooltip | null>(null);
+
+	// Last help-bearing target under the pointer / focus; kept so scroll/resize
+	// can recompute position without another hit-test.
+	const targetRef = useRef<HTMLElement | null>(null);
+
+	// Cache the active view in a ref so pointer/focus handlers always read the
+	// current value without re-subscribing listeners.
+	const activeViewRef = useRef(activeView);
+	activeViewRef.current = activeView;
 
 	// Alt key drives help mode. Kept local so the global provider never re-renders
 	// on Alt press/release.
@@ -367,73 +397,113 @@ export function HelpModeOverlay() {
 		};
 	}, []);
 
-	// Cache the active view in a ref so scroll/resize handlers always read the
-	// current value without re-subscribing listeners.
-	const activeViewRef = useRef(activeView);
-	activeViewRef.current = activeView;
-
+	// Pointer + focus targeting: one contextual tooltip under cursor / focus.
 	useEffect(() => {
 		if (!helpMode) {
-			setItems([]);
+			targetRef.current = null;
+			setTooltip(null);
 			return;
 		}
 
-		// Recompute help-item rects on a requestAnimationFrame, throttled so that a
-		// burst of scroll/resize events collapses into a single layout read per
-		// frame. No setInterval: nothing forces sync layout on a timer anymore.
-		let frame = 0;
-		let scheduled = false;
-		const run = () => {
-			scheduled = false;
-			frame = 0;
-			setItems(collectHelpItems(activeViewRef.current));
-		};
-		const update = () => {
-			if (scheduled) return;
-			scheduled = true;
-			frame = window.requestAnimationFrame(run);
+		const applyTarget = (element: HTMLElement | null) => {
+			targetRef.current = element;
+			setTooltip(buildTooltip(element, activeViewRef.current));
 		};
 
-		update();
-		window.addEventListener("resize", update);
-		window.addEventListener("scroll", update, true);
+		const onPointerMove = (event: PointerEvent | MouseEvent) => {
+			const under = document.elementFromPoint(event.clientX, event.clientY);
+			const next = findHelpTarget(under);
+			// Skip re-render when still over the same annotated element.
+			if (next === targetRef.current) return;
+			applyTarget(next);
+		};
+
+		const onFocusIn = (event: FocusEvent) => {
+			const next = findHelpTarget(
+				event.target instanceof Element ? event.target : null,
+			);
+			if (next === targetRef.current) return;
+			applyTarget(next);
+		};
+
+		// Recompute position when layout moves (scroll/resize) without changing
+		// the target. Throttled to one rAF so bursts collapse.
+		let frame = 0;
+		let scheduled = false;
+		const recomputePosition = () => {
+			scheduled = false;
+			frame = 0;
+			setTooltip(buildTooltip(targetRef.current, activeViewRef.current));
+		};
+		const scheduleRecompute = () => {
+			if (scheduled) return;
+			scheduled = true;
+			frame = window.requestAnimationFrame(recomputePosition);
+		};
+
+		// Seed from current focus if the user entered help mode via keyboard.
+		const focused =
+			document.activeElement instanceof Element
+				? document.activeElement
+				: null;
+		applyTarget(findHelpTarget(focused));
+
+		window.addEventListener("pointermove", onPointerMove);
+		// mousemove fallback for environments that do not emit pointer events.
+		window.addEventListener("mousemove", onPointerMove);
+		window.addEventListener("focusin", onFocusIn);
+		window.addEventListener("resize", scheduleRecompute);
+		window.addEventListener("scroll", scheduleRecompute, true);
+
 		return () => {
 			if (frame) window.cancelAnimationFrame(frame);
-			window.removeEventListener("resize", update);
-			window.removeEventListener("scroll", update, true);
+			window.removeEventListener("pointermove", onPointerMove);
+			window.removeEventListener("mousemove", onPointerMove);
+			window.removeEventListener("focusin", onFocusIn);
+			window.removeEventListener("resize", scheduleRecompute);
+			window.removeEventListener("scroll", scheduleRecompute, true);
 		};
 	}, [helpMode]);
 
-	// Recompute once when the active view changes while help mode is held.
+	// Rebuild tooltip copy when the active view changes while help mode is held
+	// (page line is part of readHelp).
 	useEffect(() => {
-		if (!helpMode) return;
+		if (!helpMode || !targetRef.current) return;
 		const frame = window.requestAnimationFrame(() =>
-			setItems(collectHelpItems(activeView)),
+			setTooltip(buildTooltip(targetRef.current, activeView)),
 		);
 		return () => window.cancelAnimationFrame(frame);
 	}, [activeView, helpMode]);
 
 	if (!helpMode) return null;
 
+	const pageLine = pageUseLineFor(activeView);
+
 	return (
 		<div className="pointer-events-none fixed inset-0 z-[120]">
 			<div className="absolute right-4 top-3 max-w-xs rounded-xl border border-terracotta/20 bg-white/95 px-3 py-2 text-[11px] font-semibold text-cream-700 shadow-soft-lg">
-				Help mode: hold Alt to read what each command does and why it matters
-				for Devboule.
+				<p>
+					Help mode: hold Alt and hover a control with authored help. Move the
+					pointer (or focus with the keyboard) to read one tip at a time.
+				</p>
+				<p className="mt-1 font-normal text-cream-600">{pageLine}</p>
 			</div>
-			{items.map((item) => (
+			{tooltip ? (
 				<div
-					key={item.id}
-					style={{ top: item.top, left: item.left, width: HELP_WIDTH }}
+					style={{
+						top: tooltip.top,
+						left: tooltip.left,
+						width: HELP_WIDTH,
+					}}
 					className="absolute max-h-60 overflow-hidden rounded-xl border border-terracotta/20 bg-white/95 px-3 py-2 text-left shadow-soft-lg backdrop-blur"
 				>
 					<p className="text-[12px] font-semibold leading-4 text-cream-900">
-						{item.title}
+						{tooltip.title}
 					</p>
 					<div className="mt-1 space-y-0.5">
-						{item.lines.map((line, index) => (
+						{tooltip.lines.map((line, index) => (
 							<p
-								key={`${item.id}:${index}`}
+								key={`${index}:${line.slice(0, 24)}`}
 								className="text-[10.5px] leading-4 text-cream-600"
 							>
 								{line}
@@ -441,7 +511,7 @@ export function HelpModeOverlay() {
 						))}
 					</div>
 				</div>
-			))}
+			) : null}
 		</div>
 	);
 }

@@ -161,6 +161,16 @@ export const HELP_SECTIONS: HelpSection[] = [
 		link: { label: "Open Labs", view: "labs" },
 	},
 	{
+		id: "design",
+		title: "Design",
+		body: [
+			"Design generates UI mockups grounded in your codebase — describe a section and get a visual draft you can iterate on, instead of inventing layout from a blank canvas.",
+			"Open a project with a working folder, describe the section you want, and click Generate. The backend is either Cloud/OpenRouter or a local model, configured under Settings → Providers & Models → Design.",
+			"The Orchestrator can also produce a design draft from the project console while it plans — look for the Design panel under the planner chat when there is something to show.",
+		],
+		link: { label: "Open Design", view: "design" },
+	},
+	{
 		id: "polis",
 		title: "Polis — the city of your code",
 		body: [

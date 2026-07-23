@@ -99,6 +99,15 @@ pub struct DesignRequestDirective {
     /// Phase 3: device frame skin ("android" | "ios" | "web" | "component"). Absent ⇒ default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<String>,
+    /// When set, refine the existing design with this registry id (same working folder)
+    /// instead of creating a brand-new design. Absent ⇒ fresh generation (current behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine_from: Option<String>,
+    /// When true (and `refine_from` is absent), refine the project's CURRENT design
+    /// (registry entry under the project root with the latest `lastOpenedAt`). Absent /
+    /// false ⇒ fresh generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub result_path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -205,6 +214,8 @@ mod tests {
         assert_eq!(d.id, "legacy-1");
         assert_eq!(d.mode, None, "absent mode must deserialize as None");
         assert_eq!(d.frame, None, "absent frame must deserialize as None");
+        assert_eq!(d.refine_from, None, "absent refineFrom must deserialize as None");
+        assert_eq!(d.refine, None, "absent refine must deserialize as None");
     }
 
     #[test]
@@ -225,6 +236,63 @@ mod tests {
         assert!(json.contains("\"android\""), "frame value: {json}");
         let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn directive_round_trips_refine_from() {
+        let d = DesignRequestDirective {
+            id: "d3".into(),
+            parent_agent_id: "orch-3".into(),
+            status: DesignRequestStatus::Pending,
+            prompt: "make the CTA bigger".into(),
+            refine_from: Some("p123-reg-id".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains("\"refineFrom\""),
+            "camelCase refineFrom field: {json}"
+        );
+        assert!(json.contains("p123-reg-id"), "registry id value: {json}");
+        let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.refine_from.as_deref(), Some("p123-reg-id"));
+        assert_eq!(back.refine, None);
+    }
+
+    #[test]
+    fn directive_round_trips_refine_bool() {
+        let d = DesignRequestDirective {
+            id: "d4".into(),
+            parent_agent_id: "orch-4".into(),
+            status: DesignRequestStatus::Pending,
+            prompt: "darker palette".into(),
+            refine: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"refine\""), "refine field: {json}");
+        assert!(json.contains("true"), "refine true: {json}");
+        let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(back.refine, Some(true));
+        assert_eq!(back.refine_from, None);
+    }
+
+    #[test]
+    fn directive_backward_compat_no_refine_fields() {
+        // Pre-refine-loop JSON must deserialize with refine_from=None, refine=None.
+        let old_json = r#"{
+            "id": "legacy-refine",
+            "parentAgentId": "orch-old",
+            "status": "pending",
+            "prompt": "a dashboard",
+            "mode": "interactive"
+        }"#;
+        let d: DesignRequestDirective = serde_json::from_str(old_json).unwrap();
+        assert_eq!(d.refine_from, None);
+        assert_eq!(d.refine, None);
+        assert_eq!(d.mode.as_deref(), Some("interactive"));
     }
 
     #[test]

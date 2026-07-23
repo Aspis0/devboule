@@ -34,8 +34,9 @@ import type {
 	DetectedProvider,
 } from "../../types/config";
 
-// Settings → Providers card to configure the single global design-LLM backend (the LLM
-// the generative-design module generates node markup with). A 1:1 CLONE of
+// Settings → Providers card to configure the single global Design model (the LLM
+// the generative-design module generates node markup with). Same `designLlmBackend`
+// as the Design composer model popover — one setting, two editors. A 1:1 CLONE of
 // MiniCoderBackendCard: pick the kind (Codex / Ollama / oMLX / cheap-API CLI) and fill
 // the field that kind requires. Validation is the SHARED pure helper (validateDesignBackend,
 // which itself delegates to validateMiniBackend) so the UI and the Rust boundary
@@ -261,7 +262,7 @@ export function DesignLlmBackendCard() {
 				<div className="flex items-center gap-2">
 					<Palette className="h-4 w-4 text-teal" />
 					<h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-						Design LLM backend
+						Design model
 					</h3>
 				</div>
 				<button
@@ -277,8 +278,9 @@ export function DesignLlmBackendCard() {
 				</button>
 			</div>
 			<p className="mb-3 max-w-3xl text-[12px] leading-5 text-cream-500">
-				Choose the LLM the generative-design module generates node markup with.
-				One global backend; pick a provider detected on this PC and fill its
+				One global Design model (same setting as the Design composer picker).
+				Also quick-editable from the Design composer. Choose the LLM that
+				generates node markup; pick a provider detected on this PC and fill its
 				field.
 			</p>
 

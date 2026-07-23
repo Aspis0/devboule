@@ -46,6 +46,8 @@ import {
 	persistProjectRootDraft,
 	readPersistedProjectRootDraft,
 } from "./projectRootDraft";
+import { WelcomeBanner } from "./WelcomeBanner";
+import { openHelpQuickStart } from "./welcomeBannerState";
 import {
 	CensorCountsTracker,
 	censorTrackedSignature,
@@ -3104,48 +3106,56 @@ export function ProjectsView() {
 				{/* Agent-root editor — unobtrusive single input + button, prefilled with the
         current root. Hidden for an archived (read-only) project. */}
 				{currentProject.metadata.status !== "archived" && (
-					<div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
-						<label
-							htmlFor="project-root-input"
-							className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
-						>
-							Agent root
-						</label>
-						<input
-							id="project-root-input"
-							value={rootDraft}
-							onChange={(event) => {
-								const next = event.target.value;
-								setRootDraft(next);
-								// Finding 5: persist the unsaved edit on each keystroke so it
-								// outlives an idle auto-lock unmount (removed when it equals the
-								// saved rootPath or is empty).
-								persistProjectRootDraft(
-									currentProject?.metadata.id,
-									next,
-									currentProject?.metadata.rootPath,
-								);
-							}}
-							onKeyDown={(event) => {
-								if (event.key === "Enter") void setProjectRoot();
-							}}
-							placeholder="Absolute path agents launch in (blank = default)"
-							data-help-title="The agent root is the folder CLI agents launch in."
-							data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Leave it blank to fall back to the app's default root.|It only updates project metadata; it does not move any files."
-							className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
-						/>
-						<button
-							type="button"
-							onClick={() => void setProjectRoot()}
-							disabled={
-								isBusy ||
-								rootDraft.trim() ===
-									(currentProject.metadata.rootPath ?? "").trim()
-							}
-							className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-						>
-							Set root
-						</button>
+					<div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3">
+						<div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+							<label
+								htmlFor="project-root-input"
+								className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
+							>
+								Agent root
+							</label>
+							<input
+								id="project-root-input"
+								value={rootDraft}
+								onChange={(event) => {
+									const next = event.target.value;
+									setRootDraft(next);
+									// Finding 5: persist the unsaved edit on each keystroke so it
+									// outlives an idle auto-lock unmount (removed when it equals the
+									// saved rootPath or is empty).
+									persistProjectRootDraft(
+										currentProject?.metadata.id,
+										next,
+										currentProject?.metadata.rootPath,
+									);
+								}}
+								onKeyDown={(event) => {
+									if (event.key === "Enter") void setProjectRoot();
+								}}
+								placeholder="Absolute path agents launch in"
+								data-help-title="The agent root is the folder CLI agents launch in."
+								data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Agents cannot plan or write code without a working folder.|It only updates project metadata; it does not move any files."
+								className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+							/>
+							<button
+								type="button"
+								onClick={() => void setProjectRoot()}
+								disabled={
+									isBusy ||
+									rootDraft.trim() ===
+										(currentProject.metadata.rootPath ?? "").trim()
+								}
+								className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+							>
+								Set root
+							</button>
+						</div>
+						{!(currentProject.metadata.rootPath ?? "").trim() && (
+							<p className="text-[11px] font-medium leading-snug text-amber-dark">
+								No working folder yet — pick one here before launching agents or
+								planning. Agents need a code root to read and write.
+							</p>
+						)}
 					</div>
 				)}
 
@@ -3633,6 +3643,9 @@ export function ProjectsView() {
 						</div>
 					)}
 
+					{/* First-run welcome — one-time, dismissible; does not gate the app. */}
+					<WelcomeBanner requestView={requestView} />
+
 					<section className="flex flex-wrap items-center gap-2 rounded-2xl border border-cream-200 bg-white px-3 py-2">
 						<FolderKanban className="h-5 w-5 shrink-0 text-terracotta" />
 						<input
@@ -3667,6 +3680,14 @@ export function ProjectsView() {
 									: "Folder"}
 							</span>
 						</button>
+						{/* Always-visible folder requirement (not Alt-gated) — creation stays
+						    allowed without a folder, but the consequence is clear inline. */}
+						<span
+							className="max-w-[14rem] text-[11px] leading-snug text-cream-400 sm:max-w-[18rem]"
+							title="Agents read and write code in the project folder. You can create a title-only project now and pick a folder later, but launches fail until a folder is set."
+						>
+							Agents need a working folder — pick one now or before launching.
+						</span>
 						<button
 							onClick={() => {
 								setCloneError(null);
@@ -3843,16 +3864,35 @@ export function ProjectsView() {
 							{activeProjects.length === 0 ? (
 								<main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
 									<FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
-									<p className="text-sm font-semibold text-cream-700">
-										{error && projects.length === 0
-											? "Project list unavailable."
-											: "Create a project to start."}
-									</p>
-									<p className="mt-1 text-[12px] text-cream-400">
-										{error && projects.length === 0
-											? "Fix the load error above or reload the project folder."
-											: "Files are stored as local Markdown with a structured Devboule project block."}
-									</p>
+									{error && projects.length === 0 ? (
+										<>
+											<p className="text-sm font-semibold text-cream-700">
+												Project list unavailable.
+											</p>
+											<p className="mt-1 text-[12px] text-cream-400">
+												Fix the load error above or reload the project folder.
+											</p>
+										</>
+									) : (
+										<>
+											<p className="text-sm font-semibold text-cream-700">
+												Devboule runs a team of AI coding agents on your
+												codebase: plan → code → review → ship.
+											</p>
+											<ol className="mx-auto mt-3 max-w-sm list-decimal space-y-1 pl-5 text-left text-[12px] leading-5 text-cream-500">
+												<li>Create a project on a code folder</li>
+												<li>Describe a goal to the Orchestrator</li>
+												<li>Approve its plan</li>
+											</ol>
+											<button
+												type="button"
+												onClick={() => openHelpQuickStart(requestView)}
+												className="mt-4 inline-flex items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-terracotta hover:bg-cream-100"
+											>
+												Open the Quick start guide
+											</button>
+										</>
+									)}
 								</main>
 							) : (
 								<ProjectsBoard

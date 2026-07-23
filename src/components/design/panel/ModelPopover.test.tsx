@@ -128,10 +128,11 @@ describe("ModelPopover — timeout slider persistence", () => {
 
 // BUG 3: switching to a local provider (ollama/oMLX/CLI) that has no saved config used to be a
 // SILENT no-op — the row looked unclickable. Clicking it must give visible feedback, not nothing.
+// The failed kind must NOT appear as the active selection (only the saved kind is "sel").
 describe("ModelPopover — provider switch feedback (bug #3)", () => {
   const claudeBackend: DesignLlmBackend = { kind: "claude", timeoutSecs: 180 };
 
-  function mountWith(b: DesignLlmBackend | null) {
+  function mountWith(b: DesignLlmBackend | null, openSettings = () => {}) {
     act(() => {
       root = createRoot(container);
       root.render(
@@ -140,7 +141,7 @@ describe("ModelPopover — provider switch feedback (bug #3)", () => {
           onClose: () => {},
           backend: b,
           onSave,
-          onOpenSettings: () => {},
+          onOpenSettings: openSettings,
         }),
       );
     });
@@ -156,7 +157,25 @@ describe("ModelPopover — provider switch feedback (bug #3)", () => {
     });
   }
 
-  it("clicking an unconfigured local provider shows a dedicated config hint (not a silent no-op)", () => {
+  function providerRow(name: string): HTMLButtonElement {
+    const btn = [...container.querySelectorAll("button.mp-row")].find((b) =>
+      b.textContent?.includes(name),
+    ) as HTMLButtonElement;
+    if (!btn) throw new Error(`provider row "${name}" not found`);
+    return btn;
+  }
+
+  it("labels the popover as the global Design model (same as Settings)", () => {
+    mountWith(claudeBackend);
+    expect(container.querySelector('[data-testid="design-model-global-label"]')?.textContent).toMatch(
+      /DESIGN MODEL \(GLOBAL\)/i,
+    );
+    expect(container.querySelector('[data-testid="design-model-global-note"]')?.textContent).toMatch(
+      /Also editable in Settings/i,
+    );
+  });
+
+  it("clicking an unconfigured local provider shows a dedicated not-saved hint (not a silent no-op)", () => {
     mountWith(claudeBackend);
     // No dedicated hint before any failed click (the provider list + Settings button are always
     // present, so we assert on a DEDICATED element, not on raw text — that would be tautological).
@@ -164,15 +183,63 @@ describe("ModelPopover — provider switch feedback (bug #3)", () => {
     clickProvider("Ollama");
     // It must NOT silently switch to a backend with no model…
     expect(onSave).not.toHaveBeenCalled();
-    // …and a dedicated hint must appear, naming the clicked provider.
+    // …and a dedicated hint must appear, naming the clicked provider + saying Not saved.
     const hint = container.querySelector('[data-testid="provider-config-hint"]');
     expect(hint, "expected a provider-config-hint after clicking an unconfigured provider").not.toBeNull();
+    expect(hint?.textContent ?? "").toMatch(/Not saved/i);
     expect(hint?.textContent ?? "").toMatch(/Ollama/);
+    // Saved kind stays active; attempted kind must NOT look selected.
+    expect(providerRow("Claude").classList.contains("sel")).toBe(true);
+    expect(providerRow("Ollama").classList.contains("sel")).toBe(false);
+    expect(providerRow("Ollama").getAttribute("data-needs-setup")).toBe("true");
+  });
+
+  it("Open Settings from the not-saved hint navigates to Settings", () => {
+    const onOpenSettings = vi.fn();
+    mountWith(claudeBackend, onOpenSettings);
+    clickProvider("Ollama");
+    const openBtn = container.querySelector(
+      '[data-testid="provider-open-settings"]',
+    ) as HTMLButtonElement;
+    expect(openBtn).not.toBeNull();
+    act(() => {
+      openBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
   });
 
   it("clicking a valid provider (no required fields) switches immediately", () => {
     mountWith(claudeBackend);
     clickProvider("Codex");
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ kind: "codex" }));
+  });
+});
+
+// Pure helper: can this kind be saved from the popover given the current saved backend?
+describe("nextBackendForKind — can-save decision", () => {
+  it("returns valid when the kind needs no extra fields", async () => {
+    const { nextBackendForKind } = await import("./ModelPopover");
+    const r = nextBackendForKind("codex", { kind: "claude" });
+    expect(r.valid).toBe(true);
+    expect(r.value).toMatchObject({ kind: "codex" });
+  });
+
+  it("returns invalid when required fields are missing for the target kind", async () => {
+    const { nextBackendForKind } = await import("./ModelPopover");
+    const r = nextBackendForKind("ollama", { kind: "claude" });
+    expect(r.valid).toBe(false);
+    expect(r.value).toBeNull();
+  });
+
+  it("preserves same-kind fields when switching within a configured kind", async () => {
+    const { nextBackendForKind } = await import("./ModelPopover");
+    // Re-picking ollama with a saved model should stay valid and keep the model.
+    const r = nextBackendForKind("ollama", {
+      kind: "ollama",
+      model: "qwen2.5-coder",
+      timeoutSecs: 180,
+    });
+    expect(r.valid).toBe(true);
+    expect(r.value).toMatchObject({ kind: "ollama", model: "qwen2.5-coder" });
   });
 });

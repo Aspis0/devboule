@@ -535,6 +535,13 @@ pub struct DesignRequestArgs {
     pub mode: Option<String>,
     #[serde(default)]
     pub frame: Option<String>,
+    /// Iterate: refine the design with this registry id (from a prior design_request
+    /// result) instead of generating fresh. Same working project; keeps continuity.
+    #[serde(default)]
+    pub refine_from: Option<String>,
+    /// Iterate: refine the project's CURRENT design. Ignored when `refine_from` is set.
+    #[serde(default)]
+    pub refine: Option<bool>,
     #[serde(default)]
     pub session_token: Option<String>,
 }
@@ -1445,7 +1452,7 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Orchestrator/coder: ask the DESIGNER AI to generate a UI screen. Returns design path + registry id. Outcome paths validated (relative only, F-02-013). Fail-closed if designer offline."
+        description = "Orchestrator/coder: ask the DESIGNER AI to generate OR iterate a UI screen. To ITERATE on an existing design, pass refine_from=<registryId from a prior result> (or refine=true for the project's current design) with the change to apply. Returns design path + registry id. Outcome paths validated (relative only, F-02-013). Fail-closed if designer offline."
     )]
     pub async fn design_request(
         &self,
@@ -1462,6 +1469,8 @@ impl DevbouleMcp {
                 args.context.as_deref(),
                 args.mode.as_deref(),
                 args.frame.as_deref(),
+                args.refine_from.as_deref(),
+                args.refine,
             )
         })
         .await

@@ -11,7 +11,12 @@
 import { invokeBackendCommand } from '../../../context/AppContext';
 import { startDesignGeneration, type DesignStreamHandle } from '../useDesignStream';
 import { applyGeneration } from './pipeline';
-import { buildGeneratePrompt, buildInteractivePrompt } from './prompt';
+import {
+  buildGeneratePrompt,
+  buildInteractivePrompt,
+  buildRefineFullPrompt,
+  buildInteractiveRefinePrompt,
+} from './prompt';
 import { applyInteractiveGeneration } from './interactivePipeline';
 import type { DesignProject, DesignProjectEntry, ArtifactFrameKind } from '../../../types/design';
 
@@ -28,6 +33,13 @@ export interface GenerateAndRegisterOptions {
   workingFolderPath: string;
   /** Human-readable name for the registry entry (capped at 60 chars by callers). */
   designName: string;
+  /**
+   * ITERATION (Phase 8): when set (non-empty), the CURRENT design's markup is injected
+   * as the base and the model is asked to REFINE it (apply `prompt` as a change) instead
+   * of generating from scratch. The `mode` MUST match the base's kind (the caller resolves
+   * it from `design_read_current`). Absent ⇒ fresh generation (current behavior).
+   */
+  refineBaseMarkup?: string;
 }
 
 /**
@@ -43,6 +55,8 @@ export interface GenerateAndRegisterOptions {
  */
 export async function generateAndRegisterDesign(opts: GenerateAndRegisterOptions): Promise<string> {
   const { mode, frame, prompt, context, workingFolderPath, designName } = opts;
+  const refineBase = opts.refineBaseMarkup?.trim();
+  const isRefine = !!refineBase;
 
   // Step 1: Create the project working folder. Both modes use design_create_project so the
   // folder exists when design_write_artifact later calls fs::canonicalize. The static
@@ -54,10 +68,18 @@ export async function generateAndRegisterDesign(opts: GenerateAndRegisterOptions
   });
 
   // Step 2: Build the mode-appropriate prompt (same transport, different system prompt).
-  const fullPrompt =
-    mode === 'interactive'
-      ? buildInteractivePrompt(prompt, { context })
+  // Refine variants inject the current markup as the base so the model edits it in place;
+  // the mode still selects the isolation-safe pipeline downstream (Step 4).
+  let fullPrompt: string;
+  if (mode === 'interactive') {
+    fullPrompt = isRefine
+      ? buildInteractiveRefinePrompt(refineBase!, prompt, { context })
+      : buildInteractivePrompt(prompt, { context });
+  } else {
+    fullPrompt = isRefine
+      ? buildRefineFullPrompt(refineBase!, prompt, { context })
       : buildGeneratePrompt(prompt, { context });
+  }
 
   // Step 3: Run the provider-blind design generation stream (same as the static path —
   // mode choice is orthogonal to which backend produced the text).

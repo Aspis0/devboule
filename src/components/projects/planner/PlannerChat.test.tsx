@@ -50,7 +50,7 @@ describe("PlannerChat banner (D4 chrome)", () => {
     const out = html({ banner: "delivery failed" });
     // The empty-transcript hint still shows: the banner added no message rows.
     expect(out).toContain("delivery failed");
-    expect(out).toContain("Describe a goal");
+    expect(out).toContain("Type a goal in the box below");
   });
 
   it("renders a Restart button in the banner when onResetChat is set", () => {

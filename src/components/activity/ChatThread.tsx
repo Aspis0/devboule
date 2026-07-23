@@ -44,7 +44,7 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
             textAlign: "center",
           }}
         >
-          {emptyHint ?? "Describe a goal above, or message the Orchestrator while it plans."}
+          {emptyHint ?? "Type a goal in the box below and press Enter to start the Orchestrator."}
         </div>
       ) : (
         <>

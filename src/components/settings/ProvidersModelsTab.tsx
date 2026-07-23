@@ -94,12 +94,15 @@ function DetectedProvidersStrip() {
     [detected],
   );
 
-  // Empty == detection ran and found NO available CLI/HTTP provider (api is always
-  // "configurable" and excluded from this judgement).
+  // Empty == detection ran and found NO available CLI/HTTP provider. `api` (your own
+  // command) and `cloud` (OpenRouter, a REMOTE provider — not "on this machine") are
+  // always "configure below", so both are excluded from this local-detection judgement.
   const noneAvailable = useMemo(
     () =>
       detected !== null &&
-      DESIGN_BACKEND_KINDS.every((k) => k === "api" || !statusMap[k].available),
+      DESIGN_BACKEND_KINDS.every(
+        (k) => k === "api" || k === "cloud" || !statusMap[k].available,
+      ),
     [detected, statusMap],
   );
 
@@ -157,8 +160,11 @@ function DetectedProvidersStrip() {
           <ul className="grid gap-1.5 sm:grid-cols-2">
             {DESIGN_BACKEND_KINDS.map((k) => {
               const s = statusMap[k];
-              const good = k === "api" ? false : s.available;
-              const bad = k !== "api" && !s.available;
+              // `api` and `cloud` are remote/configurable (never "detected on this
+              // machine"): show them neutral, never green/red.
+              const remote = k === "api" || k === "cloud";
+              const good = remote ? false : s.available;
+              const bad = !remote && !s.available;
               return (
                 <li
                   key={k}
@@ -329,7 +335,7 @@ export function ProvidersModelsTab() {
       >
         <RoleSection
           title="Censor model"
-          description="A review GATE, not a role: where Censor's tier-2 local review runs (Ollama, local oMLX, or Apple on-device) and which model it uses."
+          description="Optional AI review tier. Does not control the linters (those always run). Local or cloud."
         >
           <CensorLocalAiCard />
         </RoleSection>

@@ -72,50 +72,61 @@ struct ConfigPayload {
     raw: serde_json::Value,
 }
 
+/// Resolve (and if needed bootstrap) the canonical writable `config.json`.
+///
+/// Path decision is owned by [`backend::projects::resolved_config_path`] (shared
+/// with every Settings save via `locate_config_path`). On first run, when the
+/// file is missing at that writable location, seed from a bundled
+/// `resource_dir()/config.json` template if present; otherwise write the minimal
+/// `{}` default. Never writes into the read-only `.app` resource bundle.
 fn resolve_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    if let Ok(dir) = app.path().resource_dir() {
-        let path = dir.join("config.json");
-        if path.exists() {
-            return Ok(path);
+    let path = backend::projects::resolved_config_path(app)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    let dir = path.parent().ok_or_else(|| {
+        format!(
+            "config.json path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "Could not create config directory {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    // First-run seed from the packaged template (read-only resource), only when
+    // the user config does not exist yet. Fall through to minimal `{}` on any
+    // template read/parse failure.
+    if let Ok(resource) = app.path().resource_dir() {
+        let template = resource.join("config.json");
+        if template.is_file() {
+            if let Ok(raw) = fs::read_to_string(&template) {
+                if serde_json::from_str::<serde_json::Value>(&raw)
+                    .map(|v| v.is_object())
+                    .unwrap_or(false)
+                {
+                    if bootstrap_config_with_content(dir, &raw).is_ok() {
+                        return Ok(path);
+                    }
+                }
+            }
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        let parent_path = cwd.join("../config.json");
-        if parent_path.exists() {
-            return Ok(parent_path);
-        }
-        let cwd_path = cwd.join("config.json");
-        if cwd_path.exists() {
-            return Ok(cwd_path);
-        }
-        // Nothing found anywhere: bootstrap a minimal default so a fresh checkout
-        // (config.json is per-machine and untracked) gets a working app with zero
-        // manual setup. Bootstrap at the MANAGEMENT ROOT when the parent carries the
-        // oracle package — writing at the bare CWD (src-tauri in dev) is what created
-        // the 2026-07-02 split-layout incident: the readers required
-        // `<root>/config.json`, this writer produced `src-tauri/config.json`, and no
-        // directory validated as a management root any more (mute agent fleet). NEVER
-        // create in the resource dir (read-only in a packaged build). If the chosen
-        // dir is not writable, fall through to the original not-found error so
-        // callers still fail cleanly.
-        if let Ok(path) = bootstrap_default_config(&bootstrap_config_dir(&cwd)) {
-            return Ok(path);
-        }
-    }
-    Err("config.json not found in resource dir, parent of CWD, or CWD".into())
+
+    // Minimal default so a fresh checkout / first packaged launch works with zero
+    // manual setup. NEVER create in the resource dir (resolved_config_path already
+    // chose a writable location). If the chosen dir is not writable, surface Err.
+    bootstrap_default_config(dir)?;
+    Ok(path)
 }
 
-/// Where to bootstrap a missing `config.json`: the PARENT of `cwd` when it is
-/// recognizably the management root (it carries an MCP package marker), else
-/// `cwd` itself (standalone/unusual layouts keep the old behavior). Pure
-/// (filesystem-read only) so it is unit-testable. Marker set is shared with
-/// [`backend::agents::has_mcp_package_marker`] (Python `aspis_mcp.py` **or**
-/// Rust `devboule-mcp/Cargo.toml` **or** executable `DEVBOULE_MCP_BIN`).
+/// Thin re-export of the shared pure helper (kept for unit tests that historically
+/// lived next to `resolve_config_path`).
 fn bootstrap_config_dir(cwd: &std::path::Path) -> std::path::PathBuf {
-    cwd.parent()
-        .filter(|parent| backend::agents::has_mcp_package_marker(parent))
-        .map(|parent| parent.to_path_buf())
-        .unwrap_or_else(|| cwd.to_path_buf())
+    backend::projects::bootstrap_config_dir(cwd)
 }
 
 /// Create a minimal default `config.json` (`{}`) in `dir` and return its path.
@@ -130,6 +141,16 @@ fn bootstrap_config_dir(cwd: &std::path::Path) -> std::path::PathBuf {
 /// `design.rs` does); since the target does not exist no backup is ever taken. Returns
 /// `Err` (never panics) when `dir` is not writable so the caller can fall back.
 fn bootstrap_default_config(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    bootstrap_config_with_content(dir, "{}\n")
+}
+
+/// Atomic bootstrap of `dir/config.json` with the given content (temp + rename under
+/// the shared config write lock). Used for the minimal `{}` default and for seeding
+/// from a bundled template on first packaged launch.
+fn bootstrap_config_with_content(
+    dir: &std::path::Path,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
     use backend::fs_replace::replace_file_with_backup;
     use backend::projects::config_write_lock;
     use chrono::Utc;
@@ -149,7 +170,12 @@ fn bootstrap_default_config(dir: &std::path::Path) -> Result<std::path::PathBuf,
     );
     let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
     let backup_path = path.with_extension(format!("json.{suffix}.bak"));
-    fs::write(&temp_path, "{}\n").map_err(|e| {
+    let body = if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{content}\n")
+    };
+    fs::write(&temp_path, body).map_err(|e| {
         format!(
             "Could not write a default config.json in {}: {e}",
             dir.display()
@@ -444,16 +470,16 @@ pub fn run() {
             // `get_config` to lazily bootstrap it, this `setup()` would resolve the
             // projects dir to `<app_data>/projects` and `oracle_service::init` would
             // publish `.oracle-server.json` there, while agents (resolving later, after
-            // the lazy bootstrap created cwd/config.json) would look in `cwd/projects` —
+            // the lazy bootstrap created the config) would look elsewhere —
             // so the Oracle would appear OFFLINE for the entire first session and only
             // self-heal on restart. Resolving it here first makes both resolutions agree.
             //
-            // We call `resolve_config_path` (not `bootstrap_default_config` directly) so
-            // an EXISTING config is found and returned untouched — only a genuine
-            // "nothing found anywhere" triggers the lazy bootstrap at the CWD. This is
-            // exactly the same search+bootstrap `get_config` would run, just pulled
-            // forward. Best-effort: if it Errs (e.g. unwritable CWD) we proceed exactly
-            // as before; the lazy path in `resolve_config_path` remains the safety net.
+            // `resolve_config_path` uses the shared canonical resolver: existing writable
+            // repo config (dev), else management-root when the MCP package marker is
+            // present, else `<app_data_dir>/config.json` (packaged Finder launch). Only a
+            // missing file at that writable path is bootstrapped (`{}` or a bundled
+            // template seed). Best-effort: if it Errs we proceed; the lazy path remains
+            // the safety net on the next `get_config`.
             let _ = resolve_config_path(app.handle());
             // Record the projects dir for the resident-Oracle discovery file. The
             // resolution mirrors `backend::projects::projects_dir` (env override,
@@ -756,6 +782,8 @@ pub fn run() {
             backend::projects::respond_cloud_consent,
             backend::design::design_create_project,
             backend::design::design_load_project,
+            backend::design::design_read_current,
+            backend::design::design_read_folder_markup,
             backend::design::design_save_project,
             backend::design::design_write_manifest,
             backend::design::design_write_node,

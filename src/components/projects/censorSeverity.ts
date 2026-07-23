@@ -97,19 +97,25 @@ export function categoryBadgeClass(
   return "bg-cream-100 text-cream-600";
 }
 
-/** Pill classes for a source badge. `gemma` (the local-AI tier) gets a teal
- *  accent so it is visually distinct from the deterministic linters. */
+/** Pill classes for a source badge. `gemma` (the optional AI-review tier) gets a
+ *  teal accent; deterministic linters get a neutral cream pill so the two layers
+ *  read as visually distinct in the findings list. */
 export function sourceBadgeClass(source: string | undefined): string {
   if ((source ?? "").toLowerCase() === "gemma") return "bg-teal/10 text-teal-dark";
   return "bg-cream-100 text-cream-500";
 }
 
-/** Display label for a source — passthrough of the runner name, capped so a
- *  malformed shard cannot blow out the row. Never a path or value. */
+/** Human display label for a finding source.
+ *  - `"gemma"` (any case) → "AI review" (Layer 2; legacy wire name kept on the backend)
+ *  - any other runner (clippy / eslint / ruff / …) → "Linter · {tool}" (Layer 1)
+ *  Never a path or value; tool names are capped so a malformed shard cannot blow
+ *  out the row. */
 export function sourceLabel(source: string | undefined): string {
   const s = (source ?? "").trim();
-  if (!s) return "linter";
-  return s.length > 24 ? `${s.slice(0, 24)}…` : s;
+  if (!s) return "Linter";
+  if (s.toLowerCase() === "gemma") return "AI review";
+  const tool = s.length > 20 ? `${s.slice(0, 20)}…` : s;
+  return `Linter · ${tool}`;
 }
 
 /** The compact, user-facing `file:line` reference for a finding. A null line
@@ -126,11 +132,13 @@ export function fileLineLabel(
   return f;
 }
 
-/** The one-line message the Gemma-tier state shows, driven by `censor_status`. */
+/** Calm one-line note when the optional AI-review tier is offline. Driven by
+ *  `censor_status.gemmaStatus` (legacy wire name). Render this in the panel so
+ *  users see that Layer 1 linters still run without a model. */
 export function gemmaStatusNote(status: CensorGemmaStatus | string | undefined): string | null {
   switch (status) {
     case "offline":
-      return "Gemma layer offline — deterministic review active.";
+      return "AI review offline — deterministic linters still active";
     case "unknown":
       // Not yet probed this session (no watch started). No banner — deterministic
       // linters still run; we just don't claim a state we don't know.

@@ -79,6 +79,7 @@ describe("DesignLlmBackendCard — effort/timeout are not dropped on save (A2)",
 		// Must not throw; the card edits only kind/model/command/baseUrl but tolerates the
 		// extra persisted fields on `current`.
 		const html = renderToStaticMarkup(<DesignLlmBackendCard />);
-		expect(html).toContain("Design LLM backend");
+		expect(html).toContain("Design model");
+		expect(html).toContain("Also quick-editable from the Design composer");
 	});
 });

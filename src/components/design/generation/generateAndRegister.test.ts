@@ -59,6 +59,8 @@ vi.mock('./interactivePipeline', () => ({
 vi.mock('./prompt', () => ({
   buildGeneratePrompt: (instruction: string) => `static:${instruction}`,
   buildInteractivePrompt: (instruction: string) => `interactive:${instruction}`,
+  buildRefineFullPrompt: (base: string, instruction: string) => `static-refine:${instruction}:${base}`,
+  buildInteractiveRefinePrompt: (base: string, instruction: string) => `interactive-refine:${instruction}:${base}`,
 }));
 
 import { generateAndRegisterDesign } from './generateAndRegister';
@@ -235,6 +237,50 @@ describe('generateAndRegisterDesign — interactive mode', () => {
     });
     const artifactCall = invokeMock.mock.calls.find(([cmd]) => cmd === 'design_write_artifact')!;
     expect((artifactCall[1] as { html: string }).html).toBe('<html><body>custom html</body></html>');
+  });
+});
+
+describe('generateAndRegisterDesign — refine (Phase 8 iterate)', () => {
+  it('static refine uses buildRefineFullPrompt with the base markup injected', async () => {
+    setupInvoke();
+    await generateAndRegisterDesign({
+      mode: 'static',
+      prompt: 'make the header blue',
+      workingFolderPath: FOLDER,
+      designName: 'test',
+      refineBaseMarkup: '<section data-node-id="a">old</section>',
+    });
+    const [promptArg] = startDesignGenerationMock.mock.calls[0] as [string, ...unknown[]];
+    expect(promptArg).toMatch(/^static-refine:/);
+    expect(promptArg).toContain('<section data-node-id="a">old</section>');
+  });
+
+  it('interactive refine uses buildInteractiveRefinePrompt with the base document injected', async () => {
+    setupInvoke();
+    await generateAndRegisterDesign({
+      mode: 'interactive',
+      prompt: 'add a pricing section',
+      workingFolderPath: FOLDER,
+      designName: 'test',
+      refineBaseMarkup: '<!DOCTYPE html><html><body>base</body></html>',
+    });
+    const [promptArg] = startDesignGenerationMock.mock.calls[0] as [string, ...unknown[]];
+    expect(promptArg).toMatch(/^interactive-refine:/);
+    expect(promptArg).toContain('<!DOCTYPE html><html><body>base</body></html>');
+  });
+
+  it('a blank/whitespace refineBaseMarkup falls back to a fresh generation', async () => {
+    setupInvoke();
+    await generateAndRegisterDesign({
+      mode: 'interactive',
+      prompt: 'fresh',
+      workingFolderPath: FOLDER,
+      designName: 'test',
+      refineBaseMarkup: '   ',
+    });
+    const [promptArg] = startDesignGenerationMock.mock.calls[0] as [string, ...unknown[]];
+    // Not the refine prefix — the empty base means there is nothing to iterate on.
+    expect(promptArg).toMatch(/^interactive:/);
   });
 });
 

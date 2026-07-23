@@ -495,6 +495,12 @@
 }
 .dsgn .mp-row:hover { background: var(--accent-softer); }
 .dsgn .mp-row.sel { background: var(--accent-soft); border-color: color-mix(in oklab, var(--accent), white 70%); }
+/* Failed kind-switch: not active — dashed border so it never reads as "sel". */
+.dsgn .mp-row.mp-needs-setup {
+  border-style: dashed;
+  border-color: var(--border);
+  background: transparent;
+}
 .dsgn .mp-row .ico {
   width: 28px; height: 28px; border-radius: 7px; flex: none;
   background: var(--bg-sidebar); border: 1px solid var(--border);
@@ -509,6 +515,7 @@
   background: var(--bg-sidebar); border: 1px solid var(--border); color: var(--muted);
 }
 .dsgn .mp-row.sel .mp-badge { background: var(--card); color: var(--accent-ink); border-color: color-mix(in oklab, var(--accent), white 70%); }
+.dsgn .mp-row.mp-needs-setup .mp-badge { border-style: dashed; }
 .dsgn .seg { display: flex; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 9px; padding: 3px; gap: 2px; margin-bottom: 13px; }
 .dsgn .seg button { flex: 1; height: 28px; border-radius: 7px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
 .dsgn .seg button.sel { background: var(--card); color: var(--ink); box-shadow: var(--shadow-sm); }

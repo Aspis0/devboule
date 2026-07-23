@@ -102,23 +102,10 @@ pub fn require_capability(app: &tauri::AppHandle, cap: Capability) -> Result<(),
 
 // --- trust anchor -----------------------------------------------------------
 
-/// Resolve `config.json` the same way `lib.rs::resolve_config_path` does, so the
-/// backend reads the same bundled config the frontend sees.
+/// Resolve `config.json` via the shared canonical resolver (`projects::locate_config_path`),
+/// so trust-anchor reads hit the same writable path as Settings saves / `get_config`.
 fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    if let Ok(dir) = app.path().resource_dir() {
-        let path = dir.join("config.json");
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        for candidate in [cwd.join("../config.json"), cwd.join("config.json")] {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    super::projects::locate_config_path(app)
 }
 
 /// The admin signing public key (normalized hex) from `config.json`, or `None`

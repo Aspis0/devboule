@@ -108,8 +108,8 @@ describe("OracleAskPanel static render", () => {
     const html = renderToStaticMarkup(
       createElement(Panel, { onFocusFile: vi.fn(), onClose: vi.fn() }),
     );
-    // seedQuestions should appear as chips
-    expect(html).toContain("Cloudflare Worker secret rotation");
+    // seedQuestions should appear as chips (generic, repo-agnostic)
+    expect(html).toContain("What does this project do and where does it start?");
   });
 
   it("renders an Ask button", async () => {

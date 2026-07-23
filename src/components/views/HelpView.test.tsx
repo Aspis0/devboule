@@ -104,6 +104,7 @@ describe("HelpView (static help page)", () => {
     for (const expected of [
       "planner",
       "oracle",
+      "design",
       "security-lock",
       "dependencies",
       "acknowledgments",

@@ -5,13 +5,14 @@
 
 import type { CityState } from "../../types/city";
 
-// Corpus-agnostic example questions: Oracle indexes whatever folder the user
-// maps, so prompts must not assume a specific subsystem of this repo. These
-// read as generic "understand/locate code" tasks that hold for any codebase.
+// Corpus-agnostic starter questions: Oracle indexes whatever folder the user
+// maps, so prompts must not assume a specific subsystem of this monorepo.
+// Keep them generic "understand / locate code" tasks that hold for any repo.
 export const seedQuestions = [
-  "How does Cloudflare Worker secret rotation work?",
-  "Which files control Scaleway GPU and CPU VM lifecycle actions?",
-  "Which files should I read to understand how the main components fit together?",
+  "What does this project do and where does it start?",
+  "Where is authentication / the main entry point handled?",
+  "Which files should I read first to understand the architecture?",
+  "Where are the tests and how do I run them?",
 ];
 
 /**

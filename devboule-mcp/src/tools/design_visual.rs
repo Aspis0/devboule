@@ -555,6 +555,8 @@ pub fn design_request(
     context: Option<&str>,
     mode: Option<&str>,
     frame: Option<&str>,
+    refine_from: Option<&str>,
+    refine: Option<bool>,
 ) -> ToolResult<Value> {
     let (agent_id, role) =
         require_agent_tool(projects_dir, agent_id, role, "design_request", session_token)?;
@@ -569,6 +571,13 @@ pub fn design_request(
     let frame = frame
         .map(str::trim)
         .filter(|f| matches!(*f, "android" | "ios" | "web" | "component"));
+    // Iteration (Phase 8): `refine_from` targets a specific registry id, `refine`
+    // targets the project's CURRENT design. Both are hints the frontend watcher honors;
+    // the registry id is a client-opaque token (clean_text-bounded, no path semantics).
+    let refine_from = match refine_from.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => Some(clean_text(id, "Design refine registry id", 256)?),
+        None => None,
+    };
 
     let directive_id = Uuid::new_v4().simple().to_string();
     let mut directive = json!({
@@ -589,6 +598,14 @@ pub fn design_request(
         }
         if let Some(f) = frame {
             obj.insert("frame".into(), json!(f));
+        }
+        if let Some(id) = refine_from {
+            obj.insert("refineFrom".into(), json!(id));
+        } else if refine == Some(true) {
+            // Only honor `refine` when no explicit `refineFrom`: refineFrom already
+            // pins the base, and the watcher treats a bare `refine:true` as "the
+            // project's current design".
+            obj.insert("refine".into(), json!(true));
         }
     }
 
@@ -806,6 +823,8 @@ mod tests {
             None,
             Some("interactive"),
             Some("web"),
+            None,
+            None,
         )
         .unwrap();
         assert!(out.get("error").is_some(), "{out}");
@@ -837,6 +856,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(err.message.contains("cannot use"), "{}", err.message);
@@ -856,8 +877,77 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(err.message.contains("cannot use"), "{}", err.message);
+    }
+
+    #[test]
+    fn design_request_directive_carries_refine_from() {
+        let _g = env_lock();
+        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS", "0");
+        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS", "0");
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "orch-ref", "orchestrator");
+        // refine_from wins over refine; the directive must carry `refineFrom` and NOT `refine`.
+        let _ = design_request(
+            &projects,
+            "orch-ref",
+            "orchestrator",
+            Some(&tok),
+            "Make the header blue",
+            None,
+            Some("interactive"),
+            None,
+            Some("reg-abc"),
+            Some(true),
+        )
+        .unwrap();
+        let state = read_agents_state(&projects).unwrap();
+        let dirs = state
+            .get("designRequestDirectives")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let d = dirs.last().expect("one directive queued");
+        assert_eq!(d.get("refineFrom").and_then(|v| v.as_str()), Some("reg-abc"));
+        assert!(d.get("refine").is_none(), "refineFrom must suppress bare refine");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS");
+    }
+
+    #[test]
+    fn design_request_directive_carries_bare_refine() {
+        let _g = env_lock();
+        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS", "0");
+        std::env::set_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS", "0");
+        let (_tmp, projects) = temp_projects();
+        let tok = register(&projects, "orch-ref2", "orchestrator");
+        let _ = design_request(
+            &projects,
+            "orch-ref2",
+            "orchestrator",
+            Some(&tok),
+            "Darker theme",
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .unwrap();
+        let state = read_agents_state(&projects).unwrap();
+        let dirs = state
+            .get("designRequestDirectives")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let d = dirs.last().expect("one directive queued");
+        assert_eq!(d.get("refine").and_then(|v| v.as_bool()), Some(true));
+        assert!(d.get("refineFrom").is_none());
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_TIMEOUT_SECS");
+        std::env::remove_var("DEVBOULE_MCP_DESIGN_REQUEST_POLL_INTERVAL_SECS");
     }
 }

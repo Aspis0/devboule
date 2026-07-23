@@ -53,8 +53,9 @@ export function PlannerControls(props: PlannerControlsProps) {
 					fontWeight: 600,
 					cursor: "help",
 				}}
-				data-help-title="After the plan, the orchestrator hands the tasks off to the Main coder."
-				data-help-lines="The Main coder is the ROLE that builds the plan into code — configure its engine in Settings → Roles.|This dropdown is a PER-PROJECT override: one project can build with Codex, another with Claude or a local model.|Default follows the Settings → Roles Main coder; pick an engine here to override it for THIS project only.|OpenAI is also available as a cloud CLI option.|The Main coder delegates one-shot edits to minis and moves tasks toward Review."
+				title="Send the approved work to the Main coder (or another role) to implement."
+				data-help-title="Send the approved work to the Main coder (or another role) to implement."
+				data-help-lines="HAND OFF TO picks who implements the approved plan — usually the Main coder.|The Main coder is the ROLE that builds the plan into code — configure its engine in Settings → Roles.|This dropdown is a PER-PROJECT override: one project can build with Codex, another with Claude or a local model.|Default follows the Settings → Roles Main coder; pick an engine here to override it for THIS project only."
 			>
 				HAND OFF TO
 			</span>
@@ -123,11 +124,11 @@ export function PlannerControls(props: PlannerControlsProps) {
 					disabled={!canCreatePlan}
 					title={
 						canCreatePlan
-							? "Draft the plan from the conversation and create the tasks on the board."
+							? "The Orchestrator drafts a task plan you approve before any code is written."
 							: "Start the orchestrator (describe a goal) before creating the plan."
 					}
-					data-help-title="Create the plan when the conversation has converged."
-					data-help-lines="The orchestrator discusses the goal with you first — it does NOT plan on the first message.|Click this when you're happy with the direction: it asks the orchestrator to draft the plan and create the Kanban tasks.|Use the auto-create toggle instead if you want it to plan + create eagerly without waiting for this click."
+					data-help-title="The Orchestrator drafts a task plan you approve before any code is written."
+					data-help-lines="Create plan asks the Orchestrator to draft a structured task plan from the conversation.|Nothing is written to your code until you approve that plan.|Use the auto-create toggle if you want approved plans to become Kanban tasks automatically."
 					style={{
 						marginLeft: "auto",
 						display: "inline-flex",
@@ -171,11 +172,9 @@ export function PlannerControls(props: PlannerControlsProps) {
 								color: "#9c9488",
 							}),
 				}}
-				title={
-					autoCreate
-						? "When you approve the plan, its tasks are created on the board automatically."
-						: "The plan is drafted but its tasks are not created — you create them."
-				}
+				title="When on, approved plans become Kanban tasks automatically."
+				data-help-title="When on, approved plans become Kanban tasks automatically."
+				data-help-lines="auto-create tasks controls whether approving a plan also creates Kanban cards.|On: approved plans land on the board as tasks with no extra click.|Off: the plan is drafted for review and you create tasks yourself."
 			>
 				{autoCreate && <Check size={12} />}
 				auto-create tasks: {autoCreate ? "on" : "off"}

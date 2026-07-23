@@ -1,11 +1,13 @@
 // ModelPopover — the composer's provider/effort/timeout picker (opens UP).
 //
 // Mirrors panel.jsx's ModelPopover but wired to the REAL global design-LLM backend
-// (get/set_design_llm_backend). It edits three things:
+// (get/set_design_llm_backend). Same setting as Settings → Providers → Design model —
+// last-write-wins; this is a quick editor, not a second config. It edits three things:
 //   - PROVIDER (kind): design backend kinds (incl. Cloud/OpenRouter). Picking a kind
 //     PRESERVES any model/command/baseUrl already saved for that kind, then validates
 //     the result; an invalid backend (kind needs a field the saved config lacks) is NOT
-//     saved — the selection shows visually + an inline note links to Settings.
+//     saved — the active (saved) kind stays selected; the attempted kind is marked
+//     "needs setup" with an explicit not-saved note + Open Settings.
 //   - EFFORT: Low|Medium|High, persisted lowercase.
 //   - TIMEOUT: 60–600s slider, persisted on release (change-end), not every tick.
 //
@@ -41,7 +43,7 @@ export interface ModelPopoverProps {
 /** Build the next backend when switching to `kind`, preserving any field that kind
  *  uses from the current saved backend. Returns the validated value, or null when the
  *  result is invalid (the kind needs a field the current config can't supply). */
-function nextBackendForKind(
+export function nextBackendForKind(
   kind: DesignLlmBackendKind,
   current: DesignLlmBackend | null,
 ): { value: DesignLlmBackend | null; valid: boolean } {
@@ -72,22 +74,31 @@ export function ModelPopover({
   // popover remounts on each open (Popover renders null when closed), so seeding from
   // currentTimeout on mount is correct and always reflects the saved value.
   const [liveTimeout, setLiveTimeout] = useState(currentTimeout);
-  // The provider the user clicked but that couldn't be switched to (no saved config). Drives the
-  // dedicated config hint below so the click is never a silent no-op (bug #3).
+  // The provider the user clicked but that couldn't be switched to (no saved config).
+  // Never treated as active — only drives the not-saved hint (bug #3 / silent no-op).
   const [pendingKind, setPendingKind] = useState<DesignLlmBackendKind | null>(null);
 
+  // Drop a stale "needs setup" hint when the saved backend changes (e.g. user configured
+  // the kind in Settings, or a successful pick landed).
+  useEffect(() => {
+    setPendingKind(null);
+  }, [backend?.kind, backend?.model, backend?.command, backend?.baseUrl]);
+
   // Switching provider: only persist a VALID backend. If the saved config lacks the
-  // field the new kind needs, we surface a Settings note instead of saving garbage.
+  // field the new kind needs, keep the saved kind active and surface a not-saved note.
   const pickKind = useCallback(
     (kind: DesignLlmBackendKind) => {
-      if (kind === currentKind) return;
+      if (kind === currentKind) {
+        setPendingKind(null);
+        return;
+      }
       const { value, valid } = nextBackendForKind(kind, backend);
       if (valid && value) {
         onSave(value);
         setPendingKind(null);
       } else {
-        // Invalid (the kind needs a field the saved config lacks): DON'T save garbage, but DON'T
-        // silently no-op either — record the click so the hint below names this provider (bug #3).
+        // Invalid: do NOT save, do NOT mark the row as the active selection — only record
+        // the attempted kind so the hint can say clearly that nothing changed.
         setPendingKind(kind);
       }
     },
@@ -162,18 +173,50 @@ export function ModelPopover({
       timeoutSecs: backend.timeoutSecs,
     }).ok;
 
+  const goToSettings = useCallback(() => {
+    onClose();
+    onOpenSettings();
+  }, [onClose, onOpenSettings]);
+
+  const currentMeta = DESIGN_PROVIDERS.find((p) => p.id === currentKind);
+  const pendingMeta = pendingKind
+    ? DESIGN_PROVIDERS.find((p) => p.id === pendingKind)
+    : null;
+
   return (
     <Popover open={open} onClose={onClose} className="model-pop">
+      <div className="mp-label" data-testid="design-model-global-label">
+        DESIGN MODEL (GLOBAL)
+      </div>
+      <p
+        className="mp-note"
+        data-testid="design-model-global-note"
+        style={{
+          margin: "-2px 2px 10px",
+          fontSize: "11px",
+          lineHeight: 1.4,
+          color: "var(--muted)",
+        }}
+      >
+        Also editable in Settings → Providers.
+      </p>
+
       <div className="mp-label">PROVIDER</div>
       <div className="mp-prov">
         {DESIGN_PROVIDERS.map((p: DesignProviderMeta) => {
           const Icon = p.icon;
+          // Only the SAVED kind is "sel". A failed switch (pendingKind) must never look active.
           const sel = p.id === currentKind;
+          const needsSetup = p.id === pendingKind;
           return (
             <button
               key={p.id}
               type="button"
-              className={"mp-row" + (sel ? " sel" : "")}
+              className={
+                "mp-row" + (sel ? " sel" : "") + (needsSetup ? " mp-needs-setup" : "")
+              }
+              aria-current={sel ? "true" : undefined}
+              data-needs-setup={needsSetup ? "true" : undefined}
               onClick={() => pickKind(p.id)}
             >
               <span className="ico">
@@ -181,9 +224,11 @@ export function ModelPopover({
               </span>
               <div>
                 <b>{p.name}</b>
-                <span>{p.desc}</span>
+                <span>
+                  {needsSetup ? "Needs setup in Settings — not saved" : p.desc}
+                </span>
               </div>
-              <span className="mp-badge">{p.badge}</span>
+              <span className="mp-badge">{needsSetup ? "setup" : p.badge}</span>
             </button>
           );
         })}
@@ -193,6 +238,7 @@ export function ModelPopover({
         <p
           className="mp-note"
           data-testid="provider-config-hint"
+          role="status"
           style={{
             margin: "-6px 2px 12px",
             fontSize: "11.5px",
@@ -200,22 +246,22 @@ export function ModelPopover({
             color: "var(--muted)",
           }}
         >
-          {(() => {
-            const meta = DESIGN_PROVIDERS.find((p) => p.id === pendingKind);
-            const needs = meta?.needs ?? [];
-            return `${meta?.name ?? pendingKind} needs ${
-              needs.length ? needs.join(" + ") : "configuration"
-            }. `;
-          })()}
+          Not saved
+          {pendingMeta
+            ? ` — ${pendingMeta.name} needs ${
+                pendingMeta.needs.length
+                  ? pendingMeta.needs.join(" + ")
+                  : "configuration"
+              }`
+            : ""}
+          . Active model is still {currentMeta?.name ?? "unchanged"}.{" "}
           <button
             type="button"
-            onClick={() => {
-              onClose();
-              onOpenSettings();
-            }}
+            data-testid="provider-open-settings"
+            onClick={goToSettings}
             style={{ color: "inherit", textDecoration: "underline" }}
           >
-            Configure in Settings
+            Open Settings
           </button>
         </p>
       ) : needsConfig ? (
@@ -272,10 +318,7 @@ export function ModelPopover({
       <button
         type="button"
         className="mp-settings"
-        onClick={() => {
-          onClose();
-          onOpenSettings();
-        }}
+        onClick={goToSettings}
         style={{
           marginTop: "4px",
           width: "100%",
@@ -285,7 +328,7 @@ export function ModelPopover({
           padding: "6px 2px 0",
         }}
       >
-        Full provider settings → Settings · Providers
+        Full Design model editor → Settings · Providers
       </button>
     </Popover>
   );

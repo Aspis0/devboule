@@ -350,8 +350,13 @@ describe("ModelPopover — persistence + invalid gating", () => {
 
   it("shows the configure-in-Settings note when no valid backend is set", () => {
     mount(createElement(ModelPopover, popProps({ backend: null })));
-    expect(container.querySelector(".mp-note")?.textContent).toContain(
-      "Configure model/URL in Settings",
+    // Multiple `.mp-note` elements exist (the always-on "global setting" hint + the
+    // needs-config hint); assert one of them carries the configure prompt.
+    const notes = Array.from(container.querySelectorAll(".mp-note")).map(
+      (n) => n.textContent ?? "",
+    );
+    expect(notes.some((t) => t.includes("Configure model/URL in Settings"))).toBe(
+      true,
     );
   });
 });

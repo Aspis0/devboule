@@ -1354,20 +1354,29 @@ fn is_valid_management_root(path: &Path) -> bool {
     // the MCP children at a directory with no MCP package.
     let has_config =
         path.join("config.json").is_file() || path.join("src-tauri").join("config.json").is_file();
-    has_config && has_mcp_package_marker(path)
+    if !has_config {
+        return false;
+    }
+    // On-disk package tree preferred; ENV bin is a stand-in only when THIS path
+    // already has config (never invents a root from env alone / arbitrary parents).
+    has_mcp_package_marker(path) || mcp_bin_env_configured()
 }
 
-/// MCP package presence for management-root validation (P7).
+/// On-disk MCP package presence **relative to `path`** (P7 + config-path safety).
 ///
-/// Accepts **either**:
+/// Accepts **either** tree under `path` (do **not** require both):
 /// - Python: `oracle/server/aspis_mcp.py` (existing installs + `BACKEND=python` soak)
 /// - Rust crate tree: `devboule-mcp/Cargo.toml` (dev checkout)
-/// - Env marker: `DEVBOULE_MCP_BIN` points at an executable file (packaged /
-///   custom install without the Python package on disk)
 ///
-/// Do **not** require both; pure-Python installs must keep working.
+/// Path-specific only: a global `DEVBOULE_MCP_BIN` env must **not** make every
+/// candidate look like a repo/management root (that used to promote e.g.
+/// `cwd.parent()/config.json` ahead of `app_data` on a packaged Finder launch
+/// with a leftover shell env). Packaged installs without an on-disk package tree
+/// use [`mcp_bin_env_configured`] only inside [`is_valid_management_root`], which
+/// already requires `config.json` on that path.
 ///
-/// `pub(crate)` so `lib.rs` bootstrap keeps the same marker set (no drift).
+/// `pub(crate)` so `lib.rs` bootstrap / `projects::choose_config_path` keep the
+/// same on-disk marker set (no drift).
 pub(crate) fn has_mcp_package_marker(path: &Path) -> bool {
     if path
         .join("oracle")
@@ -1380,17 +1389,20 @@ pub(crate) fn has_mcp_package_marker(path: &Path) -> bool {
     if path.join("devboule-mcp").join("Cargo.toml").is_file() {
         return true;
     }
-    // Explicit bin override: validates that *some* MCP server is configured even
-    // when neither package tree is present under this root (e.g. archived Python).
-    if let Ok(bin) = std::env::var(crate::backend::mcp_backend::ENV_BIN) {
-        let trimmed = bin.trim();
-        if !trimmed.is_empty()
-            && crate::backend::provider_detect::is_executable_file(std::path::Path::new(trimmed))
-        {
-            return true;
-        }
-    }
     false
+}
+
+/// True when `DEVBOULE_MCP_BIN` names an executable file (packaged / custom install
+/// without a Python or Rust package tree on disk). Never used alone to invent a
+/// config.json location — only as a management-root package stand-in when the
+/// candidate path already has `config.json` (see [`is_valid_management_root`]).
+fn mcp_bin_env_configured() -> bool {
+    let Ok(bin) = std::env::var(crate::backend::mcp_backend::ENV_BIN) else {
+        return false;
+    };
+    let trimmed = bin.trim();
+    !trimmed.is_empty()
+        && crate::backend::provider_detect::is_executable_file(std::path::Path::new(trimmed))
 }
 
 /// Unique, stable window-title marker for an agent's dedicated console window.

@@ -30,6 +30,18 @@ function makeCity(
 // Tests
 // ---------------------------------------------------------------------------
 
+describe("seedQuestions (generic, repo-agnostic)", () => {
+  it("exposes starter questions that do not name this monorepo", () => {
+    expect(seedQuestions.length).toBeGreaterThanOrEqual(3);
+    const joined = seedQuestions.join(" ").toLowerCase();
+    expect(joined).not.toMatch(/cloudflare|scaleway|scrna/);
+    // Spot-check that they read as generic exploration prompts.
+    expect(seedQuestions.some((q) => /project|architecture|test|entry/i.test(q))).toBe(
+      true,
+    );
+  });
+});
+
 describe("buildOracleSuggestions", () => {
   it("returns seedQuestions fallback when city is null", () => {
     const result = buildOracleSuggestions(null);

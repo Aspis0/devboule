@@ -347,6 +347,11 @@ export function DesignView({ folderToOpen = null }: DesignViewProps = {}) {
   // don't render the AppProvider) degrades to a no-op rather than crashing.
   const ctx = useAppContext();
   const requestView = ctx?.requestView;
+  // Soft optional: production AppContext includes config + refreshConfig; unit tests
+  // often mock only requestView.
+  const configDesignBackend = ctx?.config?.designLlmBackend;
+  const refreshConfig =
+    typeof ctx?.refreshConfig === "function" ? ctx.refreshConfig : null;
 
   // --- Assistant panel state (the prototype's right column) -------------------
   // The composer's controlled draft (one box drives both generate + edit). The
@@ -392,7 +397,8 @@ export function DesignView({ folderToOpen = null }: DesignViewProps = {}) {
   }, [tauri]);
 
   // The current global design-LLM backend (for the composer's model chip + popover).
-  // Fetched on mount and refreshed after any save from the popover.
+  // Same `designLlmBackend` as Settings → Providers. Local state is filled from IPC
+  // on mount and kept in lockstep with AppConfig when config is available.
   const [backend, setBackend] = useState<DesignLlmBackend | null>(null);
   const refreshBackend = useCallback(async () => {
     if (!tauri) return;
@@ -410,7 +416,16 @@ export function DesignView({ folderToOpen = null }: DesignViewProps = {}) {
     void refreshBackend();
   }, [refreshBackend]);
 
-  // Persist a backend chosen in the model popover, then refresh the local copy.
+  // Settings card saves via set_design_llm_backend + refreshConfig. Mirror that shared
+  // config into the composer so both editors show the same value without a remount.
+  // Skip when `config` is absent (tests that mock only requestView — they rely on IPC).
+  useEffect(() => {
+    if (ctx?.config === undefined) return;
+    setBackend(configDesignBackend ?? null);
+  }, [configDesignBackend, ctx?.config]);
+
+  // Persist a backend chosen in the model popover, then refresh local + shared config
+  // so the Settings card sees the same designLlmBackend without a manual reload.
   const saveBackend = useCallback(
     (next: DesignLlmBackend) => {
       if (!tauri) {
@@ -420,10 +435,19 @@ export function DesignView({ folderToOpen = null }: DesignViewProps = {}) {
       invokeBackendCommand<DesignLlmBackend | null>("set_design_llm_backend", {
         backend: next,
       })
-        .then(() => refreshBackend())
+        .then(async () => {
+          await refreshBackend();
+          if (refreshConfig) {
+            try {
+              await refreshConfig();
+            } catch {
+              // Non-fatal: local composer state is already refreshed.
+            }
+          }
+        })
         .catch((e) => setError(String(e)));
     },
-    [tauri, refreshBackend],
+    [tauri, refreshBackend, refreshConfig],
   );
 
   const openProviderSettings = useCallback(() => {

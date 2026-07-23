@@ -46,10 +46,18 @@ describe("censorSeverity badge mapping", () => {
     expect(sourceBadgeClass("clippy")).not.toContain("teal");
   });
 
-  it("labels a source, capping a runaway value and defaulting an empty one", () => {
-    expect(sourceLabel("eslint")).toBe("eslint");
-    expect(sourceLabel("")).toBe("linter");
-    expect(sourceLabel("x".repeat(40)).endsWith("…")).toBe(true);
+  it("maps gemma → 'AI review' and tools → 'Linter · {tool}'", () => {
+    expect(sourceLabel("gemma")).toBe("AI review");
+    expect(sourceLabel("GEMMA")).toBe("AI review");
+    expect(sourceLabel("clippy")).toBe("Linter · clippy");
+    expect(sourceLabel("eslint")).toBe("Linter · eslint");
+    expect(sourceLabel("ruff")).toBe("Linter · ruff");
+    expect(sourceLabel("")).toBe("Linter");
+    expect(sourceLabel(undefined)).toBe("Linter");
+    // Cap a runaway tool name so the badge cannot blow out the row.
+    const long = sourceLabel("x".repeat(40));
+    expect(long.startsWith("Linter · ")).toBe(true);
+    expect(long.endsWith("…")).toBe(true);
   });
 });
 
@@ -69,8 +77,10 @@ describe("fileLineLabel", () => {
 });
 
 describe("gemmaStatusNote", () => {
-  it("shows the offline banner ONLY when the tier is offline", () => {
-    expect(gemmaStatusNote("offline")).toContain("Gemma layer offline");
+  it("shows the offline note ONLY when the AI-review tier is offline", () => {
+    expect(gemmaStatusNote("offline")).toBe(
+      "AI review offline — deterministic linters still active",
+    );
     expect(gemmaStatusNote("available")).toBeNull();
     expect(gemmaStatusNote("unknown")).toBeNull();
     expect(gemmaStatusNote(undefined)).toBeNull();

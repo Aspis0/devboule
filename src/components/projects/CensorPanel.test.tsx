@@ -70,24 +70,47 @@ describe("CensorPanelView states", () => {
     expect(html).toContain("no working root configured");
   });
 
-  it("shows the Gemma-offline banner when censor_status reports offline", () => {
-    const status: CensorStatus = { gemmaStatus: "offline", tools: [], trusted: true, coarsePolicy: "auto", lastCoarseRun: null };
+  it("shows AI review: off and the calm offline note when offline with ready linters", () => {
+    const status: CensorStatus = {
+      gemmaStatus: "offline",
+      tools: [{ name: "eslint", available: true }],
+      trusted: true,
+      coarsePolicy: "auto",
+      lastCoarseRun: null,
+    };
     const html = renderToStaticMarkup(
       <CensorPanelView {...baseProps} findings={[]} status={status} />,
     );
-    expect(html).toContain("Censor LLM: offline");
+    expect(html).toContain("AI review: off");
+    expect(html).toContain("AI review offline — deterministic linters still active");
+    expect(html).toContain("Linters: 1 ready");
+    expect(html).toContain(
+      "Layer 1 — deterministic linters always run on trusted projects",
+    );
   });
 
-  it("does NOT show the Gemma banner when available or unknown", () => {
+  it("does NOT show the AI-offline note when available or unknown", () => {
     for (const gemmaStatus of ["available", "unknown"] as const) {
       const html = renderToStaticMarkup(
-        <CensorPanelView {...baseProps} findings={[]} status={{ gemmaStatus, tools: [], trusted: true, coarsePolicy: "auto", lastCoarseRun: null }} />,
+        <CensorPanelView
+          {...baseProps}
+          findings={[]}
+          status={{
+            gemmaStatus,
+            tools: [{ name: "eslint", available: true }],
+            trusted: true,
+            coarsePolicy: "auto",
+            lastCoarseRun: null,
+          }}
+        />,
       );
-      expect(html).not.toContain("Gemma layer offline");
+      expect(html).not.toContain(
+        "AI review offline — deterministic linters still active",
+      );
     }
   });
 
-  it("lists absent tools as a skipped-layers hint", () => {
+  it("lists absent tools as optional (not installed), not failures", () => {
     const status: CensorStatus = {
       gemmaStatus: "available",
       tools: [
@@ -102,10 +125,11 @@ describe("CensorPanelView states", () => {
       <CensorPanelView {...baseProps} findings={[]} status={status} />,
     );
     // collapsed state shows the count; tool names only appear when expanded
-    expect(html).toContain("1 missing");
-    expect(html).toContain("1 ready");
+    expect(html).toContain("1 optional (not installed)");
+    expect(html).toContain("Linters: 1 ready");
+    expect(html).toContain("AI review: on");
     // eslint is available, so it is NOT in the missing list
-    expect(html).not.toContain('eslint');
+    expect(html).not.toContain("eslint");
   });
 
   it("exposes Review now and Run final review actions", () => {

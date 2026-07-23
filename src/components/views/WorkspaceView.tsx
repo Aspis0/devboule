@@ -1249,8 +1249,10 @@ export function CensorLocalAiCard() {
         </h3>
       </div>
       <p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
-        Censor is Devboule's optional local code reviewer. Here you pick which model
-        runs it — a local Ollama/oMLX server, Apple on-device, or a cloud endpoint.
+        This configures Censor&apos;s optional AI review (Layer 2). The deterministic
+        linters always run on trusted projects — no model required. Pick where the AI
+        review runs: local Ollama/oMLX, Apple on-device, or a cloud endpoint (opt-in,
+        leaves your machine).
       </p>
 
       <div className="grid gap-3 rounded-2xl border border-cream-200 p-3 md:grid-cols-2">

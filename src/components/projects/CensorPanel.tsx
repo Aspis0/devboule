@@ -33,6 +33,7 @@ import type {
 } from "../../types/backend";
 import type { SpawnLaunchInput } from "../agents/agentRowModel";
 import { CensorFindingRow } from "./CensorFindingRow";
+import { gemmaStatusNote } from "./censorSeverity";
 import {
 	CensorFindingsTracker,
 	censorPanelViewState,
@@ -423,7 +424,13 @@ export function CensorPanelView({
 				</button>
 			</div>
 
-			{/* ---- status bar (compact, 1 row) ---- */}
+			{/* ---- two-layer explainer (always visible, not data-help only) ---- */}
+			<p className="text-[11px] leading-relaxed text-cream-400">
+				Layer 1 — deterministic linters always run on trusted projects. Layer 2 —
+				an optional AI model adds file-local smells.
+			</p>
+
+			{/* ---- status bar (compact, two-layer row) ---- */}
 			<CensorStatusBar
 				status={status}
 				onCoarsePolicyChange={onCoarsePolicyChange}
@@ -493,15 +500,16 @@ function formatTimeAgo(iso: string | null | undefined): string | null {
 	return `${days}d ago`;
 }
 
-function censorLlmLabel(s: string): string {
-	if (s === "available") return "online";
-	if (s === "offline") return "offline";
+/** Map backend gemmaStatus (legacy wire name) → user-facing AI-review on/off. */
+function aiReviewStatusLabel(s: string): string {
+	if (s === "available") return "on";
+	if (s === "offline") return "off";
 	return "unknown";
 }
 
 /**
- * Compact status bar showing: ready tools, missing tools (expandable), Censor LLM status,
- * COARSE policy selector, and last coarse timestamp.
+ * Compact status bar: Layer 1 linters (ready + optional not-installed), Layer 2
+ * AI review on/off, COARSE policy, last coarse timestamp.
  */
 function CensorStatusBar({
 	status,
@@ -517,10 +525,12 @@ function CensorStatusBar({
 	const tools = status?.tools ?? [];
 	const ready = tools.filter((t) => t.available);
 	const missing = tools.filter((t) => !t.available);
-	const llmStatus = status?.gemmaStatus
-		? censorLlmLabel(status.gemmaStatus)
-		: null;
-	const llmOnline = status?.gemmaStatus === "available";
+	const aiReview =
+		status?.gemmaStatus != null
+			? aiReviewStatusLabel(status.gemmaStatus)
+			: null;
+	const aiOfflineNote =
+		ready.length > 0 ? gemmaStatusNote(status?.gemmaStatus) : null;
 	const coarsePolicy = status?.coarsePolicy ?? "auto";
 	const lastCoarse = formatTimeAgo(status?.lastCoarseRun);
 
@@ -541,30 +551,33 @@ function CensorStatusBar({
 
 	return (
 		<div className="space-y-1.5">
-			{/* Compact row */}
+			{/* Two-layer compact row */}
 			<div className="flex flex-wrap items-center gap-2 text-[11px] text-cream-500">
 				<span className="inline-flex items-center gap-1">
 					<span className="inline-block h-2 w-2 rounded-full bg-emerald" />
-					{ready.length} ready
+					Linters: {ready.length} ready
+					{missing.length > 0 && (
+						<>
+							{" · "}
+							<button
+								type="button"
+								onClick={() => setExpanded(!expanded)}
+								className="inline-flex items-center gap-1 hover:text-cream-700"
+							>
+								<span className="inline-block h-2 w-2 rounded-full bg-cream-300" />
+								{missing.length} optional (not installed)
+								<ChevronDown
+									className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`}
+								/>
+							</button>
+						</>
+					)}
 				</span>
-				{missing.length > 0 && (
-					<button
-						type="button"
-						onClick={() => setExpanded(!expanded)}
-						className="inline-flex items-center gap-1 hover:text-cream-700"
-					>
-						<span className="inline-block h-2 w-2 rounded-full bg-cream-300" />
-						{missing.length} missing
-						<ChevronDown
-							className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`}
-						/>
-					</button>
-				)}
-				{llmStatus && (
+				{aiReview && (
 					<>
 						<span className="text-cream-300">·</span>
 						<span className="inline-flex items-center gap-1">
-							{llmOnline ? "🤖" : "💤"} Censor LLM: {llmStatus}
+							AI review: {aiReview}
 						</span>
 					</>
 				)}
@@ -589,11 +602,18 @@ function CensorStatusBar({
 				)}
 			</div>
 
-			{/* Expandable: missing tools */}
+			{/* Calm note when Layer 2 is offline but Layer 1 linters are present */}
+			{aiOfflineNote && (
+				<p className="text-[11px] text-cream-400">{aiOfflineNote}</p>
+			)}
+
+			{/* Expandable: optional not-installed linters (language-filtered) */}
 			{expanded && missing.length > 0 && (
 				<div className="rounded-lg border border-cream-200 bg-cream-50 px-3 py-2">
 					<p className="mb-1.5 text-[10px] text-cream-400">
-						Not installed — click to copy install command:
+						Optional linters for this project&apos;s languages — install to
+						enable more checks (Censor works without them). Click a tool to copy
+						its install command.
 					</p>
 					<div className="flex flex-wrap gap-1">
 						{missing.map((t) => {
