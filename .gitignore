@@ -91,3 +91,26 @@ src-tauri/capabilities/pilot.json
 # Agent/workspace local state (must not be committed from attached project roots — F13)
 .aspis/
 
+# --- Public tree: keep internal process docs / handoffs / lab out of git ---
+/docs/
+/Design-handoff/
+/Polis-handoff/
+/archived/
+/audit/
+/PLAN.md
+/design.md
+/ROLES-AND-ACCESS.md
+/aspis-bio-polis-map.md
+/polis-dev.html
+/polis-dev.tsx
+/projects-dev.html
+/projects-dev.tsx
+/projects-dev-fixtures.ts
+/polis-dev-city-gap2.json
+/polis-dev-city-gap3.json
+.mcp.json
+.grok/
+
+# Local/model benches (not product)
+/bench/
+/prodbench/

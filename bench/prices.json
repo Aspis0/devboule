@@ -1,7 +1,0 @@
-{
-  "_comment": "USD per 1M tokens. EDIT to match current published pricing. Local models (oMLX Qwen, Ollama Nemotron) run on the user's Mac => marginal API cost 0; set a notional electricity rate if desired. Cloud values are placeholders for the Claude tiers — verify before quoting.",
-  "opus":     { "input": 15.0, "output": 75.0 },
-  "sonnet":   { "input": 3.0,  "output": 15.0 },
-  "qwen":     { "input": 0.0,  "output": 0.0 },
-  "nemotron": { "input": 0.0,  "output": 0.0 }
-}
