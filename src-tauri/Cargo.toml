@@ -3,6 +3,7 @@ name = "devboule"
 version = "0.1.0"
 description = "Devboule — local agent orchestration dashboard"
 edition = "2021"
+license = "Apache-2.0"
 # With two `[[bin]]` targets declared below, `cargo run` (as invoked by `tauri dev`)
 # cannot infer which to launch. Pin the GUI binary as the default so `tauri dev`/`build`
 # run the app; `claude_consent_hook` is built but only spawned explicitly by Claude Code.

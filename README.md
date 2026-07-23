@@ -26,7 +26,10 @@ Secrets stay in the OS keyring. Do not put API keys in project Markdown, prompts
 
 ## License
 
-See [LICENSE](./LICENSE) and [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+Devboule is licensed under Apache-2.0 — see [LICENSE](./LICENSE). Copied/adapted source
+snippets are attributed in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md); the full
+open-source dependency inventory (npm + Rust crates) is in
+[THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md).
 
 ## Status
 

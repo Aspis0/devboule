@@ -513,12 +513,23 @@ fn generic_host_guard_remote_providers() {
     ))
     .is_err());
 
-    // Numeric subdomain FQDN must still be accepted (alphabetic TLD present).
-    assert!(validate_remote_llm_config(&cfg(
+    // Numeric-LEADING FQDN (alphabetic TLD present) must pass the LEXICAL guards — it
+    // is NOT a bare IPv4 and must never be rejected as one. The post-DNS gate is
+    // fail-closed, so on a machine where this host does not resolve it may still be
+    // refused with a DNS-resolution error; accept Ok OR that specific DNS error, but
+    // never a lexical/bare-IP rejection. (Keeps the test hermetic without weakening the
+    // SSRF gate.)
+    match validate_remote_llm_config(&cfg(
         "openai",
-        "https://192.host.deepseek.com/v1/chat/completions"
-    ))
-    .is_ok());
+        "https://192.host.deepseek.com/v1/chat/completions",
+    )) {
+        Ok(()) => {}
+        Err(AnswerError::Validation(msg)) => assert!(
+            msg.contains("could not be resolved") || msg.contains("resolved to no addresses"),
+            "numeric-subdomain FQDN rejected for a non-DNS reason: {msg}"
+        ),
+        Err(other) => panic!("numeric-subdomain FQDN rejected lexically: {other:?}"),
+    }
 
     // SSRF: localhost.
     assert!(validate_remote_llm_config(&cfg(
@@ -559,12 +570,20 @@ fn generic_host_guard_remote_providers() {
     // host pinning: any well-formed public https FQDN is accepted, so a host like
     // `api.openai.com.evil.com` is a legitimate (if unusual) user-chosen endpoint,
     // not a rejected "subdomain trick". The guard only blocks loopback / IP-literals
-    // / intranet-metadata, which the assertions above cover.
-    assert!(validate_remote_llm_config(&cfg(
+    // / intranet-metadata (the assertions above cover those). The post-DNS gate is
+    // fail-closed, so this fake host may be refused with a DNS-resolution error where
+    // it does not resolve — accept Ok OR that DNS error, never a lexical rejection.
+    match validate_remote_llm_config(&cfg(
         "openai",
-        "https://api.openai.com.evil.com/v1"
-    ))
-    .is_ok());
+        "https://api.openai.com.evil.com/v1",
+    )) {
+        Ok(()) => {}
+        Err(AnswerError::Validation(msg)) => assert!(
+            msg.contains("could not be resolved") || msg.contains("resolved to no addresses"),
+            "well-formed public FQDN rejected for a non-DNS reason: {msg}"
+        ),
+        Err(other) => panic!("well-formed public FQDN rejected lexically: {other:?}"),
+    }
 }
 
 /// focused_excerpt behavior (review F14): untested by the golden prompts

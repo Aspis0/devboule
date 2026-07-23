@@ -339,6 +339,11 @@ fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
 
 /// Resolve `host:port` and reject any address in blocked ranges (fail-closed).
 fn reject_blocked_resolved_ips(host: &str, port: u16) -> Result<(), AnswerError> {
+    // FAIL-CLOSED: a host we cannot resolve (or that resolves to no addresses) is
+    // rejected. This gate runs at REQUEST time, so refusing an unverifiable host is
+    // the conservative posture (never open the request to something we could not
+    // vet). Do NOT relax this to fail-open — an attacker-controlled resolver could
+    // answer the validation query and the connect query differently.
     let addrs = match (host, port).to_socket_addrs() {
         Ok(iter) => iter.collect::<Vec<_>>(),
         Err(_) => {
