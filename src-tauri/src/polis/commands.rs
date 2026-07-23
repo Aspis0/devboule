@@ -223,7 +223,9 @@ impl PolisState {
 /// frontend gets agents in the same payload. The pure scanner core stays
 /// agent-free (an empty city is honest); agents are sourced ONLY from the real
 /// live state here.
-#[tauri::command]
+// Heavy FS scan must not run on the main thread / freeze the UI;
+// `(async)` runs the sync body on a worker thread.
+#[tauri::command(async)]
 pub fn generate_city_state(
     project_path: Option<String>,
     app: tauri::AppHandle,

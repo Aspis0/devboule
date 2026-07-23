@@ -514,20 +514,112 @@ function logCityComposition(
 // sync if it ever grows). This frontend check is the catch-all funnel: the ~5s
 // agent poll bypasses the backend watcher's own skip entirely.
 //
+// HASH: direct recursive tree walk, no giant intermediate JSON string (~1.5 MB
+// on a typical project). Same djb2-xor 32-bit profile, same excluded fields.
+// Traversal mirrors JSON.stringify — object enumerable own-keys in insertion
+// order (Object.keys, no sort), arrays in index order. Type markers
+// ({ } [ ] : ,) are folded in so structurally distinct values (e.g. string
+// "1,2" vs array [1,2]) cannot collide more easily than in the serialized form.
+//
 // Stored as a 32-bit hash (not the JSON string) so the module retains 4 bytes,
 // not a ~1.5MB string, for the whole session.
 let lastAppliedCitySig: number | null = null;
 
-function citySignature(city: CityState): { sig: number; chars: number } {
-  const s = JSON.stringify(city, (key, value) =>
-    key === "generatedAt" || key === "lastModified" ? undefined : value,
-  );
-  // djb2-xor over the serialized city.
-  let h = 5381;
+/** Fold charCodes of `s` into a running djb2-xor 32-bit hash. */
+function hashString(h: number, s: string): number {
   for (let i = 0; i < s.length; i++) {
     h = (Math.imul(h, 33) ^ s.charCodeAt(i)) >>> 0;
   }
-  return { sig: h, chars: s.length };
+  return h;
+}
+
+/**
+ * Recursively walk `val` and fold its contents into the accumulator
+ * `{ h, chars }`.  Type markers + key names + scalar charCodes mirror the
+ * JSON byte stream MINUS the excluded keys `generatedAt` and `lastModified`,
+ * so two cities that differ ONLY in those fields hash identically.
+ */
+function walkCityForSig(
+  val: unknown,
+  acc: { h: number; chars: number },
+): void {
+  if (val === null || val === undefined) {
+    const s = "null";
+    acc.chars += s.length;
+    acc.h = hashString(acc.h, s);
+    return;
+  }
+  const t = typeof val;
+  if (t === "string") {
+    acc.chars += (val as string).length;
+    acc.h = hashString(acc.h, val as string);
+    return;
+  }
+  if (t === "number" || t === "boolean") {
+    const s = String(val);
+    acc.chars += s.length;
+    acc.h = hashString(acc.h, s);
+    return;
+  }
+  if (Array.isArray(val)) {
+    acc.h = hashString(acc.h, "[");
+    acc.chars += 1;
+    for (let i = 0; i < val.length; i++) {
+      if (i > 0) {
+        acc.h = hashString(acc.h, ",");
+        acc.chars += 1;
+      }
+      walkCityForSig(val[i], acc);
+    }
+    acc.h = hashString(acc.h, "]");
+    acc.chars += 1;
+    return;
+  }
+  // object — walk own enumerable keys in insertion order (no sort).
+  acc.h = hashString(acc.h, "{");
+  acc.chars += 1;
+  const keys = Object.keys(val as Record<string, unknown>);
+  let first = true;
+  for (const k of keys) {
+    if (k === "generatedAt" || k === "lastModified") continue;
+    if (!first) {
+      acc.h = hashString(acc.h, ",");
+      acc.chars += 1;
+    }
+    first = false;
+    acc.chars += k.length;
+    acc.h = hashString(acc.h, k);
+    acc.h = hashString(acc.h, ":");
+    acc.chars += 1;
+    walkCityForSig((val as Record<string, unknown>)[k], acc);
+  }
+  acc.h = hashString(acc.h, "}");
+  acc.chars += 1;
+}
+
+/**
+ * Compute a content-based 32-bit djb2-xor hash + approximate character count
+ * for a CityState by walking its tree directly, WITHOUT materializing a
+ * giant intermediate JSON string (~1.5 MB on a typical project).
+ *
+ * EXCLUDED FIELDS: `generatedAt` (top-level) and `lastModified` (per-building)
+ * — matching the old JSON.stringify replacer.  Two cities that differ ONLY in
+ * those fields produce the SAME `sig`; any other structural change produces a
+ * DIFFERENT sig with the same practical collision profile as a 32-bit djb2.
+ *
+ * TRAVERSAL ORDER: mirrors JSON.stringify — object enumerable own-keys in
+ * insertion order (Object.keys, no sort), arrays in index order.  Type markers
+ * ({ } [ ] : ,) plus direct charCodes of keys/values are folded into the hash,
+ * so e.g. the string "1,2" and the array [1,2] cannot collide more easily than
+ * they would in the serialized form.
+ *
+ * `chars` is an approximate character count (keys + values + delimiters folded
+ * in), monotonic with city size.  It need not equal the old exact JSON length.
+ */
+export function citySignature(city: CityState): { sig: number; chars: number } {
+  const acc = { h: 5381, chars: 0 };
+  walkCityForSig(city, acc);
+  return { sig: acc.h, chars: acc.chars };
 }
 
 /** Browser dev fixture (no Tauri, no OS picker available). */

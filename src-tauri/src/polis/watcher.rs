@@ -37,6 +37,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -542,7 +543,7 @@ fn rescan_and_emit(
     // kept structure/agents), do NOT store or emit — re-emitting an identical city
     // only forces the frontend to re-diff every building, and a storm of those
     // (e.g. another process editing the workspace) climbs the JS heap to an OOM.
-    let sig = city_signature(&city);
+    let sig = city_signature(&mut city);
     if *last_sig == Some(sig) {
         return;
     }
@@ -598,38 +599,61 @@ fn rescan_and_emit(
     }
 }
 
-/// Content signature of a city for the SKIP-IF-UNCHANGED guard (run_loop). EXCLUDES
-/// the per-scan `generated_at` timestamp — it changes on every scan and would defeat
-/// the guard — by clearing it on a throwaway clone before hashing the serialized
-/// form. Cost (~1 MB serialize + hash) is trivial next to the spurious full re-diff
-/// of every building a needless re-emit would cause on the frontend.
-pub(crate) fn city_signature(city: &crate::polis::model::CityState) -> u64 {
-    let mut probe = city.clone();
-    // Zero out the two PER-SCAN-VOLATILE fields so a re-scan that produced the
-    // SAME city is recognized as unchanged:
-    //   - `generated_at`: a fresh now() stamp on every scan.
-    //   - each building's `last_modified`: the file's mtime — a bare `touch`, a
-    //     `git checkout`, or a formatter rewriting identical bytes changes the mtime
-    //     without changing the building's structure. Including it here would make the
-    //     signature differ on every such event and defeat the skip — i.e. the re-emit
-    //     storm / OOM would return whenever a process bumps mtimes (exactly the case:
-    //     another agent saving files in the workspace).
-    probe.generated_at = String::new();
-    for b in probe.buildings.iter_mut() {
-        b.last_modified = String::new();
+/// Streaming FNV-1a hasher behind `std::io::Write` — lets `serde_json::to_writer`
+/// feed serialized bytes straight into the running hash with no intermediate Vec.
+struct FnvHasherWriter {
+    hash: u64,
+}
+
+impl io::Write for FnvHasherWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &b in buf {
+            self.hash ^= b as u64;
+            self.hash = self.hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Ok(buf.len())
     }
-    let bytes = serde_json::to_vec(&probe).unwrap_or_default();
-    // FNV-1a over the serialized bytes — the same byte-stable pattern as
-    // scanner::stable_hash. `DefaultHasher` (SipHash with a per-process RANDOM seed)
-    // works today only because `last_sig` is process-local; switch to a seed-free
-    // hash so the signature is reproducible across processes (one persistence away
-    // from a real bug otherwise).
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in &bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
-    hash
+}
+
+/// Content signature of a city for the SKIP-IF-UNCHANGED guard (run_loop).
+///
+/// EXCLUDES the per-scan `generated_at` timestamp and each building's
+/// `last_modified` mtime — those change on every scan / `touch` / `git checkout`
+/// and would defeat the guard. Instead of a full deep-clone + Vec<u8> buffer,
+/// this takes the volatile fields in-place, streams the borrowed city directly
+/// into an FNV-1a hashing writer via `serde_json::to_writer` (zero heap
+/// allocation beyond the tiny saved-field locals), and then RESTORES every taken
+/// field exactly before returning — `city` is the live payload that will be
+/// stored + emitted, so a missed restore corrupts it.
+pub(crate) fn city_signature(city: &mut crate::polis::model::CityState) -> u64 {
+    // Take the volatile fields, leaving empty strings for serialization.
+    let saved_generated_at = std::mem::take(&mut city.generated_at);
+    let saved_last_modified: Vec<String> = city
+        .buildings
+        .iter_mut()
+        .map(|b| std::mem::take(&mut b.last_modified))
+        .collect();
+
+    // Stream-serialize the borrowed city directly into the FNV-1a hasher — no
+    // intermediate Vec<u8>, no deep clone. The taken fields are empty strings,
+    // so they contribute the same bytes regardless of their original values.
+    let mut hasher = FnvHasherWriter {
+        hash: 0xcbf2_9ce4_8422_2325,
+    };
+    let _ = serde_json::to_writer(&mut hasher, &*city);
+
+    // RESTORE every taken field EXACTLY before returning. city is the live
+    // payload that will be stored + emitted; a missing restore corrupts it.
+    city.generated_at = saved_generated_at;
+    for (b, lm) in city.buildings.iter_mut().zip(saved_last_modified) {
+        b.last_modified = lm;
+    }
+
+    hasher.hash
 }
 
 /// FIX 1: the load-bearing publish predicate, factored out so the store/emit
@@ -1047,8 +1071,8 @@ mod tests {
         let mut b = crate::polis::model::CityState::empty("proj", "Alpha");
         b.generated_at = "2026-06-10T10:05:30Z".into(); // later scan, same content
         assert_eq!(
-            city_signature(&a),
-            city_signature(&b),
+            city_signature(&mut a),
+            city_signature(&mut b),
             "differing only by generated_at must yield the SAME signature"
         );
     }
@@ -1057,11 +1081,11 @@ mod tests {
     fn city_signature_changes_when_content_changes() {
         // A real structural change (a different project / a new building) MUST
         // change the signature so a genuine edit still emits + diffs.
-        let base = crate::polis::model::CityState::empty("proj", "Alpha");
-        let other_era = crate::polis::model::CityState::empty("proj", "Beta");
+        let mut base = crate::polis::model::CityState::empty("proj", "Alpha");
+        let mut other_era = crate::polis::model::CityState::empty("proj", "Beta");
         assert_ne!(
-            city_signature(&base),
-            city_signature(&other_era),
+            city_signature(&mut base),
+            city_signature(&mut other_era),
             "a content change (era) must change the signature"
         );
     }

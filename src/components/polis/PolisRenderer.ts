@@ -681,6 +681,12 @@ export class PolisRenderer {
   private debugOverlayTimer = 0;
   // P5.1 — hero-promotion-dirty flag (re-eval on moved/zoomed + sin changes).
   private heroPromoDirty = true;
+  // P5.1 — cached set of fileIds whose building currently has a sin (disaster).
+  // Rebuilt from a full node scan ONLY when building data changed
+  // (crowdBurningDirty), so syncCrowdFires can reconcile crowd fires with an
+  // O(1) check per frame in the steady state.
+  private crowdBurningDirty = true;
+  private readonly burningFileIds = new Set<string>();
   // P5.1 — shared halo radial texture (256px, rendered once).
   private haloTex: import('pixi.js').Texture | null = null;
   // P5.1 — pooled halo sprites keyed by fileId (mirrors crowdFires lifecycle).
@@ -3114,6 +3120,7 @@ export class PolisRenderer {
     container.on("pointerout", () => this.callbacks.onHoverBuilding?.(null));
 
     this.buildingNodes.set(b.fileId, node);
+    this.crowdBurningDirty = true; // new building may have sins
     // P3.2 — apply current filter to this newly-created node so buildings born
     // during incremental build are filtered from birth.
     this.applyFilterToNode(node, b.fileId);
@@ -3393,6 +3400,7 @@ export class PolisRenderer {
     node.investigation = dyn.investigation;
     // Sin/disaster state may have changed → re-evaluate hero promotions.
     this.heroPromoDirty = true;
+    this.crowdBurningDirty = true; // sin STATE may have changed in-place
     node.hitRadius = built.hw;
 
     // Keep the path→fileId index correct (filePath could change with a rename,
@@ -3441,6 +3449,7 @@ export class PolisRenderer {
       // instances (and their Graphics) are children of the display container, so
       // they are torn down with it (no separate disposal needed).
       this.buildingNodes.delete(node.building.fileId);
+      this.crowdBurningDirty = true; // removed building may have been burning
       // Polis-P5 — drop the path→fileId index entry too (re-added by
       // createBuildingNode on a CHANGED rebuild). Only delete it if it still points
       // at THIS node's fileId, so a rebuild that already re-set it isn't clobbered.
@@ -3793,21 +3802,26 @@ export class PolisRenderer {
   // P5.1 — FIRE PROMOTION
   // ---------------------------------------------------------------------------
 
-  /** Sync crowd fires with current building disaster state. No allocation in
-   *  steady state (creates/destroys only when sins change, which is rare). */
+  /** Sync crowd fires with current building disaster state. The burning set is
+   *  cached in `burningFileIds` and rebuilt from a full node scan ONLY when
+   *  `crowdBurningDirty` is true (building data changed) — otherwise this is
+   *  an O(1) check in the steady state, allocating nothing. */
   private syncCrowdFires(): void {
     if (!this.fireAtlas) return;
-    // F6 — Track which buildings have a sin (STATE, not visibility).
+    // F6 — rebuild the cached burning set ONLY when building data changed.
     // Decoupled from node.disaster.node.visible so filters never tear down pools.
-    const currentBurning = new Set<string>();
-    for (const [fileId, node] of this.buildingNodes) {
-      if (node.disaster && worstSinSeverity(node.building) != null) {
-        currentBurning.add(fileId);
+    if (this.crowdBurningDirty) {
+      this.burningFileIds.clear();
+      for (const [fileId, node] of this.buildingNodes) {
+        if (node.disaster && worstSinSeverity(node.building) != null) {
+          this.burningFileIds.add(fileId);
+        }
       }
+      this.crowdBurningDirty = false;
     }
     // Remove crowd fires + halo sprites for buildings no longer burning.
     for (const [fileId] of this.crowdFires) {
-      if (!currentBurning.has(fileId)) {
+      if (!this.burningFileIds.has(fileId)) {
         const cf = this.crowdFires.get(fileId)!;
         cf.fireSprite.removeFromParent();
         cf.smokeSprite.removeFromParent();
@@ -3829,7 +3843,7 @@ export class PolisRenderer {
       }
     }
     // Create crowd fires for newly burning buildings.
-    for (const fileId of currentBurning) {
+    for (const fileId of this.burningFileIds) {
       if (!this.crowdFires.has(fileId)) {
         const node = this.buildingNodes.get(fileId);
         if (!node) continue;
@@ -4076,6 +4090,11 @@ export class PolisRenderer {
     }
     this.chunks.clear();
     this.buildingNodes.clear();
+    // Full teardown invalidates the burning cache. Clear it here too (belt-and-
+    // braces): the dirty flag already forces a rebuild on the next syncCrowdFires,
+    // but clearing now keeps no stale fileIds around if a future edit drops the flag.
+    this.burningFileIds.clear();
+    this.crowdBurningDirty = true;
     // Terrain layer holds the ground/props Graphics AND the water-frame chunk
     // containers (destroyed with their shimmer children here). Reset the tracking
     // array so the per-frame shimmer tick never touches a destroyed container.
