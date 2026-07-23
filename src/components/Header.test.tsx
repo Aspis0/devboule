@@ -41,6 +41,12 @@ vi.mock("../store/dismissedRisks", () => ({
   dismissRisk: vi.fn(),
   clearRisks: vi.fn(),
 }));
+vi.mock("../store/dismissedAttention", () => ({
+  useDismissedAttention: () => new Set<string>(),
+  dismissAttention: vi.fn(),
+  clearAttentions: vi.fn(),
+  attentionDismissKey: (s: { agentId: string }) => s.agentId,
+}));
 vi.mock("../hooks/useNow", () => ({ useNow: () => Date.now() }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =

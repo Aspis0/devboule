@@ -14,6 +14,12 @@ import type {
 } from "../types/backend";
 import { useAgentAttentionStore } from "../store/agentAttentionStore";
 import { useDismissedRisks, dismissRisk, clearRisks } from "../store/dismissedRisks";
+import {
+  useDismissedAttention,
+  dismissAttention,
+  clearAttentions,
+  attentionDismissKey,
+} from "../store/dismissedAttention";
 import { attentionSessions } from "./agents/agentFleet";
 import { stripSpoofChars } from "./agents/attentionNotifier";
 import { combineBadgeCount } from "./headerBadge";
@@ -149,16 +155,19 @@ export function Header() {
   // Agents needing the human. Fed by the existing agent-live-state pollers via
   // the attention store (no new poller). A live clock keeps stale/lost health
   // current between polls; attentionSessions is the SINGLE attention predicate.
+  // Manually dismissed keys (ghost / stale items the user cleared) are filtered
+  // out here — keyed by attentionDismissKey so a genuinely-new raise resurfaces.
   const attentionStoreSessions = useAgentAttentionStore((s) => s.sessions);
   const now = useNow();
+  const dismissedAttention = useDismissedAttention();
   const attention = useMemo(
-    () => attentionSessions(attentionStoreSessions, now),
-    [attentionStoreSessions, now],
+    () =>
+      attentionSessions(attentionStoreSessions, now).filter(
+        (s) => !dismissedAttention.has(attentionDismissKey(s)),
+      ),
+    [attentionStoreSessions, now, dismissedAttention],
   );
   const attentionCount = attention.length;
-  // Attention items are LIVE: an agent literally waiting on a human, clearing
-  // only when answered. They are NOT manually dismissable — clicking opens the
-  // agent to resolve it, which is why there is no per-item dismiss control here.
   const badgeCount = combineBadgeCount(riskCount, attentionCount);
   const matches = useMemo(() => {
     if (!cleanQuery) return [];
@@ -288,9 +297,20 @@ export function Header() {
                     <p className="text-[11px] font-semibold uppercase tracking-widest text-terracotta">
                       Agents need you
                     </p>
-                    <span className="text-[11px] font-medium text-cream-400">
-                      {attentionCount}
-                    </span>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          clearAttentions(attention.map(attentionDismissKey))
+                        }
+                        className="text-[11px] font-medium text-cream-400 hover:text-terracotta transition-colors"
+                      >
+                        Clear all
+                      </button>
+                      <span className="text-[11px] font-medium text-cream-400">
+                        {attentionCount}
+                      </span>
+                    </div>
                   </div>
                   <div className="max-h-60 overflow-y-auto py-1">
                     {attention.map((session) => {
@@ -304,29 +324,47 @@ export function Header() {
                       const message =
                         stripSpoofChars(rawMessage) || "Waiting on a response.";
                       const age = formatSinceAge(session.needsUser?.since, now);
+                      const dismissKey = attentionDismissKey(session);
                       return (
-                        <button
-                          key={session.agentId}
-                          onClick={() => openAgent(session)}
-                          className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-cream-50"
+                        <div
+                          key={dismissKey}
+                          className="group flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-cream-50"
                         >
-                          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-terracotta/10">
-                            <UserCircle2 className="h-3.5 w-3.5 text-terracotta" />
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-[13px] font-semibold text-cream-800">
-                              {agentId}
+                          <button
+                            type="button"
+                            onClick={() => openAgent(session)}
+                            className="flex min-w-0 flex-1 items-start gap-3 text-left"
+                          >
+                            <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-terracotta/10">
+                              <UserCircle2 className="h-3.5 w-3.5 text-terracotta" />
                             </span>
-                            <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-cream-500">
-                              {message}
-                            </span>
-                            {age && (
-                              <span className="mt-1 block text-[10px] text-cream-400">
-                                {session.role} · {age}
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[13px] font-semibold text-cream-800">
+                                {agentId}
                               </span>
-                            )}
-                          </span>
-                        </button>
+                              <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-cream-500">
+                                {message}
+                              </span>
+                              {age && (
+                                <span className="mt-1 block text-[10px] text-cream-400">
+                                  {session.role} · {age}
+                                </span>
+                              )}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Dismiss ${agentId}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              dismissAttention(dismissKey);
+                            }}
+                            className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-cream-300 opacity-0 transition-opacity hover:bg-cream-100 hover:text-coral group-hover:opacity-100 focus:opacity-100"
+                            title="Dismiss this notification"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       );
                     })}
                   </div>
