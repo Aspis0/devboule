@@ -19,10 +19,9 @@
 //! decides the role: launching the Devboule binary — or, later, a cloud CLI as the
 //! planner — yields the `orchestrator` role.
 //!
-//! This module replaces the former trio of half-measures (`normalize_agent_role`'s
-//! orchestrator→coder fold, `pending_session_role`'s client special-case, and the
-//! `launch_injects_cloudflare_env` token strip-hack): the orchestrator is first-class
-//! and simply never selects a write-token profile (see `vault::canonical_agent_role`).
+//! This module replaces the former half-measures (`normalize_agent_role`'s
+//! orchestrator→coder fold and `pending_session_role`'s client special-case):
+//! the orchestrator is first-class and never writes code itself.
 
 /// Role that plans + delegates and never writes. Also the reserved CLIENT id of the
 /// local Devboule binary — same string, two axes (see module doc).

@@ -88,11 +88,6 @@ const ORACLE_TOOL_NAMES: &[&str] = &[
     "project_append_note",
     "project_create_followup",
     "project_create_plan_tasks",
-    "provider_credentials_status",
-    "cloudflare_list_workers",
-    "cloudflare_rotate_worker_secret",
-    "scaleway_list_resources",
-    "scaleway_resource_action",
     "oracle_ask",
     "oracle_context",
     "project_structure",
@@ -470,6 +465,238 @@ fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Placeholder returned for non-empty env VALUES over `user_mcp_list` (IPC). Raw secrets
+/// stay on disk (global app-data) and in the orchestrator launch payload; they must never
+/// cross the renderer boundary in list responses.
+const ENV_VALUE_LIST_MASK: &str = "********";
+
+/// Well-known secret VALUE prefixes (API keys / PATs). Matched case-sensitively as
+/// issued by the providers; length gate avoids flagging bare prefix stubs.
+const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-ant-",
+    "sk-proj-",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "AKIA",
+    "ASIA",
+];
+
+/// Env KEY substrings that usually hold credentials (uppercased match).
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "API_KEY",
+    "APIKEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "CREDENTIAL",
+];
+
+fn env_key_looks_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_KEY_MARKERS.iter().any(|m| upper.contains(m))
+}
+
+fn value_mostly_token_chars(value: &str) -> bool {
+    let token_chars = value
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == '+'
+                || *c == '/'
+                || *c == '='
+                || *c == '-'
+                || *c == '_'
+                || *c == '.'
+        })
+        .count();
+    token_chars >= value.len().saturating_mul(9) / 10
+}
+
+/// True when a value looks like a long high-entropy token (not a short word / URL path).
+/// Plain long identifiers (e.g. `myProductionDatabase2024`) are NOT secret-shaped:
+/// the generic branch requires length ≥32 AND mixed case AND a digit.
+fn value_looks_high_entropy(value: &str) -> bool {
+    let v = value.trim();
+    if v.len() < 24 || !value_mostly_token_chars(v) {
+        return false;
+    }
+    let lower = v.to_ascii_lowercase();
+    if lower.starts_with("process.env")
+        || lower.starts_with("import.meta")
+        || lower.contains("${")
+        || lower.contains("your-")
+        || lower.contains("xxxx")
+        || lower.contains("changeme")
+        || lower.contains("example")
+        || lower.contains("placeholder")
+    {
+        return false;
+    }
+    let has_digit = v.chars().any(|c| c.is_ascii_digit());
+    let has_upper = v.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = v.chars().any(|c| c.is_ascii_lowercase());
+    // Require at least one hex LETTER: a 32+ char pure-digit value (e.g. a long numeric
+    // id) is not key-shaped and must not be flagged.
+    let is_hex = v.len() >= 32
+        && v.chars().all(|c| c.is_ascii_hexdigit())
+        && v.chars().any(|c| c.is_ascii_alphabetic());
+    // Generic token: mixed case + digit + long enough. The old `(has_digit && has_alpha)`
+    // branch flagged any 24+ alnum (e.g. myProductionDatabase2024) — too aggressive.
+    let looks_token = v.len() >= 32
+        && has_upper
+        && has_lower
+        && has_digit
+        && !v.contains(' ')
+        && !v.contains('/');
+    is_hex || looks_token
+}
+
+/// Detect secret-shaped env entries: known key prefixes / long high-entropy values /
+/// secret-like key names with opaque values. Used to WARN on global save and REFUSE
+/// writing secrets into project-scoped (git-versionable) config files.
+fn env_entry_is_secret_shaped(key: &str, value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    for prefix in SECRET_VALUE_PREFIXES {
+        // Require enough payload after the prefix so a bare "sk-" stub is not flagged.
+        if v.starts_with(prefix) && v.len() >= prefix.len().saturating_add(12) {
+            return true;
+        }
+    }
+    // A high-entropy VALUE is ambiguous — a long hex id or a long camelCase identifier can
+    // be legitimate config (e.g. `DB_NAME=someVeryLongProductionName2024`). Only treat it as
+    // secret-shaped when the KEY name also signals a secret. Unambiguous prefixed secrets
+    // (sk-/rk_/…) are already handled above regardless of key.
+    if env_key_looks_secret(key) && value_looks_high_entropy(v) {
+        return true;
+    }
+    if env_key_looks_secret(key) && v.len() >= 16 && value_mostly_token_chars(v) {
+        return true;
+    }
+    false
+}
+
+/// Scope-aware secret policy for env maps at ADD time.
+/// - PROJECT: refuse (git-versionable; secrets must not land in the repo).
+/// - GLOBAL: warn loudly but allow (app-data only; values still usable for spawn).
+fn check_env_secrets_for_scope(
+    env: &BTreeMap<String, String>,
+    scope: McpScope,
+) -> Result<(), String> {
+    for (key, value) in env {
+        if !env_entry_is_secret_shaped(key, value) {
+            continue;
+        }
+        match scope {
+            McpScope::Project => {
+                return Err(format!(
+                    "refusing to write secret-shaped env value for '{key}' into a project-scoped \
+                     (git-versionable) MCP config. Store secrets on a GLOBAL MCP server or in the \
+                     app keychain instead."
+                ));
+            }
+            McpScope::Global => {
+                eprintln!(
+                    "[user-mcp] WARNING: env '{key}' on a global MCP server looks like a secret. \
+                     Prefer the app keychain/vault when possible. The value is stored in app-data \
+                     only and is never returned by user_mcp_list."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace non-empty env VALUES with [`ENV_VALUE_LIST_MASK`] for IPC list payloads.
+/// Keys are preserved so the UI can show which vars are set; empty values stay empty.
+/// Shared by [`list_impl`] / `user_mcp_list` and IPC surfaces that return
+/// [`UserMcpServer`] (e.g. `tools_library_list`). Spawn paths must NOT use this —
+/// they need raw values via [`merged_servers`] / [`orchestrator_env_json`].
+pub(crate) fn mask_env_for_list(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                if v.is_empty() {
+                    String::new()
+                } else {
+                    ENV_VALUE_LIST_MASK.to_string()
+                },
+            )
+        })
+        .collect()
+}
+
+/// Resolve a command string for audit logs: absolute path as-is, otherwise first
+/// executable match on `PATH` (best-effort; falls back to the raw command).
+fn resolve_command_for_audit(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return command.to_string();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return trimmed.to_string();
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(trimmed);
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn audit_log_global_mcp(action: &str, name: &str, command: &str) {
+    let resolved = resolve_command_for_audit(command);
+    eprintln!(
+        "[user-mcp] AUDIT: {action} global MCP server name='{name}' \
+         command='{command}' resolved='{resolved}'"
+    );
+}
+
+/// Global MCP `command` is RCE-capable (stdio child on launch). Adding / enabling one
+/// requires an explicit `confirm_global_command` flag from the UI.
+fn require_global_command_confirm(scope: McpScope, confirmed: bool) -> Result<(), String> {
+    if matches!(scope, McpScope::Global) && !confirmed {
+        return Err(
+            "adding a global MCP server requires confirmGlobalCommand=true \
+             (the command runs as a local child process on every launch)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_global_enable_confirm(
+    scope: McpScope,
+    enabled: bool,
+    confirmed: bool,
+) -> Result<(), String> {
+    if matches!(scope, McpScope::Global) && enabled && !confirmed {
+        return Err(
+            "enabling a global MCP server requires confirmGlobalCommand=true \
+             (the command runs as a local child process on every launch)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate the COMMAND of a server (defense in depth, mirrors [`validate_args`]). The
 /// command is the child-process program (TOML-escaped for codex / JSON-escaped for claude
 /// downstream), but a control char / newline in it is never a legitimate program name and
@@ -761,14 +988,20 @@ fn resolve_path(
 }
 
 /// List the servers configured in `scope` (the flattened view, sorted by name). Returns
-/// the on-disk list AS-READ (fail-open: invalid entries already dropped by the reader).
-/// `enabled` is preserved so the UI can render the toggle state. Does NOT merge scopes —
-/// the panel manages one scope at a time.
+/// the on-disk list AS-READ (fail-open: invalid entries already dropped by the reader)
+/// with env VALUES masked for IPC — keys remain so the UI can show which vars are set;
+/// raw secrets never cross the renderer. Spawning still reads full values via
+/// [`merged_servers`] / [`orchestrator_env_json`]. `enabled` is preserved so the UI can
+/// render the toggle state. Does NOT merge scopes — the panel manages one scope at a time.
 fn list_impl(path: &Path) -> Vec<UserMcpServer> {
     read_config_file(path)
         .mcp_servers
         .into_iter()
-        .map(|(name, record)| server_from_keyed(name, record))
+        .map(|(name, record)| {
+            let mut server = server_from_keyed(name, record);
+            server.env = mask_env_for_list(&server.env);
+            server
+        })
         .collect()
 }
 
@@ -829,6 +1062,10 @@ pub fn user_mcp_list(
 /// Add a user MCP server to `scope`. Enforces the name guard, transport, and command
 /// checks at add time (design §5.3). For project scope, `project_root` is required and the
 /// `.devboule` folder is created.
+///
+/// Global scope is privileged (stdio child = RCE surface): the UI must pass
+/// `confirm_global_command: true` after explicit user consent. Secret-shaped env values
+/// are refused for project scope (git-versionable) and warned for global.
 #[tauri::command]
 pub fn user_mcp_add(
     state: State<'_, BackendState>,
@@ -836,11 +1073,17 @@ pub fn user_mcp_add(
     scope: McpScope,
     project_root: Option<String>,
     server: UserMcpServer,
+    confirm_global_command: Option<bool>,
 ) -> Result<(), String> {
     state.ensure_unlocked()?;
     let _guard = design_write_guard()?;
     // Validate BEFORE creating any directory so a rejected add leaves no `.devboule` trace.
     validate_server(&server)?;
+    require_global_command_confirm(scope, confirm_global_command.unwrap_or(false))?;
+    check_env_secrets_for_scope(&server.env, scope)?;
+    if matches!(scope, McpScope::Global) {
+        audit_log_global_mcp("add", &server.name, &server.command);
+    }
     let path = match scope {
         McpScope::Global => global_config_path(&app)?,
         McpScope::Project => {
@@ -871,6 +1114,9 @@ pub fn user_mcp_remove(
 
 /// Enable/disable a user MCP server in `scope` without deleting it. For project scope,
 /// `project_root` is required.
+///
+/// Enabling a GLOBAL server is privileged (same RCE surface as add): the UI must pass
+/// `confirm_global_command: true`. Disabling never requires confirmation.
 #[tauri::command]
 pub fn user_mcp_set_enabled(
     state: State<'_, BackendState>,
@@ -879,10 +1125,17 @@ pub fn user_mcp_set_enabled(
     project_root: Option<String>,
     name: String,
     enabled: bool,
+    confirm_global_command: Option<bool>,
 ) -> Result<(), String> {
     state.ensure_unlocked()?;
     let _guard = design_write_guard()?;
+    require_global_enable_confirm(scope, enabled, confirm_global_command.unwrap_or(false))?;
     let path = resolve_path(&app, scope, project_root.as_deref())?;
+    if matches!(scope, McpScope::Global) && enabled {
+        if let Some(record) = read_config_file(&path).mcp_servers.get(&name) {
+            audit_log_global_mcp("enable", &name, &record.command);
+        }
+    }
     set_enabled_impl(&path, &name, enabled)
 }
 
@@ -1184,7 +1437,7 @@ mod tests {
                 "env key {bad_key:?} should be rejected, got: {err}"
             );
         }
-        // A conventional env-var name is accepted and round-trips.
+        // A conventional env-var name is accepted; list returns the KEY with a masked value.
         let mut server = srv("envok", "python", true);
         server.env = BTreeMap::new();
         server.env.insert("MY_KEY".to_string(), "value".to_string());
@@ -1193,8 +1446,11 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].env.get("MY_KEY").map(String::as_str),
-            Some("value")
+            Some(ENV_VALUE_LIST_MASK)
         );
+        // On-disk still holds the raw value (spawning path).
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("\"value\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1262,7 +1518,7 @@ mod tests {
             "no entry should have been stored"
         );
 
-        // A clean value is accepted.
+        // A clean value is accepted; list masks it (IPC never returns raw values).
         let mut server = srv("test-ok", "python", true);
         server
             .env
@@ -1272,7 +1528,13 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].env.get("KEY").map(String::as_str),
-            Some("clean-value")
+            Some(ENV_VALUE_LIST_MASK)
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("clean-value"),
+            "disk must still store the raw value for spawn"
         );
 
         // READ skips a hand-edited entry whose env value contains \r (the bypass path).
@@ -1532,6 +1794,140 @@ mod tests {
         assert_eq!(listed[0].name, "proj-srv");
         assert!(root.join(".devboule").join("mcp-servers.json").is_file());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H2-1: user_mcp_list never returns raw env VALUES; keys are preserved and
+    /// non-empty values are replaced with [`ENV_VALUE_LIST_MASK`]. Disk + orchestrator
+    /// payload keep the real values so spawning is unchanged.
+    #[test]
+    fn list_masks_env_values_disk_and_orchestrator_keep_raw() {
+        let dir = fresh_dir("mask-env");
+        let path = dir.join("c.json");
+        let mut server = srv("envsrv", "python", true);
+        server
+            .env
+            .insert("MY_KEY".to_string(), "super-secret-value".to_string());
+        server.env.insert("EMPTY".to_string(), String::new());
+        add_validated(&path, server).unwrap();
+
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            disk.contains("super-secret-value"),
+            "global/app-data disk must keep raw values for spawn"
+        );
+
+        let listed = list_impl(&path);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].env.get("MY_KEY").map(String::as_str),
+            Some(ENV_VALUE_LIST_MASK)
+        );
+        assert_eq!(
+            listed[0].env.get("EMPTY").map(String::as_str),
+            Some(""),
+            "empty values stay empty (no false has-value mask)"
+        );
+        // Serialized list payload must not contain the secret.
+        let list_json = serde_json::to_string(&listed).unwrap();
+        assert!(
+            !list_json.contains("super-secret-value"),
+            "IPC list JSON leaked the raw env value: {list_json}"
+        );
+
+        // Launch payload (from on-disk records, not list_impl) still embeds raw values.
+        let full: Vec<UserMcpServer> = read_config_file(&path)
+            .mcp_servers
+            .into_iter()
+            .map(|(n, r)| server_from_keyed(n, r))
+            .collect();
+        let orch = orchestrator_env_json(&full);
+        assert!(
+            orch.contains("super-secret-value"),
+            "orchestrator payload must still carry raw env for spawn"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H2-1: secret-shaped env is refused for PROJECT scope (git-versionable) and
+    /// allowed for GLOBAL (with a loud warning on stderr).
+    #[test]
+    fn secret_shaped_env_blocked_in_project_scope_allowed_in_global() {
+        let mut secret_env = BTreeMap::new();
+        secret_env.insert(
+            "OPENAI_API_KEY".to_string(),
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string(),
+        );
+        let err = check_env_secrets_for_scope(&secret_env, McpScope::Project).unwrap_err();
+        assert!(
+            err.contains("project-scoped") || err.contains("keychain") || err.contains("GLOBAL"),
+            "project refusal must steer users away from repo files, got: {err}"
+        );
+
+        // Global allows (warn-only) — does not return Err.
+        check_env_secrets_for_scope(&secret_env, McpScope::Global).unwrap();
+
+        // Non-secret env is fine in both scopes.
+        let mut normal = BTreeMap::new();
+        normal.insert("NODE_ENV".to_string(), "production".to_string());
+        check_env_secrets_for_scope(&normal, McpScope::Project).unwrap();
+        check_env_secrets_for_scope(&normal, McpScope::Global).unwrap();
+    }
+
+    /// H2 review FIX-3: a plain long DB identifier must NOT be treated as secret-shaped
+    /// (project scope must accept it); real API keys / high-entropy tokens still blocked.
+    #[test]
+    fn benign_long_db_name_allowed_real_key_still_blocked() {
+        // 24-char mixed alnum with digit — previously hard-rejected by the old
+        // `(has_digit && has_alpha)` branch; must be allowed in project scope.
+        assert!(
+            !env_entry_is_secret_shaped("DB_NAME", "myProductionDatabase2024"),
+            "plain long identifier must not look secret-shaped"
+        );
+        let mut benign = BTreeMap::new();
+        benign.insert(
+            "DB_NAME".to_string(),
+            "myProductionDatabase2024".to_string(),
+        );
+        check_env_secrets_for_scope(&benign, McpScope::Project).unwrap();
+
+        // Known secret prefix still blocked in project scope.
+        assert!(env_entry_is_secret_shaped(
+            "OPENAI_API_KEY",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        // 32+ hex still looks high-entropy.
+        assert!(value_looks_high_entropy(
+            "0123456789abcdef0123456789abcdef"
+        ));
+        // 32+ mixed case with digit still looks high-entropy.
+        assert!(value_looks_high_entropy(
+            "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk"
+        ));
+        // A 32+ char pure-digit value is a numeric id, not a secret.
+        assert!(!value_looks_high_entropy(
+            "12345678901234567890123456789012"
+        ));
+        // A long camelCase identifier is allowed under a benign key, but the SAME value
+        // under a secret-signalling key is refused (key-gated high-entropy).
+        let long_ident = "myVeryLongCamelCaseVariableNameThatHappensToBe2024";
+        assert!(!env_entry_is_secret_shaped("DB_NAME", long_ident));
+        assert!(env_entry_is_secret_shaped("API_TOKEN", long_ident));
+    }
+
+    /// H2-2: adding/enabling a global MCP command requires an explicit confirm flag.
+    #[test]
+    fn global_mcp_command_requires_confirm_flag() {
+        assert!(require_global_command_confirm(McpScope::Global, false).is_err());
+        assert!(require_global_command_confirm(McpScope::Global, true).is_ok());
+        // Project adds are allowlist-gated separately; no confirm flag required here.
+        assert!(require_global_command_confirm(McpScope::Project, false).is_ok());
+
+        assert!(require_global_enable_confirm(McpScope::Global, true, false).is_err());
+        assert!(require_global_enable_confirm(McpScope::Global, true, true).is_ok());
+        // Disabling never requires confirm.
+        assert!(require_global_enable_confirm(McpScope::Global, false, false).is_ok());
+        assert!(require_global_enable_confirm(McpScope::Project, true, false).is_ok());
     }
 }
 

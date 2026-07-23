@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_bandit;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -78,9 +78,9 @@ pub fn parse_bandit(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 
 /// Run bandit on a single file from the project root. Absent `bandit` → empty.
 /// `--` ends flag parsing so a `-`-leading file name is never read as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("bandit") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // DEMOTED 2026-06-12 (master plan P2): bandit is FP-heavy (~15-42%) and would
     // poison the ORPO labels as a broad gate. Hard-gate only HIGH severity at
@@ -100,8 +100,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_bandit(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_bandit(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 

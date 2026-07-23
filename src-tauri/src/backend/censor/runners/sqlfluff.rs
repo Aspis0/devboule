@@ -32,7 +32,7 @@
 
 use super::super::severity::severity_from_sqlfluff;
 use super::DEFAULT_RUNNER_TIMEOUT;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -139,9 +139,9 @@ fn parse_json_files(stdout: &str) -> Option<Vec<SqlfluffFile>> {
 /// requires one). The file path is the orchestrator-validated project-relative path (a
 /// leading-`-` component is rejected upstream by `validate_rel_path`, so it can't be
 /// mistaken for a flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("sqlfluff") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "sqlfluff",
@@ -157,8 +157,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stdout {
-        Some(s) => parse_sqlfluff(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_sqlfluff(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -279,7 +279,7 @@ mod tests {
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("sqlfluff") {
             assert!(
                 !findings.is_empty(),

@@ -2,7 +2,6 @@
 //
 // Tests for PolisBottomBar: oracle item in BAR_ITEMS, toggling renders OracleAskPanel.
 // T1a.3 — Filters panel Complexity checkbox calls setFilter.
-// T1b.5 — Legend provider toggles call setProviderVisible.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createRef } from "react";
@@ -24,7 +23,6 @@ vi.mock("./OracleAskPanel", () => ({
 
 // Shared mock values so individual tests can inspect/mutate them.
 const mockSetFilter = vi.fn();
-const mockSetProviderVisible = vi.fn();
 const mockCityState = { externalServices: [] as unknown[] };
 
 // useCityStore: return values from the shared mock objects.
@@ -40,8 +38,6 @@ vi.mock("../../store/cityStore", () => ({
       filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
       setFilter: mockSetFilter,
       resetFilter: vi.fn(),
-      visibleProviders: [],
-      setProviderVisible: mockSetProviderVisible,
     }),
 }));
 
@@ -56,7 +52,6 @@ let PolisBottomBar: typeof import("./PolisBottomBar").PolisBottomBar;
 
 beforeEach(async () => {
   mockSetFilter.mockClear();
-  mockSetProviderVisible.mockClear();
   mockCityState.externalServices = [];
   ({ PolisBottomBar } = await import("./PolisBottomBar"));
 });
@@ -217,11 +212,9 @@ describe("PolisBottomBar", () => {
     expect(lastCall.categories).toContain("complexity");
   });
 
-  // T1b.5 — legend renders a toggle per provider; clicking calls setProviderVisible
-  it("legend renders provider toggles and clicking calls setProviderVisible", () => {
+  it("legend shows era monuments section without cloud harbour toggles", () => {
     const { container } = renderBar();
 
-    // Open the Legend panel
     const legendBtn = Array.from(container.querySelectorAll("button")).find(
       (b) => b.textContent?.includes("Legend"),
     )!;
@@ -229,39 +222,11 @@ describe("PolisBottomBar", () => {
       legendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    // The cloud harbour section should list providers with toggles.
-    // Look for a Cloudflare toggle button (the first provider in LEGEND_PROVIDERS).
-    const cloudflareToggle = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Cloudflare"),
-    );
-    expect(cloudflareToggle).toBeDefined();
-
-    act(() => {
-      cloudflareToggle!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    expect(mockSetProviderVisible).toHaveBeenCalledWith("cloudflare", true);
-  });
-
-  // T1b.5 — legend also shows dynamic providers from city.externalServices
-  it("legend shows dynamic providers from externalServices", () => {
-    mockCityState.externalServices = [
-      { serviceId: "s1", provider: "aws", type: "container", name: "test", status: "running", coords: { x: 0, y: 0 }, spawnable: false },
-    ];
-
-    const { container } = renderBar();
-
-    // Open the Legend panel
-    const legendBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Legend"),
-    )!;
-    act(() => {
-      legendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    // "Aws" should appear as a dynamic provider (slug capitalized)
     const text = container.textContent ?? "";
-    expect(text).toContain("Aws");
+    expect(text).toContain("Era monuments");
+    expect(text).not.toContain("Cloud harbour");
+    expect(text).not.toContain("Cloudflare");
+    expect(text).not.toContain("Scaleway");
   });
 
   // F69 — mapped city with 0 buildings must still expose File types so the

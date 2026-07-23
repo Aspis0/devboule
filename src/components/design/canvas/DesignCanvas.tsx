@@ -842,6 +842,26 @@ export function DesignCanvas({
                     borderRadius: radius,
                     boxShadow: node.flat ? "none" : undefined,
                   }}
+                  // HG-3: sanitized markup may keep safe-scheme <a href>. Default
+                  // navigation would leave the app webview (phishing / lost state).
+                  // Capture-phase so both static NodeContent and the CE root are covered.
+                  // Also auxclick: middle-click opens a new tab/window and bypasses click.
+                  onClickCapture={(e) => {
+                    const t = e.target;
+                    if (!(t instanceof Element)) return;
+                    const anchor = t.closest("a[href]");
+                    if (anchor && e.currentTarget.contains(anchor)) {
+                      e.preventDefault();
+                    }
+                  }}
+                  onAuxClickCapture={(e) => {
+                    const t = e.target;
+                    if (!(t instanceof Element)) return;
+                    const anchor = t.closest("a[href]");
+                    if (anchor && e.currentTarget.contains(anchor)) {
+                      e.preventDefault();
+                    }
+                  }}
                 >
                   {inCe ? (
                     // CE: render sanitized markup into a content root we OWN (ref'd for

@@ -264,14 +264,13 @@ Launch token: {launch_token}\n\
 Use the MCP server named devboule.\n\
 First call agent_register(agent_id=\"{agent_id}\", role=\"{role}\", model=\"{model_value}\", message=\"starting {project_id}\", launch_token=\"{launch_token}\"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.\n\
 Keep the returned sessionToken private and pass it as session_token=\"<sessionToken>\" on every later MCP call.\n\
-Then call provider_credentials_status(agent_id=\"{agent_id}\", role=\"{role}\", session_token=\"<sessionToken>\"), project_get(project_id=\"{project_id}\", agent_id=\"{agent_id}\", role=\"{role}\", session_token=\"<sessionToken>\") and oracle_context(query=\"<specific question>\", agent_id=\"{agent_id}\", role=\"{role}\", project_id=\"{project_id}\", session_token=\"<sessionToken>\") before acting.\n\
+Then call project_get(project_id=\"{project_id}\", agent_id=\"{agent_id}\", role=\"{role}\", session_token=\"<sessionToken>\") and oracle_context(query=\"<specific question>\", agent_id=\"{agent_id}\", role=\"{role}\", project_id=\"{project_id}\", session_token=\"<sessionToken>\") before acting.\n\
 Task entrypoint: {task_action}\n\
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.\n\
 Always end every turn with a short plain-text message to the user (what you did / what's next). Never end a turn with only tool calls or empty output.\n\
 MCP servers are already configured and connected; never call auth or OAuth actions on the mcp tool.\n\
-Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.\n\
 {addenda_block}\
-Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.\n",
+Never print launch tokens, session tokens or secrets.\n",
         project_id = project.metadata.id,
         project_title = project.metadata.title,
         root_path = root_path.to_string_lossy(),

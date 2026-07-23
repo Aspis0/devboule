@@ -16,14 +16,12 @@ const askOracle = vi.fn<() => Promise<OracleAnswer>>();
 const requestView = vi.fn();
 // Provider configured by default
 const oracleLlmSettings = { apiKeyConfigured: true };
-const secretStatuses: unknown[] = [];
 
 vi.mock("../../context/AppContext", () => ({
   useAppContext: () => ({
     askOracle,
     requestView,
     oracleLlmSettings,
-    secretStatuses,
   }),
 }));
 
@@ -301,7 +299,6 @@ describe("OracleAskPanel interactions", () => {
         askOracle,
         requestView,
         oracleLlmSettings: null,
-        secretStatuses: [],
       }),
     }));
 
@@ -321,8 +318,7 @@ describe("OracleAskPanel interactions", () => {
         askOracle,
         requestView,
         oracleLlmSettings,
-        secretStatuses,
-      }),
+          }),
     }));
   });
 
@@ -333,7 +329,6 @@ describe("OracleAskPanel interactions", () => {
         askOracle,
         requestView,
         oracleLlmSettings: null,
-        secretStatuses: [],
       }),
     }));
     vi.resetModules();
@@ -356,8 +351,7 @@ describe("OracleAskPanel interactions", () => {
         askOracle,
         requestView,
         oracleLlmSettings,
-        secretStatuses,
-      }),
+          }),
     }));
   });
 });

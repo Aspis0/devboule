@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::gitleaks_category;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -103,9 +103,9 @@ fn sanitize_rule_label(rule: &str) -> String {
 /// Run gitleaks on the project root (it scans the working tree / git history). We
 /// report to stdout in JSON. Absent `gitleaks` → empty. gitleaks exits non-zero
 /// when leaks are found — that is parsed normally by `run_capture`.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("gitleaks") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // `detect --report-format json --report-path -` streams JSON to stdout (`-`).
     // `--no-banner` keeps stdout clean. We run from the project root.
@@ -122,8 +122,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_gitleaks(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_gitleaks(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

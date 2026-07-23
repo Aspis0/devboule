@@ -24,8 +24,7 @@
 //! the fold continues — a single broken source never strips the city.
 
 use crate::backend::model::AgentLiveState;
-use crate::backend::providers::ProviderInventory;
-use crate::polis::model::CityState;
+use crate::polis::model::{CityState, ExternalService};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -45,8 +44,10 @@ pub struct ScanContext<'a> {
     pub project_roots: &'a BTreeMap<String, std::path::PathBuf>,
     /// Open bug-card suspects: (card_id, [suspect_file_rel_paths]).
     pub open_bug_suspects: &'a [(String, Vec<String>)],
-    /// Cached provider inventories (cloud services).
-    pub inventories: &'a [ProviderInventory],
+    /// Era monuments carried over from the previous in-memory city.
+    /// The pure scanner starts with an empty `external_services`; this slice is
+    /// re-attached so scan/watch never wipe cumulative era monuments.
+    pub preserved_monuments: &'a [ExternalService],
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +69,7 @@ pub type SourceResult<T> = Result<T, String>;
 /// See the module-level docs for the D2 typed-surface evolution plan.
 pub trait CityDataSource: Send + Sync {
     /// Stable identifier for this source (e.g. `"agents"`, `"suspect-cards"`,
-    /// `"cloud"`).  Used in diagnostic notes.
+    /// `"monuments"`).  Used in diagnostic notes.
     fn id(&self) -> &'static str;
 
     /// Apply this source's augmentation to `city`.  Called once per fold.
@@ -145,20 +146,34 @@ impl CityDataSource for SuspectCardsSource {
     }
 }
 
-/// Populates `external_services` from the cached provider inventory.
-///
-/// PURE + OFFLINE: reads the already-synced snapshot only.  Era monuments are
-/// preserved (they are not inventory-backed).  An empty inventory yields an
-/// honestly empty harbour.
-pub struct CloudSource;
+/// Re-attaches era monuments (`provider == "monument"`) preserved from the
+/// previous in-memory city.  After cloud-provider inventory removal,
+/// `external_services` holds **only** these monument entries.
+pub struct MonumentsSource;
 
-impl CityDataSource for CloudSource {
+impl CityDataSource for MonumentsSource {
     fn id(&self) -> &'static str {
-        "cloud"
+        "monuments"
     }
 
     fn apply(&self, ctx: &ScanContext, city: &mut CityState) -> SourceResult<()> {
-        crate::polis::cloud::attach_external_services(city, ctx.inventories);
+        // Drop any non-monument residue (legacy cloud outposts from old saves),
+        // then restore cumulative era monuments from the previous city.
+        city.external_services
+            .retain(|s| s.provider == "monument");
+        for m in ctx.preserved_monuments {
+            if m.provider != "monument" {
+                continue;
+            }
+            if city
+                .external_services
+                .iter()
+                .any(|s| s.service_id == m.service_id)
+            {
+                continue;
+            }
+            city.external_services.push(m.clone());
+        }
         Ok(())
     }
 }
@@ -173,7 +188,7 @@ pub fn default_sources() -> Vec<Box<dyn CityDataSource>> {
     vec![
         Box::new(AgentsSource),
         Box::new(SuspectCardsSource),
-        Box::new(CloudSource),
+        Box::new(MonumentsSource),
     ]
 }
 // ---------------------------------------------------------------------------
@@ -214,15 +229,16 @@ mod tests {
         // Safe: we only use the ctx fields that test sources actually read,
         // and our MarkerSource reads none of them.
         let dummy_path: &'static Path = Path::new("/dummy");
-        let empty_roots: &'static BTreeMap<String, std::path::PathBuf> = Box::leak(Box::new(BTreeMap::new()));
+        let empty_roots: &'static BTreeMap<String, std::path::PathBuf> =
+            Box::leak(Box::new(BTreeMap::new()));
         let empty_suspects: &'static [(String, Vec<String>)] = &[];
-        let empty_inventories: &'static [ProviderInventory] = &[];
+        let empty_monuments: &'static [ExternalService] = &[];
         ScanContext {
             project_root: dummy_path,
             live: None,
             project_roots: empty_roots,
             open_bug_suspects: empty_suspects,
-            inventories: empty_inventories,
+            preserved_monuments: empty_monuments,
         }
     }
 
@@ -231,9 +247,21 @@ mod tests {
         let mut city = empty_city();
         let ctx = empty_ctx();
         let sources: Vec<Box<dyn CityDataSource>> = vec![
-            Box::new(MarkerSource { name: "a", marker: "A", fail: false }),
-            Box::new(MarkerSource { name: "b", marker: "B", fail: false }),
-            Box::new(MarkerSource { name: "c", marker: "C", fail: false }),
+            Box::new(MarkerSource {
+                name: "a",
+                marker: "A",
+                fail: false,
+            }),
+            Box::new(MarkerSource {
+                name: "b",
+                marker: "B",
+                fail: false,
+            }),
+            Box::new(MarkerSource {
+                name: "c",
+                marker: "C",
+                fail: false,
+            }),
         ];
         fold_sources(&sources, &ctx, &mut city);
         assert_eq!(city.notes, vec!["A", "B", "C"]);
@@ -244,15 +272,31 @@ mod tests {
         let mut city = empty_city();
         let ctx = empty_ctx();
         let sources: Vec<Box<dyn CityDataSource>> = vec![
-            Box::new(MarkerSource { name: "ok", marker: "before", fail: false }),
-            Box::new(MarkerSource { name: "bad", marker: "X", fail: true }),
-            Box::new(MarkerSource { name: "ok2", marker: "after", fail: false }),
+            Box::new(MarkerSource {
+                name: "ok",
+                marker: "before",
+                fail: false,
+            }),
+            Box::new(MarkerSource {
+                name: "bad",
+                marker: "X",
+                fail: true,
+            }),
+            Box::new(MarkerSource {
+                name: "ok2",
+                marker: "after",
+                fail: false,
+            }),
         ];
         fold_sources(&sources, &ctx, &mut city);
         // "before" from first source, "after" from third (second failed).
         assert_eq!(city.notes, vec!["before", "after"]);
         // Failure recorded in scan_note.
-        assert!(city.scan_note.as_deref().unwrap().contains("source bad: injected failure"));
+        assert!(city
+            .scan_note
+            .as_deref()
+            .unwrap()
+            .contains("source bad: injected failure"));
     }
 
     #[test]
@@ -260,9 +304,21 @@ mod tests {
         let mut city = empty_city();
         let ctx = empty_ctx();
         let sources: Vec<Box<dyn CityDataSource>> = vec![
-            Box::new(MarkerSource { name: "f1", marker: "-", fail: true }),
-            Box::new(MarkerSource { name: "f2", marker: "-", fail: true }),
-            Box::new(MarkerSource { name: "ok", marker: "survivor", fail: false }),
+            Box::new(MarkerSource {
+                name: "f1",
+                marker: "-",
+                fail: true,
+            }),
+            Box::new(MarkerSource {
+                name: "f2",
+                marker: "-",
+                fail: true,
+            }),
+            Box::new(MarkerSource {
+                name: "ok",
+                marker: "survivor",
+                fail: false,
+            }),
         ];
         fold_sources(&sources, &ctx, &mut city);
         assert_eq!(city.notes, vec!["survivor"]);
@@ -286,7 +342,45 @@ mod tests {
     fn source_ids_are_stable_and_distinct() {
         assert_eq!(AgentsSource.id(), "agents");
         assert_eq!(SuspectCardsSource.id(), "suspect-cards");
-        assert_eq!(CloudSource.id(), "cloud");
+        assert_eq!(MonumentsSource.id(), "monuments");
+    }
+
+    #[test]
+    fn monuments_source_restores_era_monuments_only() {
+        let monument = ExternalService {
+            service_id: "monument-alpha".into(),
+            provider: "monument".into(),
+            service_type: "parthenon".into(),
+            name: "Era Alpha".into(),
+            status: "active".into(),
+            coords: Coords { x: -8.0, y: 0.0 },
+            spawnable: false,
+        };
+        let legacy_cloud = ExternalService {
+            service_id: "cf-worker-1".into(),
+            provider: "cloudflare".into(),
+            service_type: "worker".into(),
+            name: "legacy".into(),
+            status: "running".into(),
+            coords: Coords { x: 10.0, y: 0.0 },
+            spawnable: false,
+        };
+        let preserved = vec![monument.clone(), legacy_cloud];
+        let mut city = empty_city();
+        let dummy_path = Path::new("/dummy");
+        let roots = BTreeMap::new();
+        let suspects: [(String, Vec<String>); 0] = [];
+        let ctx = ScanContext {
+            project_root: dummy_path,
+            live: None,
+            project_roots: &roots,
+            open_bug_suspects: &suspects,
+            preserved_monuments: &preserved,
+        };
+        MonumentsSource.apply(&ctx, &mut city).unwrap();
+        assert_eq!(city.external_services.len(), 1);
+        assert_eq!(city.external_services[0].service_id, "monument-alpha");
+        assert_eq!(city.external_services[0].provider, "monument");
     }
 
     /// Identity test: running default_sources() through fold_sources produces
@@ -397,14 +491,14 @@ mod tests {
 
         let project_root = std::path::Path::new("/tmp/test-proj");
         let project_roots = std::collections::BTreeMap::new();
-        let inventories: Vec<crate::backend::providers::ProviderInventory> = vec![];
+        let preserved_monuments: Vec<ExternalService> = vec![];
 
         let ctx = ScanContext {
             project_root,
             live: Some(&live),
             project_roots: &project_roots,
             open_bug_suspects: &suspects,
-            inventories: &inventories,
+            preserved_monuments: &preserved_monuments,
         };
 
         // Variant A: fold_sources with default_sources().
@@ -415,13 +509,15 @@ mod tests {
         let mut city_b = city_a.clone();
         // Reset city_b to pre-attach state (the same base city_a was before fold).
         city_b.agents.clear();
+        city_b.external_services.clear();
         for b in city_b.buildings.iter_mut() {
             b.agent_present = None;
             b.suspect_of_card_id = None;
         }
         crate::polis::scanner::attach_agents(&mut city_b, &live, project_root, &project_roots);
         crate::polis::scanner::attach_suspect_cards(&mut city_b, &suspects);
-        crate::polis::cloud::attach_external_services(&mut city_b, &inventories);
+        // Monuments: none preserved → empty external_services.
+        city_b.external_services.retain(|s| s.provider == "monument");
 
         // Compare agent lists: same agents.
         assert_eq!(city_a.agents.len(), city_b.agents.len(), "agent count");
@@ -432,14 +528,21 @@ mod tests {
 
         // Compare suspect_of_card_id on each building.
         for (ba, bb) in city_a.buildings.iter().zip(city_b.buildings.iter()) {
-            assert_eq!(ba.suspect_of_card_id, bb.suspect_of_card_id,
-                "suspect for {}", ba.file_path);
+            assert_eq!(
+                ba.suspect_of_card_id, bb.suspect_of_card_id,
+                "suspect for {}",
+                ba.file_path
+            );
         }
 
-        // Compare external_services.
+        // Compare external_services (monuments only).
         assert_eq!(city_a.external_services.len(), city_b.external_services.len());
 
         // scan_note stays None on success (no source failure).
-        assert!(city_a.scan_note.is_none(), "scan_note should be None, got {:?}", city_a.scan_note);
+        assert!(
+            city_a.scan_note.is_none(),
+            "scan_note should be None, got {:?}",
+            city_a.scan_note
+        );
     }
 }

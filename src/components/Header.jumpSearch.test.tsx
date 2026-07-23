@@ -13,7 +13,6 @@ const requestView = vi.fn();
 vi.mock("../context/AppContext", () => ({
   useAppContext: () => ({
     activeView: "projects",
-    cloudSnapshot: null,
     roleStatus: { role: "admin", isAdmin: true, provisioned: true },
   }),
   useAppActions: () => ({

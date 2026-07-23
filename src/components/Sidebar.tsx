@@ -72,10 +72,14 @@ const HELP_NAV: NavItem = { id: "help", label: "Help", icon: "LifeBuoy" };
 
 // Nav ids that must never render in the sidebar, even if a stored/loaded
 // config still lists them (e.g. a stale persisted "providers" entry from an
-// older saved config on disk or the backend get_config). The cloud providers
-// area is hidden until the provider-agnostic refactor; it stays reachable by
-// deep link (requestView("providers")).
-const HIDDEN_NAV_IDS = new Set<string>(["providers"]);
+// older saved config). Cloud-provider console views were removed; deep-links
+// to them redirect via mapLegacyViewTarget.
+const HIDDEN_NAV_IDS = new Set<string>([
+	"providers",
+	"cloudflare",
+	"compute",
+	"budget",
+]);
 
 export function Sidebar() {
 	const { config, activeView, roleStatus } = useAppContext();
@@ -155,7 +159,7 @@ export function Sidebar() {
 								data-testid={`nav-${item.id}`}
 								onClick={() => setActiveView(item.id)}
 								data-help-title={`This opens the ${item.label} page.`}
-								data-help-lines="The sidebar only changes what you see in the app.|It does not call Cloudflare, Scaleway, Oracle, or agents by itself.|Use Projects for the work board; open a project to enter its Work mode with agent terminals, and use provider pages for live cloud operations.|If a page looks empty, run its sync or refresh action after opening it."
+								data-help-lines="The sidebar only changes what you see in the app.|It does not call Oracle or agents by itself.|Use Projects for the work board; open a project to enter its Work mode with agent terminals.|If a page looks empty, run its sync or refresh action after opening it."
 								className={`
                 flex shrink-0 items-center gap-2 rounded-2xl px-3 py-2.5 md:mb-0.5 md:w-full md:gap-3 md:px-4
                 text-[13px] font-medium transition-all duration-200 cursor-pointer

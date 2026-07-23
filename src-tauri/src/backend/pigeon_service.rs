@@ -45,10 +45,31 @@ fn pigeon_data_root() -> Option<PathBuf> {
 }
 
 /// Pure: read the `pigeon.enabled` flag out of a parsed config.json value. Default false.
+///
+/// ALPHA HARD-DISABLE (2026-07-23): Pigeon does NOT ship in the public alpha. This is the single
+/// choke point every gate funnels through (spawn, agent hints, mini-executor ingest, censor pool,
+/// prompt routing, `pigeon_spawn_env`), so forcing `false` here disables the entire transport and,
+/// crucially, makes `pigeon_spawn_env` return `None` — so the loopback `PIGEON_AUTH_TOKEN` is never
+/// minted or surfaced over IPC. No config value (`pigeon.enabled=true`) can turn it back on. The
+/// original flag read is kept below (dead under the early return) so re-enabling later is a one-line
+/// revert. See also `set_pigeon_enabled`, which refuses to persist an enable.
 pub fn pigeon_enabled_from_value(v: &serde_json::Value) -> bool {
+    // Public-alpha kill switch — remove this line to restore the config-driven flag.
+    if !pigeon_alpha_enable_override() {
+        return false;
+    }
     v.get("pigeon")
         .and_then(|p| p.get("enabled"))
         .and_then(|e| e.as_bool())
+        .unwrap_or(false)
+}
+
+/// Escape hatch for internal builds only: Pigeon stays hard-off unless `DEVBOULE_ALPHA_PIGEON=1`
+/// is set in the process environment. There is no config.json / UI path to flip this — the public
+/// alpha ships without the env var, so the transport is unreachable.
+fn pigeon_alpha_enable_override() -> bool {
+    std::env::var("DEVBOULE_ALPHA_PIGEON")
+        .map(|v| v == "1")
         .unwrap_or(false)
 }
 
@@ -305,6 +326,15 @@ pub fn set_pigeon_enabled(
     enabled: bool,
 ) -> Result<bool, String> {
     state.ensure_unlocked()?;
+
+    // ALPHA HARD-DISABLE (2026-07-23): Pigeon does not ship in the public alpha. Refuse any request
+    // to persist `pigeon.enabled=true` so the UI/config path cannot arm a transport that
+    // `pigeon_enabled_from_value` will ignore anyway. Disabling (writing `false`) is still allowed so
+    // a stale `true` from an older config can be cleaned up. Internal builds bypass via the env override.
+    if enabled && !pigeon_alpha_enable_override() {
+        return Err("Pigeon is disabled in this build and cannot be enabled.".to_string());
+    }
+
     let _lock = crate::backend::projects::config_write_lock()
         .lock()
         .map_err(|e| format!("config write lock poisoned: {e}"))?;
@@ -347,8 +377,10 @@ mod tests {
         assert!(!pigeon_enabled_from_value(&json!({"other": true})));
     }
     #[test]
-    fn reads_explicit_bool() {
-        assert!(pigeon_enabled_from_value(&json!({"pigeon": {"enabled": true}})));
+    fn alpha_hard_disable_ignores_explicit_true() {
+        // ALPHA HARD-DISABLE: even an explicit `enabled: true` reads as false while the
+        // DEVBOULE_ALPHA_PIGEON override is unset (the default for the public alpha build).
+        assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": true}})));
         assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": false}})));
     }
     #[test]

@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::super::schema::{Category, Severity};
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -114,9 +114,9 @@ pub fn parse_pip_audit(stdout: &str) -> Vec<RawFinding> {
 }
 
 /// Run pip-audit from the project root. Absent `pip-audit` → empty.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("pip-audit") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // pip-audit can be slow; allow a generous budget.
     let stdout = run_capture_with_timeout(
@@ -126,8 +126,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(300),
     );
     match stdout {
-        Some(s) => parse_pip_audit(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_pip_audit(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

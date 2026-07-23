@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::super::schema::{Category, Severity};
-use super::{redact_secrets, run_capture, run_capture_with_timeout, Granularity, RawFinding};
+use super::{redact_secrets, run_capture, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -128,9 +128,9 @@ pub fn parse_cargo_audit(stdout: &str) -> Vec<RawFinding> {
 ///
 /// The advisory-DB fetch + scan can be slow on a cold cache, so the actual audit
 /// runs under a longer timeout than the per-file default.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("cargo") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // Detect a missing `cargo-audit` subcommand. `--version` is fast and offline;
     // its absence (None) means the subcommand isn't installed.
@@ -139,7 +139,7 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
             "censor: cargo-audit not installed at {} (dependency vulnerability scan skipped)",
             root.display()
         );
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // Cold advisory-DB fetch + scan can take a while; allow a generous budget.
     let stdout = run_capture_with_timeout(
@@ -149,8 +149,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(300),
     );
     match stdout {
-        Some(s) => parse_cargo_audit(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_cargo_audit(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

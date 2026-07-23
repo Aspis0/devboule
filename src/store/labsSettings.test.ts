@@ -10,7 +10,7 @@
 // NOTE on environment: vitest is configured with `environment: "node"`. The
 // store only touches `window.localStorage`, so we inject a minimal fake
 // `window`/`localStorage` on globalThis (mirroring the repo's
-// cityStore.visibleProviders.test.ts pattern) instead of relying on a jsdom
+// in-memory store pattern) instead of relying on a jsdom
 // environment package. The behaviour under test is identical.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";

@@ -716,7 +716,29 @@ pub fn save_oracle_roots_registry(
     }
     let raw = serde_json::to_string_pretty(&oracle_roots_registry_to_value(reg))
         .unwrap_or_else(|_| "{\"roots\":[]}".into());
-    fs::write(path, raw)
+    // Registry embeds discovery authToken — owner-only (0600), no world-readable window.
+    write_owner_only_file(&path, raw.as_bytes())
+}
+
+/// Create/truncate `path` with mode 0600 (Unix) so auth tokens are never world-readable.
+fn write_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Merge + re-rank chunks by score (desc), hard-cap at `limit` (P3).
@@ -2054,6 +2076,32 @@ mod tests {
         );
         assert!(loaded.is_registered(&root_b));
         assert!(!loaded.is_registered(Path::new("/tmp/not-registered-xyz")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_oracle_roots_registry_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mgmt = tmp.path().join("mgmt");
+        fs::create_dir_all(&mgmt).unwrap();
+        let mut reg = OracleRootsRegistry::default();
+        reg.upsert(OracleRootEntry {
+            path: "/tmp/x".into(),
+            manifest_path: "/tmp/x/m.json".into(),
+            discovery: Some(OracleRootDiscovery {
+                base_url: "http://127.0.0.1:9".into(),
+                auth_token: "secret-token".into(),
+                pid: None,
+                index_root: None,
+            }),
+            last_indexed_at: None,
+            status: "indexed".into(),
+        });
+        save_oracle_roots_registry(&mgmt, &reg).unwrap();
+        let path = oracle_roots_registry_path(&mgmt);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "registry with authToken must be owner-only");
     }
 
     #[test]

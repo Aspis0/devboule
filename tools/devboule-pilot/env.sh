@@ -46,6 +46,15 @@ devboule_pilot_default_socket() {
       fi
     fi
   fi
+  # No usable private XDG_RUNTIME_DIR (the common case on macOS, where it is unset).
+  # Do NOT fall back to world-visible /tmp — any other local user could connect to the
+  # socket and drive the live UI. Use a per-user 0700 dir under $HOME instead.
+  local priv="${DEVBOULE_PILOT_STATE_DIR:-$HOME/.devboule/devboule-ui-pilot}/run"
+  if mkdir -p "$priv" 2>/dev/null && chmod 700 "$priv" 2>/dev/null; then
+    echo "${priv}/${name}"
+    return
+  fi
+  # Last resort only if the private dir could not be created (opt into /tmp explicitly).
   echo "/tmp/${name}"
 }
 

@@ -1034,13 +1034,22 @@ impl ScopedAgentTools {
                 cmd.env(key, v);
             }
         }
-        // F2: own process group so a timeout SIGKILLs the WHOLE tree (cargo→rustc→test bin,
+        // F2: own process group / tree so a timeout kills the WHOLE tree (cargo→rustc→test bin,
         // npm→node, make→…). Killing only the direct child orphans descendants AND can deadlock
         // the output drain (a surviving child keeps the pipe write end open).
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        // Windows: CREATE_NEW_PROCESS_GROUP so the child is the root of a new tree that
+        // taskkill /T can walk on timeout (mirrors Unix process_group(0) intent).
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         }
         // C3 (rlimits): Seatbelt has no native rlimit — enforce CPU/addr-space/max-procs on the
         // spawned process (inherited by the child). Bounds a runaway/fork-bomb in a sandboxed run.
@@ -1175,14 +1184,25 @@ fn drain_capped(r: &mut impl std::io::Read) -> Vec<u8> {
     buf
 }
 
-/// SIGKILL the child's whole process group (negative pid) on timeout, so descendants
-/// (rustc/test-bin/node/…) die too — they can't orphan or hold the output pipes open. Also
-/// kills + reaps the direct child (covers non-unix + belt-and-suspenders).
+/// Kill the child's whole process tree on timeout, so descendants (rustc/test-bin/node/…)
+/// die too — they can't orphan or hold the output pipes open. Unix: SIGKILL the process
+/// group (negative pid). Windows: `taskkill /T /F` walks the tree. Also kills + reaps the
+/// direct child (belt-and-suspenders).
 fn kill_process_group(pid: i32, child: &mut std::process::Child) {
     #[cfg(unix)]
     // SAFETY: kill(2) with a negative pid targets the process group; SIGKILL is async-safe.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // /T = tree kill (descendants); /F = force. Pid was just spawned by us.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1302,6 +1322,34 @@ mod tests {
         assert!(p_none.writable_paths.contains(&root), "scope root must be writable");
         let p_en = super::agentic_run_policy(&root, NetPolicy::Enabled);
         assert_eq!(p_en.net, NetPolicy::Enabled);
+    }
+
+    #[test]
+    fn kill_process_group_reaps_short_lived_child() {
+        // Timeout path must kill+reap without hang (Unix group kill / Windows taskkill /T).
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        #[cfg(windows)]
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn ping")
+        };
+        let pid = child.id() as i32;
+        super::kill_process_group(pid, &mut child);
+        // After kill_process_group has wait()ed the child, try_wait may return Ok(Some),
+        // Ok(None), or Err depending on platform/Rust — any non-hang result is success.
+        match child.try_wait() {
+            Ok(Some(_)) | Ok(None) | Err(_) => {}
+        }
     }
 
     #[test]

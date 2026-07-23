@@ -11,9 +11,8 @@ use super::fs_replace::replace_file_with_backup;
 use super::model::{
     DesignHandoffInput, ProjectAgentLaunchInput, ProjectAgentLaunchResult, ProjectCreateInput,
     ProjectDetail, ProjectGitCommandResult, ProjectGitRepoCandidate, ProjectGitStatus,
-    ProjectLinkedResource, ProjectLiveResourceStatus, ProjectLiveStatus, ProjectMetadata,
-    ProjectMetadataPatch, ProjectMilestone, ProjectNote, ProjectNoteInput, ProjectStateBlock,
-    ProjectSummary, ProjectTask, ProjectTaskCounts, ProjectTaskInput, ProviderId,
+    ProjectMetadata, ProjectMetadataPatch, ProjectMilestone, ProjectNote, ProjectNoteInput,
+    ProjectStateBlock, ProjectSummary, ProjectTask, ProjectTaskCounts, ProjectTaskInput,
 };
 use super::state::BackendState;
 use super::user_mcp_config;
@@ -154,11 +153,7 @@ pub fn get_project(
 ) -> Result<ProjectDetail, String> {
     state.ensure_unlocked()?;
     let parsed = read_project_by_id(&app, &project_id)?;
-    let linked_tasks = parsed.state.tasks.clone();
-    Ok(detail_from_project(
-        parsed,
-        live_status_from_state(&state, Some(&linked_tasks))?,
-    ))
+    Ok(detail_from_project(parsed))
 }
 
 /// Auto-trust the Censor only for a brand-new (empty or non-existent) project folder.
@@ -370,7 +365,7 @@ pub fn create_project(
         seed_attached_root_gitignore(std::path::Path::new(root));
     }
     let parsed = read_project_file(&path)?;
-    Ok(detail_from_project(parsed, ProjectLiveStatus::default()))
+    Ok(detail_from_project(parsed))
 }
 
 #[tauri::command]
@@ -464,7 +459,6 @@ pub fn create_project_task(
                 priority: clean_optional(task.priority.as_deref()),
                 assignee: clean_optional(task.assignee.as_deref()),
                 due: normalize_due(task.due.as_deref())?,
-                linked_resources: task.linked_resources.clone().unwrap_or_default(),
                 updated_at: now,
                 category: Some(category),
                 description,
@@ -748,11 +742,7 @@ fn detail_for_system_write(
     saved: Option<ParsedProject>,
 ) -> Result<ProjectDetail, String> {
     let saved = saved.ok_or_else(|| "Project not found.".to_string())?;
-    let linked_tasks = saved.state.tasks.clone();
-    Ok(detail_from_project(
-        saved,
-        live_status_from_state(state, Some(&linked_tasks))?,
-    ))
+    Ok(detail_from_project(saved))
 }
 
 #[tauri::command]
@@ -1107,16 +1097,6 @@ pub fn remove_project_milestone(
     detail_for_system_write(&state, saved)
 }
 
-#[tauri::command]
-pub fn refresh_project_live_status(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-    project_id: String,
-) -> Result<ProjectLiveStatus, String> {
-    state.ensure_unlocked()?;
-    let project = read_project_by_id(&app, &project_id)?;
-    live_status_from_state(&state, Some(&project.state.tasks))
-}
 
 /// Persist the custom agent clients into config.json (read-modify-write, mirroring
 /// `roles::bake_trust_anchor`). Validates + normalizes the whole list (id/label/
@@ -2137,13 +2117,9 @@ fn prepare_or_launch_project_agent(
     }
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path)?;
-    // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
-    // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
-    // Owner decision: the orchestrator receives the SAME provider env as a coder —
-    // it holds the full Cloudflare/Scaleway tool surface, so it carries the scoped
-    // write token like any coder-like role. The local binary's own secrets (launch
-    // token + Exa key) are appended below.
-    let mut provider_env = cloudflare_agent_provider_env_for_role(&role)?;
+    // Provider env starts empty (cloud CF/SCW inventory removed). Local secrets
+    // (Claude OAuth, launch token, Exa key, cloud LLM key) are appended below.
+    let mut provider_env: Vec<AgentLaunchEnv> = Vec::new();
     // F46-close: inject Claude setup-token for Claude CLI launches (never logged).
     if client == "claude" {
         if let Some((name, value)) =
@@ -2170,7 +2146,7 @@ fn prepare_or_launch_project_agent(
     // (fail-closed if missing) and assemble its NON-SECRET env config inline; the
     // two SECRETS the binary reads (the launch token + the Exa key, when stored) are
     // appended to `provider_env` so they ride into the child PROCESS env only —
-    // never the binary's argv (B1 invariant), exactly like the Cloudflare agent
+    // never the binary's argv (B1 invariant), exactly like other secret env injects
     // tokens. The oMLX base/model come from the orchestrator's OWN dedicated
     // `localCoderBackend` (loopback-validated by `read_local_coder_backend`) — NOT the
     // mini-coder backend. The orchestrator (local MAIN coder) and the mini (delegated
@@ -2732,11 +2708,7 @@ where
     project.metadata.updated_at = now();
     write_project_file(&project)?;
     let saved = read_project_file(&project.path)?;
-    let linked_tasks = saved.state.tasks.clone();
-    Ok(detail_from_project(
-        saved,
-        live_status_from_state(state, Some(&linked_tasks))?,
-    ))
+    Ok(detail_from_project(saved))
 }
 
 /// Locked read-modify-write for SYSTEM-initiated, field-targeted background writes
@@ -3562,9 +3534,9 @@ pub fn resolve_project_root_by_id(
 /// classification fold in `agent_role.rs`; "orchestrator" is FIRST-CLASS (it is in
 /// the Python server's VALID_ROLES, not ROLE_ALIASES) and no longer folds to coder.
 /// The canonical role now drives EVERYTHING for a launch — vault token selection
-/// (orchestrator ⇒ no Cloudflare profile), Kanban transition rules (coder-like, per
+/// Kanban transition rules (coder-like, per
 /// Python CODER_LIKE_ROLES) and the persisted session role — replacing the former
-/// normalize-fold + `pending_session_role` + `launch_injects_cloudflare_env` trio
+/// normalize-fold + `pending_session_role` pair
 /// that fought each other over the same string.
 fn normalize_agent_role(value: &str) -> Result<String, String> {
     super::agent_role::canonicalize_launch_role(value)
@@ -4583,7 +4555,7 @@ fn current_user_sid_string() -> Option<String> {
 /// also reads — `DEVBOULE_MCP_LAUNCH_TOKEN` and `EXA_API_KEY` — are NEVER part of
 /// this struct or the launch line: they are injected via the per-launch
 /// `provider_env` (the parent process env / restricted-script export), exactly like
-/// the Cloudflare agent tokens, so they stay off the binary's argv (B1 invariant).
+/// secret env injects, so they stay off the binary's argv (B1 invariant).
 ///
 /// Field names mirror the binary's env contract in `devboule-coder/src/config.rs`.
 /// Owned (not borrowed) so it can be assembled once at the launch chokepoint
@@ -5237,14 +5209,6 @@ fn build_cloud_duplex_launch(
         .collect();
     // Mirror the env the PTY launch script sets for the CLI process itself.
     // Dual-write Devboule + legacy Aspis (P0 branding; one release).
-    envs.push((
-        "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE".to_string(),
-        "1".to_string(),
-    ));
-    envs.push((
-        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".to_string(),
-        "1".to_string(),
-    ));
     envs.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
     envs.push((
         "PYTHONPATH".to_string(),
@@ -5375,41 +5339,6 @@ pub(crate) fn mcp_client_config_json(
         .map_err(|e| format!("failed to serialize MCP client config: {e}"))
 }
 
-fn cloudflare_agent_provider_env_for_role(role: &str) -> Result<Vec<AgentLaunchEnv>, String> {
-    // ROLE UNTANGLE (2026-07, owner decision): the env is ROLE-scoped with no client
-    // special case. The orchestrator — the frontier planning tier — receives the
-    // SAME provider env as a coder (it holds the full Cloudflare/Scaleway tool
-    // surface and manages the infra it plans); the verifier gets its read-only
-    // profile. This replaced the former `launch_injects_cloudflare_env` client
-    // strip-hack from the era when the orchestrator had no provider tools.
-    let mut envs = Vec::new();
-    // D1: only inject the token profile env vars this role is allowed to hold
-    // (no rotator/coder-write leaking into orchestrator/verifier, no verifier
-    // token leaking into coder).
-    for (name, value) in vault::read_cloudflare_agent_token_profile_envs_for_role(role)? {
-        envs.push(AgentLaunchEnv { name, value });
-    }
-    if let Some(profile_id) = vault::cloudflare_agent_token_profile_id_for_role(role) {
-        if let Some(token) = vault::read_cloudflare_agent_token_profile_token(profile_id)? {
-            envs.push(AgentLaunchEnv {
-                name: "ASPIS_CLOUDFLARE_API_TOKEN".into(),
-                value: token,
-            });
-            envs.push(AgentLaunchEnv {
-                name: "ASPIS_CLOUDFLARE_TOKEN_PROFILE".into(),
-                value: profile_id.into(),
-            });
-        }
-    }
-    if let Some(account_id) = vault::read_scope(ProviderId::Cloudflare)? {
-        envs.push(AgentLaunchEnv {
-            name: "ASPIS_CLOUDFLARE_ACCOUNT_ID".into(),
-            value: account_id,
-        });
-    }
-    Ok(envs)
-}
-
 
 /// Resolve a command against the AUGMENTED PATH so a GUI-launched app (stripped PATH) still
 /// finds Homebrew/npm/cargo tools. Pure scan, no shell spawn (no argv injection surface) — see
@@ -5423,7 +5352,7 @@ pub(crate) fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn detail_from_project(project: ParsedProject, live_status: ProjectLiveStatus) -> ProjectDetail {
+fn detail_from_project(project: ParsedProject) -> ProjectDetail {
     let git_status = project_git_status(project.metadata.root_path.as_deref());
     ProjectDetail {
         metadata: project.metadata,
@@ -5432,7 +5361,6 @@ fn detail_from_project(project: ParsedProject, live_status: ProjectLiveStatus) -
         revision: project.revision,
         path: project.path.to_string_lossy().into_owned(),
         modified_at: project.modified_at,
-        live_status,
         git_status,
     }
 }
@@ -5479,73 +5407,6 @@ fn task_counts(tasks: &[ProjectTask]) -> ProjectTaskCounts {
         }
     }
     counts
-}
-
-fn live_status_from_state(
-    state: &BackendState,
-    tasks: Option<&[ProjectTask]>,
-) -> Result<ProjectLiveStatus, String> {
-    let mut resources = Vec::new();
-    let inventories = state.cached_provider_inventories()?;
-    let linked = tasks
-        .into_iter()
-        .flat_map(|items| items.iter())
-        .flat_map(|task| task.linked_resources.iter())
-        .collect::<Vec<_>>();
-    for link in linked {
-        if let Some(status) = linked_resource_status(link, &inventories) {
-            resources.push(status);
-        }
-    }
-    Ok(ProjectLiveStatus {
-        resources,
-        checked_at: now(),
-    })
-}
-
-fn linked_resource_status(
-    link: &ProjectLinkedResource,
-    inventories: &[super::providers::ProviderInventory],
-) -> Option<ProjectLiveResourceStatus> {
-    let label = link
-        .label
-        .clone()
-        .unwrap_or_else(|| link.resource_id.clone());
-    match link.provider {
-        ProviderId::Cloudflare => inventories
-            .iter()
-            .find(|inventory| inventory.health.id == ProviderId::Cloudflare)
-            .and_then(|inventory| {
-                inventory
-                    .workers
-                    .iter()
-                    .find(|worker| worker.id == link.resource_id || worker.name == link.resource_id)
-            })
-            .map(|worker| ProjectLiveResourceStatus {
-                provider: ProviderId::Cloudflare,
-                resource_id: link.resource_id.clone(),
-                label,
-                status: worker.status.clone(),
-                resource_type: "Worker".into(),
-                region: None,
-            }),
-        ProviderId::Scaleway => inventories
-            .iter()
-            .find(|inventory| inventory.health.id == ProviderId::Scaleway)
-            .and_then(|inventory| {
-                inventory.compute.iter().find(|resource| {
-                    resource.id == link.resource_id || resource.name == link.resource_id
-                })
-            })
-            .map(|resource| ProjectLiveResourceStatus {
-                provider: ProviderId::Scaleway,
-                resource_id: link.resource_id.clone(),
-                label,
-                status: resource.state.clone(),
-                resource_type: resource.resource_type.clone(),
-                region: Some(resource.region.clone()),
-            }),
-    }
 }
 
 fn next_task_id(tasks: &[ProjectTask]) -> String {
@@ -7338,7 +7199,6 @@ mod tests {
                     priority: None,
                     assignee: None,
                     due: None,
-                    linked_resources: Vec::new(),
                     updated_at: "2026-05-29T00:00:00Z".into(),
                     category: Some("feature".into()),
                     description: None,
@@ -8641,29 +8501,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
     }
 
-    #[test]
-    fn agent_roles_map_to_cloudflare_profile_tokens() {
-        // Orchestrator is CF read-only (audit F-04-020); coder holds write profile.
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            Some("verifier-readonly")
-        );
-        // Verifier stays strictly read-only.
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("verifier"),
-            Some("verifier-readonly")
-        );
-        // Coder (Main coder) gets its scoped write profile.
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("coder"),
-            Some("coder-worker-write")
-        );
-        // A genuinely unknown role still maps to no profile.
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("other"),
-            None
-        );
-    }
 
     // ROLE UNTANGLE — the PERSISTED session role equals the EFFECTIVE launch role,
     // which is first-class "orchestrator" for a matching Devboule-binary launch
@@ -8704,28 +8541,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
     }
 
-    // ROLE least-privilege: orchestrator + verifier share read-only Cloudflare
-    // profile; coder alone gets write. (F40: stale fixture expected orch==coder.)
-    #[test]
-    fn orchestrator_role_selects_coder_provider_profile() {
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            Some("verifier-readonly"),
-        );
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("verifier"),
-            Some("verifier-readonly"),
-        );
-        assert_eq!(
-            vault::cloudflare_agent_token_profile_id_for_role("coder"),
-            Some("coder-worker-write"),
-        );
-        assert_ne!(
-            vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            vault::cloudflare_agent_token_profile_id_for_role("coder"),
-        );
-        assert!(vault::cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
-    }
 
     // BUG B2 — the orchestrator launch site (the `client == "orchestrator"` branch of
     // `prepare_or_launch_project_agent`) resolves `(omlx_base_url, omlx_model)` /
@@ -8856,25 +8671,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
     }
 
-    #[test]
-    fn mcp_client_configs_enable_cloudflare_profile_mode_without_tokens() {
-        with_python_mcp(|| {
-            let root = PathBuf::from("C:\\Devboule");
-            let projects = root.join("projects");
-
-            let codex =
-                codex_launch_script("python3", &root, &root, &projects, None, None, &[]).unwrap();
-            let claude = mcp_client_config_json("python3", &root, &projects, None, &[]).unwrap();
-
-            assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-            assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
-            // Dual-write Devboule counterparts (P0 branding).
-            assert!(codex.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
-            assert!(claude.contains("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"));
-            assert!(!codex.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
-            assert!(!claude.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
-        });
-    }
 
     #[test]
     fn mcp_configs_carry_app_bin_when_present_and_omit_it_when_absent() {
@@ -9045,7 +8841,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             assert!(codex_empty.contains("mcp_servers.devboule.command"));
             assert!(!codex_empty.contains("mcp_servers.my-db"));
             // And the Oracle is unaffected: its standard env keys are all present.
-            assert!(claude_empty.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
             assert!(codex_empty.contains("mcp_servers.devboule.env.PYTHONPATH"));
         });
     }
@@ -9863,8 +9658,13 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
         )
         .expect("script builds");
-        // CLIPBOARD: the prompt is delivered to the user via the clipboard only.
-        assert!(script.contains("Set-Clipboard -Value $prompt"));
+        // PROMPT DELIVERY (HE-3): the prompt is exposed via the 0600 file env, never the
+        // clipboard (the launch token must not land on the system clipboard).
+        assert!(script.contains("$env:ASPIS_AGENT_PROMPT_FILE ="));
+        assert!(
+            !script.contains("Set-Clipboard"),
+            "launch token must not be copied to the clipboard: {script}"
+        );
         // It is NEVER echoed to the terminal stream.
         assert!(
             !script.contains("Write-Host $prompt"),
@@ -10397,11 +10197,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             script.contains(&prompt_path),
             "env must point at the restricted file"
         );
-        // Still on the clipboard.
-        assert!(script.contains("Set-Clipboard -Value $prompt"));
+        // HE-3: the launch token is NOT copied to the clipboard.
+        assert!(
+            !script.contains("Set-Clipboard"),
+            "launch token must not be copied to the clipboard: {script}"
+        );
         // B1: the in-scope $prompt (launch token) is WIPED before the verbatim custom
         // command runs, so the command / any interactive shell can't read it. The clear
-        // must land AFTER the clipboard copy and BEFORE the command line.
+        // must land BEFORE the command line.
         assert!(
             script.contains("Remove-Variable -Name prompt -ErrorAction SilentlyContinue"),
             "custom script must clear $prompt: {script}"
@@ -10410,12 +10213,11 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             script.contains("$prompt = $null"),
             "custom script must null $prompt: {script}"
         );
-        let clipboard_at = script.find("Set-Clipboard -Value $prompt").unwrap();
         let clear_at = script.find("Remove-Variable -Name prompt").unwrap();
         let command_at = script.find(command).unwrap();
         assert!(
-            clipboard_at < clear_at && clear_at < command_at,
-            "clear must be after Set-Clipboard and before the command: {script}"
+            clear_at < command_at,
+            "clear must land before the verbatim custom command: {script}"
         );
         // B1: the token/prompt is NEVER echoed to the PTY stream.
         assert!(
@@ -10468,23 +10270,27 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // The secret literal is never embedded.
         assert!(!script.contains("the-secret-prompt"));
         // B1: the in-scope $PROMPT (launch token) is unset before the verbatim custom
-        // command runs. The clear must land AFTER pbcopy and BEFORE the command line.
+        // command runs, so the custom command cannot read it. The launch token is no
+        // longer copied to the clipboard (HE-3), so there is no pbcopy step to order against.
         assert!(
             script.contains("unset PROMPT"),
             "custom script must unset PROMPT: {script}"
         );
-        let pbcopy_at = script.find("pbcopy <").unwrap();
+        assert!(
+            !script.contains("pbcopy"),
+            "launch token must not be copied to the clipboard: {script}"
+        );
         let unset_at = script.find("unset PROMPT").unwrap();
         let command_at = script.find(command).unwrap();
         assert!(
-            pbcopy_at < unset_at && unset_at < command_at,
-            "unset must be after pbcopy and before the command: {script}"
+            unset_at < command_at,
+            "unset must land before the verbatim custom command: {script}"
         );
         remove_restricted_temp_file(&prompt_file);
     }
 
-    // FIX 2 — provider_env fixture carrying the two secret env vars the macOS launch
-    // is given today (the orchestrator launch token + Exa key) PLUS a Cloudflare token,
+    // FIX 2 — provider_env fixture carrying the secret env vars the macOS launch
+    // is given today (launch token + Exa key) PLUS a stand-in third secret,
     // with distinctive values so the leak assertions are unambiguous.
     #[cfg(target_os = "macos")]
     fn secret_provider_env_fixture() -> Vec<AgentLaunchEnv> {
@@ -10498,8 +10304,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 value: "exa-secret-cafebabe".into(),
             },
             AgentLaunchEnv {
-                name: "ASPIS_CLOUDFLARE_API_TOKEN".into(),
-                value: "cf-secret-write-token-1234".into(),
+                name: "TEST_PROVIDER_SECRET".into(),
+                value: "test-secret-write-token-1234".into(),
             },
         ]
     }
@@ -10539,10 +10345,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         for needle in [
             "export DEVBOULE_MCP_LAUNCH_TOKEN=",
             "export EXA_API_KEY=",
-            "export ASPIS_CLOUDFLARE_API_TOKEN=",
+            "export TEST_PROVIDER_SECRET=",
             "tok-secret-launch-deadbeef",
             "exa-secret-cafebabe",
-            "cf-secret-write-token-1234",
+            "test-secret-write-token-1234",
         ] {
             assert!(
                 !script.contains(needle),
@@ -10670,7 +10476,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // On THIS path the provider_env secrets ARE exported in-script (the only channel).
         assert!(script.contains("export DEVBOULE_MCP_LAUNCH_TOKEN="));
         assert!(script.contains("export EXA_API_KEY="));
-        assert!(script.contains("export ASPIS_CLOUDFLARE_API_TOKEN="));
+        assert!(script.contains("export TEST_PROVIDER_SECRET="));
         assert!(script.contains("unset PROMPT"));
         remove_restricted_temp_file(&prompt_file);
     }
@@ -10774,7 +10580,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             priority: None,
             assignee: None,
             due: None,
-            linked_resources: Vec::new(),
             updated_at: "2026-05-28T00:00:00Z".into(),
             category: None,
             description: None,
@@ -11057,7 +10862,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             priority: None,
             assignee: None,
             due: None,
-            linked_resources: Vec::new(),
             updated_at: "2026-05-28T00:00:00Z".into(),
             category: Some(category.into()),
             description: None,
@@ -11179,7 +10983,6 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 priority: None,
                 assignee: None,
                 due: None,
-                linked_resources: Vec::new(),
                 updated_at: "2026-05-28T00:00:00Z".into(),
                 category: Some("bug".into()),
                 description: None,
@@ -11804,18 +11607,17 @@ Preferred task_id: T1
 Use the MCP server named devboule.
 First call agent_register(agent_id="coder-1", role="coder", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
-Then call provider_credentials_status(agent_id="coder-1", role="coder", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="coder-1", role="coder", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="coder-1", role="coder", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Then call project_get(project_id="scrna-seq", agent_id="coder-1", role="coder", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="coder-1", role="coder", project_id="scrna-seq", session_token="<sessionToken>") before acting.
 Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="coder-1", role="coder", session_token="<sessionToken>")
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
 Always end every turn with a short plain-text message to the user (what you did / what's next). Never end a turn with only tool calls or empty output.
 MCP servers are already configured and connected; never call auth or OAuth actions on the mcp tool.
-Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
-Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files — split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. "P1", "P2"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. ["P1"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent.
+Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files — split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. "P1", "P2"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. ["P1"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, and use Oracle for codebase context. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent.
 At each step boundary call censor_findings(project_id, file=<files you just touched>); fix the real local findings; mark false positives with censor_dispose. This is a batch at the step boundary, not a live interrupt.
 For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.
 When you call spawn_mini_coder it BLOCKS and returns a terminal status: done -> verify its output and filesTouched, then use it; needs_clarification -> re-invoke with the answer or do it yourself; aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do NOT silently retry the mini, and escalate to the human (agent_heartbeat status="needs_user" with what happened); failed/timeout -> handle as an error. The mini never contacts the human — you are the only contact point.
 Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
-Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+Never print launch tokens, session tokens or secrets.
 "#;
         let coder_baseline = project_agent_prompt(
             &project,
@@ -11846,15 +11648,14 @@ Launch token: test-launch-token
 Use the MCP server named devboule.
 First call agent_register(agent_id="verifier-1", role="verifier", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
-Then call provider_credentials_status(agent_id="verifier-1", role="verifier", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="verifier-1", role="verifier", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Then call project_get(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="verifier-1", role="verifier", project_id="scrna-seq", session_token="<sessionToken>") before acting.
 Task entrypoint: project_next_task(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") then claim the returned task_id before working.
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
 Always end every turn with a short plain-text message to the user (what you did / what's next). Never end a turn with only tool calls or empty output.
 MCP servers are already configured and connected; never call auth or OAuth actions on the mcp tool.
-Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
 Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
 Final review: call censor_findings(project_id) for the residual ledger, ignore findings already resolved, focus on cross-file / architectural / multi-file-security issues the small model cannot see, and censor_dispose to confirm or reject each.
-Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+Never print launch tokens, session tokens or secrets.
 "#;
         let verifier_final_review = project_agent_prompt(
             &project,
@@ -11886,15 +11687,14 @@ Preferred task_id: T1
 Use the MCP server named devboule.
 First call agent_register(agent_id="orch-1", role="orchestrator", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
 Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
-Then call provider_credentials_status(agent_id="orch-1", role="orchestrator", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="orch-1", role="orchestrator", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Then call project_get(project_id="scrna-seq", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="orch-1", role="orchestrator", project_id="scrna-seq", session_token="<sessionToken>") before acting.
 Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>")
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
 Always end every turn with a short plain-text message to the user (what you did / what's next). Never end a turn with only tool calls or empty output.
 MCP servers are already configured and connected; never call auth or OAuth actions on the mcp tool.
-Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
 Plan and hand off — you NEVER write or edit files yourself, and you NEVER spawn minis. You have no file-write tool. EVERY implementation goes through spawn_main_coder (Main coder); the Main coder alone may call spawn_mini_coder for cheap mechanical sub-tasks. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks, then spawn_main_coder, then agent_heartbeat status="done" so you sleep. You return only via the human Change plan action. Split the plan into SMALL, self-contained tasks (nanophases): one task = one testable, committable unit; scope AT MOST 3 files; every task needs a deterministically verifiable acceptance. Pass plan_id = the `planId` from plan_submit, and tasks each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. Front-load titles, acceptance, and exact paths for the Main coder. For project or codebase questions use oracle_ask / oracle_context FIRST. Do not set Kanban tasks to done (verifier-only). When finished planning, status="done" — do NOT linger as an active worker on the Work console.
 Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
-Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+Never print launch tokens, session tokens or secrets.
 "#;
         let orchestrator_baseline = project_agent_prompt(
             &project,
@@ -12213,7 +12013,6 @@ mod broker_gate_projects {
                 priority: None,
                 assignee: None,
                 due: None,
-                linked_resources: Vec::new(),
                 updated_at: "2026-06-01T00:00:00Z".into(),
                 category: None,
                 description: None,

@@ -12,7 +12,7 @@
 // the A3 orchestrator. File-scoped allow (removed when A3 wires this runner in).
 #![allow(dead_code)]
 
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -120,9 +120,9 @@ pub fn parse_npm_audit(stdout: &str) -> Vec<RawFinding> {
 }
 
 /// Run npm audit from the project root. Absent `npm` → empty.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("npm") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // npm audit can be slow; allow a generous budget.
     let stdout = run_capture_with_timeout(
@@ -132,8 +132,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(300),
     );
     match stdout {
-        Some(s) => parse_npm_audit(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_npm_audit(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_oxlint;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -68,9 +68,9 @@ pub fn parse_oxlint(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 /// Run oxlint on a single file from the project root.
 /// Absent `oxlint` → empty. `--` ends flag parsing so a file whose name
 /// begins with `-` is never interpreted as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("oxlint") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture(
         "oxlint",
@@ -78,8 +78,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_oxlint(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_oxlint(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 

@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_cargo_fmt;
-use super::{cap, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use std::path::Path;
 use std::time::Duration;
 
@@ -87,9 +87,9 @@ pub fn parse_cargo_fmt(stdout: &str, root: &Path) -> Vec<RawFinding> {
 }
 
 /// Run cargo fmt from the project root. Absent `cargo` → empty.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("cargo") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "cargo",
@@ -98,8 +98,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(120),
     );
     match stdout {
-        Some(s) => parse_cargo_fmt(&s, root),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_cargo_fmt(&s, root)),
+        None => RunnerOutcome::Failed,
     }
 }
 

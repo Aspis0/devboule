@@ -308,6 +308,6 @@ pub fn agent_state(
             )));
         }
         require_session_token(session, session_token)?;
-        Ok(public_agents_state(&state))
+        Ok(public_agents_state(&state, &agent_id))
     })
 }

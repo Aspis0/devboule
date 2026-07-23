@@ -215,8 +215,11 @@ impl Drop for WatchHandle {
 /// `app` whenever a debounced relevant change is observed. Returns a handle the
 /// caller stores in `PolisState`; dropping/stopping it tears everything down.
 ///
-/// `polis` is the shared state cloned for the scan thread so each re-scan writes
-/// the new `CityState` into the same `Arc<Mutex<..>>` the commands read.
+/// `polis_city` is the shared state cloned for the scan thread so each re-scan
+/// writes the new `CityState` into the same `Arc<Mutex<..>>` the commands read.
+/// `active_project_path` is the shared "current scan root" from `PolisState`; a
+/// rescan whose `root` no longer matches is dropped so a path-switch cannot be
+/// clobbered by a late event on the old tree.
 /// `project_roots` is the real project-id -> root map (for agent re-attach),
 /// captured once at start (best-effort; a change there just isn't reflected
 /// until the next start — agents are a thin overlay, not the city geometry).
@@ -224,11 +227,13 @@ pub fn start_watch(
     app: AppHandle,
     root: PathBuf,
     polis_city: Arc<std::sync::Mutex<crate::polis::model::CityState>>,
+    active_project_path: Arc<std::sync::Mutex<Option<PathBuf>>>,
     attach: AttachAgents,
 ) -> Result<WatchHandle, String> {
     let running = Arc::new(AtomicBool::new(true));
     let thread_running = running.clone();
     let thread_root = root.clone();
+    let thread_active = Arc::clone(&active_project_path);
 
     // BLOCKER A: load the ACTIVE per-workspace extension set from the project's
     // `.aspis-meta.json` (the same override the scan reads), defaulting to the
@@ -293,7 +298,15 @@ pub fn start_watch(
         .spawn(move || {
             // Keep the watcher alive for the lifetime of the thread.
             let _watcher = watcher;
-            run_loop(app, thread_root, rx, thread_running, polis_city, attach);
+            run_loop(
+                app,
+                thread_root,
+                rx,
+                thread_running,
+                polis_city,
+                thread_active,
+                attach,
+            );
         })
         .map_err(|e| format!("Failed to spawn watcher thread: {e}"))?;
 
@@ -376,6 +389,7 @@ fn run_loop(
     rx: mpsc::Receiver<()>,
     running: Arc<AtomicBool>,
     polis_city: Arc<std::sync::Mutex<crate::polis::model::CityState>>,
+    active_project_path: Arc<std::sync::Mutex<Option<PathBuf>>>,
     attach: AttachAgents,
 ) {
     let mut debounce = DebounceState::new(Duration::from_millis(DEBOUNCE_MS));
@@ -422,8 +436,32 @@ fn run_loop(
         // that arrived during the scan re-arm `debounce` for the next pass, so we
         // always end up reflecting the LATEST state without flooding.
         if debounce.take_if_quiet(Instant::now()) {
-            rescan_and_emit(&app, &root, &polis_city, &attach, &running, &mut last_sig);
+            rescan_and_emit(
+                &app,
+                &root,
+                &polis_city,
+                &active_project_path,
+                &attach,
+                &running,
+                &mut last_sig,
+            );
         }
+    }
+}
+
+/// `true` when this watcher's `root` is still the active project path published
+/// by `PolisState`. Pure comparison (no canonicalize) — both sides are set from
+/// the same confined/canonical `resolve_scan_path` result.
+pub(crate) fn is_active_watch_root(
+    active_project_path: &std::sync::Mutex<Option<PathBuf>>,
+    root: &Path,
+) -> bool {
+    match active_project_path.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(p) => p.as_path() == root,
+            None => false,
+        },
+        Err(_) => false,
     }
 }
 
@@ -433,10 +471,18 @@ fn rescan_and_emit(
     app: &AppHandle,
     root: &Path,
     polis_city: &Arc<std::sync::Mutex<crate::polis::model::CityState>>,
+    active_project_path: &Arc<std::sync::Mutex<Option<PathBuf>>>,
     attach: &AttachAgents,
     running: &Arc<AtomicBool>,
     last_sig: &mut Option<u64>,
 ) {
+    // Path-switch guard: if `generate_city_state` (or start_watch) moved the
+    // active root, ignore this rescan even if the stop flag has not yet been
+    // observed — prevents an old-root scan from clobbering the new city.
+    if !is_active_watch_root(active_project_path, root) {
+        return;
+    }
+
     let mut city = match scanner::generate_city_state(root) {
         Ok(c) => c,
         Err(e) => {
@@ -453,27 +499,35 @@ fn rescan_and_emit(
     if !should_publish(running) {
         return;
     }
-
+    if !is_active_watch_root(active_project_path, root) {
+        return;
+    }
 
     // P7 — Unified source fold (watcher path).  `attach.fresh()` re-reads the
     // real agent live state + project roots each rescan (GAP A), falling back to
-    // the captured snapshot on a transient read miss.  The open-bug suspects and
-    // cached provider inventory are gathered here; the shared `default_sources()`
+    // the captured snapshot on a transient read miss.  Open-bug suspects and
+    // preserved era monuments are gathered here; the shared `default_sources()`
     // vector ensures this path and `commands::scan_and_store` can never diverge.
     let (live, project_roots) = attach.fresh();
     let open_bug_suspects = crate::backend::projects::gather_open_bug_suspects(app);
+    // Carry era monuments from the previous in-memory city across the rescan.
+    let preserved_monuments: Vec<crate::polis::model::ExternalService> =
+        match polis_city.lock() {
+            Ok(guard) => guard
+                .external_services
+                .iter()
+                .filter(|s| s.provider == "monument")
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
     {
-        use tauri::Manager;
-        let inventories = app
-            .state::<crate::backend::state::BackendState>()
-            .cached_provider_inventories()
-            .unwrap_or_default();
         let ctx = crate::polis::source::ScanContext {
             project_root: root,
             live: live.as_ref(),
             project_roots: &project_roots,
             open_bug_suspects: &open_bug_suspects,
-            inventories: &inventories,
+            preserved_monuments: &preserved_monuments,
         };
         crate::polis::source::fold_sources(
             &crate::polis::source::default_sources(),
@@ -510,6 +564,9 @@ fn rescan_and_emit(
             if !should_publish(running) {
                 return;
             }
+            if !is_active_watch_root(active_project_path, root) {
+                return;
+            }
             *guard = city.clone();
         }
         Err(_) => {
@@ -524,6 +581,9 @@ fn rescan_and_emit(
     // Emitting the OLD root's snapshot now would repaint a frontend that has
     // already switched to a different root — so a late scan becomes a no-op.
     if !should_publish(running) {
+        return;
+    }
+    if !is_active_watch_root(active_project_path, root) {
         return;
     }
 
@@ -598,9 +658,28 @@ fn rel_norm(root: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     fn root() -> PathBuf {
         PathBuf::from(if cfg!(windows) { r"C:\proj" } else { "/proj" })
+    }
+
+    // Path-switch guard: rescans on a root that is no longer active must be ignored.
+    #[test]
+    fn is_active_watch_root_matches_current_only() {
+        let active = Mutex::new(Some(root()));
+        assert!(is_active_watch_root(&active, &root()));
+        let other = PathBuf::from(if cfg!(windows) {
+            r"C:\other"
+        } else {
+            "/other"
+        });
+        assert!(!is_active_watch_root(&active, &other));
+        *active.lock().unwrap() = Some(other.clone());
+        assert!(!is_active_watch_root(&active, &root()));
+        assert!(is_active_watch_root(&active, &other));
+        *active.lock().unwrap() = None;
+        assert!(!is_active_watch_root(&active, &root()));
     }
 
     fn under(root: &Path, rel: &str) -> PathBuf {

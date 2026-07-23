@@ -6,13 +6,11 @@
 //! `CityState::terrain` for the frontend to draw water/shore/bridge tiles around
 //! the unchanged city. It NEVER moves a building or reroutes a road.
 //!
-//! AXIS NOTE — the seaward edge is the EAST (+x) margin. `cloud::place_external_services`
-//! anchors the harbour/cloud-outpost column at `max_x + GAP` (the buildings' east
-//! extent), so the sea band MUST be on +x for "the city meets the cloud" to mean
-//! the harbours sit ON the water. The HANDOFF demo uses `gy >= sea_y` (south); we
-//! adapt rule 1 to the project's real seaward axis: `gx >= sea_x` => `Sea`. Every
-//! other rule (rivers, shores, roads, bridges) is ported faithfully from
-//! `js/map_app.js`'s `isRiver`/`landType`.
+//! AXIS NOTE — the seaward edge is the EAST (+x) margin. The sea band stays on
+//! +x for aesthetic framing of the city against open water. The HANDOFF demo
+//! uses `gy >= sea_y` (south); we adapt rule 1 to the project's seaward axis:
+//! `gx >= sea_x` => `Sea`. Every other rule (rivers, shores, roads, bridges) is
+//! ported faithfully from `js/map_app.js`'s `isRiver`/`landType`.
 //!
 //! DETERMINISM: classification + river placement derive purely from the building
 //! extent + routed road tiles (sorted / BTree-ordered, no RNG / `Date` /
@@ -96,12 +94,9 @@ pub struct River {
 /// Coordinate conventions (all in the same absolute cartesian tile space as
 /// `Building::coords`):
 ///   - `sea_x`        : `gx >= sea_x` (within `[min_y, max_y)`) is open `Sea` —
-///                       the EAST/seaward margin, aligned with the harbour column
-///                       `cloud::place_external_services` builds at `max_x + GAP`.
-///   - `min_y/max_y`  : the inclusive-exclusive `y` band the sea spans. `min_y` is
-///                       the land's top; `max_y` is the land's bottom EXTENDED down
-///                       to cover the harbour column (so every harbour sits on
-///                       water). Outside this band there is no sea row.
+///                       the EAST/seaward margin of the land extent.
+///   - `min_y/max_y`  : the inclusive-exclusive `y` band the sea spans (matches
+///                       the land extent). Outside this band there is no sea row.
 ///   - `rivers`       : the internal river channels (each with land+shore both sides).
 ///   - `water`        : every `Sea`+`River` tile (so the frontend can draw + animate
 ///                       water as one pooled set). `deep` flags open-sea tiles
@@ -158,9 +153,8 @@ impl TerrainData {
 // Generation
 // ---------------------------------------------------------------------------
 
-/// Extra tiles of open sea drawn BEYOND `sea_x` so the harbour column (which sits
-/// at `max_x + GAP`) is comfortably surrounded by water, not on the very first
-/// sea row. The sea is rendered out to `sea_x + SEA_DEPTH`.
+/// Extra tiles of open sea drawn BEYOND `sea_x` so the seaward margin is
+/// comfortably framed by water. The sea is rendered out to `sea_x + SEA_DEPTH`.
 const SEA_DEPTH: i32 = GAP as i32 + 4;
 
 // ---------------------------------------------------------------------------
@@ -236,19 +230,13 @@ fn straight_channel_start(base: i32, _gy: i32) -> i32 {
 /// `roads` their routed `path` (post-`grid::route_roads`) — exactly the state at
 /// the `generate_city_state` integration point. Pure + deterministic.
 ///
-/// `n_external_harbours` is the number of cloud-service nodes
-/// `cloud::place_external_services` will lay down the seaward column (it anchors at
-/// the land's `min_y` and steps down by `cloud::ROW_PITCH`). The sea band is
-/// extended downward to cover that full column so EVERY harbour sits on water, not
-/// on grass below the land (FIX 3). At scan time the inventory isn't known yet, so
-/// the scanner passes `0`; `cloud::attach_external_services` REBUILDS the terrain
-/// with the real count once the harbours are placed.
+/// `n_external_harbours` is retained for API stability but is always treated as
+/// `0` after cloud-provider inventory removal (no seaward cloud-outpost column).
+/// The sea band covers the land extent only.
 ///
 /// Steps:
 ///   1. Land extent from `map_extent` (footprint-aware). Empty city -> empty terrain.
-///   2. `sea_x = max_x` (rounded) so harbours at `max_x + GAP` sit on the sea; the
-///      sea's y-band is `[min_y, max_y)` where `max_y` is extended past the land
-///      bottom to cover the harbour column.
+///   2. `sea_x = max_x` (rounded); the sea's y-band is the land `[min_y, max_y)`.
 ///   3. Deterministically place 1-2 internal river channels between districts (in
 ///      the LAND band only), 2 tiles wide per row with a gentle deterministic
 ///      meander, nudged so no channel/shore clips a building footprint.
@@ -257,7 +245,7 @@ fn straight_channel_start(base: i32, _gy: i32) -> i32 {
 pub fn build_terrain(
     buildings: &[Building],
     roads: &[Road],
-    n_external_harbours: usize,
+    _n_external_harbours: usize,
 ) -> TerrainData {
     let (min_x, min_y_f, max_x, max_y_f) = match map_extent(buildings) {
         Some(e) => e,
@@ -269,22 +257,11 @@ pub fn build_terrain(
     let min_x = min_x.floor() as i32;
     let min_y = min_y_f.floor() as i32;
     let max_x = max_x.ceil() as i32;
+    // Cloud harbour extension removed — sea band matches land extent only.
     let land_max_y = max_y_f.ceil() as i32;
+    let max_y = land_max_y;
 
-    // The harbour column (`cloud::place_external_services`) anchors at the land's
-    // `min_y` and steps DOWN by `ROW_PITCH` per service, so with enough services
-    // the lowest harbour lands BELOW the land's `max_y`. The sea band must cover
-    // the FULL harbour extent or those harbours sit on grass, not water (FIX 3).
-    let harbour_bottom =
-        crate::polis::cloud::harbour_bottom_y(n_external_harbours, min_y_f).ceil() as i32;
-    let max_y = if n_external_harbours == 0 {
-        land_max_y
-    } else {
-        land_max_y.max(harbour_bottom + 1)
-    };
-
-    // Seaward edge = east extent of the land. `gx >= sea_x` is open sea, so the
-    // harbours at `max_x + GAP` (> sea_x) land squarely on the water.
+    // Seaward edge = east extent of the land. `gx >= sea_x` is open sea.
     let sea_x = max_x;
     let sea_max_x = sea_x + SEA_DEPTH;
 
@@ -292,8 +269,7 @@ pub fn build_terrain(
     let occ = building_tiles(buildings);
 
     // --- river placement (deterministic, between districts, off buildings) ---
-    // Rivers + their shores live in the LAND band only — never in the harbour
-    // extension rows below the land (there is no land there to flow through).
+    // Rivers + their shores live in the land band only.
     let rivers = place_rivers(min_x, max_x, min_y, land_max_y, &occ, buildings);
 
     // --- routed road tiles (rasterized from each road's corner polyline) -----
@@ -304,8 +280,7 @@ pub fn build_terrain(
     let mut sand: BTreeSet<Tile> = BTreeSet::new();
     let mut bridges: BTreeSet<Tile> = BTreeSet::new();
 
-    // The SEA spans the FULL band (`min_y..max_y`), which is extended below the
-    // land to cover the harbour column (FIX 3) so every harbour sits on water.
+    // The SEA spans the land band (`min_y..max_y`).
     for gy in min_y..max_y {
         // Sea columns (east margin) for this row.
         for gx in sea_x..sea_max_x {
@@ -317,10 +292,7 @@ pub fn build_terrain(
         }
     }
 
-    // Rivers + their sand banks + the beach are LAND-band features only: they
-    // require land (and a building footprint) on both sides, which only exists in
-    // `[min_y, land_max_y)`. The harbour-extension rows below have no land, so no
-    // river/shore/beach is emitted there.
+    // Rivers + their sand banks + the beach are land-band features only.
     //
     // Per-river precomputed channel lookup: `channels[gy - min_y]` gives the
     // channel-start column at row `gy`. O(1) per query.
@@ -894,31 +866,27 @@ mod tests {
         assert!(t.rivers.is_empty());
     }
 
-    // Rule 1 + sea-on-harbour-margin alignment.
+    // Rule 1 + sea-on-east-margin alignment.
     #[test]
-    fn sea_is_on_the_eastern_harbour_margin() {
+    fn sea_is_on_the_eastern_margin() {
         let buildings = wide_city();
         let (min_x_f, _min_y, max_x, _max_y) = map_extent(&buildings).unwrap();
         let min_x = min_x_f.floor() as i32;
         let t = build_terrain(&buildings, &[], 0);
 
-        // The sea edge equals the land's east extent (rounded), so the harbour
-        // column `cloud::place_external_services` builds at `max_x + GAP` sits
-        // EAST of `sea_x` => on the water.
+        // The sea edge equals the land's east extent (rounded).
         assert_eq!(t.sea_x, max_x.ceil() as i32, "sea edge = east land extent");
-        let harbour_x = (max_x + GAP as f64) as i32;
+        let sea_tile_x = (max_x + GAP as f64) as i32;
         assert!(
-            harbour_x >= t.sea_x,
-            "harbour column x={harbour_x} must sit on/east of sea_x={}",
+            sea_tile_x >= t.sea_x,
+            "east-margin tile x={sea_tile_x} must sit on/east of sea_x={}",
             t.sea_x
         );
-        // classify a harbour tile -> Sea. Pass the REAL `min_x` (FIX 5): the prior
-        // `t.sea_x.min(0)` arg was wrong and only passed by luck (Rule 1 — sea —
-        // fires before any `min_x`-gated rule, so the bad arg never mattered).
+        // classify an open-sea tile -> Sea.
         let c = classify(
-            harbour_x, t.min_y, min_x, t.min_y, t.max_y, t.sea_x, &t.rivers, false,
+            sea_tile_x, t.min_y, min_x, t.min_y, t.max_y, t.sea_x, &t.rivers, false,
         );
-        assert_eq!(c, Terrain::Sea, "the harbour tile classifies as Sea");
+        assert_eq!(c, Terrain::Sea, "the east-margin tile classifies as Sea");
         // The water set actually contains sea tiles at >= sea_x.
         assert!(
             t.water.iter().any(|w| w.gx >= t.sea_x),
@@ -1309,59 +1277,22 @@ mod tests {
         assert_eq!(ja, jb);
     }
 
-    // FIX 3 — the sea band covers the FULL harbour column.
+    // After cloud-provider removal, n_external_harbours is ignored — sea band
+    // matches land extent whether callers pass 0 or a legacy non-zero count.
     #[test]
-    fn sea_band_covers_the_full_harbour_column() {
-        use crate::polis::cloud;
-
+    fn sea_band_matches_land_extent_regardless_of_harbour_count() {
         let buildings = wide_city();
-        let (_min_x, min_y_f, max_x, max_y_f) = map_extent(&buildings).unwrap();
+        let (_min_x, _min_y_f, _max_x, max_y_f) = map_extent(&buildings).unwrap();
         let land_max_y = max_y_f.ceil() as i32;
 
-        let n: usize = 30;
-        let t = build_terrain(&buildings, &[], n);
+        let t0 = build_terrain(&buildings, &[], 0);
+        let t_legacy = build_terrain(&buildings, &[], 30);
 
-        let bottom_y = cloud::harbour_bottom_y(n, min_y_f).ceil() as i32;
-        assert!(
-            bottom_y >= land_max_y,
-            "the {n}-harbour column must extend below the land bottom for this test \
-             (bottom_y={bottom_y}, land_max_y={land_max_y})"
+        assert_eq!(t0.max_y, land_max_y);
+        assert_eq!(
+            t0, t_legacy,
+            "n_external_harbours is ignored after cloud inventory removal"
         );
-        assert!(
-            t.max_y > bottom_y,
-            "sea band max_y={} must cover the lowest harbour row gy={bottom_y}",
-            t.max_y
-        );
-
-        let harbour_x = (max_x + GAP as f64) as i32;
-        let water: BTreeSet<Tile> = t.water.iter().map(|w| Tile::new(w.gx, w.gy)).collect();
-        for i in 0..n {
-            let gy = cloud::harbour_bottom_y(i + 1, min_y_f).ceil() as i32;
-            let tile = Tile::new(harbour_x, gy);
-            assert!(
-                water.contains(&tile),
-                "harbour {i} at {tile:?} must be a water tile"
-            );
-            assert_eq!(
-                classify(harbour_x, gy, 0, t.min_y, t.max_y, t.sea_x, &t.rivers, false),
-                Terrain::Sea,
-                "harbour {i} at {tile:?} must classify as Sea"
-            );
-        }
-
-        for gy in land_max_y..t.max_y {
-            assert!(
-                !t.sand.iter().any(|s| s.gy == gy),
-                "no sand emitted in the harbour-extension row gy={gy}"
-            );
-            assert!(
-                t.water
-                    .iter()
-                    .filter(|w| w.gy == gy)
-                    .all(|w| w.gx >= t.sea_x),
-                "extension row gy={gy} carries only sea (gx >= sea_x), no river water"
-            );
-        }
     }
 
     // A narrow city gets no river (can't host land+shore both sides) but still a sea.

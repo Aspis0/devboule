@@ -30,6 +30,25 @@ fn vault_oauth_present_in(provider_env: &[AgentLaunchEnv]) -> bool {
         .any(|e| e.name == "CLAUDE_CODE_OAUTH_TOKEN")
 }
 
+/// HE-4: env slice actually injected into a launch.
+///
+/// `custom_command` is an operator-configured command line interpolated into the
+/// launch shell/script **unescaped**. A compromised config is RCE at next launch.
+/// Trust model (alpha): operator-trusted, config integrity assumed. Isolate vault /
+/// provider secrets from that path so a malicious custom command cannot harvest them
+/// from the process environment. App-built launches (codex/claude/orchestrator) keep
+/// secrets via the normal `provider_env` channel; argv-safe construction stays there.
+fn provider_env_for_launch<'a>(
+    custom_command: Option<&str>,
+    provider_env: &'a [AgentLaunchEnv],
+) -> &'a [AgentLaunchEnv] {
+    if custom_command.is_some() {
+        &[]
+    } else {
+        provider_env
+    }
+}
+
 /// What a successful agent terminal spawn yields. `pid` is the spawned child's id
 /// (the conhost child on Windows; the osascript helper on macOS — see the macOS
 /// impl). `creation_time` is the Windows process creation FILETIME captured right
@@ -71,6 +90,9 @@ pub(crate) fn kill_spawned_agent_on_record_failure(window_title: &str, spawned: 
             "tell application \"Terminal\" to close (every window whose name is \"{needle}\")"
         );
         let _ = Command::new("osascript").arg("-e").arg(&close).status();
+        // HE-2: stop path — sweep stale secrets-bearing launch script dirs left
+        // behind when bash never ran (self-delete is inside the script).
+        sweep_stale_macos_launch_script_dirs(&std::env::temp_dir(), MACOS_LAUNCH_SCRIPT_STALE_SECS);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -235,9 +257,7 @@ fn spawn_agent_terminal_app_impl(
     let mut cmd = CommandBuilder::new("powershell.exe");
     cmd.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", &script]);
     cmd.cwd(root_path);
-    cmd.env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1");
-    cmd.env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1");
-    for env in provider_env {
+    for env in provider_env_for_launch(custom_command, provider_env) {
         cmd.env(&env.name, &env.value);
     }
 
@@ -304,9 +324,7 @@ fn spawn_agent_terminal_app_impl(
     let mut cmd = CommandBuilder::new(shell);
     cmd.args(["-ic", &script]);
     cmd.cwd(root_path);
-    cmd.env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1");
-    cmd.env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1");
-    for env in provider_env {
+    for env in provider_env_for_launch(custom_command, provider_env) {
         cmd.env(&env.name, &env.value);
     }
 
@@ -390,21 +408,23 @@ pub(crate) fn build_windows_agent_script(
         orchestrator_launch_script(orchestrator)
     } else if let Some(command) = custom_command {
         // CUSTOM CLIENT: run the operator-configured command line VERBATIM. The
-        // prompt is delivered UNIVERSALLY (clipboard + $env:ASPIS_AGENT_PROMPT_FILE,
-        // both set below), so the configured CLI can read it either way. The command
-        // is the operator's own (unlock-gated config); we do NOT shell-escape it.
+        // prompt is delivered via $env:ASPIS_AGENT_PROMPT_FILE (0600 temp file)
+        // only — never on the system clipboard (HE-3). The command is the
+        // operator's own (unlock-gated config); we do NOT shell-escape it.
+        //
+        // HE-4 trust model: operator-trusted config integrity assumed. Provider
+        // vault secrets are NOT injected into this launch env (see
+        // `provider_env_for_launch`).
         //
         // B1 INVARIANT: the launch token lives ONLY in the restricted prompt file
-        // and the clipboard — NEVER on argv and NEVER echoed to the PTY (there is no
-        // `Write-Host $prompt` here), so it cannot leak into the ConPTY snapshot.
+        // — NEVER on argv, NEVER on the clipboard, and NEVER echoed to the PTY
+        // (no `Write-Host $prompt` here), so it cannot leak into the ConPTY snapshot.
         command.to_string()
     } else if executable.is_empty() {
-        // B1: the prompt embeds the launch token. It is ALREADY on the clipboard
-        // (Set-Clipboard below) and must NEVER be written to the PTY stream — a
-        // `Write-Host $prompt` here would print the token into the ConPTY ring
-        // buffer / snapshot / xterm viewer. Only the (non-secret) clipboard hint
-        // is echoed; the script-level "prompt copied to clipboard" line follows.
-        "Write-Host 'Devboule agent prompt is copied to clipboard.'".to_string()
+        // Bare/other client: nothing to exec. Prompt stays at ASPIS_AGENT_PROMPT_FILE
+        // (HE-3: not on the clipboard; no Write-Host of `$prompt` — that would print
+        // the token into the ConPTY ring buffer / snapshot / xterm viewer).
+        String::new()
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -443,13 +463,17 @@ pub(crate) fn build_windows_agent_script(
     // (Harmless under the app-hosted PTY path, where there is no OS window to find.)
     let window_title_label = ps_single_quote(&agent_window_title(agent_id));
 
-    // Built-in clients delete the token-bearing prompt file immediately after
-    // reading it (the prompt rides into the CLI over STDIN/clipboard). A CUSTOM
-    // client instead exposes it via $env:ASPIS_AGENT_PROMPT_FILE so the arbitrary
-    // CLI can read it, so we must NOT delete it here; the ledger records the path so
+    // Built-in clients + the orchestrator delete the token-bearing prompt file
+    // immediately after reading it (built-ins pipe `$prompt` over STDIN;
+    // orchestrator is autonomous and never needs it). CUSTOM and bare/other
+    // clients instead expose it via $env:ASPIS_AGENT_PROMPT_FILE so the human /
+    // arbitrary CLI can read it (macOS parity — HE-3 removed clipboard delivery,
+    // so bare had no other channel on Windows). The ledger records the path so
     // stop_agent (and the spawn-failure rollback) still clean it up. The file stays
     // 0600 in its per-launch restricted directory either way.
-    let prompt_file_lifecycle = if is_custom {
+    // HE-3: the launch token is never placed on the system clipboard.
+    let keep_prompt_file = is_custom || (executable.is_empty() && orchestrator.is_none());
+    let prompt_file_lifecycle = if keep_prompt_file {
         format!("$env:ASPIS_AGENT_PROMPT_FILE = {prompt_path_label}\n")
     } else {
         "$promptDir = Split-Path -Parent -LiteralPath $promptFile\n\
@@ -457,19 +481,21 @@ Remove-Item -LiteralPath $promptFile -Force -ErrorAction SilentlyContinue\n\
 Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinue\n"
             .to_string()
     };
-    let copied_hint = if is_custom {
-        "Write-Host 'Devboule agent prompt copied to clipboard; also at' $env:ASPIS_AGENT_PROMPT_FILE\n"
+    let copied_hint = if keep_prompt_file {
+        "Write-Host 'Devboule agent prompt at' $env:ASPIS_AGENT_PROMPT_FILE '(not on clipboard)'\n"
+    } else if orchestrator.is_some() {
+        "Write-Host 'Devboule orchestrator is autonomous (no agent prompt file; not on clipboard).'\n"
     } else {
-        "Write-Host 'Devboule agent prompt copied to clipboard.'\n"
+        "Write-Host 'Devboule agent prompt delivered via STDIN (not on clipboard).'\n"
     };
-    // B1 (custom path only): the verbatim operator command — and any interactive
-    // shell it leaves behind — runs in THIS PowerShell scope, where `$prompt` still
-    // holds the launch token. Built-ins pipe `$prompt` into the CLI and must keep it,
-    // but a custom client receives the prompt via the clipboard + the restricted
-    // $env:ASPIS_AGENT_PROMPT_FILE (the file persists for custom), so we wipe the
-    // in-scope variable AFTER Set-Clipboard and BEFORE the command line so the token
-    // is not readable from the running command's session.
-    let prompt_clear = if is_custom {
+    // B1 (keep-file paths): the verbatim operator command / bare interactive shell
+    // runs in THIS PowerShell scope, where `$prompt` still holds the launch token.
+    // Built-ins pipe `$prompt` into the CLI and must keep it, but custom and bare
+    // receive the prompt via the restricted $env:ASPIS_AGENT_PROMPT_FILE (the file
+    // persists), so we wipe the in-scope variable BEFORE the command line so the
+    // token is not readable from the running command's session. HE-3: no clipboard
+    // copy of `$prompt`.
+    let prompt_clear = if keep_prompt_file {
         "Remove-Variable -Name prompt -ErrorAction SilentlyContinue\n$prompt = $null\n"
     } else {
         ""
@@ -529,16 +555,16 @@ Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinu
     } else {
         String::new()
     };
+    // HE-3: do NOT `Set-Clipboard -Value $prompt` — the prompt embeds the launch
+    // token and any local process can read the clipboard. Token stays in the 0600
+    // prompt file / `$prompt` for STDIN only.
     let script = format!(
         "$Host.UI.RawUI.WindowTitle = {window_title_label}\n\
 $promptFile = {prompt_path_label}\n\
 $prompt = Get-Content -Raw -LiteralPath $promptFile\n\
 {prompt_file_lifecycle}\
-Set-Clipboard -Value $prompt\n\
 $env:DEVBOULE_ROOT = {management_root_label}\n\
 $env:ASPIS_PROJECTS_DIR = {projects_dir_label}\n\
-$env:DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
-$env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE = '1'\n\
 $env:GIT_TERMINAL_PROMPT = '0'\n\
 $env:GIT_CONFIG_NOSYSTEM = '1'\n\
 $env:GIT_CONFIG_GLOBAL = {session_gitconfig_label}\n\
@@ -595,10 +621,8 @@ fn spawn_agent_terminal_impl(
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
-        .env("DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE", "1")
-        .env("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE", "1")
         .envs(
-            provider_env
+            provider_env_for_launch(custom_command, provider_env)
                 .iter()
                 .map(|env| (env.name.as_str(), env.value.as_str())),
         )
@@ -633,21 +657,23 @@ fn spawn_agent_terminal_impl(
 // model like Windows: we ask Terminal.app (via `osascript`) to open a new window
 // running a generated shell script. That script sets the window title to the
 // stable `Aspis Agent {id}` marker (so the focus command can find it by name),
-// copies the prompt to the clipboard with `pbcopy`, exports the same env vars the
-// Windows path sets, cd's to the working root and finally runs the codex/claude
-// CLI (or just echoes the prompt for the bare `powershell`/other clients).
+// loads the prompt from a 0600 temp file (HE-3: never pbcopy's the token), exports
+// the same env vars the Windows path sets, cd's to the working root and finally
+// runs the codex/claude CLI (or leaves the prompt file for bare/other clients).
 //
 // PID caveat: the pid we capture is the `osascript` helper process, NOT the
 // Terminal shell that actually runs the agent. We store it for parity, but
-// killing it will not stop the agent (see stop_agent's unix branch TODO).
+// killing it will not stop the agent (see stop_agent's unix branch TODO). HE-1:
+// the osascript Child is reaped on a detached thread so it cannot zombie.
 /// SHARED macOS launch-script builder used by BOTH the external Terminal.app path
 /// (`spawn_agent_terminal_impl`) and the app-hosted PTY path
 /// (`spawn_agent_terminal_app_impl`). Mirrors `build_windows_agent_script`: it
 /// guarantees identical prompt-file handling (token-bearing prompt read from a
-/// 0o600 temp file, copied to the clipboard, then deleted — never on argv) and
+/// 0o600 temp file, never on argv / never on the clipboard — HE-3) and
 /// identical env exports (management root, projects dir, PYTHONPATH, profile
-/// mode, provider env). Returns the restricted prompt-file path (so the caller
-/// can delete it if the spawn fails) and the shell script text.
+/// mode, provider env — HE-4: provider secrets omitted for custom_command).
+/// Returns the restricted prompt-file path (so the caller can delete it if the
+/// spawn fails) and the shell script text.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_macos_agent_script(
@@ -684,10 +710,10 @@ pub(crate) fn build_macos_agent_script(
     user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<(PathBuf, String), String> {
     // Same temp-file delivery contract as Windows: keep the launch-token-bearing
-    // prompt off the child argv. The generated shell script reads it, copies it to
-    // the clipboard, then deletes it (built-ins) or exposes it via
-    // $ASPIS_AGENT_PROMPT_FILE (custom). The file is locked to 0o600 (see the unix
-    // branch in write_restricted_prompt_file).
+    // prompt off the child argv. The generated shell script reads it from a 0600
+    // file (HE-3: never pbcopy), then deletes it (built-ins that consume STDIN) or
+    // exposes it via $ASPIS_AGENT_PROMPT_FILE (custom / bare). The file is locked
+    // to 0o600 (see the unix branch in write_restricted_prompt_file).
     let is_custom = custom_command.is_some();
     let prompt_file = write_restricted_prompt_file(prompt)?;
 
@@ -698,12 +724,15 @@ pub(crate) fn build_macos_agent_script(
         macos_orchestrator_launch_line(orchestrator)
     } else if let Some(command) = custom_command {
         // CUSTOM CLIENT: run the operator-configured command verbatim. The prompt is
-        // delivered via the clipboard and $ASPIS_AGENT_PROMPT_FILE (exported below).
+        // delivered via $ASPIS_AGENT_PROMPT_FILE only (HE-3: no clipboard token).
+        // HE-4 trust model: operator-trusted config integrity assumed; vault secrets
+        // are NOT exported into this launch (see `provider_env_for_launch` / the
+        // `!is_custom` guard on the in-script export block below).
         // B1: the launch token is never on argv and never echoed to the PTY.
         command.to_string()
     } else if executable.is_empty() {
-        // Bare/other client: nothing to exec, the prompt is already on the
-        // clipboard and echoed above.
+        // Bare/other client: nothing to exec; prompt stays at ASPIS_AGENT_PROMPT_FILE
+        // (HE-3: not on the clipboard).
         String::new()
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
@@ -735,7 +764,7 @@ pub(crate) fn build_macos_agent_script(
     let window_title = agent_window_title(agent_id);
     let mut script = String::new();
     // FIX 2(b) — external Terminal.app path only: this script is a 0600 temp file that
-    // carries the provider_env secrets (launch token, Exa key, Cloudflare token) in its
+    // carries the provider_env secrets (launch token, Exa key, etc.) in its
     // `export` block below, because Terminal.app gives no out-of-band env channel. Make
     // it SELF-DELETE the instant bash starts (`$0` is the script path under `bash
     // <file>`), so the secrets file is gone immediately on a SUCCESSFUL launch instead
@@ -753,21 +782,23 @@ pub(crate) fn build_macos_agent_script(
         "printf '\\033]0;%s\\007' {}\n",
         sh_single_quote(&window_title)
     ));
-    // Read the prompt from the restricted temp file and copy it to the clipboard.
+    // Read the prompt from the restricted temp file into $PROMPT for STDIN piping.
+    // HE-3: do NOT `pbcopy` the token-bearing prompt — any local process can read
+    // the system clipboard. Token stays in the 0600 file / $PROMPT only.
     script.push_str(&format!(
         "ASPIS_PROMPT_FILE={}\n",
         sh_single_quote(&prompt_file.display().to_string())
     ));
-    script.push_str("pbcopy < \"$ASPIS_PROMPT_FILE\" 2>/dev/null || true\n");
     script.push_str("PROMPT=\"$(cat \"$ASPIS_PROMPT_FILE\")\"\n");
-    if is_custom {
-        // CUSTOM CLIENT: expose the restricted prompt file to the configured CLI and
-        // do NOT delete it (the ledger records the path so stop_agent cleans it up).
+    // Keep the 0600 prompt file for custom (CLI reads ASPIS_AGENT_PROMPT_FILE) and
+    // bare/other (no STDIN consumer). Built-ins + orchestrator delete after load.
+    let keep_prompt_file = is_custom || (executable.is_empty() && orchestrator.is_none());
+    if keep_prompt_file {
         script.push_str("export ASPIS_AGENT_PROMPT_FILE=\"$ASPIS_PROMPT_FILE\"\n");
     } else {
         // FIX 2: the prompt file lives inside a per-launch restricted directory;
         // remove the whole directory so nothing (and no empty restricted dir)
-        // lingers once a built-in CLI has the prompt over STDIN/clipboard.
+        // lingers once a built-in CLI has the prompt over STDIN.
         script.push_str("rm -rf \"$(dirname \"$ASPIS_PROMPT_FILE\")\" 2>/dev/null || true\n");
     }
     // Export the same env vars the Windows path sets.
@@ -779,8 +810,6 @@ pub(crate) fn build_macos_agent_script(
         "export ASPIS_PROJECTS_DIR={}\n",
         sh_single_quote(&projects_dir.display().to_string())
     ));
-    script.push_str("export DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE='1'\n");
-    script.push_str("export ASPIS_MCP_CLOUDFLARE_PROFILE_MODE='1'\n");
     // GH-P5 (cooperative push enforcement, NOT a security sandbox) — mirror of the
     // Windows builder's git neutralizers, exported on the SPAWNED agent's environment
     // so a CONFUSED cooperative agent's raw `git push` fails fast instead of
@@ -838,7 +867,7 @@ pub(crate) fn build_macos_agent_script(
         "if [ -n \"$PYTHONPATH\" ]; then export PYTHONPATH={mr}:\"$PYTHONPATH\"; else export PYTHONPATH={mr}; fi\n",
         mr = sh_single_quote(&management_root.display().to_string())
     ));
-    // FIX 2(a) — provider env vars (role-scoped Cloudflare token, the orchestrator's
+    // FIX 2(a) — provider env vars (launch token, Exa key, the orchestrator's
     // launch token + Exa key, etc.) are SECRETS. Export them IN-SCRIPT ONLY on the
     // external Terminal.app path (`runs_from_temp_file`), where there is no other env
     // channel and the script file is 0600 + self-deleting. On the in-app PTY path the
@@ -847,8 +876,13 @@ pub(crate) fn build_macos_agent_script(
     // the B1 leak. So SKIP the in-script export there; cmd.env is the sole channel.
     // (The non-secret GIT neutralizers + PYTHONPATH above stay in-script on BOTH paths
     // because the PTY caller does NOT set those via cmd.env.)
-    if runs_from_temp_file {
-        for env in provider_env {
+    //
+    // HE-4: also skip when `custom_command` is set — that path interpolates an
+    // operator-trusted command unescaped (RCE if config is compromised). Isolating
+    // vault secrets from the custom launch env is the alpha mitigation; config
+    // integrity is assumed.
+    if runs_from_temp_file && !is_custom {
+        for env in provider_env_for_launch(custom_command, provider_env) {
             script.push_str(&format!(
                 "export {}={}\n",
                 shell_env_name(&env.name),
@@ -860,12 +894,16 @@ pub(crate) fn build_macos_agent_script(
         "cd {} || true\n",
         sh_single_quote(&root_path.display().to_string())
     ));
-    if is_custom {
+    if keep_prompt_file {
         script.push_str(
-            "echo \"Devboule agent prompt copied to clipboard; also at $ASPIS_AGENT_PROMPT_FILE\"\n",
+            "echo \"Devboule agent prompt at $ASPIS_AGENT_PROMPT_FILE (not on clipboard)\"\n",
+        );
+    } else if orchestrator.is_some() {
+        script.push_str(
+            "echo 'Devboule orchestrator is autonomous (no agent prompt file; not on clipboard).'\n",
         );
     } else {
-        script.push_str("echo 'Devboule agent prompt copied to clipboard.'\n");
+        script.push_str("echo 'Devboule agent prompt delivered via STDIN (not on clipboard).'\n");
     }
     // FIX 2(c) [corrected by the max-recall adversarial pass] — clear `$PROMPT` before the
     // command line for every client EXCEPT the codex/claude built-ins. `$PROMPT` holds the
@@ -908,6 +946,10 @@ fn spawn_agent_terminal_impl(
     orchestrator: Option<&OrchestratorLaunchConfig>,
     user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<SpawnedAgent, String> {
+    // HE-2: start-path sweep of stale secrets-bearing launch script dirs left
+    // when a prior launch never reached bash's self-delete (`rm -f "$0"`).
+    sweep_stale_macos_launch_script_dirs(&std::env::temp_dir(), MACOS_LAUNCH_SCRIPT_STALE_SECS);
+
     let (prompt_file, script) = build_macos_agent_script(
         agent_id,
         root_path,
@@ -918,20 +960,27 @@ fn spawn_agent_terminal_impl(
         management_root,
         projects_dir,
         model,
+        // Pass the UNFILTERED provider env so vault_oauth_present_in (F65/CLAUDE
+        // isolation) still sees real vault presence. HE-4 secret stripping for the
+        // custom_command path is applied inside the builder (export block skips
+        // custom; provider_env_for_launch) — do not pre-filter here or the OAuth
+        // hint collapses to "absent".
         provider_env,
         orchestrator,
         // FIX 2 — external Terminal.app path: osascript runs `bash <script_file>`, so
         // there is no cmd.env channel and the provider_env secrets MUST be exported
-        // in-script. The script is written to a 0600 temp file just below, so the
-        // builder also injects the `rm -f "$0"` self-delete (first line) to remove that
-        // secrets file the moment bash starts. -> true.
+        // in-script (except HE-4 custom). The script is written to a 0600 temp file
+        // just below, so the builder also injects the `rm -f "$0"` self-delete (first
+        // line) to remove that secrets file the moment bash starts. -> true.
         true,
         user_servers,
     )?;
 
     // Write the generated script to its own restricted temp file and have Terminal
     // run it. Embedding a multi-line script directly inside an AppleScript string
-    // is brittle (quoting/escaping); a file path is robust.
+    // is brittle (quoting/escaping); a file path is robust. HE-2: this file may
+    // carry provider_env secrets — cleaned on spawn failure / osascript non-zero
+    // / stale sweep if bash never self-deletes it.
     let script_file = write_restricted_script_file(&script)?;
     let script_path = script_file.display().to_string();
 
@@ -955,11 +1004,27 @@ fn spawn_agent_terminal_impl(
         // on macOS closes the Terminal window by its EXACT title instead of killing
         // this pid, so the pid is stored only for parity. creation_time is None on
         // macOS (the verified-pid fallback is Windows-only).
-        Ok(child) => Ok(SpawnedAgent {
-            pid: child.id(),
-            creation_time: None,
-            prompt_file: Some(prompt_file),
-        }),
+        // HE-1: reap osascript on a detached thread so the Child is not dropped
+        // without wait (zombie accumulation). HE-2: if osascript fails, bash never
+        // ran the self-delete — remove the secrets-bearing script file AND the
+        // token-bearing 0600 prompt file (both live in restricted temp dirs).
+        Ok(mut child) => {
+            let pid = child.id();
+            let script_file_for_reap = script_file;
+            let prompt_file_for_reap = prompt_file.clone();
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                _ => {
+                    remove_restricted_temp_file(&script_file_for_reap);
+                    remove_restricted_temp_file(&prompt_file_for_reap);
+                }
+            });
+            Ok(SpawnedAgent {
+                pid,
+                creation_time: None,
+                prompt_file: Some(prompt_file),
+            })
+        }
         Err(e) => {
             // The Terminal script never ran, so it cannot delete the temp files.
             remove_restricted_temp_file(&prompt_file);
@@ -1095,9 +1160,48 @@ pub(crate) fn write_session_gitconfig() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// HE-2: age threshold for sweeping abandoned macOS launch-script dirs under the
+/// OS temp root. Successful launches self-delete the `.sh` on bash start; failed
+/// pre-exec paths can leave the secrets-bearing tree until this sweep.
+#[cfg(target_os = "macos")]
+const MACOS_LAUNCH_SCRIPT_STALE_SECS: u64 = 300;
+
+/// HE-2: remove stale `aspis-agent-launch-*.d` directories under `temp_root` whose
+/// mtime is at least `max_age_secs` old. Concurrent launches younger than the
+/// threshold are preserved. Best-effort; errors are ignored.
+#[cfg(target_os = "macos")]
+fn sweep_stale_macos_launch_script_dirs(temp_root: &Path, max_age_secs: u64) {
+    let Ok(entries) = fs::read_dir(temp_root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("aspis-agent-launch-") && name.ends_with(".d")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let stale = match now.duration_since(modified) {
+            Ok(age) => age.as_secs() >= max_age_secs,
+            // Clock skew / future mtime: treat as stale so secrets cannot linger.
+            Err(_) => true,
+        };
+        if stale {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// macOS-only: write a generated shell script to a restricted (0o600) temp file
-/// so Terminal can `bash` it. Kept separate from the prompt file because the
-/// script itself is not secret but should still not be world-writable.
+/// so Terminal can `bash` it. May carry provider_env secrets on the external
+/// path — cleaned on failure (HE-2) and self-deleted by bash on success.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 fn write_restricted_script_file(script: &str) -> Result<PathBuf, String> {
@@ -1538,14 +1642,11 @@ pub(crate) fn codex_launch_script(
     // Deliver the prompt via STDIN, not as a trailing native argv. Passing the
     // multi-line prompt as `$prompt` argv makes PowerShell word-split it and
     // mangle `<`/`>` (codex/claude then clap-error on "model>, message=..."). It
-    // also keeps the embedded launch token off the codex command line. The script
-    // already does `Set-Clipboard -Value $prompt`, so the prompt stays recoverable
-    // if the CLI ignores stdin.
+    // also keeps the embedded launch token off the codex command line.
     //
-    // B1 INVARIANT: the prompt/launch token must NEVER be written to the PTY
-    // stream. It is delivered to the CLI over STDIN and to the user via the
-    // clipboard ONLY — there is no `Write-Host $prompt`/`echo $prompt` anywhere,
-    // so the token cannot leak into the ConPTY ring buffer / snapshot / xterm.
+    // B1 + HE-3: the prompt/launch token must NEVER be written to the PTY stream
+    // and must NEVER be placed on the system clipboard. Delivered to the CLI over
+    // STDIN only — no `Write-Host $prompt`/`echo $prompt`/`Set-Clipboard`.
     Ok(format!(
         "$codexArgs = @({args})\n$prompt | & codex @codexArgs"
     ))
@@ -1569,11 +1670,10 @@ pub(crate) fn claude_launch_script(
     // Deliver the prompt via STDIN, not as a trailing native argv (see
     // codex_launch_script for the full rationale): avoids PowerShell word-splitting
     // and `<`/`>` mangling, and keeps the embedded launch token off claude's
-    // command line. Set-Clipboard in the wrapper keeps the prompt recoverable.
+    // command line.
     //
-    // B1 INVARIANT: same as codex — the prompt/launch token is delivered over
-    // STDIN and the clipboard ONLY; it is NEVER written to the PTY stream (no
-    // `Write-Host $prompt`), so it cannot leak into the ConPTY snapshot/xterm.
+    // B1 + HE-3: same as codex — the prompt/launch token is delivered over STDIN
+    // only; never written to the PTY stream and never placed on the clipboard.
     Ok(format!(
         "$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig"
     ))
@@ -1593,10 +1693,506 @@ fn toml_array(values: &[&str]) -> String {
     format!("[{values}]")
 }
 
+#[cfg(test)]
+mod he_security_tests {
+    use super::*;
+    use crate::backend::projects::AgentLaunchEnv;
+    #[cfg(windows)]
+    use std::path::PathBuf;
+
+    fn secret_env_fixture() -> Vec<AgentLaunchEnv> {
+        vec![
+            AgentLaunchEnv {
+                name: "DEVBOULE_MCP_LAUNCH_TOKEN".into(),
+                value: "tok-secret-launch-he4-test".into(),
+            },
+            AgentLaunchEnv {
+                name: "EXA_API_KEY".into(),
+                value: "exa-secret-he4-test".into(),
+            },
+        ]
+    }
+
+    /// HE-4: custom_command path must not receive vault/provider secrets.
+    #[test]
+    fn custom_command_launch_env_omits_vault_secrets() {
+        let envs = secret_env_fixture();
+        assert!(
+            provider_env_for_launch(Some("evil-cli --flag"), &envs).is_empty(),
+            "custom_command must isolate provider secrets"
+        );
+        assert_eq!(
+            provider_env_for_launch(None, &envs).len(),
+            envs.len(),
+            "built-in path keeps provider_env"
+        );
+    }
+
+    /// HE-2: simulated launch-failure cleanup removes the restricted temp tree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn temp_script_removed_on_simulated_launch_failure() {
+        let script_file =
+            write_restricted_script_file("export SECRET='should-not-linger'\n").expect("write");
+        assert!(script_file.is_file());
+        let parent = script_file.parent().map(|p| p.to_path_buf());
+        // Same cleanup the external spawn Err / osascript non-zero path runs.
+        remove_restricted_temp_file(&script_file);
+        assert!(
+            !script_file.exists(),
+            "secrets-bearing script must be gone after failure cleanup"
+        );
+        if let Some(parent) = parent {
+            assert!(
+                !parent.exists(),
+                "restricted parent dir must be removed: {parent:?}"
+            );
+        }
+    }
+
+    /// HE-2: age-based sweep removes stale launch dirs, keeps fresh ones.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_stale_launch_script_dirs_respects_age() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-he2-sweep-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let stale = base.join("aspis-agent-launch-stale.d");
+        let fresh = base.join("aspis-agent-launch-fresh.d");
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(stale.join("aspis-agent-launch-stale.sh"), b"secret").unwrap();
+        fs::write(fresh.join("aspis-agent-launch-fresh.sh"), b"secret").unwrap();
+
+        // max_age = u64::MAX → nothing is old enough.
+        sweep_stale_macos_launch_script_dirs(&base, u64::MAX);
+        assert!(stale.is_dir());
+        assert!(fresh.is_dir());
+
+        // max_age = 0 → every existing dir is stale.
+        sweep_stale_macos_launch_script_dirs(&base, 0);
+        assert!(!stale.exists(), "stale dir must be swept");
+        assert!(!fresh.exists(), "zero-age threshold sweeps all matching dirs");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// HE-3: macOS launch script must not put the token-bearing prompt on pbcopy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_script_clipboard_payload_has_no_token() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-he3-mac-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let projects = base.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+
+        let token_prompt = "launch-token-HE3-should-not-reach-clipboard";
+        let result = build_macos_agent_script(
+            "coder-he3",
+            &root,
+            "deepseek",
+            "",
+            Some("deepseek chat"),
+            token_prompt,
+            &root,
+            &projects,
+            None,
+            &secret_env_fixture(),
+            None,
+            true,
+            &[],
+        );
+        let (prompt_file, script) = result.expect("custom script builds without MCP");
+        assert!(
+            !script.contains("pbcopy"),
+            "HE-3: script must not pbcopy the token-bearing prompt: {script}"
+        );
+        assert!(
+            !script.contains(token_prompt),
+            "token must not be embedded in the script body"
+        );
+        assert!(
+            script.contains("export ASPIS_AGENT_PROMPT_FILE="),
+            "token delivery is the 0600 prompt file only"
+        );
+        // HE-4: custom + external must not export vault secrets into the script.
+        assert!(
+            !script.contains("export DEVBOULE_MCP_LAUNCH_TOKEN="),
+            "HE-4: custom path must not export launch token: {script}"
+        );
+        assert!(
+            !script.contains("tok-secret-launch-he4-test"),
+            "HE-4: secret value must not appear in custom launch script"
+        );
+        assert!(
+            !script.contains("exa-secret-he4-test"),
+            "HE-4: Exa key must not appear in custom launch script"
+        );
+        remove_restricted_temp_file(&prompt_file);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// HE-3: Windows launch script must not Set-Clipboard the token-bearing prompt.
+    #[cfg(windows)]
+    #[test]
+    fn windows_script_clipboard_payload_has_no_token() {
+        let root = PathBuf::from("C:\\Devboule");
+        let projects = root.join("projects");
+        let token_prompt = "launch-token-HE3-should-not-reach-clipboard";
+        let (prompt_file, script) = build_windows_agent_script(
+            "coder-he3",
+            &root,
+            "deepseek",
+            "",
+            Some("deepseek chat"),
+            token_prompt,
+            &root,
+            &projects,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .expect("script builds");
+        assert!(
+            !script.contains("Set-Clipboard"),
+            "HE-3: script must not put the prompt on the clipboard: {script}"
+        );
+        assert!(
+            !script.contains(token_prompt),
+            "token must not be embedded in the script body"
+        );
+        assert!(
+            script.contains("$env:ASPIS_AGENT_PROMPT_FILE = "),
+            "token delivery is the 0600 prompt file only"
+        );
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    /// M-1: Windows bare/other client delivers the prompt via the 0600 file + env
+    /// (macOS parity). HE-3 removed clipboard delivery; bare must still have a channel.
+    #[cfg(windows)]
+    #[test]
+    fn windows_bare_prompt_delivered_via_env_file_not_clipboard() {
+        let root = PathBuf::from("C:\\Devboule");
+        let projects = root.join("projects");
+        let token_prompt = "launch-token-bare-windows-m1";
+        let (prompt_file, script) = build_windows_agent_script(
+            "coder-bare-m1",
+            &root,
+            "other",
+            "", // empty executable = bare/other
+            None,
+            token_prompt,
+            &root,
+            &projects,
+            None,
+            None, // no orchestrator
+            &[],
+            false,
+        )
+        .expect("bare script builds");
+        assert!(
+            !script.contains("Set-Clipboard"),
+            "HE-3: bare path must not put the prompt on the clipboard: {script}"
+        );
+        assert!(
+            !script.contains(token_prompt),
+            "token must not be embedded in the script body"
+        );
+        assert!(
+            script.contains("$env:ASPIS_AGENT_PROMPT_FILE = "),
+            "bare path must export ASPIS_AGENT_PROMPT_FILE like macOS: {script}"
+        );
+        assert!(
+            !script.contains("Remove-Item -LiteralPath $promptFile"),
+            "bare path must keep the 0600 prompt file (not delete after load): {script}"
+        );
+        assert!(
+            script.contains(
+                "Write-Host 'Devboule agent prompt at' $env:ASPIS_AGENT_PROMPT_FILE '(not on clipboard)'"
+            ),
+            "bare hint must point at the env file path: {script}"
+        );
+        assert!(
+            prompt_file.is_file(),
+            "builder must leave the restricted prompt file on disk for bare"
+        );
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    /// M-3: orchestrator launch hint must not claim STDIN delivery.
+    #[cfg(windows)]
+    #[test]
+    fn windows_orchestrator_hint_is_autonomous_not_stdin() {
+        let root = PathBuf::from("C:\\Devboule");
+        let projects = root.join("projects");
+        let orch = OrchestratorLaunchConfig {
+            binary: PathBuf::from("C:\\Devboule\\devboule-coder.exe"),
+            omlx_base_url: String::new(),
+            omlx_model: String::new(),
+            context_window: 8192,
+            cloud_base_url: String::new(),
+            cloud_model: String::new(),
+            mcp_python: "python".into(),
+            mcp_root: root.clone(),
+            mcp_projects_dir: projects.clone(),
+            agent_id: "orch-m3".into(),
+            project_root: root.clone(),
+            app_bin: String::new(),
+            activity_file: String::new(),
+            steer_file: String::new(),
+            project_id: String::new(),
+            plan_first: String::new(),
+            user_mcp_servers_json: String::new(),
+            lang_skill: String::new(),
+            project_context: String::new(),
+            initial_goal: String::new(),
+            auto_create: String::new(),
+        };
+        let (prompt_file, script) = build_windows_agent_script(
+            "orch-m3",
+            &root,
+            "devboule",
+            "",
+            None,
+            "orchestrator-prompt-unused",
+            &root,
+            &projects,
+            None,
+            Some(&orch),
+            &[],
+            false,
+        )
+        .expect("orchestrator script builds");
+        assert!(
+            script.contains(
+                "Write-Host 'Devboule orchestrator is autonomous (no agent prompt file; not on clipboard).'"
+            ),
+            "orchestrator hint must be accurate: {script}"
+        );
+        assert!(
+            !script.contains("delivered via STDIN"),
+            "orchestrator must not claim STDIN delivery: {script}"
+        );
+        assert!(
+            !script.contains("$env:ASPIS_AGENT_PROMPT_FILE = "),
+            "orchestrator must not keep the prompt file: {script}"
+        );
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    /// H-1: OAuth-present hint must be computed on the unfiltered provider env.
+    /// HE-4 still strips secrets from the launch injection slice for custom.
+    #[test]
+    fn oauth_present_hint_uses_unfiltered_provider_env_for_custom() {
+        let mut envs = secret_env_fixture();
+        envs.push(AgentLaunchEnv {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            value: "oauth-tok-h1-must-not-leak".into(),
+        });
+        // Launch injection stays empty under custom (HE-4).
+        assert!(
+            provider_env_for_launch(Some("custom-cli --flag"), &envs).is_empty(),
+            "custom must still isolate provider secrets from the launch env"
+        );
+        // Hint / CLAUDE isolation must see the real vault presence on the unfiltered slice.
+        assert!(
+            vault_oauth_present_in(&envs),
+            "unfiltered provider_env must report OAuth present"
+        );
+        assert!(
+            !vault_oauth_present_in(provider_env_for_launch(Some("custom-cli --flag"), &envs)),
+            "filtered slice is empty — double-filtering would collapse the hint"
+        );
+    }
+
+    /// H-1 integrated (macOS): custom + claude + oauth token → CLAUDE_CONFIG_DIR path
+    /// treats vault as present (drops stale .credentials.json) while HE-4 still
+    /// omits secrets from the script export block.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_custom_claude_oauth_hint_from_unfiltered_env() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-h1-oauth-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let projects = base.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+
+        let agent_id = "agent-h1-oauth";
+        let config_dir =
+            crate::backend::cloud_claude_config::claude_product_config_dir(&projects, agent_id);
+        fs::create_dir_all(&config_dir).unwrap();
+        let creds = config_dir.join(".credentials.json");
+        fs::write(&creds, b"stale-credentials").unwrap();
+
+        let mut envs = secret_env_fixture();
+        envs.push(AgentLaunchEnv {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            value: "oauth-tok-h1-must-not-leak".into(),
+        });
+
+        let result = build_macos_agent_script(
+            agent_id,
+            &root,
+            "claude",
+            "",
+            Some("claude --custom-wrapper"),
+            "custom-claude-prompt",
+            &root,
+            &projects,
+            None,
+            &envs, // unfiltered — matches post-H-1 spawn path
+            None,
+            true,
+            &[],
+        );
+        let (prompt_file, script) = result.expect("custom claude script builds");
+        assert!(
+            !creds.exists(),
+            "vault OAuth present on unfiltered env must drop stale .credentials.json"
+        );
+        assert!(
+            !script.contains("export CLAUDE_CODE_OAUTH_TOKEN="),
+            "HE-4: custom must not export OAuth token: {script}"
+        );
+        assert!(
+            !script.contains("oauth-tok-h1-must-not-leak"),
+            "HE-4: OAuth secret value must not appear in custom launch script"
+        );
+        assert!(
+            !script.contains("export DEVBOULE_MCP_LAUNCH_TOKEN="),
+            "HE-4: custom must not export launch token"
+        );
+        remove_restricted_temp_file(&prompt_file);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// H-2: osascript failure cleanup must remove both the secrets-bearing script
+    /// file and the token-bearing 0600 prompt file (and their restricted parents).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prompt_and_script_removed_on_simulated_osascript_failure() {
+        let prompt_file =
+            write_restricted_prompt_file("launch-token-h2-should-not-linger").expect("prompt");
+        let script_file =
+            write_restricted_script_file("export SECRET='should-not-linger'\n").expect("script");
+        assert!(prompt_file.is_file());
+        assert!(script_file.is_file());
+        let prompt_parent = prompt_file.parent().map(|p| p.to_path_buf());
+        let script_parent = script_file.parent().map(|p| p.to_path_buf());
+        // Same cleanup the osascript Err / non-success wait path runs (H-2).
+        remove_restricted_temp_file(&script_file);
+        remove_restricted_temp_file(&prompt_file);
+        assert!(
+            !script_file.exists(),
+            "secrets-bearing script must be gone after failure cleanup"
+        );
+        assert!(
+            !prompt_file.exists(),
+            "token-bearing prompt file must be gone after failure cleanup"
+        );
+        if let Some(parent) = script_parent {
+            assert!(
+                !parent.exists(),
+                "script restricted parent dir must be removed: {parent:?}"
+            );
+        }
+        if let Some(parent) = prompt_parent {
+            assert!(
+                !parent.exists(),
+                "prompt restricted parent dir must be removed: {parent:?}"
+            );
+        }
+    }
+
+    /// M-3 (macOS): orchestrator launch hint must not claim STDIN delivery.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_orchestrator_hint_is_autonomous_not_stdin() {
+        let base = std::env::temp_dir().join(format!(
+            "devboule-m3-orch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let projects = base.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+
+        let orch = OrchestratorLaunchConfig {
+            binary: base.join("devboule-coder"),
+            omlx_base_url: String::new(),
+            omlx_model: String::new(),
+            context_window: 8192,
+            cloud_base_url: String::new(),
+            cloud_model: String::new(),
+            mcp_python: "python".into(),
+            mcp_root: root.clone(),
+            mcp_projects_dir: projects.clone(),
+            agent_id: "orch-m3".into(),
+            project_root: root.clone(),
+            app_bin: String::new(),
+            activity_file: String::new(),
+            steer_file: String::new(),
+            project_id: String::new(),
+            plan_first: String::new(),
+            user_mcp_servers_json: String::new(),
+            lang_skill: String::new(),
+            project_context: String::new(),
+            initial_goal: String::new(),
+            auto_create: String::new(),
+        };
+        let (prompt_file, script) = build_macos_agent_script(
+            "orch-m3",
+            &root,
+            "devboule",
+            "",
+            None,
+            "orchestrator-prompt-unused",
+            &root,
+            &projects,
+            None,
+            &[],
+            Some(&orch),
+            true,
+            &[],
+        )
+        .expect("orchestrator script builds");
+        assert!(
+            script.contains(
+                "echo 'Devboule orchestrator is autonomous (no agent prompt file; not on clipboard).'"
+            ),
+            "orchestrator hint must be accurate: {script}"
+        );
+        assert!(
+            !script.contains("delivered via STDIN"),
+            "orchestrator must not claim STDIN delivery: {script}"
+        );
+        remove_restricted_temp_file(&prompt_file);
+        let _ = fs::remove_dir_all(&base);
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod f36_isolation_tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn macos_claude_script_exports_claude_config_dir() {

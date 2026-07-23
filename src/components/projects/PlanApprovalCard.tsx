@@ -56,6 +56,10 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
   const inFlightRef = useRef(false);
   const busyRef = useRef<string | null>(null);
   const resolvedTimerRef = useRef<number | null>(null);
+  // Monotonic generation: only the latest poll/expand response may write state
+  // (mirrors ChangesDockTab requestToken — older responses are dropped).
+  const pollGenRef = useRef(0);
+  const mdGenRef = useRef(0);
 
   const clearResolvedTimer = useCallback(() => {
     if (resolvedTimerRef.current !== null) {
@@ -71,16 +75,20 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
     if (isControlled) return;
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    const gen = ++pollGenRef.current;
     try {
       const all = await invokeBackendCommand<PlanApprovalRequest[]>(
         "plan_approval_requests_list",
       );
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || gen !== pollGenRef.current) return;
       setPolledRequests(pendingPlanRequestsForProject(all, projectId));
     } catch {
-      if (mountedRef.current) setPolledRequests((prev) => prev);
+      // Keep prior list; only the latest generation may touch state.
+      if (mountedRef.current && gen === pollGenRef.current) {
+        setPolledRequests((prev) => prev);
+      }
     } finally {
-      inFlightRef.current = false;
+      if (gen === pollGenRef.current) inFlightRef.current = false;
     }
   }, [projectId, isControlled]);
 
@@ -93,6 +101,8 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
     }, POLL_INTERVAL_MS);
     return () => {
       mountedRef.current = false;
+      pollGenRef.current++;
+      mdGenRef.current++;
       window.clearInterval(id);
       clearResolvedTimer();
     };
@@ -112,44 +122,52 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
   const fetchMarkdown = useCallback(
     async (request: PlanApprovalRequest) => {
       if (expanded?.requestId === request.id) {
-        // Toggle off if already expanded.
+        // Toggle off if already expanded; invalidate any in-flight expand fetch.
+        mdGenRef.current++;
         setExpanded(null);
         return;
       }
+      const gen = ++mdGenRef.current;
       setExpanded({ requestId: request.id, markdown: null, loading: true, error: null });
       try {
         const md = await invokeBackendCommand<string>("get_plan_markdown", {
           projectId: request.projectId,
           planId: request.id,
         });
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || gen !== mdGenRef.current) return;
         // F04: empty/failed load must not render MarkdownRenderer(null) → blank
         // expand with no error. Surface an explicit message instead.
         const text = (md ?? "").trim();
-        if (!text) {
-          setExpanded({
+        // Only apply if this request is still the expanded one (user may have
+        // collapsed or opened another plan while the fetch was in flight).
+        setExpanded((prev) => {
+          if (!prev || prev.requestId !== request.id) return prev;
+          if (!text) {
+            return {
+              requestId: request.id,
+              markdown: null,
+              loading: false,
+              error: "Plan markdown is empty or missing on disk.",
+            };
+          }
+          return {
             requestId: request.id,
-            markdown: null,
+            markdown: text,
             loading: false,
-            error: "Plan markdown is empty or missing on disk.",
-          });
-          return;
-        }
-        setExpanded({
-          requestId: request.id,
-          markdown: text,
-          loading: false,
-          error: null,
+            error: null,
+          };
         });
       } catch (e) {
-        if (mountedRef.current) {
-          setExpanded({
+        if (!mountedRef.current || gen !== mdGenRef.current) return;
+        setExpanded((prev) => {
+          if (!prev || prev.requestId !== request.id) return prev;
+          return {
             requestId: request.id,
             markdown: null,
             loading: false,
             error: e instanceof Error ? e.message : "Failed to load plan.",
-          });
-        }
+          };
+        });
       }
     },
     [expanded],
@@ -174,16 +192,20 @@ export function PlanApprovalCard({ projectId, requests: externalRequests, onPend
           resolvedTimerRef.current = null;
           if (mountedRef.current) setLastResolved(null);
         }, RESOLVED_LINGER_MS);
-        if (expanded?.requestId === request.id) setExpanded(null);
+        if (expanded?.requestId === request.id) {
+          mdGenRef.current++;
+          setExpanded(null);
+        }
         // F05: notify PlansDockTab to refetch approval history immediately.
         try {
           window.dispatchEvent(new CustomEvent("devboule:plans-refresh"));
         } catch {
           /* ignore */
         }
-        // Do NOT manually reset inFlightRef here: `load()` owns it via try/finally.
-        // Resetting it would let a poll load already in flight be stomped, opening a
-        // concurrent-load race. If a poll load is running, this load() correctly bails.
+        // Force a post-action refresh (same as PushApprovalCard): an interval poll
+        // mid-flight would make load() a no-op under inFlightRef; generation tokens
+        // then drop that poll's stale list once this refresh completes.
+        inFlightRef.current = false;
         await load();
       } catch (e) {
         if (mountedRef.current) {

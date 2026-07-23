@@ -132,13 +132,10 @@ pub mod purpose_source {
     pub const DEFAULT: &str = "default";
 }
 
-/// Known TECH-LIVERY provider slugs (Polis F4). The `Building::provider` field
-/// stays `Option<String>` on the wire; these are the known machine keys the
-/// scanner derives. `None`/absent = pure local code (the common case).
-pub mod provider {
-    pub const CLOUDFLARE: &str = "cloudflare";
-    pub const SCALEWAY: &str = "scaleway";
-}
+/// Known TECH-LIVERY provider slugs. After cloud-provider inventory removal,
+/// `Building::provider` is always `None` (pure local code). Kept as an empty
+/// module seam for a future non-CF/SCW livery if needed.
+pub mod provider {}
 
 /// Known `VisualTier` values. Stored as `String` on the wire.
 pub mod visual_tier {
@@ -328,7 +325,7 @@ impl AssetCensus {
 pub struct District {
     pub district_id: String,
     pub name: String,
-    /// "cloudflare_worker" | "scaleway_zone" | "scripts" | "core"
+    /// District type slug (e.g. `"scripts"`, `"core"`).
     #[serde(rename = "type")]
     pub district_type: String,
     pub bounds: Bounds,
@@ -374,18 +371,9 @@ pub struct Building {
     /// assignment from a fallback. `#[serde(default)]` -> empty on a pre-F1 city.
     #[serde(default)]
     pub feature_source: String,
-    /// Polis F4 — TECH LIVERY channel (the 3rd orthogonal visual channel:
-    /// district=feature, building-shape=purpose, livery=PROVIDER). Which cloud
-    /// provider this file is tied to, DERIVED each scan from path + import/config
-    /// signals (`scanner::derive_provider`): `Some("cloudflare")` / `Some("scaleway")`
-    /// for files with a conservative provider signal, `None` for pure local code
-    /// (the vast majority). The frontend renders a small roof pennant + tint per
-    /// provider (LOD-gated). Independent of `purpose`/`feature_id`.
-    ///
-    /// NOT PERSISTED: unlike `feature_id`/coords this is recomputed every scan from
-    /// current content (cheap, always fresh, never a layout input). `#[serde(default,
-    /// skip_serializing_if = "Option::is_none")]` so old persisted state still loads
-    /// and a `None` building omits the field entirely on the wire.
+    /// Optional tech-livery slug. After cloud-provider inventory removal this is
+    /// always `None` (pure local code). Kept on the wire for backward-compatible
+    /// deserialization of older city snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub lines_of_code: u32,
@@ -591,33 +579,23 @@ pub mod agent_status {
 // ExternalService
 // ---------------------------------------------------------------------------
 
-/// DATA-PURITY CONTRACT — external services mirror REAL cloud inventory only.
+/// DATA-PURITY CONTRACT — `external_services` holds **era monuments only**.
 ///
-/// When the provider seam is wired, the `provider == "scaleway"` /
-/// `"cloudflare"` services in `CityState::external_services` MUST be sourced
-/// from the real cached provider inventory (`backend::providers::ProviderInventory`,
-/// populated from the live Scaleway/Cloudflare APIs). A service appears on the
-/// map only if it is present in that inventory. The scanner currently emits an
-/// EMPTY service list rather than placeholder infrastructure.
-///
-/// NOTE: era monuments (`provider == "monument"`) are the one legitimate
-/// non-inventory entry — they are derived from real archived `CityState`
-/// statistics, not invented (see `commands::reset_city_in_place`).
-///
-// POLIS FOLLOW-UP: populate scaleway/cloudflare services from the cached
-// `ProviderInventory` (containers, VMs, object stores, workers). Never
-// synthesize services that are not in the real inventory.
+/// After removal of the Scaleway/Cloudflare inventory subsystem, the only
+/// legitimate entries are era monuments (`provider == "monument"`), erected by
+/// `commands::reset_city_in_place` from real archived `CityState` statistics.
+/// Scan/watch re-attach preserved monuments and never invent cloud outposts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalService {
     pub service_id: String,
-    /// "scaleway" | "cloudflare"
+    /// Always `"monument"` after cloud-provider removal.
     pub provider: String,
-    /// "container" | "gpu_vm" | "cpu_vm" | "object_store" | "llm_api" | "worker"
+    /// Wonder slug (e.g. `"parthenon"`, `"colosseum"`).
     #[serde(rename = "type")]
     pub service_type: String,
     pub name: String,
-    /// "running" | "stopped" | "spawning" | "error"
+    /// Monument lifecycle status (typically `"active"`).
     pub status: String,
     pub coords: Coords,
     pub spawnable: bool,
@@ -779,8 +757,8 @@ mod tests {
     #[test]
     fn external_feature_kind_serializes_camel_case() {
         let f = Feature {
-            id: "scaleway".into(),
-            label: "Scaleway".into(),
+            id: "external-area".into(),
+            label: "External".into(),
             description: String::new(),
             color_accent: "#A89880".into(),
             kind: FeatureKind::External,

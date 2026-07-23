@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_semgrep;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -200,25 +200,25 @@ pub fn parse_semgrep(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 /// PRIVACY/LICENSE/DETERMINISM: we never use a registry pack (`p/ci` / `auto` /
 /// `r/...`); a local `--config <abs path>` does zero network fetches and the rules
 /// are ours. See `resources/censor/semgrep-rules.yml` for the rationale.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("semgrep") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let ruleset = match resolve_semgrep_ruleset() {
         Some(p) => p,
         // No bundled ruleset → skip. NEVER fall back to the network registry.
-        None => return Vec::new(),
+        None => return RunnerOutcome::Skipped,
     };
     let ruleset_str = match ruleset.to_str() {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return RunnerOutcome::Failed,
     };
     let args = build_args(ruleset_str, &target.file_rel_path);
     // semgrep rule evaluation can be slow; allow a generous budget.
     let stdout = run_capture_with_timeout("semgrep", &args, root, Duration::from_secs(300));
     match stdout {
-        Some(s) => parse_semgrep(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_semgrep(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -404,7 +404,7 @@ mod tests {
         let target = RunTarget {
             file_rel_path: "src/app.py".to_string(),
         };
-        let out = run(std::path::Path::new("/nonexistent-project-root"), &target);
+        let out = run(std::path::Path::new("/nonexistent-project-root"), &target).into_findings();
         assert!(out.is_empty());
     }
 

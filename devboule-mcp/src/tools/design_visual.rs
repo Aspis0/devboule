@@ -10,7 +10,7 @@
 //!
 //! * Role allowlists + session token + live session gate.
 //! * design outcome path validation (F-02-013): relative only, no `..` / abs.
-//! * visual html_path: control-char / length bounds.
+//! * visual html_path: relative project path only (no absolute / `..` / drive roots).
 //! * Queue caps so agents cannot unbounded-grow state.
 
 use crate::state::{
@@ -306,7 +306,32 @@ fn clean_visual_html_path(value: &str) -> ToolResult<String> {
             "visual_check html_path must not contain control characters.",
         ));
     }
-    Ok(text.replace('\\', "/"))
+    // Same relative-path confinement as validate_design_outcome_path / validate_mini_rel_path.
+    let normalized = text.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.starts_with('~') {
+        return Err(ToolError::new(
+            "visual_check html_path must be a project-relative path.",
+        ));
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(ToolError::new(
+            "visual_check html_path must be a project-relative path.",
+        ));
+    }
+    for seg in normalized.split('/') {
+        if seg == ".." {
+            return Err(ToolError::new(
+                "visual_check html_path must not contain '..'.",
+            ));
+        }
+        if seg.is_empty() {
+            return Err(ToolError::new(
+                "visual_check html_path must not contain empty segments.",
+            ));
+        }
+    }
+    Ok(normalized)
 }
 
 fn directive_sort_key(d: &Value) -> (String, String) {
@@ -955,6 +980,16 @@ mod tests {
         assert!(clean_visual_html_path("a\nb").is_err());
         let long = "x".repeat(2000);
         assert!(clean_visual_html_path(&long).is_err());
+        // Relative-path confinement (absolute / .. / Windows drive).
+        assert!(clean_visual_html_path("/etc/passwd").is_err());
+        assert!(clean_visual_html_path("~/secrets.html").is_err());
+        assert!(clean_visual_html_path("a/../../b.html").is_err());
+        assert!(clean_visual_html_path("C:\\Windows\\system32\\x.html").is_err());
+        assert!(clean_visual_html_path("out//x.html").is_err());
+        assert_eq!(
+            clean_visual_html_path("out\\nested\\x.html").unwrap(),
+            "out/nested/x.html"
+        );
     }
 
     #[test]

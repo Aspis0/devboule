@@ -18,7 +18,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use state::resolve_projects_dir;
-use tools::{agent_lifecycle, censor, ckg_structure, cloud, design_visual, human_gates, mini_coder, oracle, project};
+use tools::{agent_lifecycle, censor, ckg_structure, design_visual, human_gates, mini_coder, oracle, project};
 
 /// SSoT role rules (same file as the Tauri app and legacy Python MCP).
 const ROLE_RULES_JSON: &str = include_str!("../../oracle/server/role_rules.json");
@@ -50,11 +50,6 @@ const IMPLEMENTED_TOOLS: &[&str] = &[
     "steer_mini_coder",
     "mini_coder_result",
     "spawn_main_coder",
-    "provider_credentials_status",
-    "cloudflare_list_workers",
-    "scaleway_list_resources",
-    "cloudflare_rotate_worker_secret",
-    "scaleway_resource_action",
     "oracle_ask",
     "oracle_context",
     "oracle_find",
@@ -311,85 +306,6 @@ pub struct MiniCoderResultArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ProviderCredentialsStatusArgs {
-    pub agent_id: String,
-    pub role: String,
-    #[serde(default)]
-    pub session_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CloudflareListWorkersArgs {
-    pub agent_id: String,
-    pub role: String,
-    #[serde(default)]
-    pub session_token: Option<String>,
-    #[serde(default)]
-    pub account_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CloudflareRotateWorkerSecretArgs {
-    pub agent_id: String,
-    pub role: String,
-    pub worker_name: String,
-    pub secret_name: String,
-    pub secret_value: String,
-    #[serde(default)]
-    pub session_token: Option<String>,
-    #[serde(default)]
-    pub account_id: Option<String>,
-    #[serde(default)]
-    pub management_project_id: Option<String>,
-    #[serde(default)]
-    pub aspis_project_id: Option<String>,
-    #[serde(default)]
-    pub task_id: Option<String>,
-    #[serde(default)]
-    pub evidence: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ScalewayListResourcesArgs {
-    pub agent_id: String,
-    pub role: String,
-    #[serde(default)]
-    pub session_token: Option<String>,
-    #[serde(default)]
-    pub project_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ScalewayResourceActionArgs {
-    pub agent_id: String,
-    pub role: String,
-    pub resource_id: String,
-    pub action: String,
-    #[serde(default)]
-    pub session_token: Option<String>,
-    #[serde(default)]
-    pub confirm_resource_name: Option<String>,
-    /// Scaleway cloud project id pin (not the management Kanban project).
-    #[serde(default)]
-    pub scaleway_project_id: Option<String>,
-    #[serde(default)]
-    pub provider_project_id: Option<String>,
-    /// Ambiguous: preferred as SCW pin when scaleway_project_id unset; management
-    /// Kanban id is `management_project_id`.
-    #[serde(default)]
-    pub project_id: Option<String>,
-    #[serde(default)]
-    pub management_project_id: Option<String>,
-    #[serde(default)]
-    pub aspis_project_id: Option<String>,
-    #[serde(default)]
-    pub task_id: Option<String>,
-    #[serde(default)]
-    pub evidence: Option<String>,
-}
-
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OracleAskArgs {
     pub query: String,
     pub agent_id: String,
@@ -572,11 +488,11 @@ impl DevbouleMcp {
         }
     }
 
-    /// Practical roles for Devboule agents (P5: + cloud list/mutate).
+    /// Practical roles for Devboule agents (lifecycle + project + human gates + mini/main + oracle/CKG/censor/design).
     ///
     /// Each role keeps only `role`, filtered `allowedTools`, and a short summary.
     #[tool(
-        description = "Return Devboule agent role rules for this Rust MCP (P6: lifecycle + project + human gates + mini/main coder + cloud + oracle/CKG/censor/design/visual). Roles are slim: role, allowedTools, summary."
+        description = "Return Devboule agent role rules for this Rust MCP (P6: lifecycle + project + human gates + mini/main coder + oracle/CKG/censor/design/visual). Roles are slim: role, allowedTools, summary."
     )]
     pub async fn agent_rules(
         &self,
@@ -590,7 +506,7 @@ impl DevbouleMcp {
             "roles": rules,
             "implementedTools": IMPLEMENTED_TOOLS,
             "portPhase": "P6",
-            "note": "Rust MCP (P6). Lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle (HTTP loopback fail-closed) + project_structure/CKG + censor + visual_check + design_request. Scope fail-closed; no full-corpus leak. Provider tokens from env only. MCP never self-approves plans/pushes or logs secrets.",
+            "note": "Rust MCP (P6). Lifecycle + project/Kanban + human gates + mini/main coder + oracle (HTTP loopback fail-closed) + project_structure/CKG + censor + visual_check + design_request. Scope fail-closed; no full-corpus leak. MCP never self-approves plans/pushes or logs secrets.",
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -1051,147 +967,6 @@ impl DevbouleMcp {
     }
 
     #[tool(
-        description = "Read provider credential readiness (Cloudflare/Scaleway/GitHub/Oracle LLM) without ever returning secret values. Sources are env-injected tokens (and vault targets for docs)."
-    )]
-    pub async fn provider_credentials_status(
-        &self,
-        Parameters(args): Parameters<ProviderCredentialsStatusArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let projects = resolve_projects_dir();
-        let body = cloud::provider_credentials_status(
-            &projects,
-            &args.agent_id,
-            &args.role,
-            args.session_token.as_deref(),
-        )
-        .map_err(tool_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
-        description = "List Cloudflare Workers in the pinned Aspis Bio / Devboule account scope (sibling workers are hidden). Tokens from env only."
-    )]
-    pub async fn cloudflare_list_workers(
-        &self,
-        Parameters(args): Parameters<CloudflareListWorkersArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = tokio::task::spawn_blocking(move || {
-            let projects = resolve_projects_dir();
-            cloud::cloudflare_list_workers(
-                &projects,
-                &args.agent_id,
-                &args.role,
-                args.session_token.as_deref(),
-                args.account_id.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| internal(format!("cloudflare_list_workers join: {e}")))?
-        .map_err(tool_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
-        description = "Coder-only: rotate a Cloudflare Worker secret binding. Requires session token, active claim, live wip/blocked task with non-coder approvedBy, and evidence. Worker must be in Aspis Bio inventory/scope. Never logs the secret value."
-    )]
-    pub async fn cloudflare_rotate_worker_secret(
-        &self,
-        Parameters(args): Parameters<CloudflareRotateWorkerSecretArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = tokio::task::spawn_blocking(move || {
-            let projects = resolve_projects_dir();
-            cloud::cloudflare_rotate_worker_secret(
-                &projects,
-                &args.agent_id,
-                &args.role,
-                args.session_token.as_deref(),
-                &args.worker_name,
-                &args.secret_name,
-                &args.secret_value,
-                args.account_id.as_deref(),
-                args.management_project_id.as_deref(),
-                args.aspis_project_id.as_deref(),
-                args.task_id.as_deref(),
-                args.evidence.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| internal(format!("cloudflare_rotate_worker_secret join: {e}")))?
-        .map_err(tool_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
-        description = "List Scaleway resources in the pinned aspis-bio Devboule project (instances, serverless, block, file, SQL). Tokens from env only."
-    )]
-    pub async fn scaleway_list_resources(
-        &self,
-        Parameters(args): Parameters<ScalewayListResourcesArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = tokio::task::spawn_blocking(move || {
-            let projects = resolve_projects_dir();
-            cloud::scaleway_list_resources(
-                &projects,
-                &args.agent_id,
-                &args.role,
-                args.session_token.as_deref(),
-                args.project_id.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| internal(format!("scaleway_list_resources join: {e}")))?
-        .map_err(tool_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
-        description = "Coder-only: Scaleway resource action (start/stop/reboot/deploy/delete). Requires session token, claim, live task + approvedBy, evidence. delete requires confirm_resource_name exact match. terminate is rejected — use delete. Project pin must be aspis-bio."
-    )]
-    pub async fn scaleway_resource_action(
-        &self,
-        Parameters(args): Parameters<ScalewayResourceActionArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = tokio::task::spawn_blocking(move || {
-            let projects = resolve_projects_dir();
-            // SCW cloud project pin: explicit scaleway/provider field, else project_id
-            // when it is not the management Kanban id.
-            let scw_pin = args
-                .scaleway_project_id
-                .as_deref()
-                .or(args.provider_project_id.as_deref())
-                .or(args.project_id.as_deref());
-            cloud::scaleway_resource_action(
-                &projects,
-                &args.agent_id,
-                &args.role,
-                args.session_token.as_deref(),
-                &args.resource_id,
-                &args.action,
-                args.confirm_resource_name.as_deref(),
-                scw_pin,
-                args.management_project_id.as_deref(),
-                args.aspis_project_id.as_deref(),
-                args.task_id.as_deref(),
-                args.evidence.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| internal(format!("scaleway_resource_action join: {e}")))?
-        .map_err(tool_err)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
         description = "Ask the Oracle for information about the project's architecture (HTTP to resident server; fail-closed if app offline). Pre-filter with kind/language/symbols. Scope is project-bounded (never full corpus)."
     )]
     pub async fn oracle_ask(
@@ -1532,7 +1307,7 @@ impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Devboule app-tools MCP (Rust). P6: lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle_ask/context/find (HTTP loopback fail-closed) + project_structure + get_neighborhood/find_imports + censor_findings/dispose + visual_check + design_request. Scope fail-closed; path confinement; design outcome path validation (F-02-013). Cloud mutate coder-only. Tokens from env only; never log secrets. Agents never self-approve plans/pushes."
+                "Devboule app-tools MCP (Rust). P6: lifecycle + project/Kanban + human gates + mini/main coder + oracle_ask/context/find (HTTP loopback fail-closed) + project_structure + get_neighborhood/find_imports + censor_findings/dispose + visual_check + design_request. Scope fail-closed; path confinement; design outcome path validation (F-02-013). Never log secrets. Agents never self-approve plans/pushes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -1550,7 +1325,7 @@ impl ServerHandler for DevbouleMcp {
 
 /// Short per-role summary for the slim payload.
 const P6_ROLE_SUMMARY: &str =
-    "P6 Rust MCP: lifecycle + project/Kanban + human gates + mini/main coder + cloud + oracle/CKG/censor/design/visual (role-filtered).";
+    "P6 Rust MCP: lifecycle + project/Kanban + human gates + mini/main coder + oracle/CKG/censor/design/visual (role-filtered).";
 
 /// Load role rules, filter `allowedTools` to `IMPLEMENTED_TOOLS`, and strip prose.
 fn load_role_rules_for_client() -> Result<Value> {
@@ -1775,11 +1550,6 @@ mod tests {
             "spawn_mini_coder",
             "steer_mini_coder",
             "mini_coder_result",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
         ] {
             assert!(tools.contains(&need), "coder missing {need}");
         }
@@ -1864,8 +1634,6 @@ mod tests {
             "plan_submit",
             "request_git_push",
             "spawn_mini_coder",
-            "provider_credentials_status",
-            "cloudflare_rotate_worker_secret",
         ] {
             assert!(
                 dumped.contains(required),
@@ -1929,28 +1697,6 @@ mod tests {
                 && IMPLEMENTED_TOOLS.contains(&"design_request"),
             "P6 tools must be listed in IMPLEMENTED_TOOLS"
         );
-    }
-
-    #[test]
-    fn orchestrator_gets_cloud_read_not_mutate() {
-        let roles = load_role_rules_for_client().expect("parse");
-        let orch = roles
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["role"] == "orchestrator")
-            .expect("orchestrator");
-        let tools: Vec<&str> = orch["allowedTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t.as_str())
-            .collect();
-        assert!(tools.contains(&"provider_credentials_status"));
-        assert!(tools.contains(&"cloudflare_list_workers"));
-        assert!(tools.contains(&"scaleway_list_resources"));
-        assert!(!tools.contains(&"cloudflare_rotate_worker_secret"));
-        assert!(!tools.contains(&"scaleway_resource_action"));
     }
 
     #[test]
@@ -2323,12 +2069,18 @@ mod tests {
         let session_token = ack["sessionToken"].as_str().unwrap().to_string();
         let state = agent_state(&projects, "state-coder", "coder", Some(&session_token)).unwrap();
         assert!(state.get("sessions").is_some());
+        assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
         let session = &state["sessions"][0];
         assert_eq!(session["agentId"], "state-coder");
         assert!(session.get("launchTokenHash").is_none());
         assert!(session.get("sessionTokenHash").is_none());
         assert!(session.get("launchConsumedAt").is_none());
         assert!(session.get("sessionTokenIssuedAt").is_none());
+        // Peer-safe shape: fleet counts only — no directive queues.
+        assert!(state.get("fleet").is_some());
+        assert!(state.get("miniCoderDirectives").is_none());
+        assert!(state.get("claims").is_none());
+        assert!(state.get("events").is_none());
     }
 
     #[test]

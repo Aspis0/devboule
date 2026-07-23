@@ -49,12 +49,7 @@ export interface OracleAskPanelProps {
 // ---------------------------------------------------------------------------
 
 export function OracleAskPanel({ onFocusFile, onClose }: OracleAskPanelProps) {
-  const {
-    askOracle,
-    requestView,
-    oracleLlmSettings,
-    secretStatuses,
-  } = useAppContext();
+  const { askOracle, requestView, oracleLlmSettings } = useAppContext();
 
   const cityState = useCityStore((s) => s.cityState);
 
@@ -81,7 +76,6 @@ export function OracleAskPanel({ onFocusFile, onClose }: OracleAskPanelProps) {
   );
   const providerConfigured = deriveProviderConfigured(
     oracleLlmSettings ?? null,
-    secretStatuses,
   );
 
   const runQuery = useCallback(

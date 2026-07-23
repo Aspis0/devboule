@@ -28,7 +28,7 @@
 use super::super::severity::severity_from_yamllint;
 use super::DEFAULT_RUNNER_TIMEOUT;
 use super::{
-    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding,
+    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding, RunnerOutcome,
     RunTarget,
 };
 use std::path::Path;
@@ -103,9 +103,9 @@ fn parse_yamllint_line(line: &str) -> Option<RawFinding> {
 /// stdout with the default per-file timeout. The file path is the orchestrator-validated
 /// project-relative path (a leading-`-` component is rejected upstream by
 /// `validate_rel_path`, so it can't be mistaken for a flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("yamllint") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "yamllint",
@@ -114,8 +114,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stdout {
-        Some(s) => parse_yamllint(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_yamllint(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -239,7 +239,7 @@ a.yaml:12:1: [error] another real one (syntax)
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("yamllint") {
             assert!(
                 !findings.is_empty(),

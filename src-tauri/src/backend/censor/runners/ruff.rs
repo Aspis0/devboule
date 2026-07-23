@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_ruff;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -79,9 +79,9 @@ pub fn parse_ruff(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 /// Run ruff on a single file from the project root using the project's
 /// ruff.toml/pyproject.toml config. Absent `ruff` → empty. `--` ends flag parsing
 /// so a `-`-leading file name is never read as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("ruff") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture(
         "ruff",
@@ -95,8 +95,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_ruff(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_ruff(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 

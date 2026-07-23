@@ -407,6 +407,18 @@ mod tests {
     }
 
     #[test]
+    fn clamp_oracle_result_limit_defaults_and_caps() {
+        assert_eq!(clamp_oracle_result_limit(None), ORACLE_RESULT_DEFAULT_LIMIT);
+        assert_eq!(clamp_oracle_result_limit(Some(0)), 1);
+        assert_eq!(clamp_oracle_result_limit(Some(8)), 8);
+        assert_eq!(clamp_oracle_result_limit(Some(32)), 32);
+        assert_eq!(
+            clamp_oracle_result_limit(Some(10_000)),
+            ORACLE_RESULT_MAX_LIMIT
+        );
+    }
+
+    #[test]
     fn indexed_files_query_clamps_limit_and_encodes_filter() {
         let root = std::path::PathBuf::from("/tmp/workspace");
 
@@ -813,6 +825,19 @@ pub async fn get_oracle_snapshot(
     oracle_readonly_get::<OracleSnapshot>("/snapshot").await
 }
 
+/// Default / max for operator result-limit parameters (`ask_oracle`,
+/// `get_oracle_similar`). Mirrors `ORACLE_INDEXED_FILES_MAX_LIMIT` style.
+const ORACLE_RESULT_DEFAULT_LIMIT: usize = 8;
+const ORACLE_RESULT_MAX_LIMIT: usize = 32;
+
+/// Clamp an optional operator result limit to `[1, ORACLE_RESULT_MAX_LIMIT]`,
+/// defaulting to `ORACLE_RESULT_DEFAULT_LIMIT`. Pure seam for unit tests.
+pub(crate) fn clamp_oracle_result_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(ORACLE_RESULT_DEFAULT_LIMIT)
+        .clamp(1, ORACLE_RESULT_MAX_LIMIT)
+}
+
 #[tauri::command]
 pub async fn ask_oracle(
     auth_state: tauri::State<'_, BackendState>,
@@ -831,7 +856,7 @@ pub async fn ask_oracle(
     // is the AGENT endpoint whose `allowed_file_ids` scope FAIL-CLOSES to empty when
     // absent — the operator ask would always answer "not found in corpus".
     let index_root = oracle_index_root()?;
-    let limit = limit.unwrap_or(8);
+    let limit = clamp_oracle_result_limit(limit);
     let body = serde_json::json!({
         "query": query,
         "limit": limit,
@@ -1153,8 +1178,9 @@ pub async fn get_oracle_similar(
     require_oracle_auth(&auth_state)?;
 
     // P2: read-only similarity lookup — bounded HTTP-only GET, no ask permit, no
-    // CLI fallback. `/similar/{id}?limit=N`.
-    let limit = limit.unwrap_or(8);
+    // CLI fallback. `/similar/{id}?limit=N`. Clamp limit server-side so a large
+    // UI value cannot inflate the response.
+    let limit = clamp_oracle_result_limit(limit);
     let path = format!(
         "/similar/{}?limit={}",
         encode_oracle_path_segment(&node_id),

@@ -732,35 +732,87 @@ pub fn format_findings_text(findings: &[Finding]) -> String {
     out
 }
 
+/// Outcome of waiting for Censor findings (H4-4 fail-closed).
+///
+/// Gates must NOT treat [`CensorWaitOutcome::Pending`] as clean — only
+/// [`CensorWaitOutcome::Clean`] means a settled pass produced no Open findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CensorWaitOutcome {
+    /// Timeout elapsed while a scan is still registered as running.
+    /// Must not be reported as clean.
+    Pending,
+    /// Deadline elapsed with no Open findings and no running scan.
+    Clean,
+    /// Open findings present (capped at 50).
+    Findings(Vec<Finding>),
+}
+
 /// Wait up to `timeout` for Censor findings on the given files.
-/// Polls the shard directory every 200ms until findings appear or timeout expires.
+///
+/// Polls the shard directory every 200ms. Returns:
+///   - [`CensorWaitOutcome::Findings`] as soon as any Open findings appear
+///   - [`CensorWaitOutcome::Clean`] when the deadline elapses and no scan is
+///     still registered as running for `project_id`
+///   - [`CensorWaitOutcome::Pending`] when the deadline elapses while a scan is
+///     still running — fail-closed: gates must not treat this as clean
+///
+/// Pass `registry` + `project_id` so a live pass is visible. When either is
+/// `None`, a timeout with no findings is Clean (no running signal available —
+/// used by unit tests and post-sync callers).
 /// Capped at 50 findings across all files to bound state size.
-#[allow(dead_code)] // called in Step 4 (finalize_finished_mini)
-pub fn wait_for_censor_findings(root: &Path, files: &[String], timeout: Duration) -> Vec<Finding> {
+#[allow(dead_code)] // called in Step 4 (finalize_finished_mini) + pi_sidecar
+pub fn wait_for_censor_findings(
+    root: &Path,
+    files: &[String],
+    timeout: Duration,
+    registry: Option<&CensorScanRegistry>,
+    project_id: Option<&str>,
+) -> CensorWaitOutcome {
     let deadline = Instant::now() + timeout;
     loop {
         let mut all: Vec<Finding> = Vec::new();
+        let mut shard_read_failed = false;
         for file in files {
-            if let Ok(Some(shard)) = ledger::read_shard(root, file) {
-                for f in shard.findings {
-                    if f.disposition == Disposition::Open {
-                        all.push(f);
-                        if all.len() >= 50 {
-                            return all; // cap at 50 to bound state/event size
+            match ledger::read_shard(root, file) {
+                Ok(Some(shard)) => {
+                    for f in shard.findings {
+                        if f.disposition == Disposition::Open {
+                            all.push(f);
+                            if all.len() >= 50 {
+                                return CensorWaitOutcome::Findings(all);
+                            }
                         }
                     }
                 }
+                Ok(None) => {}
+                Err(_) => {
+                    // IO/corrupt: unknown, not clear — fail-closed on timeout.
+                    shard_read_failed = true;
+                }
             }
         }
-        if !all.is_empty() || Instant::now() >= deadline {
-            return all;
+        if !all.is_empty() {
+            return CensorWaitOutcome::Findings(all);
+        }
+        let scan_running = match (registry, project_id) {
+            (Some(reg), Some(pid)) => reg.get(pid).is_some(),
+            _ => false,
+        };
+        if Instant::now() >= deadline {
+            // Fail-closed: still running OR unreadable shards → Pending, not Clean.
+            return if scan_running || shard_read_failed {
+                CensorWaitOutcome::Pending
+            } else {
+                CensorWaitOutcome::Clean
+            };
         }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
 /// Drain all pending Censor queue batches. Reads `<root>/.aspis/censor_queue/pending/*.json`,
-/// deletes each file after reading, returns deduplicated findings sorted by severity (High first).
+/// deletes each file only after a successful parse (H4-3: a read/parse error must not
+/// drop the batch). Returns deduplicated findings sorted by severity (High first).
 pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Finding> {
     let queue_dir = root.join(".aspis").join("censor_queue").join("pending");
     if !queue_dir.exists() {
@@ -770,24 +822,45 @@ pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Fi
     if let Ok(entries) = std::fs::read_dir(&queue_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    match serde_json::from_str::<crate::backend::censor::schema::FindingBatch>(
-                        &content,
-                    ) {
-                        Ok(batch) => batches.push(batch),
-                        Err(e) => {
-                            eprintln!(
-                                "censor queue: skipping corrupt batch {}: {e}",
-                                path.display()
-                            );
-                            // Rename instead of delete so corrupt file is inspectable
-                            let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
-                            continue; // skip delete below
-                        }
-                    }
+            if !path.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Leave the file in place so a later drain can retry.
+                    eprintln!(
+                        "censor queue: read failed for {} ({e}); leaving in pending",
+                        path.display()
+                    );
+                    continue;
                 }
-                let _ = std::fs::remove_file(&path); // exactly-once delivery
+            };
+            match serde_json::from_str::<crate::backend::censor::schema::FindingBatch>(&content) {
+                Ok(batch) => {
+                    batches.push(batch);
+                    // Exactly-once delivery: remove only after successful parse.
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "censor queue: corrupt batch {}: {e}",
+                        path.display()
+                    );
+                    // Move aside so it is not re-read forever; keep inspectable.
+                    // Unique dest: on Windows rename fails if the target already
+                    // exists; a fixed `.json.corrupt` suffix would leave the bad
+                    // file in place and re-fail every drain.
+                    let unique = format!(
+                        "json.corrupt.{}.{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    );
+                    let _ = std::fs::rename(&path, path.with_extension(&unique));
+                }
             }
         }
     }
@@ -868,11 +941,18 @@ mod tests {
 
     #[test]
     // ---- wait_for_censor_findings tests ----
-    fn wait_for_censor_findings_returns_empty_when_no_shards() {
+    fn wait_for_censor_findings_returns_clean_when_no_shards() {
         let root = std::env::temp_dir().join(format!("aspis-censor-empty-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(1));
-        assert!(got.is_empty(), "no shards → empty");
+        let got = wait_for_censor_findings(
+            &root,
+            &["src/a.rs".into()],
+            Duration::from_secs(1),
+            None,
+            None,
+        );
+        assert_eq!(got, CensorWaitOutcome::Clean, "no shards + no scan → Clean");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -896,10 +976,22 @@ mod tests {
                 ..Default::default()
             }],
         };
-        ledger::write_shard(&root, &shard);
-        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(2));
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].title, "unused");
+        ledger::write_shard(&root, &shard).unwrap();
+        let got = wait_for_censor_findings(
+            &root,
+            &["src/a.rs".into()],
+            Duration::from_secs(2),
+            None,
+            None,
+        );
+        match got {
+            CensorWaitOutcome::Findings(fs) => {
+                assert_eq!(fs.len(), 1);
+                assert_eq!(fs[0].title, "unused");
+            }
+            other => panic!("expected Findings, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -929,26 +1021,75 @@ mod tests {
                 },
             ],
         };
-        ledger::write_shard(&root, &shard);
-        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(2));
-        assert!(got.is_empty(), "Fixed/Fp/Wontfix must be skipped");
+        ledger::write_shard(&root, &shard).unwrap();
+        let got = wait_for_censor_findings(
+            &root,
+            &["src/a.rs".into()],
+            Duration::from_secs(2),
+            None,
+            None,
+        );
+        assert_eq!(
+            got,
+            CensorWaitOutcome::Clean,
+            "Fixed/Fp/Wontfix must be skipped → Clean"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn wait_for_censor_findings_times_out_when_no_shard_appears() {
+    fn wait_for_censor_findings_times_out_clean_when_no_shard_appears() {
         let root = std::env::temp_dir().join(format!("aspis-censor-poll-{}", std::process::id()));
         let _censor_dir = root.join(".aspis-censor");
         std::fs::create_dir_all(&_censor_dir).unwrap();
         let start = std::time::Instant::now();
-        // No shard for "src/x.rs" — must poll until timeout
-        let got = wait_for_censor_findings(&root, &["src/x.rs".into()], Duration::from_millis(500));
+        // No shard for "src/x.rs" — must poll until timeout → Clean (no scan).
+        let got = wait_for_censor_findings(
+            &root,
+            &["src/x.rs".into()],
+            Duration::from_millis(500),
+            None,
+            None,
+        );
         let elapsed = start.elapsed();
-        assert!(got.is_empty(), "no shard → empty");
+        assert_eq!(got, CensorWaitOutcome::Clean, "no shard + no scan → Clean");
         assert!(
             elapsed >= Duration::from_millis(400),
             "must wait at least ~400ms, got {:?}",
             elapsed
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wait_for_censor_findings_timeout_with_running_scan_is_pending() {
+        // H4-4: timeout while scan registry still shows a running pass → Pending
+        // (must NOT be Clean, which gates would read as "all clear").
+        let root =
+            std::env::temp_dir().join(format!("aspis-censor-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let reg = CensorScanRegistry::default();
+        let _gen = reg.set(
+            "proj-pending",
+            ScanStartedPayload {
+                project_id: "proj-pending".into(),
+                kind: "fine",
+                file_count: 1,
+            },
+        );
+        let got = wait_for_censor_findings(
+            &root,
+            &["src/x.rs".into()],
+            Duration::from_millis(400),
+            Some(&reg),
+            Some("proj-pending"),
+        );
+        assert_eq!(
+            got,
+            CensorWaitOutcome::Pending,
+            "running scan + timeout + no findings → Pending, not Clean"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- format_findings_text tests ----
@@ -1673,5 +1814,109 @@ mod tests {
         }
         let got = drain_censor_queue(&tmp);
         assert_eq!(got.len(), 1, "deduplicated");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn drain_censor_queue_leaves_file_on_corrupt_parse() {
+        // H4-3: parse error must not delete the pending batch (renames to a unique
+        // .corrupt.* suffix for inspection; the pending .json is gone only via
+        // rename, not silent drop).
+        let tmp = std::env::temp_dir().join(format!("aspis-dq-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let queue_dir = tmp.join(".aspis").join("censor_queue").join("pending");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let bad = queue_dir.join("bad.json");
+        std::fs::write(&bad, "{ not valid json ").unwrap();
+        let got = drain_censor_queue(&tmp);
+        assert!(got.is_empty());
+        assert!(!bad.exists(), "corrupt file must be moved aside");
+        let moved: Vec<_> = queue_dir
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("bad.json.corrupt."))
+            .collect();
+        assert_eq!(
+            moved.len(),
+            1,
+            "corrupt batch must remain inspectable under a unique .corrupt suffix; got {moved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn drain_censor_queue_corrupt_rename_uses_unique_suffix() {
+        // HL-1: a pre-existing `.json.corrupt` dest must not block rename (Windows
+        // fails when dest exists). Unique pid+timestamp suffix keeps each bad
+        // batch inspectable and prevents an infinite re-parse loop.
+        let tmp = std::env::temp_dir().join(format!(
+            "aspis-dq-corrupt-unique-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let queue_dir = tmp.join(".aspis").join("censor_queue").join("pending");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        // Simulate a prior fixed-suffix quarantine that would collide on Windows.
+        std::fs::write(queue_dir.join("bad.json.corrupt"), "old quarantine").unwrap();
+        let bad = queue_dir.join("bad.json");
+        std::fs::write(&bad, "{ not valid json ").unwrap();
+        let got = drain_censor_queue(&tmp);
+        assert!(got.is_empty());
+        assert!(!bad.exists(), "corrupt file must be moved aside even when fixed dest exists");
+        // Second drain must not re-see the pending .json (infinite loop guard).
+        let got2 = drain_censor_queue(&tmp);
+        assert!(got2.is_empty());
+        assert!(
+            !queue_dir.join("bad.json").exists(),
+            "pending bad.json must not reappear after second drain"
+        );
+        let unique_moved = queue_dir
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("bad.json.corrupt.") && n != "bad.json.corrupt.")
+            .count();
+        assert!(
+            unique_moved >= 1,
+            "must quarantine under a unique suffix, not only the fixed .json.corrupt name"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn drain_censor_queue_leaves_file_on_unreadable() {
+        // H4-3: read failure must leave the file in pending (not remove_file).
+        // Simulate by writing a valid path then making it a directory so
+        // read_to_string fails (platform-portable: read_dir on a dir named *.json
+        // is awkward; instead write a zero-permission file when possible, or a
+        // nested path). On Unix, chmod 000; on other platforms, skip.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp =
+                std::env::temp_dir().join(format!("aspis-dq-unreadable-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            let queue_dir = tmp.join(".aspis").join("censor_queue").join("pending");
+            std::fs::create_dir_all(&queue_dir).unwrap();
+            let path = queue_dir.join("locked.json");
+            std::fs::write(&path, r#"{"batchId":"x","timestamp":"t","passType":"coarse","files":[],"findings":[]}"#).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o000);
+            std::fs::set_permissions(&path, perms).unwrap();
+            let got = drain_censor_queue(&tmp);
+            assert!(got.is_empty());
+            // Restore perms so cleanup works; assert file still present first.
+            assert!(
+                path.exists(),
+                "unreadable batch must remain in pending for retry"
+            );
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o644);
+            let _ = std::fs::set_permissions(&path, perms);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 }

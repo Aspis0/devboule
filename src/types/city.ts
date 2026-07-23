@@ -197,16 +197,16 @@ export type AgentStatus =
   | "reviewing"
   | "surveying";
 
-export type ExternalProvider = "scaleway" | "cloudflare" | string;
+/**
+ * External-service provider id. After cloud-outpost removal this is
+ * monument-only in new data (`"monument"`). Legacy `"scaleway"` /
+ * `"cloudflare"` strings may still appear in saved CityState JSON and are
+ * treated as inert (not rendered as harbours).
+ */
+export type ExternalProvider = "monument" | string;
 
-export type ExternalServiceType =
-  | "container"
-  | "gpu_vm"
-  | "cpu_vm"
-  | "object_store"
-  | "llm_api"
-  | "worker"
-  | string;
+/** Service kind. Monuments use wonder slugs (e.g. "colossus"); legacy cloud types may linger in old JSON. */
+export type ExternalServiceType = string;
 
 export type ExternalServiceStatus =
   | "running"
@@ -286,11 +286,8 @@ export interface Building {
    */
   featureSource?: FeatureSource;
   /**
-   * TECH LIVERY (Polis F4) — the 3rd orthogonal visual channel: which cloud
-   * provider this file is tied to ("cloudflare" | "scaleway"), or absent for
-   * pure local code (the common case). DERIVED each scan in Rust from path +
-   * import/config signals (never persisted). The renderer draws a small roof
-   * pennant + tint per provider; absent → no livery. Mirrors `ExternalProvider`.
+   * Optional tech-livery tag from the scanner (never persisted). Cloud-provider
+   * tagging was removed; may be absent for pure local code (the common case).
    */
   provider?: ExternalProvider;
   linesOfCode: number;
@@ -378,6 +375,11 @@ export interface Agent {
   subagents?: AgentSubagentBrief[];
 }
 
+/**
+ * City outpost / monument node. After cloud-provider removal this is used for
+ * era monuments only (`provider === "monument"`). Keep the shape for serde of
+ * legacy CityState JSON that may still contain old cloud outpost entries.
+ */
 export interface ExternalService {
   serviceId: string;
   provider: ExternalProvider;

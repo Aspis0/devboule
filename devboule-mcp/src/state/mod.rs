@@ -394,8 +394,8 @@ pub fn read_agents_state(projects_dir: &Path) -> ToolResult<Value> {
     })?;
     normalize_agents_state(&mut state);
     // P1: skip deep claim-md reconcile against project markdown (Python
-    // `reconcile_agents_state_with_projects`). agent_state still returns
-    // sessions/claims/events after secret scrub. Full reconcile is P2+.
+    // `reconcile_agents_state_with_projects`). agent_state returns a peer-safe
+    // view (own session + fleet counts) via public_agents_state. Full reconcile is P2+.
     Ok(state)
 }
 
@@ -440,16 +440,35 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
     let write_result = (|| -> std::io::Result<()> {
         {
             use std::io::Write;
-            let mut file = std::fs::File::create(&temp_path)?;
+            // Owner-only (0600): agent state holds session token hashes, tasks, prompts.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&temp_path)?;
             file.write_all(content.as_bytes())?;
             file.flush()?;
             // fsync file data (Unix: fsync; Windows: FlushFileBuffers).
             file.sync_all()?;
         }
+        #[cfg(unix)]
+        {
+            // Re-assert if a pre-existing temp inode kept an older mode.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         if path.exists() {
             let _ = std::fs::copy(path, &backup_path);
         }
         replace_existing(&temp_path, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         if backup_path.exists() {
             let _ = std::fs::remove_file(&backup_path);
         }
@@ -662,19 +681,40 @@ fn scrub_session_secrets(session: &mut Value) {
     }
 }
 
-/// Deep-clone state and scrub token fields from every session.
-pub fn public_agents_state(state: &Value) -> Value {
-    let mut public = state.clone();
-    if let Some(sessions) = public
-        .as_object_mut()
-        .and_then(|o| o.get_mut("sessions"))
-        .and_then(|s| s.as_array_mut())
-    {
-        for session in sessions.iter_mut() {
-            scrub_session_secrets(session);
-        }
+/// Peer-safe `agent_state` view: caller's own session (token-scrubbed) + fleet
+/// aggregate counts only. Never returns foreign sessions, directive bodies
+/// (mini/design/visual task/prompt text), claims, events, or gate queues.
+pub fn public_agents_state(state: &Value, agent_id: &str) -> Value {
+    let sessions = state
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut own: Option<Value> = sessions
+        .iter()
+        .find(|s| s.get("agentId").and_then(|v| v.as_str()) == Some(agent_id))
+        .cloned();
+    if let Some(ref mut session) = own {
+        scrub_session_secrets(session);
     }
-    public
+    let active = sessions
+        .iter()
+        .filter(|s| {
+            s.get("status")
+                .and_then(|v| v.as_str())
+                .map(|st| st.eq_ignore_ascii_case("active"))
+                .unwrap_or(false)
+        })
+        .count();
+    json!({
+        "version": state.get("version"),
+        "updatedAt": state.get("updatedAt"),
+        "sessions": own.map(|s| vec![s]).unwrap_or_else(Vec::new),
+        "fleet": {
+            "sessions": sessions.len(),
+            "active": active,
+        },
+    })
 }
 
 /// Compact register/heartbeat ack (own session + fleet summary). Never dumps fleet.
@@ -711,7 +751,7 @@ pub fn compact_session_ack(
         "session": own,
         "fleet": { "sessions": sessions.len(), "active": active },
         "note": (
-            "Full fleet state available via agent_state. \
+            "agent_state returns your session + fleet counts only (no peer directive bodies). \
              Heartbeat acks do not echo sessionToken -- keep using the token \
              from agent_register; a missing token in the ack is NOT an error."
         ),
@@ -1126,6 +1166,86 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_text_crash_safe_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-mode-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.json");
+        write_text_crash_safe(&path, r#"{"token":"x"}"#, "test file").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret-bearing file must be owner-only");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn public_agents_state_omits_foreign_sessions_and_directive_bodies() {
+        let state = json!({
+            "version": 2,
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "sessions": [
+                {
+                    "agentId": "alice",
+                    "role": "coder",
+                    "status": "active",
+                    "sessionTokenHash": "hash-alice",
+                    "launchTokenHash": "launch-alice",
+                },
+                {
+                    "agentId": "bob",
+                    "role": "coder",
+                    "status": "active",
+                    "sessionTokenHash": "hash-bob",
+                },
+            ],
+            "claims": [{"agentId": "bob", "taskId": "T1"}],
+            "events": [{"agentId": "bob", "type": "note", "message": "secret evidence"}],
+            "miniCoderDirectives": [{
+                "id": "d1",
+                "parentAgentId": "bob",
+                "task": "FULL FOREIGN TASK BODY with files",
+                "status": "pending",
+            }],
+            "designRequestDirectives": [{
+                "id": "dr1",
+                "parentAgentId": "bob",
+                "prompt": "FOREIGN DESIGN PROMPT",
+                "planContext": "foreign plan",
+            }],
+            "visualCheckDirectives": [{
+                "id": "v1",
+                "parentAgentId": "bob",
+                "htmlPath": "x.html",
+            }],
+        });
+        let public = public_agents_state(&state, "alice");
+        assert_eq!(public["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(public["sessions"][0]["agentId"], "alice");
+        assert!(public["sessions"][0].get("sessionTokenHash").is_none());
+        assert!(public["sessions"][0].get("launchTokenHash").is_none());
+        assert_eq!(public["fleet"]["sessions"], 2);
+        assert_eq!(public["fleet"]["active"], 2);
+        // No foreign directive bodies / claims / events leak to peers.
+        assert!(public.get("miniCoderDirectives").is_none());
+        assert!(public.get("designRequestDirectives").is_none());
+        assert!(public.get("visualCheckDirectives").is_none());
+        assert!(public.get("claims").is_none());
+        assert!(public.get("events").is_none());
+        let dumped = public.to_string();
+        assert!(!dumped.contains("FULL FOREIGN TASK BODY"));
+        assert!(!dumped.contains("FOREIGN DESIGN PROMPT"));
+        assert!(!dumped.contains("hash-bob"));
+        assert!(!dumped.contains("\"bob\""));
     }
 
     #[test]

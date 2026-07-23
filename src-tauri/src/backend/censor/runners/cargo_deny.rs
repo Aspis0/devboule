@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_cargo_deny;
-use super::{cap, redact_secrets, run_capture, run_capture_stderr_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture, run_capture_stderr_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -122,7 +122,7 @@ pub fn parse_cargo_deny(stderr: &str) -> Vec<RawFinding> {
 /// Run cargo-deny from the project root. A missing binary is logged as a
 /// SPECIFIC "not installed" (never a silent all-clear); the --version probe is
 /// cheap and offline.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if run_capture("cargo-deny", &["--version"], root).is_none() {
         // Once per session (max-recall fix): the coarse pass fires every few
         // seconds of activity — a per-pass line would flood the log.
@@ -133,7 +133,7 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
                 root.display()
             );
         }
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // Max-recall fixes:
     //   --offline: a censor runner must never block the serialized worker on a
@@ -153,7 +153,7 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         CARGO_DENY_TIMEOUT,
     ) {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return RunnerOutcome::Failed,
     };
     let findings = parse_cargo_deny(&stderr);
     if findings.is_empty()
@@ -161,15 +161,16 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         && !stderr.contains("\"type\":\"diagnostic\"")
     {
         // The tool spoke but produced NO parseable diagnostics: likely a
-        // missing cached advisory DB (--offline) or a config error. Say so —
-        // a security scanner must never silently read as all-clear.
-        // Identity-only log (the text may echo project details).
+        // missing cached advisory DB (--offline) or a config error. Fail-closed
+        // (H4-1): do NOT report Ok([]) — that would drop prior Open findings as
+        // "resolved-by-absence". Identity-only log (text may echo project details).
         eprintln!(
             "censor: cargo-deny ran but produced no parseable diagnostics at {} — check `cargo deny fetch` / deny.toml",
             root.display()
         );
+        return RunnerOutcome::Failed;
     }
-    findings
+    RunnerOutcome::Ok(findings)
 }
 
 #[cfg(test)]

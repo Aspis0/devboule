@@ -23,7 +23,6 @@
 #![allow(dead_code)]
 
 pub mod augure;
-pub mod cloud;
 pub mod commands;
 pub mod footprint;
 pub mod grid;

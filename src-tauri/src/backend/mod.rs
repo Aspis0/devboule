@@ -72,7 +72,6 @@ pub mod project_file;
 pub mod projects;
 pub mod roles_config;
 pub mod provider_detect;
-pub mod providers;
 pub mod roles;
 pub mod sandbox;
 pub mod saved_workflows;

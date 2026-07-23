@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::jscpd_category;
-use super::{run_capture, Granularity, RawFinding};
+use super::{run_capture, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,9 +108,9 @@ static JSCPD_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// temp dir up afterwards (best-effort). Using the system temp (not a dir under
 /// the watched root) keeps the report out of the project tree so the file watcher
 /// never re-triggers on it.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("jscpd") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let n = JSCPD_COUNTER.fetch_add(1, Ordering::Relaxed);
     let out_dir =
@@ -118,7 +118,7 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
     // Fresh dir; ignore a pre-existing one (unique name makes this unlikely).
     let _ = std::fs::remove_dir_all(&out_dir);
     if std::fs::create_dir_all(&out_dir).is_err() {
-        return Vec::new();
+        return RunnerOutcome::Failed;
     }
     let out_dir_str = out_dir.to_string_lossy().into_owned();
     // `--silent` suppresses the human report; `--reporters json` + `--output <dir>`
@@ -139,11 +139,11 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
     let report_path = out_dir.join("jscpd-report.json");
     let findings = match std::fs::read_to_string(&report_path) {
         Ok(json) => parse_jscpd(&json),
-        Err(_) => Vec::new(),
+        Err(_) => return { let _ = std::fs::remove_dir_all(&out_dir); RunnerOutcome::Failed },
     };
     // Clean up the temp report dir (best-effort; never fatal).
     let _ = std::fs::remove_dir_all(&out_dir);
-    findings
+    RunnerOutcome::Ok(findings)
 }
 
 #[cfg(test)]

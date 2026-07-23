@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_vulture;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -80,9 +80,9 @@ fn parse_vulture_line(line: &str) -> Option<(String, u32, String)> {
 
 /// Run vulture on a single file from the project root. Absent `vulture` → empty.
 /// `--` ends flag parsing so a `-`-leading file name is never read as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("vulture") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // DEMOTED 2026-06-12 (master plan P2): vulture is FP-prone on dynamic Python;
     // only 100%-confidence findings are objective enough for the gate.
@@ -92,8 +92,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_vulture(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_vulture(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

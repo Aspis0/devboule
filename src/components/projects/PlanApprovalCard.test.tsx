@@ -236,11 +236,12 @@ describe("PlanApprovalCard resolve does not race the poll", () => {
     (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = prevActEnv;
   });
 
-  it("a resolve does not start a list concurrent with an already in-flight poll load", async () => {
-    // Real race: a poll's load() is in flight (inFlightRef === true) when resolve
-    // finishes. The buggy `inFlightRef.current = false` before `await load()` stomps
-    // the in-flight poll's guard, so resolve's load() starts CONCURRENTLY with the
-    // still-running poll load. The fix removes the manual reset.
+  it("a resolve forces a fresh list even while a poll is in flight (stale poll superseded)", async () => {
+    // A poll's load() is in flight when resolve finishes. Resolve deliberately forces a
+    // fresh refresh (`inFlightRef.current = false; await load()`) so the post-approve state
+    // shows immediately rather than waiting a full poll interval. The forced load runs
+    // concurrently with the held stale poll, and the monotonic generation token drops the
+    // stale poll's late result so the fresh load wins (PushApprovalCard parity).
     let listInFlight = 0;
     let maxConcurrentList = 0;
     let listCallCount = 0;
@@ -304,8 +305,13 @@ describe("PlanApprovalCard resolve does not race the poll", () => {
       await Promise.resolve();
     });
 
-    // Fixed: load() sees inFlightRef === true and bails -> no concurrent list.
-    expect(maxConcurrentList).toBe(1);
+    // Fixed (PushApprovalCard parity): resolve FORCES a fresh refresh even while a poll
+    // is in flight (list call #3), so the just-approved state shows immediately instead of
+    // waiting a full poll interval. The forced refresh runs concurrently with the held
+    // stale poll (maxConcurrent === 2); the generation token then drops the stale poll's
+    // result when it finally returns, so the fresh load wins.
+    expect(listCallCount).toBe(3);
+    expect(maxConcurrentList).toBe(2);
 
     // Release held list(s) and unmount cleanly.
     gates.forEach((g) => g());

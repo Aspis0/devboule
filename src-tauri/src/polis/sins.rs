@@ -12,11 +12,9 @@
 //! `"Hardcoded secret-like value at line N"`. The matched bytes are never
 //! copied into any output string. See `detect_secrets` + its tests.
 //!
-//! DEFERRED (require git / Scaleway / external state — left as seams):
+//! DEFERRED (require git / external state — left as seams):
 //!   - Secret in committed `.env`            (needs git log)
 //!   - Stale file / old pinned dependency    (needs git log / dates)
-//!   - Scaleway endpoint without IAM header  (provider-specific)
-//!   - IAM key expiry within 30 days         (Scaleway API)
 
 use crate::polis::augure::DetectedSin;
 use crate::polis::model::{purpose, severity, Building, Road, UrbanSin};

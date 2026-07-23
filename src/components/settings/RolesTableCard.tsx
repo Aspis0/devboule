@@ -1287,7 +1287,7 @@ export function RolesTableCard() {
 
 	const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
 	const [busyRole, setBusyRole] = useState<RoleKey | null>(null);
-	const [error, setError] = useState<string | null>(null);
+	const [, setError] = useState<string | null>(null);
 	// Per-row error so a failed Orchestrator Save is visible next to that Save
 	// button (global error alone sat under Mini/Verifier and looked like "nothing happened").
 	const [roleError, setRoleError] = useState<Partial<Record<RoleKey, string>>>(
@@ -1296,6 +1296,18 @@ export function RolesTableCard() {
 	const [savedRole, setSavedRole] = useState<RoleKey | null>(null);
 	const mountedRef = useRef(true);
 	const savedTimerRef = useRef<number | null>(null);
+	// Sync mutex: React busyRole commits a tick late, so two rapid Saves on different
+	// rows can interleave full-document set_roles_config and last-write-wins clobber.
+	// While any save is in flight every role Save is disabled (see busy check below).
+	const saveInflightRef = useRef(false);
+	// Latest resolved clients for sequential saveClients calls within one onSaveRole
+	// (setState is async — a second saveClients must not rebuild from a stale closure).
+	const clientsRef = useRef<EffectiveRolesConfig | null>(null);
+	// After a successful row Save, suppress the next config→draft effect so refreshConfig
+	// does not wipe OTHER rows' unsaved drafts. External config changes still full-reseed.
+	const suppressNextDraftReseedRef = useRef(false);
+	// Role just saved: when suppressing, re-seed only this role from the new config.
+	const lastSavedRoleRef = useRef<RoleKey | null>(null);
 	// "Same as Main coder" is seeded from persisted equality ONCE on the initial load, then it
 	// is a sticky user toggle — NOT re-derived on every save (that made saving an unrelated row
 	// silently flip it, the adversarial-verify finding).
@@ -1529,15 +1541,21 @@ export function RolesTableCard() {
 			const result = await invokeBackendCommand<EffectiveRolesConfig>(
 				"get_roles_config_cmd",
 			);
-			if (mountedRef.current && result) setClients(result);
+			if (mountedRef.current && result) {
+				clientsRef.current = result;
+				setClients(result);
+			}
 		} catch {
 			// Degrade: fall back to a conservative default so the table still renders.
-			if (mountedRef.current)
-				setClients({
+			if (mountedRef.current) {
+				const fallback = {
 					orchestratorClient: "orchestrator",
 					coderClient: "claude",
 					verifierClient: "claude",
-				});
+				};
+				clientsRef.current = fallback;
+				setClients(fallback);
+			}
 		}
 	}, []);
 	useEffect(() => {
@@ -1561,11 +1579,59 @@ export function RolesTableCard() {
 		[detected],
 	);
 
-	// Reflect external config changes into the local-model drafts (e.g. after a save).
-	// Also drop staged placement: a config refresh (or concurrent save elsewhere) can
-	// rewrite drafts while `stagedPlacement` still says "Cloud API", leaving kind=omlx
-	// under a Cloud API segment — Save permanently disabled ("current — not offered").
+	// Reflect config into local-model drafts. After a successful row Save we suppress a
+	// full wipe (refreshConfig would otherwise clobber other rows' unsaved drafts) and
+	// re-seed only the saved role. Mount / external config change still full-reseeds.
+	// Also drop staged placement for reseeded roles (stale "Cloud API" + local kind
+	// would permanently disable Save).
 	useEffect(() => {
+		if (suppressNextDraftReseedRef.current) {
+			suppressNextDraftReseedRef.current = false;
+			const only = lastSavedRoleRef.current;
+			lastSavedRoleRef.current = null;
+			if (only === "coder") {
+				setMainDraft(draftFromBackend(config.mainCoderBackend));
+				setStagedPlacement((p) => {
+					if (!("coder" in p)) return p;
+					const n = { ...p };
+					delete n.coder;
+					return n;
+				});
+				return;
+			}
+			if (only === "mini") {
+				setMiniDraft(draftFromBackend(config.miniCoderBackend));
+				setStagedPlacement((p) => {
+					if (!("mini" in p)) return p;
+					const n = { ...p };
+					delete n.mini;
+					return n;
+				});
+				return;
+			}
+			if (only === "verifier") {
+				setVerifierDraft(draftFromBackend(config.verifierBackend));
+				setStagedPlacement((p) => {
+					if (!("verifier" in p)) return p;
+					const n = { ...p };
+					delete n.verifier;
+					return n;
+				});
+				return;
+			}
+			if (only === "orchestrator") {
+				setOrchestratorDraft(localDraftFromBackend(config.localCoderBackend));
+				setStagedPlacement((p) => {
+					if (!("orchestrator" in p)) return p;
+					const n = { ...p };
+					delete n.orchestrator;
+					return n;
+				});
+				return;
+			}
+			// Save path set suppress but no role marker — leave drafts alone.
+			return;
+		}
 		setMainDraft(draftFromBackend(config.mainCoderBackend));
 		setMiniDraft(draftFromBackend(config.miniCoderBackend));
 		setVerifierDraft(draftFromBackend(config.verifierBackend));
@@ -1603,35 +1669,34 @@ export function RolesTableCard() {
 	// Persist ONE role's client. The command REPLACES the whole rolesConfig, so we send the
 	// full triple — but built from the PERSISTED baseline with only THIS role's new value, so
 	// another row's unsaved dropdown edit is never dragged in (review finding #7). On success we
-	// adopt the resolved result and drop this role's pending edit.
-	const saveClients = useCallback(
-		async (role: RoleKey, value: string) => {
-			const base = clients ?? {
-				orchestratorClient: "orchestrator",
-				coderClient: "claude",
-				verifierClient: "claude",
-			};
-			const next: RolesConfig = {
-				orchestratorClient:
-					role === "orchestrator" ? value : base.orchestratorClient,
-				coderClient: role === "coder" ? value : base.coderClient,
-				verifierClient: role === "verifier" ? value : base.verifierClient,
-			};
-			const result = await invokeBackendCommand<EffectiveRolesConfig>(
-				"set_roles_config_cmd",
-				{ input: next },
-			);
-			if (mountedRef.current && result) {
-				setClients(result);
-				setPendingClients((p) => {
-					const n = { ...p };
-					delete n[role];
-					return n;
-				});
-			}
-		},
-		[clients],
-	);
+	// adopt the resolved result and drop this role's pending edit. clientsRef keeps sequential
+	// multi-role saves (e.g. coder + mirror verifier) from rebuilding off a stale closure.
+	const saveClients = useCallback(async (role: RoleKey, value: string) => {
+		const base = clientsRef.current ?? {
+			orchestratorClient: "orchestrator",
+			coderClient: "claude",
+			verifierClient: "claude",
+		};
+		const next: RolesConfig = {
+			orchestratorClient:
+				role === "orchestrator" ? value : base.orchestratorClient,
+			coderClient: role === "coder" ? value : base.coderClient,
+			verifierClient: role === "verifier" ? value : base.verifierClient,
+		};
+		const result = await invokeBackendCommand<EffectiveRolesConfig>(
+			"set_roles_config_cmd",
+			{ input: next },
+		);
+		if (mountedRef.current && result) {
+			clientsRef.current = result;
+			setClients(result);
+			setPendingClients((p) => {
+				const n = { ...p };
+				delete n[role];
+				return n;
+			});
+		}
+	}, []);
 
 	const saveMiniBackend = useCallback(
 		async (command: string, draft: BackendDraft) => {
@@ -1690,6 +1755,9 @@ export function RolesTableCard() {
 	// Row save orchestration. Each role wires the client selector and/or its backend.
 	const onSaveRole = useCallback(
 		async (role: RoleKey) => {
+			// Global sync mutex — disable every role Save while one is in flight.
+			if (saveInflightRef.current) return;
+			saveInflightRef.current = true;
 			setBusyRole(role);
 			setError(null);
 			setRoleError((prev) => {
@@ -1813,12 +1881,32 @@ export function RolesTableCard() {
 						await saveClients("verifier", client);
 					}
 				}
-				// Clear staged placement and verifier change tracking after successful save.
-				setStagedPlacement({});
+				// Suppress the next full draft reseed from refreshConfig; re-seed only
+				// this role (see draft effect). Other rows' unsaved drafts survive.
+				// If config backend deps are unchanged the effect may not run — a
+				// deferred clear drops the markers so the next external refresh is full.
 				verifierChangedRef.current = false;
+				suppressNextDraftReseedRef.current = true;
+				lastSavedRoleRef.current = role;
 				await refreshConfig();
-				if (mountedRef.current) flashSaved(role);
+				window.setTimeout(() => {
+					if (suppressNextDraftReseedRef.current) {
+						suppressNextDraftReseedRef.current = false;
+						lastSavedRoleRef.current = null;
+					}
+				}, 0);
+				if (mountedRef.current) {
+					setStagedPlacement((p) => {
+						if (!(role in p)) return p;
+						const n = { ...p };
+						delete n[role];
+						return n;
+					});
+					flashSaved(role);
+				}
 			} catch (e) {
+				suppressNextDraftReseedRef.current = false;
+				lastSavedRoleRef.current = null;
 				const msg =
 					typeof e === "string" && e.trim()
 						? e
@@ -1830,6 +1918,7 @@ export function RolesTableCard() {
 					setRoleError((prev) => ({ ...prev, [role]: msg }));
 				}
 			} finally {
+				saveInflightRef.current = false;
 				if (mountedRef.current) setBusyRole(null);
 			}
 		},
@@ -2577,7 +2666,9 @@ export function RolesTableCard() {
 										verifierChangedRef.current = true;
 										setVerifierDraft(d);
 									};
-					const busy = busyRole === meta.key;
+					// Any in-flight save disables ALL role Saves (global mutex UI surface).
+					const busy = busyRole !== null;
+					const busyThis = busyRole === meta.key;
 					// B1/M1/M4/M8: compute whether the current kind is foreign to the
 					// effective placement — used to disable Save and show the inline note.
 					// Mini has NO client: placement is kind-based (Local vs Cloud), same as
@@ -2638,7 +2729,11 @@ export function RolesTableCard() {
 									className="ml-auto inline-flex items-center gap-1.5 rounded-md bg-teal px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
 								>
 									<CheckCircle2 className="h-3.5 w-3.5" />
-									{savedRole === meta.key ? "Saved" : busy ? "Saving…" : "Save"}
+									{savedRole === meta.key
+										? "Saved"
+										: busyThis
+											? "Saving…"
+											: "Save"}
 								</button>
 							</div>
 							{roleError[meta.key] ? (

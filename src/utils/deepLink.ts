@@ -1,8 +1,7 @@
 // Tiny deep-link convention so a single click can target a top-level view AND
-// an inner sub-tab. After the sidebar was compressed to 6 entries, several pages
-// (Secrets, Cloudflare, Compute, Budget, Devices, Workspace, Agents) live as
-// tabs inside Providers / Projects / Settings. Risk-flag clicks and jump-search
-// need to land on the right tab, so we encode the target as "view#tab".
+// an inner sub-tab. After the sidebar was compressed, several pages (Secrets,
+// Devices, Workspace) live as tabs inside Settings. Jump-search needs to land
+// on the right tab, so we encode the target as "view#tab".
 //
 // Pure module (no React, no DOM) — unit-tested in deepLink.test.ts.
 
@@ -173,22 +172,31 @@ export function shouldClearWorkEntryBridge(args: {
  * The standalone "oracle" view was RESTORED, so it is no longer remapped — it
  * passes through verbatim like any real view. This guard is kept (composed at
  * the top of requestView) so a future removed view id can be added here without
- * per-call awareness. The only entry today: the removed Dashboard page redirects
- * to Projects (the cloud-ops overview returns later with the notifications rewrite).
+ * per-call awareness.
  *
  * Note: "settings" with tab "oracle" is a separate concern handled downstream by
  * mapLegacySettingsTab (the Oracle LLM settings sub-tab → "providers"); this
- * function does NOT touch it.
+ * function does NOT touch it. That "providers" tab is the Settings LLM Providers
+ * & Models tab — not the deleted cloud Providers console.
  */
 export function mapLegacyViewTarget(
   view: string,
   tab?: string | null,
 ): { view: string; tab: string | null } {
   const cleanTab = tab !== undefined && tab !== null ? tab : null;
-  // Dashboard was removed; redirect any lingering "dashboard" deep-link/notification
-  // to Projects so it lands somewhere real instead of falling through App.tsx's
-  // `default:` with no active nav item highlighted.
+  // Dashboard was removed; redirect any lingering "dashboard" deep-link to Projects.
   if (view === "dashboard") return { view: "projects", tab: null };
+  // Cloud-provider console views (Providers / Cloudflare / Compute / Budget)
+  // were deleted with the CF/SCW subsystem. Land on Projects so stale deep-links
+  // do not fall through App.tsx with no active nav item.
+  if (
+    view === "providers" ||
+    view === "cloudflare" ||
+    view === "compute" ||
+    view === "budget"
+  ) {
+    return { view: "projects", tab: null };
+  }
   return { view, tab: cleanTab };
 }
 

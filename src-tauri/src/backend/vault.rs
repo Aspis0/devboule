@@ -1,6 +1,5 @@
 use super::model::{
-    AuxCredentialStatus, CloudflareAgentTokenProfileStatus, OracleIndexPreferences,
-    OracleLlmSettings, OracleLlmSettingsStatus, ProviderId, ProviderScopeStatus, SecretStatus,
+    AuxCredentialStatus, OracleIndexPreferences, OracleLlmSettings, OracleLlmSettingsStatus,
 };
 use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
@@ -9,66 +8,12 @@ use std::path::{Path, PathBuf};
 
 const SERVICE: &str = "Devboule";
 
-#[derive(Debug, Clone, Copy)]
-pub struct CloudflareAgentTokenProfileSpec {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub role: &'static str,
-    pub env_var: &'static str,
-    pub message: &'static str,
-}
-
-pub const CLOUDFLARE_AGENT_TOKEN_PROFILES: &[CloudflareAgentTokenProfileSpec] = &[
-    CloudflareAgentTokenProfileSpec {
-        id: "verifier-readonly",
-        label: "Verifier read-only",
-        role: "orchestrator/verifier",
-        env_var: "ASPIS_CLOUDFLARE_VERIFIER_TOKEN",
-        message: "Read-only Cloudflare token for orchestrator and verifier agents.",
-    },
-    CloudflareAgentTokenProfileSpec {
-        id: "coder-worker-write",
-        label: "Coder Worker write",
-        role: "coder",
-        env_var: "ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN",
-        message: "Workers Scripts Write token for coder agents, without account-admin scope.",
-    },
-    CloudflareAgentTokenProfileSpec {
-        id: "secrets-rotator",
-        label: "Secrets rotator",
-        role: "coder-secret-rotation",
-        env_var: "ASPIS_CLOUDFLARE_SECRETS_ROTATOR_TOKEN",
-        message: "Dedicated secret-rotation token, used only by guarded Cloudflare mutation tools.",
-    },
-];
-
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn entry(provider: ProviderId) -> Result<Entry, String> {
-    Entry::new(SERVICE, provider.credential_account()).map_err(|_| vault_error("open"))
-}
-
 fn account_entry(account: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, account).map_err(|_| vault_error("open"))
-}
-
-fn cloudflare_agent_token_profile_account(profile_id: &str) -> Result<String, String> {
-    let spec = cloudflare_agent_token_profile_spec(profile_id)?;
-    Ok(format!("provider:cloudflare_agent_profile:{}", spec.id))
-}
-
-fn scope_entry(provider: ProviderId) -> Result<Entry, String> {
-    Entry::new(SERVICE, provider.scope_credential_account()).map_err(|_| vault_error("open"))
-}
-
-fn scaleway_object_access_key_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, "aux:scaleway_object_access_key").map_err(|_| vault_error("open"))
-}
-
-fn scaleway_object_secret_key_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, "aux:scaleway_object_secret_key").map_err(|_| vault_error("open"))
 }
 
 fn github_token_entry() -> Result<Entry, String> {
@@ -194,39 +139,8 @@ fn vault_error(action: &str) -> String {
     format!("The system keyring could not {action} this provider token.")
 }
 
-pub fn save_token(provider: ProviderId, token: &str) -> Result<SecretStatus, String> {
-    let cleaned = token.trim();
-    if cleaned.len() < 16 {
-        return Ok(SecretStatus {
-            provider,
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some("Token is too short to save.".into()),
-        });
-    }
 
-    entry(provider)?
-        .set_password(cleaned)
-        .map_err(|_| vault_error("save"))?;
-    status(provider)
-}
 
-pub fn delete_token(provider: ProviderId) -> Result<SecretStatus, String> {
-    match entry(provider)?.delete_credential() {
-        Ok(()) | Err(KeyringError::NoEntry) => {}
-        Err(_) => return Err(vault_error("delete")),
-    }
-    status(provider)
-}
-
-pub fn read_token(provider: ProviderId) -> Result<Option<String>, String> {
-    match entry(provider)?.get_password() {
-        Ok(token) => Ok(Some(token)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(_) => Err(vault_error("read")),
-    }
-}
 
 fn llm_provider_credential_account(provider: &str) -> Option<&'static str> {
     // The generic `openai` provider has no shared provider token — the dedicated
@@ -247,38 +161,7 @@ pub fn read_llm_provider_token(provider: &str) -> Result<Option<String>, String>
     }
 }
 
-pub fn status(provider: ProviderId) -> Result<SecretStatus, String> {
-    match read_token(provider) {
-        Ok(Some(_)) => Ok(SecretStatus {
-            provider,
-            configured: true,
-            status: "configured".into(),
-            last_checked_at: Some(now()),
-            message: None,
-        }),
-        Ok(None) => Ok(SecretStatus {
-            provider,
-            configured: false,
-            status: "missing".into(),
-            last_checked_at: Some(now()),
-            message: Some(format!("{} token is not configured.", provider.label())),
-        }),
-        Err(e) => Ok(SecretStatus {
-            provider,
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some(e),
-        }),
-    }
-}
 
-pub fn all_statuses() -> Result<Vec<SecretStatus>, String> {
-    Ok(vec![
-        status(ProviderId::Cloudflare)?,
-        status(ProviderId::Scaleway)?,
-    ])
-}
 
 pub fn save_github_token(token: &str) -> Result<(), String> {
     let cleaned = token.trim();
@@ -355,8 +238,7 @@ pub fn read_exa_key() -> Result<Option<String>, String> {
     }
 }
 
-/// Present/absent status ONLY — never the value. Mirrors
-/// `scaleway_object_access_key_status`.
+/// Present/absent status ONLY — never the value.
 pub fn exa_key_status() -> Result<AuxCredentialStatus, String> {
     match read_exa_key() {
         Ok(Some(_)) => Ok(AuxCredentialStatus {
@@ -883,14 +765,30 @@ pub fn save_websearch_key(provider: &str, key: &str) -> Result<AuxCredentialStat
     validate_websearch_provider(provider)?;
     let cleaned = key.trim();
     let label = websearch_provider_label(provider);
+    let id = format!("{provider}_api_key");
+    let status_label = format!("{label} web-search API key");
+    // Same length / whitespace / control-char paste guard as cloud LLM keys
+    // (`validate_cloud_llm_key_paste`): a key with \x01/\r is never legitimate.
     if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
         return Ok(AuxCredentialStatus {
-            id: format!("{provider}_api_key"),
-            label: format!("{label} web-search API key"),
+            id,
+            label: status_label,
             configured: false,
             status: "error".into(),
             last_checked_at: Some(now()),
             message: Some(format!("{label} API key is too short or contains whitespace.")),
+        });
+    }
+    if cleaned.chars().any(|c| c.is_control()) {
+        return Ok(AuxCredentialStatus {
+            id,
+            label: status_label,
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(format!(
+                "{label} API key must not contain control characters."
+            )),
         });
     }
     websearch_keyring_entry(provider)?
@@ -960,169 +858,8 @@ pub fn delete_device_signing_private_key() -> Result<(), String> {
     }
 }
 
-/// ROLE UNTANGLE (2026-07): collapse spawn-role aliases to the canonical roles so
-/// the vault selection is defensive even if a caller forgets to normalize. Mirrors
-/// `agent_role::canonicalize_launch_role` and ROLE_ALIASES in aspis_mcp.py.
-/// "orchestrator" is FIRST-CLASS (it no longer folds to coder as an alias; it is
-/// its own arm). Token selection: orchestrator is **read-only** on Cloudflare
-/// (audit F-04-020 / product non-negotiable — plan and delegate, no provider
-/// mutations). Coder holds the scoped write profile.
-fn canonical_agent_role(role: &str) -> &'static str {
-    match role.trim().to_ascii_lowercase().as_str() {
-        "verifier" => "verifier",
-        "orchestrator" => "orchestrator",
-        // coder + its legacy writer aliases (architect/code) -> coder.
-        "coder" | "architect" | "code" => "coder",
-        _ => "",
-    }
-}
 
-pub fn cloudflare_agent_token_profile_id_for_role(role: &str) -> Option<&'static str> {
-    // coder -> scoped write; orchestrator + verifier -> read-only.
-    match canonical_agent_role(role) {
-        "verifier" | "orchestrator" => Some("verifier-readonly"),
-        "coder" => Some("coder-worker-write"),
-        _ => None,
-    }
-}
 
-pub fn cloudflare_agent_token_profile_spec(
-    profile_id: &str,
-) -> Result<CloudflareAgentTokenProfileSpec, String> {
-    let id = profile_id.trim().to_ascii_lowercase();
-    CLOUDFLARE_AGENT_TOKEN_PROFILES
-        .iter()
-        .copied()
-        .find(|profile| profile.id == id)
-        .ok_or_else(|| "Unknown Cloudflare agent token profile.".to_string())
-}
-
-pub fn read_cloudflare_agent_token_profile_token(
-    profile_id: &str,
-) -> Result<Option<String>, String> {
-    let account = cloudflare_agent_token_profile_account(profile_id)?;
-    match account_entry(&account)?.get_password() {
-        Ok(token) => Ok(Some(token)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(_) => Err(vault_error("read")),
-    }
-}
-
-pub fn save_cloudflare_agent_token_profile(
-    profile_id: &str,
-    token: &str,
-) -> Result<CloudflareAgentTokenProfileStatus, String> {
-    let spec = cloudflare_agent_token_profile_spec(profile_id)?;
-    let cleaned = token.trim();
-    if cleaned.len() < 16 || cleaned.chars().any(char::is_whitespace) {
-        return Ok(cloudflare_agent_token_profile_status_with(
-            spec,
-            false,
-            "error",
-            Some("Token is too short or contains whitespace."),
-        ));
-    }
-    let account = cloudflare_agent_token_profile_account(profile_id)?;
-    account_entry(&account)?
-        .set_password(cleaned)
-        .map_err(|_| vault_error("save"))?;
-    cloudflare_agent_token_profile_status(profile_id)
-}
-
-pub fn delete_cloudflare_agent_token_profile(
-    profile_id: &str,
-) -> Result<CloudflareAgentTokenProfileStatus, String> {
-    let account = cloudflare_agent_token_profile_account(profile_id)?;
-    match account_entry(&account)?.delete_credential() {
-        Ok(()) | Err(KeyringError::NoEntry) => {}
-        Err(_) => return Err(vault_error("delete")),
-    }
-    cloudflare_agent_token_profile_status(profile_id)
-}
-
-pub fn cloudflare_agent_token_profile_status(
-    profile_id: &str,
-) -> Result<CloudflareAgentTokenProfileStatus, String> {
-    let spec = cloudflare_agent_token_profile_spec(profile_id)?;
-    match read_cloudflare_agent_token_profile_token(profile_id) {
-        Ok(Some(_)) => Ok(cloudflare_agent_token_profile_status_with(
-            spec,
-            true,
-            "configured",
-            Some(spec.message),
-        )),
-        Ok(None) => Ok(cloudflare_agent_token_profile_status_with(
-            spec,
-            false,
-            "missing",
-            Some("Profile token is not configured."),
-        )),
-        Err(e) => Ok(cloudflare_agent_token_profile_status_with(
-            spec,
-            false,
-            "error",
-            Some(e.as_str()),
-        )),
-    }
-}
-
-pub fn all_cloudflare_agent_token_profile_statuses(
-) -> Result<Vec<CloudflareAgentTokenProfileStatus>, String> {
-    CLOUDFLARE_AGENT_TOKEN_PROFILES
-        .iter()
-        .map(|profile| cloudflare_agent_token_profile_status(profile.id))
-        .collect()
-}
-
-/// D1: profile ids a given agent role is allowed to receive. Verifier and
-/// orchestrator get read-only only; coder gets scoped write. Secrets-rotator is
-/// NEVER injected into a launched agent through this path (reserved for guarded
-/// mutation tools). Audit F-04-020: orchestrator must not hold write CF tokens.
-pub fn cloudflare_agent_token_profile_ids_for_role(role: &str) -> &'static [&'static str] {
-    match canonical_agent_role(role) {
-        "verifier" | "orchestrator" => &["verifier-readonly"],
-        "coder" => &["coder-worker-write"],
-        _ => &[],
-    }
-}
-
-/// D1: role-filtered replacement for read_cloudflare_agent_token_profile_envs.
-/// Only the profile(s) the role is allowed to hold are returned, so a coder no
-/// longer receives the verifier token, and no role receives the rotator token.
-pub fn read_cloudflare_agent_token_profile_envs_for_role(
-    role: &str,
-) -> Result<Vec<(String, String)>, String> {
-    let allowed = cloudflare_agent_token_profile_ids_for_role(role);
-    let mut envs = Vec::new();
-    for profile in CLOUDFLARE_AGENT_TOKEN_PROFILES {
-        if !allowed.contains(&profile.id) {
-            continue;
-        }
-        if let Some(token) = read_cloudflare_agent_token_profile_token(profile.id)? {
-            envs.push((profile.env_var.to_string(), token));
-        }
-    }
-    Ok(envs)
-}
-
-fn cloudflare_agent_token_profile_status_with(
-    spec: CloudflareAgentTokenProfileSpec,
-    configured: bool,
-    status: &str,
-    message: Option<&str>,
-) -> CloudflareAgentTokenProfileStatus {
-    CloudflareAgentTokenProfileStatus {
-        id: spec.id.into(),
-        label: spec.label.into(),
-        role: spec.role.into(),
-        configured,
-        status: status.into(),
-        env_var: spec.env_var.into(),
-        credential_account: cloudflare_agent_token_profile_account(spec.id).unwrap_or_default(),
-        last_checked_at: Some(now()),
-        message: message.map(String::from),
-    }
-}
 
 /// Remote-first default: Oracle answers are API-only (remote providers).
 ///
@@ -1849,210 +1586,7 @@ fn legacy_oracle_llm_key_scope(settings: &OracleLlmSettings) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub fn save_scaleway_object_access_key(access_key: &str) -> Result<AuxCredentialStatus, String> {
-    let cleaned = access_key.trim();
-    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
-        return Ok(AuxCredentialStatus {
-            id: "scaleway_object_access_key".into(),
-            label: "Scaleway Object Storage access key".into(),
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some("Access key is too short or contains whitespace.".into()),
-        });
-    }
 
-    scaleway_object_access_key_entry()?
-        .set_password(cleaned)
-        .map_err(|_| vault_error("save"))?;
-    scaleway_object_access_key_status()
-}
-
-pub fn delete_scaleway_object_access_key() -> Result<AuxCredentialStatus, String> {
-    match scaleway_object_access_key_entry()?.delete_credential() {
-        Ok(()) | Err(KeyringError::NoEntry) => {}
-        Err(_) => return Err(vault_error("delete")),
-    }
-    scaleway_object_access_key_status()
-}
-
-pub fn read_scaleway_object_access_key() -> Result<Option<String>, String> {
-    match scaleway_object_access_key_entry()?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(_) => Err(vault_error("read")),
-    }
-}
-
-pub fn scaleway_object_access_key_status() -> Result<AuxCredentialStatus, String> {
-    match read_scaleway_object_access_key() {
-        Ok(Some(_)) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_access_key".into(),
-            label: "Scaleway Object Storage access key".into(),
-            configured: true,
-            status: "configured".into(),
-            last_checked_at: Some(now()),
-            message: None,
-        }),
-        Ok(None) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_access_key".into(),
-            label: "Scaleway Object Storage access key".into(),
-            configured: false,
-            status: "missing".into(),
-            last_checked_at: Some(now()),
-            message: Some("Required for live Object Storage bucket inventory.".into()),
-        }),
-        Err(e) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_access_key".into(),
-            label: "Scaleway Object Storage access key".into(),
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some(e),
-        }),
-    }
-}
-
-pub fn save_scaleway_object_secret_key(secret_key: &str) -> Result<AuxCredentialStatus, String> {
-    let cleaned = secret_key.trim();
-    if cleaned.len() < 16 || cleaned.contains(char::is_whitespace) {
-        return Ok(AuxCredentialStatus {
-            id: "scaleway_object_secret_key".into(),
-            label: "Scaleway Object Storage secret key".into(),
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some("Secret key is too short or contains whitespace.".into()),
-        });
-    }
-
-    scaleway_object_secret_key_entry()?
-        .set_password(cleaned)
-        .map_err(|_| vault_error("save"))?;
-    scaleway_object_secret_key_status()
-}
-
-pub fn delete_scaleway_object_secret_key() -> Result<AuxCredentialStatus, String> {
-    match scaleway_object_secret_key_entry()?.delete_credential() {
-        Ok(()) | Err(KeyringError::NoEntry) => {}
-        Err(_) => return Err(vault_error("delete")),
-    }
-    scaleway_object_secret_key_status()
-}
-
-pub fn read_scaleway_object_secret_key() -> Result<Option<String>, String> {
-    match scaleway_object_secret_key_entry()?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(_) => Err(vault_error("read")),
-    }
-}
-
-pub fn scaleway_object_secret_key_status() -> Result<AuxCredentialStatus, String> {
-    match read_scaleway_object_secret_key() {
-        Ok(Some(_)) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_secret_key".into(),
-            label: "Scaleway Object Storage secret key".into(),
-            configured: true,
-            status: "configured".into(),
-            last_checked_at: Some(now()),
-            message: None,
-        }),
-        Ok(None) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_secret_key".into(),
-            label: "Scaleway Object Storage secret key".into(),
-            configured: false,
-            status: "missing".into(),
-            last_checked_at: Some(now()),
-            message: Some(
-                "Required with the access key for live Object Storage bucket inventory.".into(),
-            ),
-        }),
-        Err(e) => Ok(AuxCredentialStatus {
-            id: "scaleway_object_secret_key".into(),
-            label: "Scaleway Object Storage secret key".into(),
-            configured: false,
-            status: "error".into(),
-            last_checked_at: Some(now()),
-            message: Some(e),
-        }),
-    }
-}
-
-pub fn save_scope(provider: ProviderId, pinned_id: &str) -> Result<ProviderScopeStatus, String> {
-    let cleaned = pinned_id.trim();
-    scope_entry(provider)?
-        .set_password(cleaned)
-        .map_err(|_| vault_error("save"))?;
-    scope_status(provider)
-}
-
-pub fn delete_scope(provider: ProviderId) -> Result<ProviderScopeStatus, String> {
-    match scope_entry(provider)?.delete_credential() {
-        Ok(()) | Err(KeyringError::NoEntry) => {}
-        Err(_) => return Err(vault_error("delete")),
-    }
-    scope_status(provider)
-}
-
-pub fn read_scope(provider: ProviderId) -> Result<Option<String>, String> {
-    match scope_entry(provider)?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(_) => Err(vault_error("read")),
-    }
-}
-
-pub fn scope_status(provider: ProviderId) -> Result<ProviderScopeStatus, String> {
-    match read_scope(provider) {
-        Ok(Some(value)) => Ok(ProviderScopeStatus {
-            provider,
-            configured: true,
-            pinned_id: Some(value),
-            label: provider_scope_label(provider).into(),
-            message: None,
-        }),
-        Ok(None) => Ok(ProviderScopeStatus {
-            provider,
-            configured: false,
-            pinned_id: None,
-            label: provider_scope_label(provider).into(),
-            message: Some(provider_scope_missing_message(provider).into()),
-        }),
-        Err(e) => Ok(ProviderScopeStatus {
-            provider,
-            configured: false,
-            pinned_id: None,
-            label: provider_scope_label(provider).into(),
-            message: Some(e),
-        }),
-    }
-}
-
-pub fn all_scope_statuses() -> Result<Vec<ProviderScopeStatus>, String> {
-    Ok(vec![
-        scope_status(ProviderId::Cloudflare)?,
-        scope_status(ProviderId::Scaleway)?,
-    ])
-}
-
-fn provider_scope_label(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Cloudflare => "Cloudflare account id",
-        ProviderId::Scaleway => "Scaleway project id",
-    }
-}
-
-fn provider_scope_missing_message(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Cloudflare => {
-            "Optional. Required only when the token can see multiple Cloudflare accounts."
-        }
-        ProviderId::Scaleway => {
-            "Optional. Required only when multiple accessible projects normalize to aspis-bio."
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2354,39 +1888,6 @@ mod tests {
         let _ = delete_oracle_llm_api_key();
     }
 
-    #[test]
-    fn cloudflare_agent_profile_ids_are_role_least_privilege() {
-        // Orchestrator is plan/read-only for Cloudflare tokens (audit F-04-020).
-        assert_eq!(
-            cloudflare_agent_token_profile_ids_for_role("orchestrator"),
-            &["verifier-readonly"]
-        );
-        // Verifier remains strictly read-only.
-        assert_eq!(
-            cloudflare_agent_token_profile_ids_for_role("verifier"),
-            &["verifier-readonly"]
-        );
-        // Coder gets only its scoped write profile.
-        assert_eq!(
-            cloudflare_agent_token_profile_ids_for_role("coder"),
-            &["coder-worker-write"]
-        );
-        // No role receives the secrets-rotator profile via this path.
-        for role in ["orchestrator", "verifier", "coder", "unknown"] {
-            assert!(
-                !cloudflare_agent_token_profile_ids_for_role(role).contains(&"secrets-rotator"),
-                "role {role} must never receive the secrets-rotator profile"
-            );
-        }
-        // Unknown roles get nothing.
-        assert!(cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
-    }
-
-    /// The dedicated-key scope is a STORAGE SLOT: it must be STABLE across
-    /// base_url edits for the same provider (a user has one key per provider),
-    /// and DIFFER across providers. Regression guard for the bug where the
-    /// scope included base_url, moving the key to a different slot whenever the
-    /// user edited their endpoint URL.
     #[test]
     fn oracle_llm_key_scope_is_stable_across_base_url_and_differs_by_provider() {
         let openai = OracleLlmSettings {
@@ -3289,6 +2790,37 @@ mod tests {
         }
     }
 
+    /// H2-3: websearch key save must reject control characters (same as cloud LLM keys)
+    /// without leaking the rejected value into the status message / JSON.
+    #[test]
+    fn websearch_save_rejects_control_characters_without_leaking() {
+        let with_ctrl = "brave-key\u{0001}suffix-long-enough";
+        let status = save_websearch_key("brave", with_ctrl).expect("status not Err");
+        assert!(!status.configured);
+        assert_eq!(status.status, "error");
+        assert!(
+            status
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("control characters"),
+            "expected control-char message, got: {:?}",
+            status.message
+        );
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains('\u{0001}'));
+        assert!(!json.contains("brave-key"));
+        // CR / DEL also rejected.
+        let with_cr = save_websearch_key("brave", "brave-key\rsuffix-long-enough").expect("status");
+        assert!(!with_cr.configured);
+        assert_eq!(with_cr.status, "error");
+        let with_del = save_websearch_key("brave", "brave-key\u{007f}suffix-long-enough")
+            .expect("status");
+        assert!(!with_del.configured);
+        assert_eq!(with_del.status, "error");
+    }
+
+    /// H2-4: generic provider token paste rejects whitespace / control (pre-keyring).
     #[test]
     fn websearch_key_status_returns_present_absent_only() {
         // Exa reuses the legacy `provider:exa` entry. Present/absent status

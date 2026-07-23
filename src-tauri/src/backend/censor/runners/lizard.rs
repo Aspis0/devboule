@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::lizard_complexity;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -93,14 +93,14 @@ pub fn parse_lizard(stdout: &str, threshold: u32) -> Vec<RawFinding> {
 /// Run lizard on a single file from the project root, CSV output, default
 /// threshold. Absent `lizard` → empty. `--` ends flag parsing so a `-`-leading
 /// file name is never read as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("lizard") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture("lizard", &["--csv", "--", &target.file_rel_path], root);
     match stdout {
-        Some(s) => parse_lizard(&s, DEFAULT_CCN_THRESHOLD),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_lizard(&s, DEFAULT_CCN_THRESHOLD)),
+        None => RunnerOutcome::Failed,
     }
 }
 

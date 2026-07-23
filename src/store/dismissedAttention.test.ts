@@ -14,7 +14,7 @@
 //   (j) cap drops oldest when exceeding max
 //
 // Environment: vitest `environment: "node"` — inject minimal fake window/
-// localStorage (same pattern as dismissedRisks.test.ts).
+// localStorage (in-memory store).
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { AgentSession } from "../types/backend";

@@ -32,7 +32,7 @@
 use super::super::severity::severity_from_cppcheck;
 use super::{
     cap, redact_secrets, run_capture_stderr_with_timeout, split_file_and_line, Granularity,
-    RawFinding, RunTarget,
+    RawFinding, RunnerOutcome, RunTarget,
 };
 use super::DEFAULT_RUNNER_TIMEOUT;
 use std::path::Path;
@@ -116,9 +116,9 @@ fn parse_cppcheck_line(line: &str) -> Option<RawFinding> {
 /// stderr stream with the default per-file timeout. The file path is the orchestrator-
 /// validated project-relative path (a leading-`-` component is rejected upstream by
 /// `validate_rel_path`, so it can't be mistaken for a flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("cppcheck") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stderr = run_capture_stderr_with_timeout(
         "cppcheck",
@@ -133,8 +133,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stderr {
-        Some(s) => parse_cppcheck(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_cppcheck(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -290,7 +290,7 @@ a.cpp:2:performance:perf:slow construct
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("cppcheck") {
             // The toolchain SHOULD flag the null deref; we assert at least one finding
             // and that every finding is well-formed (source + advisory severity cap).

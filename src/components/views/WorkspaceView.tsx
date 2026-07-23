@@ -134,7 +134,7 @@ export function WorkspaceView() {
   >(null);
   const [decryptPath, setDecryptPath] = useState("");
   // Collaborator X path: pull the encrypted .aspiswspkg straight from a cloud URL
-  // (e.g. a Scaleway/S3 presigned link) instead of downloading it by hand. On
+  // (e.g. an HTTPS/S3 presigned link) instead of downloading it by hand. On
   // success we auto-fill the decrypt path with the saved local file.
   const [downloadUrl, setDownloadUrl] = useState("");
   const [isDownloading, setIsDownloading] = useState(false);
@@ -717,6 +717,14 @@ function CustomAgentClientsCard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // Latest list for re-read-before-write; overlapping add/remove must not both
+  // snapshot the same React `clients` and last-write-wins-drop an entry.
+  const clientsRef = useRef(clients);
+  clientsRef.current = clients;
+  // Serialize full-array replaces so concurrent mutations apply in order.
+  const persistChainRef = useRef(Promise.resolve());
+  // Sync inflight: React `busy` commits a tick late; gate double-clicks here.
+  const persistInflightRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -742,35 +750,58 @@ function CustomAgentClientsCard() {
     commandDraft.length > 0 && Boolean(validation.errors.command);
 
   const persist = useCallback(
-    async (next: CustomAgentClient[]) => {
-      setBusy(true);
-      setError(null);
-      try {
-        await invokeBackendCommand<CustomAgentClient[]>(
-          "set_custom_agent_clients",
-          { clients: next },
-        );
-        await refreshConfig();
-      } catch (e) {
+    (mutate: (current: CustomAgentClient[]) => CustomAgentClient[]) => {
+      const run = async () => {
+        persistInflightRef.current = true;
         if (mountedRef.current) {
-          setError(
-            e instanceof Error
-              ? e.message
-              : "Could not save custom agent CLIs.",
-          );
+          setBusy(true);
+          setError(null);
         }
-        throw e;
-      } finally {
-        if (mountedRef.current) setBusy(false);
-      }
+        try {
+          // Re-read latest list at write time (not the React closure snapshot).
+          const next = mutate(clientsRef.current);
+          await invokeBackendCommand<CustomAgentClient[]>(
+            "set_custom_agent_clients",
+            { clients: next },
+          );
+          // Optimistic baseline so a chained mutation does not re-read the
+          // pre-write snapshot while refreshConfig is still in flight.
+          clientsRef.current = next;
+          await refreshConfig();
+        } catch (e) {
+          if (mountedRef.current) {
+            setError(
+              e instanceof Error
+                ? e.message
+                : "Could not save custom agent CLIs.",
+            );
+          }
+          throw e;
+        } finally {
+          persistInflightRef.current = false;
+          if (mountedRef.current) setBusy(false);
+        }
+      };
+      const queued = persistChainRef.current.then(run, run);
+      // Keep the chain alive after a rejection so later mutations still run.
+      persistChainRef.current = queued.then(
+        () => undefined,
+        () => undefined,
+      );
+      return queued;
     },
     [refreshConfig],
   );
 
   const addClient = async () => {
     if (!validation.ok || !validation.value) return;
+    const toAdd = validation.value;
     try {
-      await persist([...clients, validation.value]);
+      // Re-read-before-write via clientsRef + persist chain; id-dedupe so a
+      // double-click cannot insert the same CLI twice.
+      await persist((current) =>
+        current.some((c) => c.id === toAdd.id) ? current : [...current, toAdd],
+      );
       if (!mountedRef.current) return;
       setLabelDraft("");
       setIdDraft("");
@@ -783,7 +814,7 @@ function CustomAgentClientsCard() {
 
   const removeClient = async (id: string) => {
     try {
-      await persist(clients.filter((client) => client.id !== id));
+      await persist((current) => current.filter((client) => client.id !== id));
     } catch {
       // Error surfaced by persist.
     }
@@ -1549,7 +1580,7 @@ function WorkspaceBootstrapPanel({
               onChange={(event) => onDownloadUrlChange(event.target.value)}
               placeholder="https://… link to the encrypted .aspiswspkg"
               data-help-title="Fetch the encrypted package straight from a cloud URL."
-              data-help-lines="For a collaborator who does not have the Devboule folder yet.|Paste an https link (e.g. a Scaleway/S3 presigned URL) to the .aspiswspkg.|The app downloads the encrypted bytes only — it never trusts them; the normal signature-verified decrypt still runs.|On success the local path is filled in below, ready to decrypt."
+              data-help-lines="For a collaborator who does not have the Devboule folder yet.|Paste an https link (e.g. an HTTPS/S3 presigned URL) to the .aspiswspkg.|The app downloads the encrypted bytes only — it never trusts them; the normal signature-verified decrypt still runs.|On success the local path is filled in below, ready to decrypt."
               className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-white px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
             />
             <button

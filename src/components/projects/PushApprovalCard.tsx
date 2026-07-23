@@ -49,6 +49,9 @@ export function PushApprovalCard({ projectId }: PushApprovalCardProps) {
   // FIX F11: the auto-dismiss timer for the last-resolved result line, so we can
   // clear it on unmount / on the next action (no stale timer, no setState-after-unmount).
   const resolvedTimerRef = useRef<number | null>(null);
+  // Monotonic generation: only the latest list response may write state
+  // (mirrors ChangesDockTab — a slow poll must not overwrite a fresher post-approve list).
+  const pollGenRef = useRef(0);
 
   const clearResolvedTimer = useCallback(() => {
     if (resolvedTimerRef.current !== null) {
@@ -61,17 +64,20 @@ export function PushApprovalCard({ projectId }: PushApprovalCardProps) {
     // In-flight guard: never overlap two list fetches (a slow tick must not stack).
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    const gen = ++pollGenRef.current;
     try {
       const all = await invokeBackendCommand<GitPushRequest[]>(
         "git_push_requests_list",
       );
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || gen !== pollGenRef.current) return;
       setRequests(pendingPushRequestsForProject(all, projectId));
     } catch {
       // A degraded fetch must not crash the card; keep the prior pending list.
-      if (mountedRef.current) setRequests((prev) => prev);
+      if (mountedRef.current && gen === pollGenRef.current) {
+        setRequests((prev) => prev);
+      }
     } finally {
-      inFlightRef.current = false;
+      if (gen === pollGenRef.current) inFlightRef.current = false;
     }
   }, [projectId]);
 
@@ -84,6 +90,7 @@ export function PushApprovalCard({ projectId }: PushApprovalCardProps) {
     }, POLL_INTERVAL_MS);
     return () => {
       mountedRef.current = false;
+      pollGenRef.current++;
       window.clearInterval(id);
       clearResolvedTimer();
     };

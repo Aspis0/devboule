@@ -12,11 +12,16 @@ use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::answer::context::redact_secret_tokens;
 use crate::config;
 use crate::ingest::retrieval_text;
 use crate::query::lexical::{self, ScoredChunk};
 use crate::store::lance::{hash_embed, LanceHit, LanceStore};
 use crate::store::sqlite::{FileChunk, NodeCard, SqliteStore};
+
+/// Hard cap on chunks materialized/scored on the lexical path per query.
+/// Prevents O(corpus) RAM spikes under concurrent agent retrieval.
+const MAX_LEXICAL_SCAN: usize = 10_000;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Traits
@@ -290,7 +295,8 @@ impl From<&FileChunk> for ChunkPreview {
             chunk_index: c.chunk_index,
             start_char: c.start_char,
             end_char: c.end_char,
-            text: c.text.clone(),
+            // Redact at the preview/serialization boundary (same as ContextChunk).
+            text: redact_secret_tokens(&c.text),
             kind: c.kind.clone(),
             symbol_name: c.symbol_name.clone(),
             signature: c.signature.clone(),
@@ -510,13 +516,14 @@ impl QueryEngine {
         imports: Option<&[String]>,
         module: Option<&str>,
     ) -> Result<Vec<ContextChunk>> {
+        let limit = limit.clamp(1, config::MAX_BOUNDED_LIMIT);
         let mut combined: HashMap<String, ContextChunk> = HashMap::new();
 
         // ── Dense path ───────────────────────────────────────────────
         if !prefer_lexical {
             if let Some(ref chunk_vectors) = self.chunk_vectors {
                 let query_vec = self.embed_query(embedder, query).await?;
-                let hits = chunk_vectors.search(&query_vec, limit.max(1)).await?;
+                let hits = chunk_vectors.search(&query_vec, limit).await?;
                 for hit in hits {
                     if let Some(chunk) = self.sqlite.get_chunk(&hit.id)? {
                         if allowed_file_ids.is_none_or(|ids| ids.contains(&chunk.file_id))
@@ -533,8 +540,18 @@ impl QueryEngine {
             }
         }
 
-        // ── Lexical path ─────────────────────────────────────────────
-        let all_chunks = self.sqlite.all_chunks()?;
+        // ── Lexical path (bounded scan — never materialize the full corpus) ─
+        // Prefer dense when available: lexical still runs for hybrid merge, but
+        // only over a hard-capped window so concurrent queries cannot OOM.
+        let total_chunks = self.sqlite.chunk_count().unwrap_or(0);
+        let scan_cap = MAX_LEXICAL_SCAN;
+        if total_chunks > scan_cap {
+            eprintln!(
+                "[oracle] lexical scan truncated: corpus has {total_chunks} chunks, \
+                 scanning at most {scan_cap} (not full coverage)"
+            );
+        }
+        let all_chunks = self.sqlite.all_chunks_limited(scan_cap)?;
         let filtered: Vec<FileChunk> = all_chunks
             .into_iter()
             .filter(|c| allowed_file_ids.is_none_or(|ids| ids.contains(&c.file_id)))
@@ -586,10 +603,14 @@ impl QueryEngine {
         module: Option<&str>,
         group_by_file: bool,
     ) -> Result<AskResponse> {
+        // Bound every public limit before fan-out (MCP/HTTP should already
+        // clamp; this is defense-in-depth for library callers).
+        let bounded_limit = limit.clamp(1, config::MAX_BOUNDED_LIMIT);
+
         let context_chunks = self
             .context(
                 query,
-                limit.max(1),
+                bounded_limit,
                 embedder,
                 allowed_file_ids,
                 prefer_lexical,
@@ -612,8 +633,8 @@ impl QueryEngine {
         let vector_scores: HashMap<String, f64> = if prefer_lexical {
             HashMap::new()
         } else {
-            let count = self.vectors.count().await?;
-            let search_limit = count.max(limit);
+            // Was `count.max(limit)` — that scanned the entire node store.
+            let search_limit = (bounded_limit.saturating_mul(4)).clamp(1, config::MAX_BOUNDED_LIMIT);
             let qv = self.embed_query(embedder, query).await?;
             let hits = self.vectors.search(&qv, search_limit).await?;
             hits.into_iter().map(|h| (h.id, h.score as f64)).collect()
@@ -624,7 +645,10 @@ impl QueryEngine {
             (HashMap::new(), HashMap::new())
         } else {
             let qv = self.embed_query(embedder, query).await?;
-            self.chunk_scores(&qv, (30).max(limit * 8), allowed_file_ids)
+            let chunk_limit = (30usize)
+                .max(bounded_limit.saturating_mul(8))
+                .min(config::MAX_BOUNDED_LIMIT.saturating_mul(8));
+            self.chunk_scores(&qv, chunk_limit, allowed_file_ids)
                 .await?
         };
 
@@ -685,7 +709,7 @@ impl QueryEngine {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        let effective_limit = limit.max(1);
+        let effective_limit = bounded_limit;
         let results: Vec<ResultEntry> = rows
             .iter()
             .take(effective_limit)
@@ -738,6 +762,7 @@ impl QueryEngine {
 
     /// Similar nodes: node-card store first, file_vectors fallback.
     pub async fn similar(&self, node_id: &str, limit: usize) -> Result<Vec<ResultEntry>> {
+        let limit = limit.clamp(1, config::MAX_BOUNDED_LIMIT);
         let hits = self.vectors.similar(node_id, limit).await?;
         if !hits.is_empty() {
             return Ok(hits
@@ -1240,7 +1265,9 @@ impl ContextChunk {
             end_char: chunk.end_char as usize,
             score,
             retrieval: retrieval.to_string(),
-            text: chunk.text.clone(),
+            // Redact at the retrieval serialization boundary so every rail
+            // (MCP/HTTP context, extractive answers, previews) gets safe text.
+            text: redact_secret_tokens(&chunk.text),
             last_modified: chunk.ultima_modifica.clone(),
             kind: chunk.kind.clone(),
             symbol_name: chunk.symbol_name.clone(),
@@ -1374,5 +1401,45 @@ mod tests {
 
         let terms2: HashSet<String> = ["hello", "world"].iter().map(|s| s.to_string()).collect();
         assert!(!is_frontend_view_query(&terms2));
+    }
+
+    #[test]
+    fn context_chunk_redacts_secret_tokens_at_boundary() {
+        let chunk = FileChunk {
+            id: "f#chunk-0000".into(),
+            file_id: "f".into(),
+            chunk_index: 0,
+            start_char: 0,
+            end_char: 40,
+            text: r#"password = "hunter2secret""#.into(),
+            file_sorgente: "src/x.py".into(),
+            ultima_modifica: String::new(),
+            embedding_dims: 0,
+            kind: "function".into(),
+            symbol_name: "x".into(),
+            signature: String::new(),
+            line_start: 1,
+            line_end: 1,
+            language: "python".into(),
+            symbols_used: vec![],
+        };
+        let ctx = ContextChunk::from_file_chunk(&chunk, 1.0, "lexical");
+        assert!(
+            !ctx.text.contains("hunter2secret"),
+            "raw secret must not leave the retrieval boundary: {}",
+            ctx.text
+        );
+        assert!(ctx.text.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn bounded_limit_clamps_to_max() {
+        assert_eq!(1usize.clamp(1, config::MAX_BOUNDED_LIMIT), 1);
+        assert_eq!(5usize.clamp(1, config::MAX_BOUNDED_LIMIT), 5);
+        assert_eq!(
+            10_000usize.clamp(1, config::MAX_BOUNDED_LIMIT),
+            config::MAX_BOUNDED_LIMIT
+        );
+        assert_eq!(0usize.clamp(1, config::MAX_BOUNDED_LIMIT), 1);
     }
 }

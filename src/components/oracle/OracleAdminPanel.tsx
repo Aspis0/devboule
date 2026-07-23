@@ -88,7 +88,6 @@ export function OracleAdminPanel() {
     oracleLlmSettings,
     oracleIndexPreferences,
     oracleIndexStatus,
-    secretStatuses,
     refreshOracleRuntime,
     refreshOracleLlmSettings,
     refreshOracleIndexStatus,
@@ -372,8 +371,8 @@ export function OracleAdminPanel() {
   // Lifted into the shared oracleProviderState util so the future Polis ask-panel
   // agrees with this admin surface.
   const providerConfigured = useMemo(
-    () => deriveProviderConfigured(oracleLlmSettings, secretStatuses),
-    [oracleLlmSettings, secretStatuses],
+    () => deriveProviderConfigured(oracleLlmSettings),
+    [oracleLlmSettings],
   );
 
   // Debounced runtime-readiness so a KNOWN transient restart does not flash red.

@@ -17,7 +17,7 @@
 //! against real `codex app-server` output in e2e (the app-server likely needs an
 //! `initialize`/`newThread` handshake before `sendUserMessage`, which is NOT implemented).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{Emitter, Manager, State};
 
@@ -112,6 +112,9 @@ pub fn encode_user_turn(provider: Provider, msg: &str) -> String {
 
 /// A live duplex session: the child (shared so the reader OR kill reaps it once), its stdin (for
 /// steering), the reader thread, and an exited flag.
+///
+/// Registered into the session map as soon as the child is spawned (before handshake/reader
+/// setup) so `kill_cloud_duplex` can reap a keyed child during the TOCTOU window.
 struct DuplexSession {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -119,6 +122,10 @@ struct DuplexSession {
     /// (see `append_user_echo`). Empty when the launch had no bridge.
     activity_file: PathBuf,
     reader: Option<JoinHandle<()>>,
+    /// Codex `initialize`→`thread/start` driver. Joined on kill (with a budget) after cancel.
+    handshake: Option<JoinHandle<()>>,
+    /// Set on kill so the handshake driver exits promptly instead of parking up to 30s.
+    handshake_cancel: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
     provider: Provider,
     /// Owning project id — carried so the reader thread can stamp `ConsentRequest.project_id`
@@ -128,6 +135,37 @@ struct DuplexSession {
     /// Codex JSON-RPC correlator. `Some` only for Codex sessions; `None` for Claude (the
     /// Claude path keeps its byte-identical NDJSON behaviour and never touches this).
     codex: Option<Arc<CodexClient>>,
+}
+
+/// Owns a just-spawned `Child` until the session is registered (or the child is explicitly
+/// released). Drop kills+waits so a failed post-spawn setup never orphans a process that holds
+/// API keys in its env.
+struct KillOnDrop {
+    child: Option<Child>,
+}
+
+impl KillOnDrop {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("KillOnDrop already disarmed")
+    }
+
+    /// Release ownership without killing (caller now owns the Child).
+    fn disarm(mut self) -> Child {
+        self.child.take().expect("KillOnDrop already disarmed")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 /// Tauri-managed map of agent_id -> live duplex session. Registered in lib.rs via `.manage(...)`.
@@ -217,6 +255,31 @@ fn reap_child(child: &Arc<Mutex<Option<Child>>>, kill: bool) {
     }
 }
 
+/// Drop pending JSON-RPC response waiters and cancel every in-flight Codex approval so
+/// handshake / approval-waiter threads exit promptly on kill or reader EOF.
+fn cancel_codex_session_waiters(app: &tauri::AppHandle, codex: &CodexClient) {
+    codex.cancel_all_pending();
+    let ids = codex.drain_approvals();
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(cc) = app.try_state::<crate::backend::broker::CloudConsentState>() {
+        for id in ids {
+            cc.cancel(&id);
+        }
+    }
+}
+
+/// Join a worker thread, abandoning the join after `budget` so kill paths cannot stall.
+fn join_with_budget(handle: JoinHandle<()>, budget: Duration) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(budget);
+}
+
 /// Spawn `program args` as a PIPED child speaking the duplex protocol for `provider`, stream its
 /// normalized activity into `activity_file`, and (if `initial_goal` is set) send it as the first
 /// user turn. The session is registered under `agent_id` (an existing one is killed+replaced).
@@ -259,21 +322,26 @@ pub fn spawn_cloud_duplex(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+    // Kill+wait on any early return after spawn (stdin/stdout take failure, lock poison, …)
+    // so a keyed child with vault API keys in its env is never orphaned untracked.
+    let mut guard = KillOnDrop::new(child);
 
-    let child_stdin = child
+    let child_stdin = guard
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| "child stdin unavailable".to_string())?;
-    let child_stdout = child
+    let child_stdout = guard
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| "child stdout unavailable".to_string())?;
-    let child_stderr = child.stderr.take();
+    let child_stderr = guard.child_mut().stderr.take();
     let stdin = Arc::new(Mutex::new(child_stdin));
-    let child = Arc::new(Mutex::new(Some(child)));
+    let child = Arc::new(Mutex::new(Some(guard.disarm())));
 
     // Codex sessions get a JSON-RPC correlator shared between the handshake driver, the reader
     // dispatcher, and the steering path. Claude sessions keep `None` (NDJSON, no correlation).
@@ -281,6 +349,37 @@ pub fn spawn_cloud_duplex(
         Provider::Codex => Some(Arc::new(CodexClient::new())),
         Provider::Claude | Provider::OpenAi => None,
     };
+
+    let exited = Arc::new(AtomicBool::new(false));
+    let handshake_cancel = Arc::new(AtomicBool::new(false));
+
+    // Register the child BEFORE handshake/reader setup so kill_cloud_duplex covers the
+    // TOCTOU window between spawn and full session readiness.
+    {
+        let session = DuplexSession {
+            child: Arc::clone(&child),
+            stdin: Arc::clone(&stdin),
+            activity_file: activity_file.clone(),
+            reader: None,
+            handshake: None,
+            handshake_cancel: Arc::clone(&handshake_cancel),
+            exited: Arc::clone(&exited),
+            provider,
+            project_id: project_id.to_string(),
+            codex: codex.clone(),
+        };
+        match sessions.inner.lock() {
+            Ok(mut map) => {
+                map.insert(agent_id.to_string(), session);
+            }
+            Err(_) => {
+                reap_child(&child, true);
+                return Err(
+                    "could not register the cloud orchestrator session (state lock poisoned)".into(),
+                );
+            }
+        }
+    }
 
     match provider {
         // Claude / OpenAi: send the opening goal as the first user turn inline (byte-identical
@@ -329,8 +428,9 @@ pub fn spawn_cloud_duplex(
                 .map(str::to_string);
             let initial_goal_msg_id_owned: Option<String> = initial_goal_msg_id.map(str::to_string);
             let resume_context_owned: Option<String> = resume_context.map(str::to_string);
+            let cancel_driver = Arc::clone(&handshake_cancel);
 
-            let _ = std::thread::Builder::new()
+            if let Ok(handle) = std::thread::Builder::new()
                 .name(format!("cloud-duplex-codex-handshake-{agent_id}"))
                 .spawn(move || {
                     codex_handshake_driver(
@@ -343,12 +443,26 @@ pub fn spawn_cloud_duplex(
                         initial_goal_owned,
                         initial_goal_msg_id_owned,
                         resume_context_owned,
+                        cancel_driver,
                     );
-                });
+                })
+            {
+                if let Ok(mut map) = sessions.inner.lock() {
+                    if let Some(s) = map.get_mut(agent_id) {
+                        s.handshake = Some(handle);
+                    } else {
+                        // Killed during setup — abandon the handshake handle (cancel already set
+                        // by kill, or set it now so the driver exits on its next poll).
+                        handshake_cancel.store(true, Ordering::SeqCst);
+                        join_with_budget(handle, Duration::from_secs(2));
+                    }
+                } else {
+                    handshake_cancel.store(true, Ordering::SeqCst);
+                    join_with_budget(handle, Duration::from_secs(2));
+                }
+            }
         }
     }
-
-    let exited = Arc::new(AtomicBool::new(false));
 
     // stderr → a single milestone line so a CLI launch failure (bad key, model not found, denied
     // by --permission-mode) is visible in the Stage instead of a silent blank panel.
@@ -385,7 +499,14 @@ pub fn spawn_cloud_duplex(
         let child = child.clone();
         // A separate handle for the error path (the one above is moved into the thread closure).
         let child_err = child.clone();
+        // `app` / `agent_id` are moved into the reader closure below; the reader-start error path
+        // needs its own copies to reap the child and drop the pending map entry.
+        let err_app = app.clone();
+        let err_agent_id = agent_id.clone();
         let activity_file = activity_file.clone();
+        // Same flag kill uses: set on EOF so the handshake driver does not write a bogus
+        // "timed out" milestone after a clean child close.
+        let reader_handshake_cancel = Arc::clone(&handshake_cancel);
         // Codex-only: the correlator (for responses) + a stdin handle (to write approval results).
         // `None` for Claude — the reader then takes the byte-identical normalizer-only path.
         let reader_codex = codex.clone();
@@ -415,15 +536,15 @@ pub fn spawn_cloud_duplex(
                 // their own, so stamp the session's last_seen_at from the OUTPUT
                 // stream — any line proves the child is alive. Throttled so a token
                 // storm costs one locked state write per minute, not per token.
-                let mut last_touch = std::time::Instant::now();
+                let mut last_touch = Instant::now();
                 for line in BufReader::new(child_stdout).lines() {
                     let Ok(line) = line else { break };
                     if line.trim().is_empty() {
                         continue;
                     }
-                    if last_touch.elapsed() >= std::time::Duration::from_secs(60) {
+                    if last_touch.elapsed() >= Duration::from_secs(60) {
                         crate::backend::agents::touch_agent_session(&app, &agent_id, None);
-                        last_touch = std::time::Instant::now();
+                        last_touch = Instant::now();
                     }
                     // Codex JSON-RPC dispatch: peek the line; route responses to the correlator and
                     // approval server-requests to the bridge. Everything else (and any non-JSON
@@ -483,54 +604,73 @@ pub fn spawn_cloud_duplex(
                         }
                     }
                 }
-                // EOF: the child closed stdout (exited / was killed). Reap it (no-op if kill
-                // already took it), remove ourselves from the registry, and mark the UI closed.
-                // NOTE: any in-flight Codex approval-waiter threads are NOT cancelled here; they
-                // linger up to CODEX_APPROVAL_TIMEOUT (120s) before auto-declining, then write to
-                // the dead child's stdin (the write fails harmlessly). A future slice may track the
-                // session's pending approval_ids and `cancel()` them on kill to drop the waiters
-                // eagerly.
+                // EOF: the child closed stdout (exited / was killed). Mirror kill_cloud_duplex:
+                // set handshake_cancel BEFORE cancelling waiters so the handshake driver does not
+                // write a bogus "timed out" milestone on a clean close; cancel Codex waiters so
+                // approval threads do not linger; reap the child (no-op if kill already took it);
+                // remove ourselves from the registry (joining the handshake handle with a budget
+                // so it is not detached for ~30s); and mark the UI closed.
+                reader_handshake_cancel.store(true, Ordering::SeqCst);
+                if let Some(codex) = reader_codex.as_ref() {
+                    cancel_codex_session_waiters(&app, codex);
+                }
                 exited.store(true, Ordering::SeqCst);
                 reap_child(&child, false);
                 if let Some(sessions) = app.try_state::<CloudDuplexSessions>() {
                     if let Ok(mut map) = sessions.inner.lock() {
-                        map.remove(&agent_id);
+                        if let Some(mut session) = map.remove(&agent_id) {
+                            if let Some(handshake) = session.handshake.take() {
+                                join_with_budget(handshake, Duration::from_secs(2));
+                            }
+                        }
                     }
                 }
                 crate::backend::agents::mark_agent_session_closed_public(&app, &agent_id);
             })
             .map_err(|e| {
-                // Reader thread couldn't start — reap the child so it isn't left running with the
-                // API key in its env, then fail the launch.
+                // Reader thread couldn't start — reap the child, drop the pending map entry, and
+                // fail the launch so a keyed orphan with API keys never remains.
+                if let Some(codex) = codex.as_ref() {
+                    cancel_codex_session_waiters(&err_app, codex);
+                }
+                handshake_cancel.store(true, Ordering::SeqCst);
                 reap_child(&child_err, true);
+                if let Ok(mut map) = sessions.inner.lock() {
+                    if let Some(mut s) = map.remove(&err_agent_id) {
+                        if let Some(h) = s.handshake.take() {
+                            join_with_budget(h, Duration::from_secs(2));
+                        }
+                    }
+                }
                 format!("failed to start reader thread: {e}")
             })?
     };
 
-    let session = DuplexSession {
-        child,
-        stdin,
-        activity_file: activity_file.clone(),
-        reader: Some(reader),
-        exited,
-        provider,
-        project_id: project_id.to_string(),
-        codex,
-    };
+    // Attach the reader handle to the already-registered session. If kill removed us mid-setup,
+    // join the orphaned reader and report failure (child was already reaped by kill).
     match sessions.inner.lock() {
         Ok(mut map) => {
-            map.insert(agent_id.to_string(), session);
-            // The duplex spawn IS this session's registration: cloud CLIs never call
-            // agent_register, so without this promotion the session sat in
-            // launch_pending forever with a frozen last_seen_at and the frontend's
-            // recency filter eventually dropped it mid-conversation.
-            crate::backend::agents::touch_agent_session(app, agent_id, Some("active"));
-            Ok(())
+            if let Some(s) = map.get_mut(agent_id) {
+                s.reader = Some(reader);
+                // The duplex spawn IS this session's registration: cloud CLIs never call
+                // agent_register, so without this promotion the session sat in
+                // launch_pending forever with a frozen last_seen_at and the frontend's
+                // recency filter eventually dropped it mid-conversation.
+                crate::backend::agents::touch_agent_session(app, agent_id, Some("active"));
+                Ok(())
+            } else {
+                let _ = reader.join();
+                Err("cloud orchestrator session was stopped during spawn".into())
+            }
         }
         Err(_) => {
-            // Can't register (poisoned lock) — kill the child so it can't keep running
-            // uncontrollable with the API key, and report the failure (never a false Ok).
-            reap_child(&session.child, true);
+            // Poisoned lock — kill the child so it can't keep running with the API key.
+            if let Some(codex) = codex.as_ref() {
+                cancel_codex_session_waiters(app, codex);
+            }
+            handshake_cancel.store(true, Ordering::SeqCst);
+            reap_child(&child, true);
+            let _ = reader.join();
             Err("could not register the cloud orchestrator session (state lock poisoned)".into())
         }
     }
@@ -663,7 +803,8 @@ pub fn project_cloud_orchestrator_interrupt(
 }
 
 /// Kill + reap a duplex child (idempotent; no-op if absent). The child handle is shared with the
-/// reader thread, so whichever runs first reaps it exactly once.
+/// reader thread, so whichever runs first reaps it exactly once. Also cancels the Codex handshake
+/// driver and any in-flight approval waiters so they do not linger on their timeouts.
 pub fn kill_cloud_duplex(app: &tauri::AppHandle, sessions: &CloudDuplexSessions, agent_id: &str) {
     let session = sessions
         .inner
@@ -673,9 +814,17 @@ pub fn kill_cloud_duplex(app: &tauri::AppHandle, sessions: &CloudDuplexSessions,
     let had_session = session.is_some();
     if let Some(mut session) = session {
         session.exited.store(true, Ordering::SeqCst);
+        session.handshake_cancel.store(true, Ordering::SeqCst);
+        if let Some(codex) = session.codex.as_ref() {
+            cancel_codex_session_waiters(app, codex);
+        }
         // Kill via the shared handle (the OS then closes the child's stdout → the reader hits EOF
         // and exits). No map lock is held here, so the reader can remove itself without blocking.
         reap_child(&session.child, true);
+        if let Some(handshake) = session.handshake.take() {
+            // Cancel drops pending response senders → driver unblocks; budget bounds a hang.
+            join_with_budget(handshake, Duration::from_secs(2));
+        }
         if let Some(reader) = session.reader.take() {
             let _ = reader.join();
         }
@@ -826,10 +975,36 @@ fn write_codex_line(stdin: &Arc<Mutex<ChildStdin>>, line: &str) -> bool {
     }
 }
 
+/// Wait for a JSON-RPC response, polling `cancel` so kill can abort without waiting the full
+/// timeout. Returns `Some(value)` on success, `None` on timeout / disconnect / cancel.
+fn wait_codex_response(
+    rx: &mpsc::Receiver<serde_json::Value>,
+    total: Duration,
+    cancel: &AtomicBool,
+) -> Option<serde_json::Value> {
+    let deadline = Instant::now() + total;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let slice = remaining.min(Duration::from_millis(100));
+        match rx.recv_timeout(slice) {
+            Ok(v) => return Some(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 /// Drive the Codex app-server handshake on its OWN thread: `initialize` → `thread/start` →
 /// (optional) opening `turn/start`. Each request blocks on its response with a timeout so a hung
 /// app-server can never park this thread forever. On any timeout / missing thread id it appends a
 /// milestone and returns (the session stays alive but cannot take turns until relaunched).
+/// `cancel` is set by `kill_cloud_duplex` so the driver exits promptly instead of lingering ~30s.
 #[allow(clippy::too_many_arguments)]
 fn codex_handshake_driver(
     codex: Arc<CodexClient>,
@@ -843,21 +1018,33 @@ fn codex_handshake_driver(
     initial_goal_msg_id: Option<String>,
     // D-resume: history prepended to the DELIVERED goal turn; the echo stays the goal.
     resume_context: Option<String>,
+    cancel: Arc<AtomicBool>,
 ) {
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
     // 1. initialize
     let id1 = codex.alloc_id();
     let rx1 = codex.register_response(id1);
     if !write_codex_line(&stdin, &encode_initialize(id1)) {
         // stdin lock poisoned — fail fast instead of waiting the full 30s for a reply that
         // can never come (nothing was written).
-        append_codex_milestone(
-            &activity_file,
-            "⚠ Codex handshake failed: could not write initialize",
-        );
+        if !cancel.load(Ordering::SeqCst) {
+            append_codex_milestone(
+                &activity_file,
+                "⚠ Codex handshake failed: could not write initialize",
+            );
+        }
         return;
     }
-    if rx1.recv_timeout(CODEX_HANDSHAKE_TIMEOUT).is_err() {
-        append_codex_milestone(&activity_file, "⚠ Codex handshake timed out (initialize)");
+    if wait_codex_response(&rx1, CODEX_HANDSHAKE_TIMEOUT, &cancel).is_none() {
+        if !cancel.load(Ordering::SeqCst) {
+            append_codex_milestone(&activity_file, "⚠ Codex handshake timed out (initialize)");
+        }
+        return;
+    }
+
+    if cancel.load(Ordering::SeqCst) {
         return;
     }
 
@@ -868,16 +1055,20 @@ fn codex_handshake_driver(
         &stdin,
         &encode_thread_start(id2, &cwd, model.as_deref(), &policy),
     ) {
-        append_codex_milestone(
-            &activity_file,
-            "⚠ Codex handshake failed: could not write thread/start",
-        );
+        if !cancel.load(Ordering::SeqCst) {
+            append_codex_milestone(
+                &activity_file,
+                "⚠ Codex handshake failed: could not write thread/start",
+            );
+        }
         return;
     }
-    let resp = match rx2.recv_timeout(CODEX_HANDSHAKE_TIMEOUT) {
-        Ok(resp) => resp,
-        Err(_) => {
-            append_codex_milestone(&activity_file, "⚠ Codex handshake timed out (thread/start)");
+    let resp = match wait_codex_response(&rx2, CODEX_HANDSHAKE_TIMEOUT, &cancel) {
+        Some(resp) => resp,
+        None => {
+            if !cancel.load(Ordering::SeqCst) {
+                append_codex_milestone(&activity_file, "⚠ Codex handshake timed out (thread/start)");
+            }
             return;
         }
     };
@@ -889,14 +1080,20 @@ fn codex_handshake_driver(
         .or_else(|| resp["result"]["thread_id"].as_str())
         .or_else(|| resp["result"]["id"].as_str());
     let Some(tid) = tid else {
-        append_codex_milestone(
-            &activity_file,
-            "⚠ Codex handshake failed: thread/start returned no thread id",
-        );
+        if !cancel.load(Ordering::SeqCst) {
+            append_codex_milestone(
+                &activity_file,
+                "⚠ Codex handshake failed: thread/start returned no thread id",
+            );
+        }
         return;
     };
     let tid = tid.to_string();
     codex.set_thread_id(tid.clone());
+
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
 
     // 3. opening goal as the first turn (fire-and-forget — no need to await the turn response;
     //    its streamed notifications drive the Stage like any other turn).
@@ -1044,6 +1241,8 @@ fn handle_codex_approval(
     append_codex_milestone(activity_file, "⏳ Codex is waiting for your approval");
 
     // Spawn the waiter so the reader keeps draining stdout (an approval must NEVER block reads).
+    // Track the id so kill/EOF can cancel it promptly instead of waiting CODEX_APPROVAL_TIMEOUT.
+    codex.track_approval(&approval_id);
     codex.inc_approval();
     let app_waiter = app.clone();
     let codex_waiter = codex.clone();
@@ -1066,10 +1265,18 @@ fn handle_codex_approval(
                     {
                         cc.cancel(&approval_id);
                     }
-                    append_codex_milestone(&activity_file, "⚠ Codex approval timed out — declined");
+                    // Only surface a timeout milestone when the session is still live; kill/EOF
+                    // cancel is silent (the turn is already dead).
+                    if codex_waiter.approval_still_tracked(&approval_id) {
+                        append_codex_milestone(
+                            &activity_file,
+                            "⚠ Codex approval timed out — declined",
+                        );
+                    }
                     CodexApprovalReply::Decline
                 }
             };
+            codex_waiter.untrack_approval(&approval_id);
             write_codex_line(
                 &stdin_waiter,
                 &encode_approval_result(&id_owned, reply.as_wire()),
@@ -1083,6 +1290,7 @@ fn handle_codex_approval(
     // future approval (a self-inflicted DoS). Also write an inline decline so this turn does not
     // hang, and cancel the just-registered waiter so no stale entry lingers.
     if spawn_res.is_err() {
+        codex.untrack_approval(&approval_id_fallback);
         codex.dec_approval();
         cloud_consent.cancel(&approval_id_fallback);
         write_codex_line(
@@ -1290,6 +1498,8 @@ pub struct CodexClient {
     /// Count of approval-waiter threads currently blocked on a human decision. Bounded by
     /// `MAX_INFLIGHT_APPROVALS` so a misbehaving Codex cannot exhaust the OS thread limit.
     in_flight_approvals: AtomicUsize,
+    /// Live approval_ids for this session; drained on kill/EOF so waiters exit promptly.
+    approval_ids: Mutex<HashSet<String>>,
     /// Per-session nonce (from `CODEX_SESSION_SEQ`) that disambiguates `approval_id`s across a
     /// relaunch of the same `agent_id`. Distinct per `CodexClient`; never changes after `new()`.
     session_nonce: u64,
@@ -1302,6 +1512,7 @@ impl CodexClient {
             pending: Mutex::new(HashMap::new()),
             thread_id: Mutex::new(None),
             in_flight_approvals: AtomicUsize::new(0),
+            approval_ids: Mutex::new(HashSet::new()),
             session_nonce: CODEX_SESSION_SEQ.fetch_add(1, Ordering::SeqCst),
         }
     }
@@ -1329,6 +1540,36 @@ impl CodexClient {
     /// Mark one approval-waiter thread as finished (called as the waiter exits).
     pub fn dec_approval(&self) {
         self.in_flight_approvals.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Record an in-flight approval_id so kill/EOF can cancel it.
+    pub fn track_approval(&self, approval_id: &str) {
+        let mut set = self.approval_ids.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(approval_id.to_string());
+    }
+
+    /// Drop a finished approval_id from the tracking set.
+    pub fn untrack_approval(&self, approval_id: &str) {
+        let mut set = self.approval_ids.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(approval_id);
+    }
+
+    /// True while `approval_id` is still tracked (not yet drained by kill/EOF).
+    pub fn approval_still_tracked(&self, approval_id: &str) -> bool {
+        let set = self.approval_ids.lock().unwrap_or_else(|e| e.into_inner());
+        set.contains(approval_id)
+    }
+
+    /// Take every tracked approval_id (for cancel-on-kill).
+    pub fn drain_approvals(&self) -> Vec<String> {
+        let mut set = self.approval_ids.lock().unwrap_or_else(|e| e.into_inner());
+        set.drain().collect()
+    }
+
+    /// Drop all pending response senders so handshake `recv` unblocks on kill.
+    pub fn cancel_all_pending(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.clear();
     }
 
     /// Register a waiter for the response to request `id`; returns the `Receiver` to block on.
@@ -1697,5 +1938,174 @@ mod tests {
         assert!(client.complete_response(5, serde_json::json!({"ok": true})));
         assert_eq!(rx.recv().unwrap(), serde_json::json!({"ok": true}));
         assert!(!client.complete_response(5, serde_json::json!({"ok": false})));
+    }
+
+    #[test]
+    fn kill_on_drop_reaps_child_when_not_disarmed() {
+        // Short-lived sleep; drop must kill+wait so the pid is gone (CRIT-11).
+        #[cfg(unix)]
+        let child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        #[cfg(windows)]
+        let child = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn ping")
+        };
+        let pid = child.id();
+        drop(KillOnDrop::new(child));
+        #[cfg(unix)]
+        {
+            // kill(pid, 0) succeeds only if a process with that pid still exists.
+            let still_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+            assert!(!still_alive, "KillOnDrop must kill the child on drop");
+        }
+        #[cfg(windows)]
+        {
+            // After Drop's kill+wait the process object is gone; OpenProcess must fail.
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            let still_alive = unsafe {
+                match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    Ok(h) => {
+                        let _ = CloseHandle(h);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            };
+            assert!(!still_alive, "KillOnDrop must kill the child on drop");
+        }
+    }
+
+    #[test]
+    fn kill_on_drop_disarm_releases_without_kill_on_drop() {
+        // Child already exited: disarm then wait ourselves; Drop must be a no-op (no double-wait panic).
+        #[cfg(unix)]
+        let child = Command::new("true").spawn().expect("spawn true");
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd");
+        let mut child = KillOnDrop::new(child).disarm();
+        let status = child.wait().expect("wait disarmed child");
+        assert!(status.success() || status.code().is_some());
+    }
+
+    #[test]
+    fn codex_client_cancel_all_pending_unblocks_waiter() {
+        let c = CodexClient::new();
+        let rx = c.register_response(1);
+        c.cancel_all_pending();
+        // Sender dropped → recv fails immediately (handshake kill path).
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn codex_client_drain_approvals_clears_tracked_ids() {
+        let c = CodexClient::new();
+        c.track_approval("a:1:2");
+        c.track_approval("a:1:3");
+        assert!(c.approval_still_tracked("a:1:2"));
+        let ids = c.drain_approvals();
+        assert_eq!(ids.len(), 2);
+        assert!(!c.approval_still_tracked("a:1:2"));
+        assert!(c.drain_approvals().is_empty());
+    }
+
+    #[test]
+    fn wait_codex_response_exits_on_cancel() {
+        let (_tx, rx) = mpsc::channel::<serde_json::Value>();
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(wait_codex_response(&rx, Duration::from_secs(30), &cancel).is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cancel must not wait the full handshake timeout"
+        );
+    }
+
+    #[test]
+    fn handshake_driver_pre_cancelled_writes_no_timeout_milestone() {
+        // FIX-1: reader EOF sets handshake_cancel before dropping response waiters. The
+        // driver must exit silently — never fabricate "⚠ Codex handshake timed out".
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-hs-cancel-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let activity = dir.join("activity.jsonl");
+        let _ = std::fs::File::create(&activity);
+
+        #[cfg(unix)]
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        #[cfg(windows)]
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            Command::new("ping")
+                .args(["-n", "5", "127.0.0.1"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn ping")
+        };
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin")));
+        let codex = Arc::new(CodexClient::new());
+        let cancel = Arc::new(AtomicBool::new(true));
+        let policy = crate::backend::broker::resolve_codex_thread_policy(
+            crate::backend::broker::SandboxMode::Ask,
+            "/tmp",
+            &[],
+            false,
+        );
+        codex_handshake_driver(
+            codex,
+            stdin,
+            activity.clone(),
+            "/tmp".into(),
+            None,
+            policy,
+            None,
+            None,
+            None,
+            cancel,
+        );
+        let content = std::fs::read_to_string(&activity).unwrap_or_default();
+        assert!(
+            !content.contains("timed out"),
+            "cancelled handshake must not write a timeout milestone; got: {content}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_with_budget_reaps_finished_thread() {
+        // FIX-2: reader EOF joins the handshake handle with a 2s budget (same as kill)
+        // so Drop does not detach it for up to ~30s.
+        let handle = std::thread::spawn(|| {});
+        let start = Instant::now();
+        join_with_budget(handle, Duration::from_secs(2));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "finished thread must join well inside the budget"
+        );
     }
 }

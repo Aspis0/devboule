@@ -42,7 +42,6 @@ from oracle.server.aspis_mcp import (
     MINI_CODER_WRITE_MODE_DEFAULT,
     TOOLS,
     upsert_session,
-    cloudflare_worker_in_aspis_bio_scope,
     create_mcp_server,
     censor_shard_path,
     compact_structure,
@@ -74,9 +73,6 @@ from oracle.server.aspis_mcp import (
     oracle_allowed_file_ids,
     public_agents_state,
     require_registered_role,
-    sanitize_provider_error,
-    scaleway_list_resources,
-    scaleway_resource_action,
     strip_invisible_and_bidi,
     validate_launch_token_for_registration,
     validate_project_state,
@@ -1826,38 +1822,6 @@ root_path: "{escaped_work_root}"
                 "C:\\Users\\gualt\\Desktop\\aspis bio",
             )
 
-    def test_verifier_cannot_mutate_provider_tools(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            prepare_management_root(root)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "verifier-1",
-                    "role": "verifier",
-                    "model": "cheap-checker",
-                    "message": "verifying",
-                },
-                root=root,
-            )
-
-            with self.assertRaises(McpError) as ctx:
-                handle_tool_call(
-                    "scaleway_resource_action",
-                    {
-                        "agent_id": "verifier-1",
-                        "role": "verifier",
-                        "resource_id": "srv-1",
-                        "action": "stop",
-                    },
-                    root=root,
-                )
-
-            self.assertIn(
-                "verifier agents cannot use scaleway_resource_action",
-                str(ctx.exception),
-            )
-
     def test_registered_verifier_cannot_spoof_coder_role(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2514,153 +2478,6 @@ root_path: "{escaped_work_root}"
             )
             self.assertEqual(len(long_desc["task"]["description"]), 4000)
 
-    def test_coder_provider_mutation_requires_env_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = prepare_management_root(root)
-            path = sample_project(projects)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "codex",
-                    "role": "coder",
-                    "model": "codex",
-                    "message": "coding",
-                },
-                root=root,
-            )
-            handle_tool_call(
-                "project_claim_task",
-                {
-                    "project_id": "scrna-seq",
-                    "task_id": "T1",
-                    "agent_id": "codex",
-                    "role": "coder",
-                },
-                root=root,
-            )
-            # A non-coder (human/verifier) approves the destructive action by
-            # adding approvedBy to the task. Coders cannot set this via MCP.
-            path.write_text(
-                path.read_text(encoding="utf-8").replace(
-                    '"status": "wip"',
-                    '"status": "wip",\n      "approvedBy": "verifier-1"',
-                    1,
-                ),
-                encoding="utf-8",
-            )
-
-            with self.assertRaises(McpError) as ctx:
-                handle_tool_call(
-                    "cloudflare_rotate_worker_secret",
-                    {
-                        "agent_id": "codex",
-                        "role": "coder",
-                        "worker_name": "api",
-                        "secret_name": "API_KEY",
-                        "secret_value": "long-enough-value",
-                        "management_project_id": "scrna-seq",
-                        "task_id": "T1",
-                        "evidence": "Rotate API key for the claimed implementation task.",
-                    },
-                    root=root,
-                )
-
-            self.assertIn("Missing provider token", str(ctx.exception))
-
-    def test_coder_provider_mutation_blocked_without_non_coder_approval(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = prepare_management_root(root)
-            sample_project(projects)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "codex",
-                    "role": "coder",
-                    "model": "codex",
-                    "message": "coding",
-                },
-                root=root,
-            )
-            handle_tool_call(
-                "project_claim_task",
-                {
-                    "project_id": "scrna-seq",
-                    "task_id": "T1",
-                    "agent_id": "codex",
-                    "role": "coder",
-                },
-                root=root,
-            )
-
-            with self.assertRaises(McpError) as ctx:
-                handle_tool_call(
-                    "cloudflare_rotate_worker_secret",
-                    {
-                        "agent_id": "codex",
-                        "role": "coder",
-                        "worker_name": "api",
-                        "secret_name": "API_KEY",
-                        "secret_value": "long-enough-value",
-                        "management_project_id": "scrna-seq",
-                        "task_id": "T1",
-                        "evidence": "Self-attested rotation without any verifier approval.",
-                    },
-                    root=root,
-                )
-
-            self.assertIn("approval marker", str(ctx.exception))
-
-    def test_provider_mutation_rechecks_live_project_before_external_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = prepare_management_root(root)
-            path = sample_project(projects)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "codex",
-                    "role": "coder",
-                    "model": "codex",
-                    "message": "coding",
-                },
-                root=root,
-            )
-            handle_tool_call(
-                "project_claim_task",
-                {
-                    "project_id": "scrna-seq",
-                    "task_id": "T1",
-                    "agent_id": "codex",
-                    "role": "coder",
-                },
-                root=root,
-            )
-            path.write_text(
-                path.read_text(encoding="utf-8").replace(
-                    '"status": "wip"', '"status": "review"'
-                ),
-                encoding="utf-8",
-            )
-
-            with self.assertRaises(McpError) as ctx:
-                handle_tool_call(
-                    "scaleway_resource_action",
-                    {
-                        "agent_id": "codex",
-                        "role": "coder",
-                        "resource_id": "srv-1",
-                        "action": "stop",
-                        "management_project_id": "scrna-seq",
-                        "task_id": "T1",
-                        "evidence": "Stop server while implementing claimed task.",
-                    },
-                    root=root,
-                )
-
-            self.assertIn("live task", str(ctx.exception))
-
     def test_paused_project_cannot_be_claimed_by_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2697,393 +2514,21 @@ root_path: "{escaped_work_root}"
 
             self.assertIn("paused", str(ctx.exception))
 
-    def test_coder_provider_mutation_requires_kanban_task_context(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = prepare_management_root(root)
-            sample_project(projects)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "codex",
-                    "role": "coder",
-                    "model": "codex",
-                    "message": "coding",
-                },
-                root=root,
-            )
-
-            with self.assertRaises(McpError) as ctx:
-                handle_tool_call(
-                    "scaleway_resource_action",
-                    {
-                        "agent_id": "codex",
-                        "role": "coder",
-                        "resource_id": "srv-1",
-                        "action": "stop",
-                    },
-                    root=root,
-                )
-
-            self.assertIn("management_project_id", str(ctx.exception))
-
     def test_app_vault_target_matches_rust_keyring_convention(self):
         self.assertEqual(
-            app_vault_target("provider:cloudflare"),
-            "provider:cloudflare.Devboule",
+            app_vault_target("provider:scaleway_ai"),
+            "provider:scaleway_ai.Devboule",
         )
 
-    def test_provider_mcp_reads_existing_app_vault_fields(self):
-        self.assertEqual(APP_VAULT_ACCOUNTS["cloudflare_token"], "provider:cloudflare")
-        self.assertEqual(
-            APP_VAULT_ACCOUNTS["cloudflare_account_id"], "scope:cloudflare_account_id"
-        )
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_token"], "provider:scaleway")
+    def test_oracle_llm_app_vault_fields(self):
+        # Oracle LLM provider vault keys only (cloud-infra CF/SCW removed).
         self.assertEqual(
             APP_VAULT_ACCOUNTS["scaleway_ai_token"], "provider:scaleway_ai"
         )
-        self.assertEqual(
-            APP_VAULT_ACCOUNTS["scaleway_project_id"], "scope:scaleway_project_id"
-        )
-        self.assertEqual(
-            APP_VAULT_ACCOUNTS["scaleway_object_secret_key"],
-            "aux:scaleway_object_secret_key",
-        )
-
-    def test_cloudflare_worker_scope_filter_hides_sibling_workers(self):
-        self.assertTrue(cloudflare_worker_in_aspis_bio_scope("aspis-bio-api", []))
-        self.assertTrue(cloudflare_worker_in_aspis_bio_scope("orasis-worker", []))
-        self.assertTrue(
-            cloudflare_worker_in_aspis_bio_scope(
-                "custom-worker",
-                [{"pattern": "api.aspis-bio.com/*"}],
-            )
-        )
-        self.assertFalse(cloudflare_worker_in_aspis_bio_scope("aspis-food-worker", []))
-        self.assertFalse(cloudflare_worker_in_aspis_bio_scope("transit-proxy", []))
-
-    def test_scaleway_list_parity_inspect_only_resources(self):
-        project = {"id": "proj-1", "name": "aspis-bio"}
-
-        def fake_api_get(url, headers, params=None):
-            if "/block/v1/zones/fr-par-1/volumes" in url:
-                return {
-                    "volumes": [{"id": "vol-1", "name": "data", "status": "available"}]
-                }
-            if "/block/v1/zones/fr-par-1/snapshots" in url:
-                return {
-                    "snapshots": [
-                        {"id": "snap-1", "name": "backup", "status": "available"}
-                    ]
-                }
-            if "/file/v1alpha1/regions/fr-par/filesystems" in url:
-                return {
-                    "filesystems": [
-                        {"id": "fs-1", "name": "shared", "status": "available"}
-                    ]
-                }
-            if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
-                return {
-                    "databases": [
-                        {
-                            "id": "db-1",
-                            "name": "analytics",
-                            "status": "ready",
-                            # Richly-populated raw item: the allow-list field
-                            # selection must drop every one of these.
-                            "endpoint": "postgres://user:topsecret@host/db",
-                            "password": "topsecret",
-                            "connection_string": "postgres://user:topsecret@host/db",
-                            "dsn": "postgres://user:topsecret@host/db",
-                        }
-                    ]
-                }
-            return {}
-
-        with (
-            patch(
-                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-            ),
-            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
-        ):
-            result = scaleway_list_resources("token", "proj-1")
-
-        by_type = {item["resourceType"]: item for item in result["resources"]}
-        for resource_type in (
-            "block_volume",
-            "block_snapshot",
-            "file_system",
-            "serverless_sql_database",
-        ):
-            self.assertIn(resource_type, by_type)
-            self.assertEqual(by_type[resource_type]["availableActions"], [])
-            self.assertEqual(by_type[resource_type]["projectId"], "proj-1")
-
-        # State is mapped from status, and NO credential field (endpoint/DSN/
-        # password/connection_string) leaks into any emitted resource — neither
-        # as a key nor as a value substring.
-        self.assertEqual(by_type["serverless_sql_database"]["state"], "ready")
-        for item in result["resources"]:
-            for forbidden_key in ("endpoint", "password", "connection_string", "dsn"):
-                self.assertNotIn(forbidden_key, item)
-            for value in item.values():
-                self.assertNotIn("topsecret", str(value))
-
-    def test_scaleway_list_parity_sibling_failure_does_not_truncate(self):
-        # A failure of the FIRST api_get in a zone/region pair must NOT skip the
-        # sibling call: volumes 5xx still leaves that zone's snapshots, and a
-        # filesystems failure still leaves that region's SQL databases.
-        project = {"id": "proj-1", "name": "aspis-bio"}
-
-        def fake_api_get(url, headers, params=None):
-            if "/block/v1/zones/fr-par-1/volumes" in url:
-                raise RuntimeError("boom 503")
-            if "/block/v1/zones/fr-par-1/snapshots" in url:
-                return {
-                    "snapshots": [
-                        {"id": "snap-1", "name": "backup", "status": "available"}
-                    ]
-                }
-            if "/file/v1alpha1/regions/fr-par/filesystems" in url:
-                raise RuntimeError("boom 503")
-            if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
-                return {
-                    "databases": [
-                        {"id": "db-1", "name": "analytics", "status": "ready"}
-                    ]
-                }
-            return {}
-
-        with (
-            patch(
-                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-            ),
-            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
-        ):
-            result = scaleway_list_resources("token", "proj-1")
-
-        ids = {item["id"] for item in result["resources"]}
-        # The sibling of each failed call survived the failure.
-        self.assertIn("snap-1", ids)
-        self.assertIn("db-1", ids)
-
-    def test_scaleway_list_parity_tolerates_non_dict_payload(self):
-        # v1alpha endpoints are unstable: a top-level list/None payload must not
-        # crash the whole listing.
-        project = {"id": "proj-1", "name": "aspis-bio"}
-
-        def fake_api_get(url, headers, params=None):
-            if "/block/v1/zones/fr-par-1/volumes" in url:
-                return ["unexpected", "array"]
-            if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
-                return None
-            if "/file/v1alpha1/regions/fr-par/filesystems" in url:
-                return {
-                    "filesystems": [
-                        {"id": "fs-1", "name": "shared", "status": "available"}
-                    ]
-                }
-            return {}
-
-        with (
-            patch(
-                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-            ),
-            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
-        ):
-            result = scaleway_list_resources("token", "proj-1")
-
-        ids = {item["id"] for item in result["resources"]}
-        self.assertIn("fs-1", ids)
-
-    def test_scaleway_resource_action_rejects_inspect_only_and_unknown_types(self):
-        project = {"id": "proj-1", "name": "aspis-bio"}
-
-        def fake_api_get(url, headers, params=None):
-            if "/block/v1/zones/fr-par-1/volumes" in url:
-                return {
-                    "volumes": [{"id": "vol-1", "name": "data", "status": "available"}]
-                }
-            return {}
-
-        with (
-            patch(
-                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-            ),
-            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
-        ):
-            # An inspect-only resource (empty availableActions) rejects any action.
-            with self.assertRaises(McpError) as ctx:
-                scaleway_resource_action("token", "vol-1", "delete", "data", "proj-1")
-            self.assertIn("not available", str(ctx.exception))
-
-            # An id absent from the inventory is rejected outright.
-            with self.assertRaises(McpError) as ctx2:
-                scaleway_resource_action("token", "ghost-1", "start", None, "proj-1")
-            self.assertIn("not in the Devboule inventory", str(ctx2.exception))
-
-    def test_provider_error_sanitizer_redacts_access_keys_and_bearers(self):
-        raw = (
-            "401 for https://api.scaleway.com/iam/v1alpha1/api-keys/SCWG23BVY4W9C9VEQFFB "
-            "with Bearer secret-token and X-Auth-Token scw-secret"
-        )
-        clean = sanitize_provider_error(raw)
-
-        self.assertIn("SCW[redacted]", clean)
-        self.assertNotIn("SCWG23BVY4W9C9VEQFFB", clean)
-        self.assertIn("Bearer [redacted]", clean)
-        self.assertIn("X-Auth-Token [redacted]", clean)
-        self.assertNotIn("secret-token", clean)
-        self.assertNotIn("scw-secret", clean)
-
-    def test_provider_credentials_status_is_agent_readable_without_secret_leak(self):
-        settings = {
-            "provider": "scaleway",
-            "model": "voxtral-small-24b-2507",
-            "baseUrl": "https://api.scaleway.ai/v1/chat/completions",
-            "remoteEnabled": True,
-        }
-
-        def fake_secret(account: str):
-            if account == "provider:cloudflare":
-                return "cf-test-token"
-            if account == "scope:cloudflare_account_id":
-                return "cf-account-id"
-            if account == "oracle:llm_settings":
-                return json.dumps(settings)
-            if account == "provider:infomaniak":
-                return "infomaniak-test-token"
-            if account == "provider:scaleway_ai":
-                return "scaleway-ai-test-token"
-            if account == "provider:github":
-                return "ghp_github-test-token"
-            return None
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            prepare_management_root(root)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "status-agent",
-                    "role": "verifier",
-                    "model": "test",
-                    "message": "checking credentials",
-                },
-                root=root,
-            )
-            with patch(
-                "oracle.server.aspis_mcp.app_vault_account_secret",
-                side_effect=fake_secret,
-            ):
-                with patch.dict(
-                    "os.environ",
-                    {
-                        "SCALEWAY_API_TOKEN": "scaleway-env-token",
-                        "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": "1",
-                    },
-                    clear=True,
-                ):
-                    result = handle_tool_call(
-                        "provider_credentials_status",
-                        {"agent_id": "status-agent", "role": "verifier"},
-                        root=root,
-                    )
-
-        self.assertTrue(result["providers"]["cloudflare"]["token"]["configured"])
-        self.assertEqual(
-            result["providers"]["cloudflare"]["token"]["source"], "app_vault"
-        )
-        self.assertTrue(result["providers"]["scaleway"]["token"]["configured"])
-        self.assertEqual(
-            result["providers"]["scaleway"]["token"]["source"], "env:SCALEWAY_API_TOKEN"
-        )
-        # GitHub is reported status-only via its bespoke "provider:github" account.
-        github = result["providers"]["github"]
-        self.assertTrue(github["configured"])
-        self.assertEqual(github["source"], "app_vault")
-        self.assertEqual(github["target"], app_vault_target("provider:github"))
-        # The status block must never carry the token value.
-        self.assertNotIn("token", github)
-        self.assertTrue(result["oracleLlm"]["settingsConfigured"])
-        self.assertEqual(result["oracleLlm"]["provider"], "scaleway")
-        self.assertTrue(result["oracleLlm"]["credential"]["configured"])
-        # The LLM-to-LLM fallback was removed: no fallback block is emitted.
-        self.assertNotIn("fallback", result["oracleLlm"])
-        serialized = json.dumps(result)
-        self.assertNotIn("cf-test-token", serialized)
-        self.assertNotIn("scaleway-env-token", serialized)
-        self.assertNotIn("scaleway-ai-test-token", serialized)
-        self.assertNotIn("infomaniak-test-token", serialized)
-        self.assertNotIn("ghp_github-test-token", serialized)
-        self.assertEqual(
-            APP_VAULT_ACCOUNTS["scaleway_object_access_key"],
-            "aux:scaleway_object_access_key",
-        )
-        self.assertEqual(
-            APP_VAULT_ACCOUNTS["scaleway_object_secret_key"],
-            "aux:scaleway_object_secret_key",
-        )
         self.assertEqual(APP_VAULT_ACCOUNTS["infomaniak_token"], "provider:infomaniak")
-
-    def test_provider_credentials_status_github_missing_when_no_token(self):
-        from oracle.server.aspis_mcp import provider_credentials_status
-
-        # No vault token and no env: github must report "missing", configured
-        # False, and still expose its vault target — never a token value.
-        with patch(
-            "oracle.server.aspis_mcp.app_vault_account_secret",
-            return_value=None,
-        ):
-            with patch.dict("os.environ", {}, clear=True):
-                result = provider_credentials_status()
-
-        github = result["providers"]["github"]
-        self.assertFalse(github["configured"])
-        self.assertEqual(github["source"], "missing")
-        self.assertEqual(github["target"], app_vault_target("provider:github"))
-        self.assertNotIn("token", github)
-
-    def test_cloudflare_profile_mode_reports_agent_env_not_dashboard_vault_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            prepare_management_root(root)
-            handle_tool_call(
-                "agent_register",
-                {
-                    "agent_id": "profile-agent",
-                    "role": "verifier",
-                    "model": "test",
-                    "message": "checking profile token",
-                },
-                root=root,
-            )
-            with patch.dict(
-                "os.environ",
-                {
-                    "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1",
-                    "ASPIS_CLOUDFLARE_VERIFIER_TOKEN": "profile-readonly-token",
-                    "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": "1",
-                    "ASPIS_MCP_DISABLE_APP_VAULT": "1",
-                },
-                clear=True,
-            ):
-                result = handle_tool_call(
-                    "provider_credentials_status",
-                    {"agent_id": "profile-agent", "role": "verifier"},
-                    root=root,
-                )
-
-        cloudflare = result["providers"]["cloudflare"]
-        self.assertTrue(cloudflare["token"]["configured"])
-        self.assertEqual(
-            cloudflare["token"]["source"], "env:ASPIS_CLOUDFLARE_VERIFIER_TOKEN"
-        )
-        self.assertEqual(
-            cloudflare["agentProfiles"]["verifierReadonly"]["source"],
-            "env:ASPIS_CLOUDFLARE_VERIFIER_TOKEN",
-        )
-        self.assertNotIn("profile-readonly-token", json.dumps(result))
+        self.assertEqual(APP_VAULT_ACCOUNTS["mistral_token"], "provider:mistral")
+        self.assertNotIn("cloudflare_token", APP_VAULT_ACCOUNTS)
+        self.assertNotIn("scaleway_token", APP_VAULT_ACCOUNTS)
 
     def test_mcp_server_constructs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3800,28 +3245,6 @@ updated_at: 2026-05-28T00:00:00Z
             self.assertIn("draft", str(ctx.exception))
             self.assertIn("Cannot update tasks", str(ctx.exception))
 
-    def test_draft_provider_mutation_rejected(self):
-        # MUTATION: provider mutations require `active`; draft must be
-        # explicitly enumerated in the rejection message so the planner
-        # can see what was rejected.
-        from oracle.server.aspis_mcp import (
-            require_live_task_for_provider_mutation,
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = root / "projects"
-            projects.mkdir()
-            self._write_draft_project(projects)
-            with self.assertRaises(McpError) as ctx:
-                require_live_task_for_provider_mutation(
-                    projects, "draft-proj", "T1"
-                )
-            message = str(ctx.exception)
-            # Error must keep the active-only contract AND enumerate `draft`.
-            self.assertIn("active Management project", message)
-            self.assertIn("draft", message)
-
     def test_draft_project_append_note_rejected(self):
         # MUTATION: project_append_note must reject draft projects.
         with tempfile.TemporaryDirectory() as tmp:
@@ -4421,9 +3844,7 @@ class OrchestratorRoleTests(unittest.TestCase):
             [
                 "censor_dispose",
                 "censor_findings",
-                "cloudflare_rotate_worker_secret",
                 "mini_coder_result",
-                "scaleway_resource_action",
                 "spawn_mini_coder",
                 "steer_mini_coder",
                 "visual_check",
@@ -4446,10 +3867,6 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_set_title",
                 "project_create_followup",
                 "project_create_plan_tasks",
-                # Provider mutations (rotate / SCW action) are coder-only (F-04-020).
-                "provider_credentials_status",
-                "cloudflare_list_workers",
-                "scaleway_list_resources",
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
@@ -4462,6 +3879,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "plan_status",
                 "ask_user",
                 "design_request",
+                "design_result",
             },
         )
 
@@ -4524,7 +3942,7 @@ class OrchestratorRoleTests(unittest.TestCase):
 
     def test_orchestrator_has_no_write_censor_or_mini_tools(self):
         # Plan + spawn_main_coder only for implementation. No minis, no censor
-        # adjudication, no provider mutations (rotate/SCW action are coder-only).
+        # adjudication.
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         for forbidden in (
             "censor_findings",
@@ -4533,17 +3951,9 @@ class OrchestratorRoleTests(unittest.TestCase):
             "spawn_mini_coder",
             "steer_mini_coder",
             "mini_coder_result",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_resource_action",
         ):
             self.assertNotIn(forbidden, orch)
-        for allowed in (
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "scaleway_list_resources",
-            "spawn_main_coder",
-        ):
-            self.assertIn(allowed, orch)
+        self.assertIn("spawn_main_coder", orch)
 
     def test_role_gate_allows_orchestrator_for_its_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4568,9 +3978,6 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_create_followup",
                 "plan_submit",
                 "plan_status",
-                "provider_credentials_status",
-                "cloudflare_list_workers",
-                "scaleway_list_resources",
             ):
                 self.assertEqual(
                     require_registered_role(projects, "orch", "orchestrator", tool),
@@ -4592,8 +3999,6 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "spawn_mini_coder",
                 "steer_mini_coder",
                 "mini_coder_result",
-                "cloudflare_rotate_worker_secret",
-                "scaleway_resource_action",
             ):
                 with self.assertRaises(McpError, msg=tool):
                     require_registered_role(projects, "orch", "orchestrator", tool)

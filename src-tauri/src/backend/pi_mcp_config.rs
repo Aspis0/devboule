@@ -433,8 +433,6 @@ mod tests {
         // Dual-write: Devboule + legacy Aspis app-bin keys.
         assert_eq!(env["DEVBOULE_APP_BIN"], "/usr/local/bin/aspis-app");
         assert_eq!(env["ASPIS_APP_BIN"], "/usr/local/bin/aspis-app");
-        assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], "1");
-        assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], "1");
         cleanup_project(&root);
     }
 

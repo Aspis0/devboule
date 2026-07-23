@@ -58,19 +58,30 @@ describe("mapLegacyViewTarget", () => {
     });
   });
 
-  it("passes all other known views through unchanged", () => {
+  it("passes remaining known views through unchanged", () => {
     const passThrough = [
-      "providers",
       "projects",
-      "cloudflare",
-      "compute",
-      "budget",
       "secrets",
       "devices",
       "workspace",
+      "polis",
+      "settings",
     ];
     for (const view of passThrough) {
       expect(mapLegacyViewTarget(view)).toEqual({ view, tab: null });
+    }
+  });
+
+  it("redirects removed cloud-provider views to projects", () => {
+    for (const view of ["providers", "cloudflare", "compute", "budget"]) {
+      expect(mapLegacyViewTarget(view)).toEqual({
+        view: "projects",
+        tab: null,
+      });
+      expect(mapLegacyViewTarget(view, "anyTab")).toEqual({
+        view: "projects",
+        tab: null,
+      });
     }
   });
 });

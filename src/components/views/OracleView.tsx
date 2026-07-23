@@ -26,8 +26,7 @@ import { seedQuestions } from "../polis/oracleSuggestions";
 import type { OracleAnswer, OracleError } from "../../types/backend";
 
 export function OracleView() {
-  const { askOracle, oracleLlmSettings, secretStatuses } =
-    useAppContext();
+  const { askOracle, oracleLlmSettings } = useAppContext();
 
   // All hooks declared unconditionally and BEFORE any early return so the hook
   // order is stable across renders (no conditional-hook bug).
@@ -54,7 +53,6 @@ export function OracleView() {
   // Polis ask panel so all three agree).
   const providerConfigured = deriveProviderConfigured(
     oracleLlmSettings ?? null,
-    secretStatuses,
   );
 
   const runQuery = useCallback(

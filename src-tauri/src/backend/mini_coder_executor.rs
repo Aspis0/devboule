@@ -1868,9 +1868,9 @@ fn claim_and_launch(
         let scope = directive.files.clone();
         let round_n = directive.attempt.saturating_add(1);
 
-        // P2 cost: estimate + record on new tasks (attempt 0); persist across retries.
-        // Out of scope (P2b): capturing real usage.cost from the model client —
-        // for now the ledger accumulates ESTIMATES.
+        // P2 cost: estimate + record ONCE on new tasks (attempt 0); never re-record
+        // on retries (ledger would double-count). Out of scope (P2b): real usage.cost
+        // from the model client — for now the ledger accumulates ESTIMATES.
         let est = backend.model.as_deref().and_then(|m| {
             super::cost::estimate_task_cost(app.clone(), m.to_string())
                 .ok()
@@ -1884,11 +1884,6 @@ fn claim_and_launch(
 
         if let Some(store) = console_store(app) {
             let projects_dir = super::projects::ensure_projects_dir(app).ok();
-            if directive.attempt == 0 {
-                if let (Some(usd), Some(m)) = (est, backend.model.as_deref()) {
-                    let _ = super::cost::record_cost(app.clone(), m.to_string(), usd);
-                }
-            }
 
             let f = |a: &mut super::mini_activity::ConsoleActivity| {
                 if directive.attempt == 0 {
@@ -2088,11 +2083,19 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                         map.insert(f.clone(), now);
                     }
                 }
-                // Collect open findings from shards.
-                let findings = crate::backend::censor::orchestrator::collect_open_findings(
+                // Collect open findings from shards. On a read/corrupt error we do NOT
+                // know the true findings — skip steering this round (fail-safe: never
+                // inject a possibly-wrong or empty steer as if the file were clean).
+                let findings = match crate::backend::censor::orchestrator::collect_open_findings(
                     &root,
                     &files_to_censor,
-                );
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("censor phase-a: collect_open_findings failed: {e}");
+                        return;
+                    }
+                };
                 if findings.is_empty() {
                     return;
                 }
@@ -4301,6 +4304,29 @@ fn build_headless_mini_command(
 #[cfg(test)]
 #[path = "mini_coder_executor_tests.rs"]
 mod tests;
+
+/// HL-3: console-seed path must call `record_cost` exactly once for attempt-0
+/// roots (historical double-count inflated the ledger on every mini spawn).
+#[cfg(test)]
+mod hl3_cost_once_tests {
+    #[test]
+    fn mini_console_seed_records_cost_exactly_once() {
+        let src = include_str!("mini_coder_executor.rs");
+        let start = src
+            .find("// CONSOLE (Step B):")
+            .expect("console seed marker");
+        let end = src[start..]
+            .find("/// Read the finished mini's result file")
+            .map(|i| start + i)
+            .expect("finalize marker after console seed");
+        let block = &src[start..end];
+        let count = block.matches("record_cost").count();
+        assert_eq!(
+            count, 1,
+            "attempt-0 mini root must call record_cost exactly once in console seed (got {count})"
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "rig_executor_tests.rs"]

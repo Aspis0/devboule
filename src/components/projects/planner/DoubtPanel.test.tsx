@@ -39,7 +39,7 @@ describe("DoubtPanel F38 single-fire + F37 sizing", () => {
         createElement(DoubtPanel, {
           questions: [question()],
           onSend,
-          highlightedDoubtIds: new Set(),
+          highlightedDoubtIds: new Set<string>(),
           onHoverDoubt: () => {},
         }),
       );
@@ -76,7 +76,7 @@ describe("DoubtPanel F38 single-fire + F37 sizing", () => {
         createElement(DoubtPanel, {
           questions: [question()],
           onSend: () => {},
-          highlightedDoubtIds: new Set(),
+          highlightedDoubtIds: new Set<string>(),
           onHoverDoubt: () => {},
         }),
       );
@@ -122,7 +122,7 @@ describe("DoubtPanel F38 single-fire + F37 sizing", () => {
             }),
           ],
           onSend: () => {},
-          highlightedDoubtIds: new Set(),
+          highlightedDoubtIds: new Set<string>(),
           onHoverDoubt: () => {},
         }),
       );

@@ -35,11 +35,6 @@
         "project_set_title",
         "project_create_followup",
         "project_create_plan_tasks",
-        "provider_credentials_status",
-        "cloudflare_list_workers",
-        "cloudflare_rotate_worker_secret",
-        "scaleway_list_resources",
-        "scaleway_resource_action",
         "oracle_ask",
         "oracle_context",
         "project_structure",
@@ -61,7 +56,6 @@
       "forbidden": [
         "No done status: done is verifier-only with evidence.",
         "No token printing or token logging. Use only tokens from env within verified Devboule scopes.",
-        "No provider action outside verified Devboule scopes.",
         "Delegate only cheap, mechanical sub-tasks to spawn_mini_coder (boilerplate, bulk read->summary, simple edits, docstrings, tests); front-load the needed context; do the thinking yourself; REVIEW the mini's output as a draft before using it.",
         "To SUPERVISE a delegated mini call spawn_mini_coder with wait=false for its directiveId, watch its activity, steer with steer_mini_coder(directiveId, message) (or \"stop\" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation.",
         "For a WRITE task set spawn_mini_coder's write_mode: use 'agenticIterative' ONLY for files in a language with deterministic-gate coverage in this project AND when the local model is capable enough to iterate usefully; otherwise use 'emitEdits' (the default). When unsure, use 'emitEdits'.",
@@ -75,11 +69,11 @@
         "Whenever you spawn or close subagents, send agent_heartbeat with an updated `subagents=[{label, model, count, role?}]`.",
         "When waiting on the human (question, allow/deny permission, blocker) send agent_heartbeat with status=\"needs_user\" and a clear message."
       ],
-      "launchPrompt": "Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list \u2014 the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files \u2014 split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. \"P1\", \"P2\"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. [\"P1\"]) \u2014 NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete and the project can advance \u2014 do NOT just close the terminal, or you will linger as a stale active agent."
+      "launchPrompt": "Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list \u2014 the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files \u2014 split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. \"P1\", \"P2\"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. [\"P1\"]) \u2014 NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, and use Oracle for codebase context. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete and the project can advance \u2014 do NOT just close the terminal, or you will linger as a stale active agent."
     },
     {
       "role": "orchestrator",
-      "summary": "The frontier PLANNING tier: understands project and infrastructure (Oracle + Cloudflare/Scaleway read/list tools), then hands ALL implementation to the Main coder via spawn_main_coder \u2014 never writes code, never spawns minis, never rotates secrets or runs SCW actions.",
+      "summary": "The frontier PLANNING tier: understands the project via Oracle, then hands ALL implementation to the Main coder via spawn_main_coder \u2014 never writes code, never spawns minis.",
       "plan": [
         "Before any multi-file work, submit the plan with plan_submit(project_id, title, plan_markdown) and WAIT for the human approval: do not start delegating before status=\"approved\".",
         "As soon as it is approved (status=\"approved\"), IMMEDIATELY call project_create_plan_tasks: the Kanban has ZERO tasks until you do. Create the tasks BEFORE handing off. Split the plan into SMALL, self-contained tasks (nanophases) \u2014 NOT one per phase: one task = one testable, committable unit; a task's scope (the files it modifies) has AT MOST 3 entries, so split anything larger; give every task a deterministically verifiable acceptance (a test/typecheck/lint command). Pass plan_id = the `planId` field returned by plan_submit, and tasks = the nano-task list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. \"P1\"); `dependsOn` lists ids of OTHER tasks in THIS SAME call \u2014 NOT the Kanban T-numbers (the server allocates those).",
@@ -106,9 +100,6 @@
         "project_set_title",
         "project_create_followup",
         "project_create_plan_tasks",
-        "provider_credentials_status",
-        "cloudflare_list_workers",
-        "scaleway_list_resources",
         "oracle_ask",
         "oracle_context",
         "project_structure",
@@ -128,7 +119,6 @@
         "For project or codebase questions use oracle_ask / oracle_context FIRST (grounded understanding) \u2014 never guess or hand-read the filesystem.",
         "No done status on Kanban tasks: done is verifier-only with evidence. Prefer leaving claim/wip/review transitions to the Main coder after hand-off.",
         "Every change goes through Censor + the Kanban + the human gate: never unattended full-auto. The Main coder sets review; the verifier gives the final verdict.",
-        "No provider action outside verified Devboule scopes.",
         "Never read or print tokens or secrets. Use only tokens from env within verified Devboule scopes; no OpenAI/Anthropic-API/GCP/AWS providers on user data (Scaleway/Infomaniak EU only, ZDR)."
       ],
       "contract": [
@@ -156,9 +146,6 @@
         "project_claim_task",
         "project_update_status",
         "project_append_note",
-        "provider_credentials_status",
-        "cloudflare_list_workers",
-        "scaleway_list_resources",
         "oracle_ask",
         "oracle_context",
         "project_structure",
@@ -172,7 +159,6 @@
       ],
       "forbidden": [
         "No coding.",
-        "No Cloudflare or Scaleway mutation; read-only provider access.",
         "No done status unless the task is in review, with concrete evidence and confidence >= 0.70.",
         "When reviewing a self-contained HTML artifact, call visual_check(html_path, focus?) if visual layout could affect the verdict; treat the critique as advisory evidence."
       ],

@@ -426,10 +426,8 @@ pub(crate) fn generate_city_state_with_metrics(
     // filled in phase 4). Precedence (highest-confidence first): oracle/meta
     // override -> real entry point -> reliable extension -> directory role ->
     // import-graph degree -> low-confidence filename heuristic -> default.
-    // TECH LIVERY (F4): the Worker-project directory zones, computed once from
-    // the scanned set so each file's provider derivation can ask "is an ancestor
-    // dir a wrangler-config zone?". Deterministic (BTreeSet).
-    let cf_zones = wrangler_dirs(&scanned);
+    // Building.provider is always None after cloud-provider inventory removal
+    // (no CF/SCW tech-livery tagging).
 
     let mut buildings: Vec<Building> = Vec::with_capacity(scanned.len());
     for f in &scanned {
@@ -456,10 +454,8 @@ pub(crate) fn generate_city_state_with_metrics(
             // Set in phase 3b (assign_features), after roads are built.
             feature_id: String::new(),
             feature_source: String::new(),
-            // TECH LIVERY (F4) — DERIVED here from path + imports + wrangler zones,
-            // never persisted (recomputed fresh each scan). Conservative: None for
-            // pure local code.
-            provider: derive_provider(&f.rel_path, &f.raw_imports, &cf_zones),
+            // Cloud tech-livery removed — never tag buildings cloudflare/scaleway.
+            provider: None,
             lines_of_code: f.lines_of_code,
             visual_tier: tier.to_string(),
             coords: Coords::new(0.0, 0.0), // set in phase 4
@@ -628,32 +624,12 @@ pub(crate) fn generate_city_state_with_metrics(
 
     // Phase 4c — TERRAIN FRAME (sea + rivers + shores + bridges). ADDITIVE: now
     // that buildings have coords and roads have routed paths, classify the
-    // surrounding terrain — open sea on the EAST/seaward margin (aligned with the
-    // harbour column `cloud::place_external_services` builds at `max_x + GAP`),
-    // 1–2 internal rivers running between districts into the sea with sand shores
-    // on both banks, and a Bridge wherever a routed road crosses a river. Pure +
+    // surrounding terrain — open sea on the EAST/seaward margin, 1–2 internal
+    // rivers running between districts into the sea with sand shores on both
+    // banks, and a Bridge wherever a routed road crosses a river. Pure +
     // deterministic; never moves a building or reroutes a road. Sparse on the wire.
-    // The cloud inventory (and thus the harbour count) isn't known at scan time, so
-    // pass 0 here; `cloud::attach_external_services` REBUILDS the terrain with the
-    // real harbour count once the seaward column is placed (so the sea band covers
-    // it). An inventory-less city keeps this honest 0-harbour terrain.
+    // Cloud harbour column removed — always `n_external_harbours = 0`.
     let terrain = terrain::build_terrain(&buildings, &roads, 0);
-
-    // LOAD-BEARING GUARANTEE — "citizens walk only on roads/bridges, never on
-    // water or a footprint". The routed `Road.path` polylines the frontend walks
-    // must be entirely walkable (every tile `Road` or `Bridge`). By construction
-    // roads route AROUND footprints and a road-over-river tile is marked `Bridge`,
-    // so this holds — but a future regression (a road tile over un-bridged water /
-    // a footprint, or a mis-marked bridge) must SURFACE there, not rest solely on
-    // the frontend guard.
-    //
-    // FIX 2 (validate the FINAL terrain): the check is NOT run here against this
-    // 0-harbour terrain. `cloud::attach_external_services` REBUILDS the terrain
-    // with the REAL harbour count (extending the sea band), and THAT is the terrain
-    // the CityState carries and the frontend renders/guards. Running the check on
-    // this scan-time terrain would validate a DIFFERENT map than the one shipped.
-    // So `attach_external_services` owns the guarantee, validating `&city.terrain`
-    // after the rebuild (debug_assert in dev / distinct `scan_note` in release).
 
     // Build the road graph (file_id -> coords + edges) and keep it available
     // for sin detection (cycles) and future agent movement.
@@ -2076,159 +2052,6 @@ fn name_keyword_role(file_lower: &str) -> Option<&'static str> {
     if has(&["upload", "download", "stream"]) {
         return Some(purpose::HARBOR);
     }
-    // market — explicit external provider names.
-    if has(&["scaleway", "cloudflare"]) {
-        return Some(purpose::MARKET);
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// TECH LIVERY — deterministic per-file `provider` derivation (Polis F4)
-// ---------------------------------------------------------------------------
-//
-// The THIRD orthogonal visual channel: district=feature, building-shape=purpose,
-// LIVERY=provider. We tag a file with `Some("cloudflare")` / `Some("scaleway")`
-// only when a REAL, conservative signal ties it to that provider; otherwise
-// `None` (pure local code — the vast majority). Mirrors the PURE-DATA honesty of
-// the purpose classifier: no false provider tags, no guessing from a weak token.
-//
-// DERIVED, NOT PERSISTED: recomputed every scan from current path + imports +
-// the wrangler-config directory set. Cheap, always fresh, never a layout input.
-//
-// DETERMINISM: a pure function of (rel_path, raw_imports, wrangler_dirs). No RNG,
-// no `Date`, no HashMap-iteration-order in the output. `wrangler_dirs` is a
-// `BTreeSet` so the "nearest ancestor wrangler dir" scan is order-independent.
-//
-// DETECTION RULES (cloudflare wins over scaleway when BOTH match — checked
-// first; in practice a single file rarely signals both):
-//   cloudflare, if ANY of:
-//     1. the file lives under a SUBDIRECTORY that contains a `wrangler.toml` /
-//        `wrangler.jsonc` / `wrangler.json` (a Worker project root) — i.e. some
-//        ancestor dir of the file is in `wrangler_dirs`. A ROOT-level wrangler
-//        (at the scan root) is DELIBERATELY EXCLUDED from `wrangler_dirs`: in a
-//        polyglot repo it would blanket-tag every file cloudflare (a false sea of
-//        orange). A root wrangler is a tooling harness, not a "whole tree is a
-//        Worker" declaration; such files are tagged only via signal 2/3 below.
-//     2. an import specifier of `@cloudflare/...` (e.g. `@cloudflare/workers-types`)
-//        or a `cloudflare:...` built-in module (e.g. `cloudflare:workers`,
-//        `cloudflare:sockets`);
-//     3. a path segment is a conventional workers dir (`workers` / `worker`).
-//   scaleway, if ANY of:
-//     1. an import specifier under the Scaleway SDK family
-//        (`@scaleway/...` or `@scaleway/sdk...`);
-//     2. a path segment named `scaleway` / `scw` (config / client dir marker).
-//   else None.
-
-/// The Worker-project directory markers whose presence in a directory makes that
-/// directory (and everything beneath it) a Cloudflare provider zone.
-const WRANGLER_CONFIG_NAMES: &[&str] = &["wrangler.toml", "wrangler.jsonc", "wrangler.json"];
-
-/// Collect the set of normalized SUBDIRECTORIES that contain a wrangler config,
-/// from the scanned file list. A file is in a Cloudflare zone when one of these
-/// dirs is an ANCESTOR of (or equal to) its directory. Deterministic order via
-/// `BTreeSet`.
-///
-/// ROOT-LEVEL WRANGLER IS DELIBERATELY EXCLUDED. A `wrangler.toml` at the SCAN
-/// ROOT yields the empty directory "" — i.e. "the whole project". In a polyglot
-/// repo (aspis-bio: Rust + Python + Tauri + Scaleway alongside a Worker) that is
-/// a false "sea of orange": it would tag EVERY file `cloudflare`. A root-level
-/// wrangler is a tooling harness, not a declaration that the whole tree is a
-/// Worker, so we DROP the "" entry here. A root wrangler still lets individual
-/// files be tagged via the OTHER signals in `derive_provider` (an
-/// `@cloudflare/*` / `cloudflare:*` import, or a `workers`/`worker` dir segment).
-/// Only a wrangler config in a SUBDIRECTORY tags its own subtree.
-///
-/// NOTE: `wrangler.toml`/`wrangler.json` are kept by the scan filter (the `.toml`
-/// extension / `CRITICAL_JSON`), so they appear as `ScannedFile`s. `wrangler.jsonc`
-/// is NOT a scanned extension, so it would not appear here on its own; rule 2/3
-/// (imports / `workers` dir) still cover those Worker projects. We additionally
-/// match a `wrangler.jsonc` name defensively in case a caller passes one in.
-pub fn wrangler_dirs(scanned: &[ScannedFile]) -> BTreeSet<String> {
-    let mut dirs = BTreeSet::new();
-    for f in scanned {
-        let name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path);
-        if WRANGLER_CONFIG_NAMES
-            .iter()
-            .any(|w| name.eq_ignore_ascii_case(w))
-        {
-            // The directory holding the config (forward-slash, normalized). A
-            // root-level config has no '/' in its rel_path → directory "" → it is
-            // the scan root; we SKIP it (see the doc comment above). Only a config
-            // in a subdirectory contributes a Cloudflare zone.
-            if let Some((dir, _)) = f.rel_path.rsplit_once('/') {
-                dirs.insert(dir.to_string());
-            }
-        }
-    }
-    dirs
-}
-
-/// `true` if `rel_path`'s directory is, or is nested under, one of `wrangler_dirs`.
-/// `wrangler_dirs` never contains the root "" (see `wrangler_dirs`), so a file is
-/// only matched by a genuine subdirectory wrangler zone.
-fn under_wrangler_dir(rel_path: &str, wrangler_dirs: &BTreeSet<String>) -> bool {
-    let file_dir = match rel_path.rsplit_once('/') {
-        Some((d, _)) => d,
-        None => "",
-    };
-    wrangler_dirs.iter().any(|wd| {
-        // Exact match (file directly in the wrangler dir), or `file_dir` is nested
-        // under `wd` — i.e. `file_dir` starts with `wd` followed by a '/'. The
-        // explicit boundary byte check avoids both a per-call `format!`
-        // allocation and a false match like "workersrc" against "workers".
-        file_dir == wd
-            || (file_dir.len() > wd.len()
-                && file_dir.starts_with(wd.as_str())
-                && file_dir.as_bytes()[wd.len()] == b'/')
-    })
-}
-
-/// DETERMINISTIC tech-livery provider derivation for one file. Pure: depends only
-/// on the path, its raw import specifiers, and the precomputed wrangler-dir set.
-/// Returns the provider slug (`provider::CLOUDFLARE` / `provider::SCALEWAY`) or
-/// `None` for pure local code. See the module comment for the exact rules.
-pub fn derive_provider(
-    rel_path: &str,
-    raw_imports: &[String],
-    wrangler_dirs: &BTreeSet<String>,
-) -> Option<String> {
-    let lower = rel_path.to_ascii_lowercase();
-    let segments: Vec<&str> = lower.split('/').collect();
-    // Only treat a name as a DIRECTORY segment (not the final filename).
-    let dir_segments = || segments.iter().take(segments.len().saturating_sub(1));
-
-    // --- Cloudflare (checked first; wins a rare double-match) ---
-    // (1) under a wrangler-config zone.
-    if under_wrangler_dir(rel_path, wrangler_dirs) {
-        return Some(provider::CLOUDFLARE.to_string());
-    }
-    // (2) a Cloudflare import: `@cloudflare/...` or `cloudflare:...` builtin.
-    let has_cf_import = raw_imports.iter().any(|i| {
-        let s = i.trim();
-        s.starts_with("@cloudflare/") || s.starts_with("cloudflare:")
-    });
-    if has_cf_import {
-        return Some(provider::CLOUDFLARE.to_string());
-    }
-    // (3) a conventional workers directory.
-    if dir_segments().any(|s| *s == "workers" || *s == "worker") {
-        return Some(provider::CLOUDFLARE.to_string());
-    }
-
-    // --- Scaleway ---
-    // (1) a Scaleway SDK import: `@scaleway/...`.
-    let has_scw_import = raw_imports
-        .iter()
-        .any(|i| i.trim().starts_with("@scaleway/"));
-    if has_scw_import {
-        return Some(provider::SCALEWAY.to_string());
-    }
-    // (2) a `scaleway` / `scw` directory marker.
-    if dir_segments().any(|s| *s == "scaleway" || *s == "scw") {
-        return Some(provider::SCALEWAY.to_string());
-    }
-
     None
 }
 
@@ -6952,7 +6775,6 @@ const y = await import('@/lazy');
             ("src/storage/blob.ts", purpose::WAREHOUSE),
             ("src/middleware/cors.ts", purpose::CONDUIT),
             ("src/logging/sink.ts", purpose::THEATER),
-            ("src/providers/scaleway.ts", purpose::MARKET),
             ("src/models/user.ts", purpose::LIBRARY),
         ] {
             let v = classify_path(path);
@@ -7011,216 +6833,6 @@ const y = await import('@/lazy');
         let v = classify_path("src/components/Button.tsx");
         assert_eq!(v.purpose, purpose::HOUSE);
         assert_eq!(v.source, purpose_source::DEFAULT);
-    }
-
-    // ---- TECH LIVERY: deterministic provider derivation (F4) ----
-
-    /// Convenience: derive a provider with no wrangler zones and no imports.
-    fn provider_of(rel: &str, imports: &[&str], zones: &[&str]) -> Option<String> {
-        let imports: Vec<String> = imports.iter().map(|s| s.to_string()).collect();
-        let zones: BTreeSet<String> = zones.iter().map(|s| s.to_string()).collect();
-        derive_provider(rel, &imports, &zones)
-    }
-
-    #[test]
-    fn cloudflare_import_signal_tags_provider() {
-        // `@cloudflare/...` import -> cloudflare, regardless of path.
-        assert_eq!(
-            provider_of("src/api/handler.ts", &["@cloudflare/workers-types"], &[]),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-        // `cloudflare:...` builtin module specifier -> cloudflare.
-        assert_eq!(
-            provider_of("src/edge/sock.ts", &["cloudflare:sockets"], &[]),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-    }
-
-    #[test]
-    fn cloudflare_wrangler_zone_and_workers_dir_tag_provider() {
-        // A wrangler.toml in `workers/api/` makes everything under it cloudflare.
-        let zones = ["workers/api"];
-        assert_eq!(
-            provider_of("workers/api/src/index.ts", &[], &zones),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-        // A conventional `workers/` directory segment alone is enough.
-        assert_eq!(
-            provider_of("workers/edge/router.ts", &[], &[]),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-    }
-
-    #[test]
-    fn scaleway_signal_tags_provider() {
-        // `@scaleway/...` SDK import -> scaleway.
-        assert_eq!(
-            provider_of("src/cloud/upload.ts", &["@scaleway/sdk"], &[]),
-            Some(provider::SCALEWAY.to_string())
-        );
-        // A `scaleway` / `scw` directory marker -> scaleway.
-        assert_eq!(
-            provider_of("src/scaleway/object_store.ts", &[], &[]),
-            Some(provider::SCALEWAY.to_string())
-        );
-        assert_eq!(
-            provider_of("infra/scw/client.ts", &[], &[]),
-            Some(provider::SCALEWAY.to_string())
-        );
-    }
-
-    #[test]
-    fn plain_local_file_has_no_provider() {
-        // A normal TS file with no provider signal -> None (no false tag).
-        assert_eq!(
-            provider_of("src/components/Button.tsx", &["react"], &[]),
-            None
-        );
-        // A plain Rust file likewise.
-        assert_eq!(
-            provider_of("src/polis/scanner.rs", &["crate", "std"], &[]),
-            None
-        );
-        // The literal substring "scaleway" inside a filename is NOT a directory
-        // segment, so it does NOT false-positive (conservative; matches the
-        // purpose classifier's "scaleway"->market name heuristic staying separate).
-        assert_eq!(provider_of("src/providers/scaleway.ts", &[], &[]), None);
-    }
-
-    #[test]
-    fn cloudflare_wins_over_scaleway_on_double_match() {
-        // A file under a wrangler zone that ALSO imports the scaleway SDK is
-        // tagged cloudflare (checked first) — deterministic, documented tie-break.
-        assert_eq!(
-            provider_of("workers/x/h.ts", &["@scaleway/sdk"], &["workers/x"]),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-    }
-
-    #[test]
-    fn subdir_wrangler_zone_tags_its_subtree() {
-        // A wrangler config in a SUBDIRECTORY tags its own subtree cloudflare.
-        assert_eq!(
-            provider_of("workers/api/src/index.ts", &[], &["workers/api"]),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-        // A sibling subtree outside the zone, with no other signal, stays None.
-        assert_eq!(provider_of("backend/main.rs", &[], &["workers/api"]), None);
-    }
-
-    #[test]
-    fn derive_provider_is_deterministic_across_runs() {
-        // Same inputs -> same output, twice (no RNG / time / map-order leak).
-        let imports = ["@cloudflare/workers-types", "react"];
-        let zones = ["a/b", "workers"];
-        let first = provider_of("workers/h.ts", &imports, &zones);
-        let second = provider_of("workers/h.ts", &imports, &zones);
-        assert_eq!(first, second);
-        assert_eq!(first, Some(provider::CLOUDFLARE.to_string()));
-    }
-
-    #[test]
-    fn wrangler_dirs_collects_config_directories() {
-        // Build a scanned set with a wrangler.toml in workers/api/ and a plain
-        // file elsewhere; the zone set must contain exactly "workers/api".
-        let mk = |rel: &str| ScannedFile {
-            rel_path: rel.to_string(),
-            abs_path: std::path::PathBuf::from(rel),
-            lines_of_code: 1,
-            raw_imports: Vec::new(),
-            head: String::new(),
-            has_exported_symbol: false,
-            content_sins: Vec::new(),
-            content_hash: String::new(),
-            scan_note: None,
-        };
-        let scanned = vec![
-            mk("workers/api/wrangler.toml"),
-            mk("workers/api/src/index.ts"),
-            mk("frontend/app.ts"), // outside the worker zone
-        ];
-        let zones = wrangler_dirs(&scanned);
-        assert!(zones.contains("workers/api"));
-        // The plain frontend dir is NOT a config dir.
-        assert!(!zones.contains("frontend"));
-        // A file under the discovered zone derives cloudflare.
-        assert_eq!(
-            derive_provider("workers/api/src/index.ts", &[], &zones),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-        // A file outside any zone with no signal -> None (note: `frontend` is a
-        // Tier-C app shell, not a worker dir, so no false cloudflare tag).
-        assert_eq!(derive_provider("frontend/app.ts", &[], &zones), None);
-    }
-
-    #[test]
-    fn root_wrangler_does_not_blanket_tag_polyglot_repo() {
-        // A root-level wrangler config (e.g. aspis-bio's tooling harness) must NOT
-        // make the whole polyglot tree cloudflare. It contributes NO zone (the ""
-        // root entry is dropped); files are tagged only via the other signals.
-        let mk = |rel: &str| ScannedFile {
-            rel_path: rel.to_string(),
-            abs_path: std::path::PathBuf::from(rel),
-            lines_of_code: 1,
-            raw_imports: Vec::new(),
-            head: String::new(),
-            has_exported_symbol: false,
-            content_sins: Vec::new(),
-            content_hash: String::new(),
-            scan_note: None,
-        };
-        // Root wrangler.toml alongside a subdirectory wrangler.json.
-        let scanned = vec![
-            mk("wrangler.toml"),
-            mk("backend/main.rs"),
-            mk("infra/scaleway/upload.ts"),
-            mk("workers/api/wrangler.json"),
-            mk("workers/api/src/index.ts"),
-        ];
-        let zones = wrangler_dirs(&scanned);
-        // The root config is NOT a zone; the subdirectory one IS.
-        assert!(!zones.contains(""), "root wrangler must not be a zone");
-        assert!(zones.contains("workers/api"), "subdir wrangler is a zone");
-
-        // A pure Rust file with no cloudflare signal -> None (NOT cloudflare),
-        // despite the root wrangler.toml.
-        assert_eq!(derive_provider("backend/main.rs", &[], &zones), None);
-        // A Scaleway file under the root wrangler -> scaleway, not cloudflare.
-        assert_eq!(
-            derive_provider("infra/scaleway/upload.ts", &[], &zones),
-            Some(provider::SCALEWAY.to_string())
-        );
-        // A file that imports `@cloudflare/...` is STILL cloudflare via signal (2),
-        // even though the root wrangler contributes no zone.
-        let cf_import = ["@cloudflare/workers-types".to_string()];
-        assert_eq!(
-            derive_provider("backend/edge.rs", &cf_import, &zones),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-        // The subdirectory wrangler still tags its own subtree.
-        assert_eq!(
-            derive_provider("workers/api/src/index.ts", &[], &zones),
-            Some(provider::CLOUDFLARE.to_string())
-        );
-    }
-
-    #[test]
-    fn under_wrangler_dir_does_not_false_match_prefix() {
-        // A zone "workers" must NOT match a sibling dir "workersrc" (boundary byte
-        // check, not a bare starts_with).
-        let zones: BTreeSet<String> = ["workers".to_string()].into_iter().collect();
-        assert!(
-            under_wrangler_dir("workers/x/h.ts", &zones),
-            "nested under zone"
-        );
-        assert!(
-            under_wrangler_dir("workers/h.ts", &zones),
-            "file directly in the zone dir"
-        );
-        assert!(
-            !under_wrangler_dir("workersrc/h.ts", &zones),
-            "prefix sibling must not match"
-        );
     }
 
     #[test]
@@ -8973,22 +8585,11 @@ import { cdn } from 'https://cdn.example.com/x';
         assert_eq!(main_id, main_id2, "file ids must be stable across scans");
     }
 
-    // FIX 2 (guarantee moved off the scanner's 0-harbour terrain): the scanner
-    // itself no longer runs the "citizens walk only on roads/bridges" check — it
-    // builds the terrain with 0 harbours, but `cloud::attach_external_services`
-    // REBUILDS the terrain with the real harbour count and that rebuilt terrain is
-    // what the CityState carries and the frontend renders. So the guarantee is
-    // enforced THERE, against the FINAL terrain. This test pins that the SCANNER's
-    // own output never carries a nav-walkability note (it doesn't run the check),
-    // so the note isn't accidentally emitted against the wrong (scan-time) terrain.
-    // The positive/negative guarantee on the FINAL terrain lives in
-    // `cloud::tests` (`attach_external_services_*walkab*`) and the check's
-    // non-vacuity in `nav::tests::road_paths_check_flags_a_road_over_the_sea`.
+    // Scan-time terrain is final (no post-scan harbour rebuild). Pin that a
+    // normal city does not emit a walkability note on its own.
     #[test]
     fn scanner_does_not_emit_walkability_note_on_normal_city() {
         let t = TempTree::new("nav-walkable");
-        // A small tree with import edges so roads are actually routed (and thus the
-        // walkability check has road tiles to validate, not a vacuous empty set).
         t.file(
             "src/main.tsx",
             "import { a } from './a';\nimport { b } from './b';\n",
@@ -8999,14 +8600,10 @@ import { cdn } from 'https://cdn.example.com/x';
         t.file("Cargo.toml", "[package]\nname = \"x\"\n");
 
         let city = generate_city_state(&t.root).expect("scan succeeds");
-        // There are routed roads (so a city that DID run the check would be
-        // non-vacuous) — the guarantee on these roads is enforced post-attach.
         assert!(
             city.roads.iter().any(|r| r.path.is_some()),
             "expected at least one routed road"
         );
-        // The scanner does not emit the walkability note (the check moved to
-        // attach_external_services against the final terrain).
         if let Some(note) = &city.scan_note {
             assert!(
                 !note.contains("walkable"),

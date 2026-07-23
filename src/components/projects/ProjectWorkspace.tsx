@@ -792,13 +792,16 @@ export function ProjectWorkspace({
         // NOT the fire-and-forget grant_* commands (which only persist for the next spawn).
         // Truthy check (not `!== undefined`) so a malformed empty-string id doesn't route.
         if (head.approvalId) {
-          // F3: record the id as decided BEFORE the await so a poll that fires mid-flight
-          // (and reads a stale pending snapshot) cannot re-enqueue this request afterwards.
-          decidedConsentIdsRef.current.add(head.approvalId);
+          // Do NOT mark decided until the invoke succeeds. Marking early + popping on
+          // transient error permanently buries the request (poller filters decided ids)
+          // while the live agent stays blocked. In-flight dedupe is handled by
+          // enqueueConsent + consentBusyRef; stale post-success polls are filtered once
+          // we add the id below, before the queue pop.
           await invokeBackendCommand<void>(
             "respond_cloud_consent",
             respondCloudConsentArgs({ approvalId: head.approvalId, decision }),
           );
+          decidedConsentIdsRef.current.add(head.approvalId);
         } else if (head.kind === "folderWrite") {
           // Branch by kind: Net → grant_net_consent, FolderWrite → grant_folder_consent.
           // Both share the same ConsentDecision enum and the same mounted-ref / FIFO logic.
@@ -852,15 +855,9 @@ export function ProjectWorkspace({
         if (consentMountedRef.current) {
           // FIX 2: Tauri rejects with a string, not an Error — use String(e)
           setConsentError(e instanceof Error ? e.message : String(e));
-          // Slice 5: a cloud request that errors means the live waiter is GONE (the agent
-          // timed out / the session ended) — retrying always fails with the same error and
-          // there is no on-disk grant to fall back on. Pop the head so the modal can't get
-          // permanently stuck. Local net/folder errors are left queued (retry is valid there).
-          if (head.approvalId) {
-            setPendingConsents((prev) =>
-              prev.filter((r) => !sameConsentRequest(r, head)),
-            );
-          }
+          // Keep the head on failure (cloud and local). Transient IPC errors must not
+          // bury a live agent request: decidedConsentIdsRef is only written on success,
+          // so a later poll can re-surface the same approvalId if it left the queue.
         }
       } finally {
         // Always clear the synchronous guard (even when unmounted) so a remount isn't wedged.

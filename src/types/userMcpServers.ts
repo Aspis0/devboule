@@ -8,10 +8,12 @@
 // These are TYPE-ONLY for now (Phase A.3 builds the Settings/project panels that
 // consume them). The four commands they pair with:
 //   user_mcp_list(scope, projectRoot?)            -> UserMcpServer[]
-//   user_mcp_add(scope, projectRoot?, server)     -> void
+//   user_mcp_add(scope, projectRoot?, server, confirmGlobalCommand?) -> void
 //   user_mcp_remove(scope, projectRoot?, name)    -> void
-//   user_mcp_set_enabled(scope, projectRoot?, name, enabled) -> void
+//   user_mcp_set_enabled(scope, projectRoot?, name, enabled, confirmGlobalCommand?) -> void
 // For `scope === "project"`, `projectRoot` is REQUIRED (the backend errors otherwise).
+// For `scope === "global"`, add always requires confirmGlobalCommand=true (consent);
+// set_enabled requires it only when enabling (re-launch runs the command).
 
 /**
  * Which config file a command targets:

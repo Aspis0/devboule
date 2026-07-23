@@ -30,7 +30,7 @@
 use super::super::severity::severity_from_actionlint;
 use super::DEFAULT_RUNNER_TIMEOUT;
 use super::{
-    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding,
+    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding, RunnerOutcome,
     RunTarget,
 };
 use std::path::Path;
@@ -98,9 +98,9 @@ fn parse_actionlint_line(line: &str) -> Option<RawFinding> {
 /// with the default per-file timeout. The file path is the orchestrator-validated
 /// project-relative path (a leading-`-` component is rejected upstream by
 /// `validate_rel_path`, so it can't be mistaken for a flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("actionlint") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "actionlint",
@@ -109,8 +109,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stdout {
-        Some(s) => parse_actionlint(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_actionlint(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -246,7 +246,7 @@ f.yml:12:4: another real one [rule]
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("actionlint") {
             assert!(
                 !findings.is_empty(),

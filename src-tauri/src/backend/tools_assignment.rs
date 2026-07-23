@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use super::project_skill::validate_profile;
-use super::user_mcp_config::{merged_servers, UserMcpServer};
+use super::user_mcp_config::{mask_env_for_list, merged_servers, UserMcpServer};
 use super::design::{atomic_write, canonical_working_folder, design_write_guard};
 use super::state::BackendState;
 
@@ -197,7 +197,18 @@ pub fn tools_assignment_set(app: tauri::AppHandle, state: State<'_, BackendState
 pub fn tools_library_list(app: tauri::AppHandle, state: State<'_, BackendState>, working_folder_path: String) -> Result<Vec<UserMcpServer>, String> {
     state.ensure_unlocked()?;
     let canonical = canonical_working_folder(&working_folder_path)?;
-    Ok(merged_servers(&app, &canonical))
+    // Mask env VALUES for IPC (same as user_mcp_list). Spawn still uses
+    // merged_servers / orchestrator_env_json with raw values.
+    Ok(mask_servers_env_for_ipc(merged_servers(&app, &canonical)))
+}
+
+/// Apply [`mask_env_for_list`] to every server — pure helper so IPC list paths
+/// share one mask and unit tests can assert the contract without an AppHandle.
+fn mask_servers_env_for_ipc(mut servers: Vec<UserMcpServer>) -> Vec<UserMcpServer> {
+    for server in &mut servers {
+        server.env = mask_env_for_list(&server.env);
+    }
+    servers
 }
 
 #[cfg(test)]
@@ -464,5 +475,44 @@ mod tests {
         let got = inject_servers_for_profile(dir.to_str().unwrap(), "mini-big", servers);
         assert!(got.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// tools_library_list must mask env VALUES for IPC; spawn path (raw merged
+    /// servers / orchestrator payload) must keep the real values.
+    #[test]
+    fn tools_library_list_masks_env_spawn_path_keeps_raw() {
+        let mut srv = server("secretsrv");
+        srv.env.insert("API_TOKEN".to_string(), "super-secret-value".to_string());
+        srv.env.insert("EMPTY".to_string(), String::new());
+        let raw = vec![srv];
+
+        // IPC path (what tools_library_list returns after merge).
+        let listed = mask_servers_env_for_ipc(raw.clone());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].env.get("API_TOKEN").map(String::as_str),
+            Some("********")
+        );
+        assert_eq!(
+            listed[0].env.get("EMPTY").map(String::as_str),
+            Some(""),
+            "empty values stay empty"
+        );
+        let list_json = serde_json::to_string(&listed).unwrap();
+        assert!(
+            !list_json.contains("super-secret-value"),
+            "tools_library_list IPC JSON leaked raw env: {list_json}"
+        );
+
+        // Spawn path: raw servers (merged_servers) still carry the secret.
+        assert_eq!(
+            raw[0].env.get("API_TOKEN").map(String::as_str),
+            Some("super-secret-value")
+        );
+        let orch = super::super::user_mcp_config::orchestrator_env_json(&raw);
+        assert!(
+            orch.contains("super-secret-value"),
+            "orchestrator spawn payload must keep raw env values"
+        );
     }
 }

@@ -17,22 +17,14 @@ export const HELP_TARGET_SELECTOR =
 	"[data-help-title], [data-help-lines]";
 
 const pageUseLines: Record<string, string> = {
-	cloudflare:
-		"For Devboule, Cloudflare is the edge layer: Workers, routes, R2/KV/D1/queues, secrets, smoke checks, and agent-safe provider operations.",
-	compute:
-		"For Devboule, compute is where expensive CPU/GPU resources live, so this page helps prevent idle VM cost and wrong-project operations.",
 	secrets:
-		"For Devboule, this page keeps provider keys, project scopes, object-storage credentials, and model keys out of code and project notes.",
+		"For Devboule, this page keeps GitHub tokens and vault credentials out of code and project notes.",
 	oracle:
-		"For Devboule, Oracle is the local memory agents should query before touching code, cloud resources, plans, or project notes.",
+		"For Devboule, Oracle is the local memory agents should query before touching code, plans, or project notes.",
 	projects:
 		"For Devboule, Projects is the mini-Notion control board where human plans, agent claims, evidence, and verifier gates meet.",
 	agents:
-		"For Devboule, Agents is the bridge between the Kanban, CLI terminals, MCP tools, Oracle, and provider permissions.",
-	providers:
-		"For Devboule, Providers maps what parts of Cloudflare and Scaleway are already dashboard-ready and what still needs safer tooling.",
-	budget:
-		"For Devboule, Budget is the cost-warning layer before GPU, VM, storage, or Worker usage becomes invisible spend.",
+		"For Devboule, Agents is the bridge between the Kanban, CLI terminals, MCP tools, and Oracle.",
 	graph:
 		"For Devboule, Graph is a structural map of code relationships; Oracle is the stronger source for semantic answers.",
 	design:
@@ -57,7 +49,7 @@ const pageUseLines: Record<string, string> = {
 export function pageUseLineFor(activeView: string): string {
 	return (
 		pageUseLines[activeView] ??
-		"For Devboule, use this only when it makes the local project, agents, cloud state, or Oracle memory more reliable."
+		"For Devboule, use this only when it makes the local project, agents, or Oracle memory more reliable."
 	);
 }
 
@@ -110,7 +102,7 @@ function semanticLines(element: HTMLElement, title: string) {
 
 	if (haystack.includes("secret")) {
 		lines.push(
-			"For Devboule, secrets keep model, provider, and Worker credentials out of code, Markdown, Oracle chunks, and agent prompts.",
+			"For Devboule, secrets keep model and vault credentials out of code, Markdown, Oracle chunks, and agent prompts.",
 		);
 	}
 	if (
@@ -119,32 +111,10 @@ function semanticLines(element: HTMLElement, title: string) {
 		haystack.includes("key")
 	) {
 		lines.push(
-			"For Devboule, tokens decide whether the app can read inventory, rotate Worker secrets, query remote models, or give agents scoped access.",
+			"For Devboule, tokens decide whether the app can access GitHub, query remote models, or give agents scoped vault access.",
 		);
 		lines.push(
 			"Temporary keys expire: replace them in the app vault instead of hardcoding them or pasting them into project notes.",
-		);
-	}
-	if (
-		haystack.includes("cloudflare") ||
-		haystack.includes("worker") ||
-		haystack.includes("r2") ||
-		haystack.includes("kv") ||
-		haystack.includes("d1")
-	) {
-		lines.push(
-			"For Devboule, Cloudflare can host edge APIs, Workers, storage, queues, routing, and smoke checks used by pipelines and agent tooling.",
-		);
-	}
-	if (
-		haystack.includes("scaleway") ||
-		haystack.includes("gpu") ||
-		haystack.includes("cpu") ||
-		haystack.includes(" vm") ||
-		haystack.includes("compute")
-	) {
-		lines.push(
-			"For Devboule, Scaleway resources are real spend: sync before action, stop idle machines, and confirm project scope before delete or terminate.",
 		);
 	}
 	if (
@@ -167,7 +137,7 @@ function semanticLines(element: HTMLElement, title: string) {
 		haystack.includes("coder")
 	) {
 		lines.push(
-			"For Devboule, agents should work through MCP: read project state, ask Oracle, claim tasks, use allowed provider tools, then update status.",
+			"For Devboule, agents should work through MCP: read project state, ask Oracle, claim tasks, then update status.",
 		);
 	}
 	if (
@@ -181,22 +151,12 @@ function semanticLines(element: HTMLElement, title: string) {
 		);
 	}
 	if (
-		haystack.includes("budget") ||
-		haystack.includes("cost") ||
-		haystack.includes("billing") ||
-		haystack.includes("price")
-	) {
-		lines.push(
-			"For Devboule, cost signals matter because GPU/CPU VM mistakes can burn money faster than Worker or storage mistakes.",
-		);
-	}
-	if (
 		haystack.includes("dry") ||
 		haystack.includes("smoke") ||
 		haystack.includes("audit")
 	) {
 		lines.push(
-			"For Devboule, dry runs and audits are proof steps: they should show scope, token, API equivalent, and evidence before a real write.",
+			"For Devboule, dry runs and audits are proof steps: they should show scope and evidence before a real write.",
 		);
 	}
 

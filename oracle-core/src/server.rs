@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::answer::LlmAnswerer;
-use crate::config::OracleDataPaths;
+use crate::config::{self, OracleDataPaths};
 use crate::embed::{CancelFlag, EmbedderPool};
 use crate::ingest::indexer::{self, chunk_index_status, TextEmbedder};
 use crate::jobs::OracleIndexJobManager;
@@ -38,7 +38,7 @@ use crate::store::sqlite::SqliteStore;
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_BOUNDED_LIMIT: usize = 100;
+const MAX_BOUNDED_LIMIT: usize = config::MAX_BOUNDED_LIMIT;
 const MAX_BOUNDED_ALLOWED_IDS: usize = 10_000;
 const MAX_BOUNDED_EMBED_TEXTS: usize = 64;
 // M3-P12c: cap on bounded filter lists (symbols/imports). Kept small since
@@ -640,6 +640,7 @@ async fn ask_get_handler(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let limit = limit.clamp(1, MAX_BOUNDED_LIMIT);
     run_ask(&state, &q, limit).await
 }
 
@@ -650,7 +651,7 @@ async fn ask_post_handler(
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
     let q = payload.query.or(payload.q).unwrap_or_default();
-    let limit = payload.limit.unwrap_or(5).max(1) as usize;
+    let limit = payload.limit.unwrap_or(5).max(1).min(MAX_BOUNDED_LIMIT as i64) as usize;
     run_ask(&state, &q, limit).await
 }
 
@@ -946,7 +947,7 @@ async fn similar_handler(
     Query(params): Query<SimilarQuery>,
 ) -> Result<Json<serde_json::Value>, Response> {
     require_operator(&headers, &state).map_err(auth_error)?;
-    let limit = params.limit.unwrap_or(5);
+    let limit = params.limit.unwrap_or(5).clamp(1, MAX_BOUNDED_LIMIT);
     let engine = state.engine().map_err(internal_error)?;
     let result = engine.similar(&node_id, limit).await.map_err(|e| {
         (

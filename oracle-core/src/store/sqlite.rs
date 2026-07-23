@@ -522,6 +522,21 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Bounded chunk materialization for lexical scoring — never loads more
+    /// than `limit` rows (ordered by `id`). Used as an OOM guard on the
+    /// query path; callers that need the full corpus use [`all_chunks`].
+    pub fn all_chunks_limited(&self, limit: usize) -> Result<Vec<FileChunk>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare("SELECT * FROM file_chunks ORDER BY id LIMIT ?1")
+            .context("preparing all_chunks_limited")?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row_to_chunk(row, ""))
+            .context("querying all_chunks_limited")?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Total chunk count. Mirrors `sqlite_store.py::chunk_count`.
     pub fn chunk_count(&self) -> Result<usize> {
         let conn = self.connect()?;

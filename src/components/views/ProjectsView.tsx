@@ -2534,7 +2534,7 @@ export function ProjectsView() {
 	// DEEP-LINK consume (Phase G): the Header attention bell deep-links a needs-you
 	// agent straight into its project's Work mode via `projects#work:<projectId>`.
 	// parseViewTarget splits that into the `work:<id>` pending tab; parseWorkTab maps
-	// it to {selectedId, workMode}. Consume here exactly like ProvidersView /
+	// it to {selectedId, workMode}. Consume here exactly like Settings /
 	// SettingsView do, depending on `pendingTab` (not just the stable callback) so a
 	// request that arrives while Projects is ALREADY the active view still re-runs
 	// (otherwise the click is dead — the M1 pattern). A bell click with no resolvable

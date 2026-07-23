@@ -189,6 +189,23 @@ fn validate_push_remote(value: Option<&str>) -> ToolResult<Option<String>> {
     Ok(Some(raw.to_string()))
 }
 
+/// Git ref-safe branch charset at the MCP boundary: `^[A-Za-z0-9._/\-]+$`.
+fn validate_push_branch(value: Option<&str>) -> ToolResult<Option<String>> {
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let cleaned = clean_text(raw, "Branch", 200)?;
+    if !cleaned
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    {
+        return Err(ToolError::new(
+            "Branch name may only contain letters, digits, . _ - /",
+        ));
+    }
+    Ok(Some(cleaned))
+}
+
 fn validate_plan_scope_path(rel: &str) -> ToolResult<String> {
     let text = rel.trim();
     if text.is_empty() {
@@ -688,10 +705,7 @@ pub fn request_git_push(
         session_token,
     )?;
     let project_id = normalize_project_id(project_id)?;
-    let branch = match branch {
-        Some(b) if !b.trim().is_empty() => Some(clean_text(b, "Branch", 200)?),
-        _ => None,
-    };
+    let branch = validate_push_branch(branch)?;
     let remote = validate_push_remote(remote)?;
 
     let request_id = new_hex_id();
@@ -2198,6 +2212,28 @@ mod tests {
             .unwrap_err();
             assert!(!err.message.is_empty(), "bad={bad}");
         }
+
+        for bad in ["main;rm -rf /", "feat$(whoami)", "a b", "feat|x", "x&&y"] {
+            let err = request_git_push(
+                &projects,
+                "codex",
+                "coder",
+                "scrna-seq",
+                Some(bad),
+                None,
+                false,
+                Some(&tok),
+            )
+            .unwrap_err();
+            assert!(
+                err.message.contains("Branch") || err.message.contains("branch"),
+                "bad branch {bad:?}: {}",
+                err.message
+            );
+        }
+        // Allowlisted charset still accepted.
+        assert!(validate_push_branch(Some("feature/foo-bar_1.2")).is_ok());
+        assert!(validate_push_branch(None).is_ok());
 
         let vtok = register(&projects, "vfx", "verifier");
         let err = request_git_push(

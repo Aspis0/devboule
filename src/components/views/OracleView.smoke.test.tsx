@@ -35,11 +35,10 @@ const mockCtx = {
   oracleLlmSettings: { apiKeyConfigured: true } as {
     apiKeyConfigured: boolean;
   } | null,
-  secretStatuses: [] as unknown[],
 };
 
 // Provider configured → ask controls enabled. The view reads askOracle,
-// requestView, oracleLlmSettings, secretStatuses from context.
+// requestView, oracleLlmSettings from context.
 vi.mock("../../context/AppContext", () => ({
   useAppContext: () => mockCtx,
 }));
@@ -61,7 +60,6 @@ beforeEach(() => {
   askOracle.mockImplementation(async () => mockAnswer());
   requestView.mockClear();
   mockCtx.oracleLlmSettings = { apiKeyConfigured: true };
-  mockCtx.secretStatuses = [];
   container = document.createElement("div");
   document.body.appendChild(container);
 });

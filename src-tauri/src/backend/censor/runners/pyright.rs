@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_pyright;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -86,9 +86,9 @@ pub fn parse_pyright(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 /// Run pyright on a single file from the project root.
 /// Absent `pyright` → empty. `--` ends flag parsing so a file whose name
 /// begins with `-` is never interpreted as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("pyright") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture(
         "pyright",
@@ -96,8 +96,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_pyright(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_pyright(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 

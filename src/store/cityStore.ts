@@ -47,29 +47,6 @@ function writeLastFolder(path: string | null): void {
   }
 }
 
-/** localStorage key for the user's visible external providers preference. */
-const VISIBLE_PROVIDERS_KEY = "polis:visibleProviders";
-
-function readVisibleProviders(): string[] {
-  try {
-    const raw = window.localStorage.getItem(VISIBLE_PROVIDERS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return [...new Set(parsed.filter((v): v is string => typeof v === "string"))];
-  } catch {
-    return [];
-  }
-}
-
-function writeVisibleProviders(list: string[]): void {
-  try {
-    window.localStorage.setItem(VISIBLE_PROVIDERS_KEY, JSON.stringify(list));
-  } catch {
-    // Private mode / quota — non-fatal.
-  }
-}
-
 /** Last path component (basename) for display, handling both `/` and `\`. */
 export function folderBasename(path: string | null): string | null {
   if (!path) return null;
@@ -195,14 +172,6 @@ interface CityStoreState {
   filter: FilterState;
   setFilter: (patch: Partial<FilterState>) => void;
   resetFilter: () => void;
-
-  /** T1b — User preference: which external providers are visible on the map.
-   *  Default [] = all providers OFF (user must toggle them on via Legend).
-   *  "monument" is always visible regardless of this list. Persists to
-   *  localStorage. Does NOT reset on folder switch. */
-  visibleProviders: string[];
-  /** Toggle a single provider on/off. Deduplicates and persists. */
-  setProviderVisible: (provider: string, on: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,9 +196,39 @@ let watchedFolder: string | null = null;
  *  captures its value; if a NEWER start has begun by the time an await resolves,
  *  the superseded start bows out (no double-subscribe, no stale claim stomp). */
 let watchEpoch = 0;
+/** Epoch of the start that installed the current unlisten handles. A superseded
+ *  start may only drop listeners when this still equals its own epoch — never a
+ *  newer generation's handles (HF1-1). */
+let listenerOwnerEpoch = 0;
+/** Serializes watch start/stop async work so two concurrent starts cannot
+ *  interleave subscribe/start_watch (HF1-2). Claim + epoch bumps stay sync. */
+let watchOpChain: Promise<void> = Promise.resolve();
 /** Monotonic sequence for live updates (forces the view effect to re-run even on
  *  structurally-equal payloads). */
 let liveSeq = 0;
+
+function enqueueWatchOp(op: () => Promise<void>): Promise<void> {
+  const run = watchOpChain.then(op, op);
+  watchOpChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** Drop event listeners only if `epoch` still owns them. */
+function dropListenersIfOwned(epoch: number): void {
+  if (listenerOwnerEpoch !== epoch) return;
+  if (cityUpdatedUnlisten) {
+    cityUpdatedUnlisten();
+    cityUpdatedUnlisten = null;
+  }
+  if (semanticUpdatedUnlisten) {
+    semanticUpdatedUnlisten();
+    semanticUpdatedUnlisten = null;
+  }
+  listenerOwnerEpoch = 0;
+}
 
 // ---------------------------------------------------------------------------
 // Live AGENT poll (GAP A): module-level so it survives store-action identity.
@@ -341,6 +340,7 @@ async function teardownWatchPlumbing(): Promise<void> {
     semanticUpdatedUnlisten();
     semanticUpdatedUnlisten = null;
   }
+  listenerOwnerEpoch = 0;
   if (!isTauriRuntime()) return;
   try {
     await invokeBackendCommand<void>("polis_stop_watch");
@@ -373,7 +373,11 @@ async function teardownWatchPlumbing(): Promise<void> {
  *    4. A monotonic `watchEpoch` lets a superseded start (one whose folder was
  *       re-claimed by a newer call mid-await) bow out and skip its subscribe/start.
  *    5. On failure, only clear the claim if it STILL equals `path` (never stomp a
- *       newer claim). */
+ *       newer claim).
+ *    6. Async start/stop work is serialized via `enqueueWatchOp` so a superseded
+ *       start cannot interleave with a newer start's subscribe/start_watch.
+ *    7. Listeners are tagged with `listenerOwnerEpoch`; a stale start only
+ *       unlisten/nulls handles it still owns. */
 async function startWatchFor(
   path: string,
   onCity: (city: CityState) => void,
@@ -387,42 +391,65 @@ async function startWatchFor(
   watchedFolder = path;
   // (4) Capture this start's epoch; a newer start bumps it and supersedes us.
   const epoch = ++watchEpoch;
-  try {
-    // (3) Tear down the PREVIOUS watcher (listener + backend) WITHOUT nulling our
-    // fresh claim. After the await a newer start may have begun — bail if so.
-    await teardownWatchPlumbing();
+
+  await enqueueWatchOp(async () => {
+    // Superseded before our turn — newer start/stop owns the generation.
     if (epoch !== watchEpoch) return;
-    // Subscribe BEFORE starting so we can't miss an immediate emit.
-    await subscribeCityUpdated(onCity);
-    await subscribeSemanticUpdated();
-    if (epoch !== watchEpoch) {
-      // Superseded mid-subscribe: drop the listeners we just attached so a newer
-      // start owns the single listener, and bow out.
-      if (cityUpdatedUnlisten) {
-        cityUpdatedUnlisten();
-        cityUpdatedUnlisten = null;
+    try {
+      // (3) Tear down the PREVIOUS watcher (listener + backend) WITHOUT nulling our
+      // fresh claim. After the await a newer start may have begun — bail if so.
+      await teardownWatchPlumbing();
+      if (epoch !== watchEpoch) return;
+      // Subscribe BEFORE starting so we can't miss an immediate emit.
+      await subscribeCityUpdated(onCity);
+      await subscribeSemanticUpdated();
+      // Tag handles as owned by this start (HF1-1).
+      listenerOwnerEpoch = epoch;
+      if (epoch !== watchEpoch) {
+        // Superseded mid-subscribe: drop ONLY if we still own the handles.
+        dropListenersIfOwned(epoch);
+        return;
       }
-      if (semanticUpdatedUnlisten) {
-        semanticUpdatedUnlisten();
-        semanticUpdatedUnlisten = null;
+      // The backend command mirrors generate_city_state's signature: `projectPath`
+      // is the folder to watch. Idempotent on the same root.
+      await invokeBackendCommand<void>("polis_start_watch", { projectPath: path });
+      // (4) Superseded during/after start_watch: the next serialized op (newer
+      // start or stopWatch) reconciles backend + listeners. If stop claimed null
+      // after we started, stop the backend ourselves so we never leave it
+      // watching after an unowned start (HF1-2).
+      if (epoch !== watchEpoch) {
+        if (watchedFolder === null) {
+          try {
+            await invokeBackendCommand<void>("polis_stop_watch");
+          } catch {
+            // Already stopped / unlock lapsed.
+          }
+        } else if (watchedFolder !== path) {
+          // Newer claim wants a different folder — re-issue so the backend is
+          // not left on our stale path until the next start runs (idempotent if
+          // that start also issues start_watch).
+          try {
+            await invokeBackendCommand<void>("polis_start_watch", {
+              projectPath: watchedFolder,
+            });
+          } catch {
+            // Best-effort; the owning start will retry.
+          }
+        }
+        return;
       }
-      return;
+    } catch {
+      // HF1-3: only tear down if THIS start still owns the generation.
+      if (epoch !== watchEpoch) return;
+      // Watch is best-effort: a failure (unlock lapsed, path vanished) leaves the
+      // static map intact. Drop the half-open listener + stop any backend watcher
+      // the failed start may have left running, so we never orphan a backend watch
+      // with no live listener.
+      await teardownWatchPlumbing();
+      // (5) Only clear OUR claim — never stomp a newer start's claim.
+      if (watchedFolder === path) watchedFolder = null;
     }
-    // The backend command mirrors generate_city_state's signature: `projectPath`
-    // is the folder to watch. Idempotent on the same root.
-    await invokeBackendCommand<void>("polis_start_watch", { projectPath: path });
-    // (4) A newer start superseded us during polis_start_watch: leave the claim
-    // to the newer start (it owns watchedFolder now) and bow out.
-    if (epoch !== watchEpoch) return;
-  } catch {
-    // Watch is best-effort: a failure (unlock lapsed, path vanished) leaves the
-    // static map intact. Drop the half-open listener + stop any backend watcher
-    // the failed start may have left running, so we never orphan a backend watch
-    // with no live listener.
-    await teardownWatchPlumbing();
-    // (5) Only clear OUR claim — never stomp a newer start's claim.
-    if (watchedFolder === path) watchedFolder = null;
-  }
+  });
 }
 
 // Monotonic request id. Each load()/loadFolder()/refresh() bumps it and captures
@@ -528,7 +555,6 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   sinRecords: null,
   sinActionPending: [],
   filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
-  visibleProviders: readVisibleProviders(),
 
   load: async () => {
     if (get().loading) return;
@@ -667,13 +693,14 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
     // (it won't subscribe/start, and its catch won't stomp state). Clear the
     // claim synchronously, then tear down the plumbing (drop the listener so no
     // in-flight event re-arms anything, then stop the backend watcher). All
-    // idempotent / best-effort.
+    // idempotent / best-effort. Serialized with startWatchFor so teardown cannot
+    // race a concurrent start's subscribe/start_watch.
     watchEpoch += 1;
     watchedFolder = null;
     // No watcher -> no live deliveries to dedupe; drop the signature so a later
     // restart starts clean (and nothing lingers after the view unmounts).
     lastAppliedCitySig = null;
-    await teardownWatchPlumbing();
+    await enqueueWatchOp(() => teardownWatchPlumbing());
   },
 
   selectBuilding: (fileId) => set({ selectedBuildingId: fileId }),
@@ -681,15 +708,6 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   setFilter: (patch) => set((s) => ({ filter: { ...s.filter, ...patch } })),
   resetFilter: () => set({ filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" } }),
 
-  setProviderVisible: (provider, on) =>
-    set((s) => {
-      const prev = s.visibleProviders;
-      const next = on
-        ? (prev.includes(provider) ? prev : [...prev, provider])
-        : prev.filter((p) => p !== provider);
-      writeVisibleProviders(next);
-      return { visibleProviders: next };
-    }),
 
   startAgentPoll: () => {
     // Tauri-only; the browser fixture has no live agents. Idempotent: a second
@@ -832,8 +850,13 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       // B1: re-check folder before reloading — a concurrent loadFolder may have switched
       if (get().selectedFolder !== folder) return null;
       // Refresh the ledger + city so the map reflects the changed disposition.
+      // Action already succeeded: refresh is best-effort and must not mask success.
       void get().loadSinRecords();
-      await get().refresh(true);
+      try {
+        await get().refresh(true);
+      } catch {
+        // refresh/loadFolder surfaces its own error on the store; keep action ok.
+      }
       return null;
     } catch (e) {
       return e instanceof Error ? e.message : String(e);
@@ -857,8 +880,13 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       // B1: re-check folder before reloading — a concurrent loadFolder may have switched
       if (get().selectedFolder !== folder) return null;
       // Refresh the ledger + city so the building gains the agent overlay.
+      // Action already succeeded: refresh is best-effort and must not mask success.
       void get().loadSinRecords();
-      await get().refresh(true);
+      try {
+        await get().refresh(true);
+      } catch {
+        // refresh/loadFolder surfaces its own error on the store; keep action ok.
+      }
       return null;
     } catch (e) {
       return e instanceof Error ? e.message : String(e);
@@ -982,10 +1010,6 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         get().applyLiveUpdate(city);
         set({ loading: false });
         void get().loadSinRecords();
-        // Restart the live fs-watcher on the folder (best-effort, Tauri-only).
-        if (watchedFolder !== folder) {
-          void startWatchFor(folder, (live) => get().applyLiveUpdate(live));
-        }
         return { ok: true, status: `New era “${era}” begun.` };
       } catch {
         if (seq !== requestSeq)
@@ -1004,6 +1028,16 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         e instanceof Error ? e.message : "Failed to start the new era.";
       set({ loading: false, error: null });
       return { ok: false, status };
+    } finally {
+      // HF1-4: stopWatch always runs above; on seq mismatch (or any exit) the
+      // success-path restart used to be skipped, leaving live watch permanently
+      // stopped. Reconcile desired watch for the current mapped folder.
+      if (isTauriRuntime()) {
+        const current = get().selectedFolder;
+        if (current && watchedFolder !== current) {
+          void startWatchFor(current, (live) => get().applyLiveUpdate(live));
+        }
+      }
     }
   },
 

@@ -106,7 +106,7 @@ export type InspectSubject =
   // the imported dependency (supplier) — the same orientation the road graph and
   // the building Connections section use. Resolved to real Buildings here.
   | { kind: "connection"; from: string; to: string }
-  // An EXTERNAL CLOUD SERVICE: a real Scaleway/Cloudflare resource (from the
+  // An EXTERNAL SERVICE: era monument (or legacy cloud outpost from old JSON) (from the
   // synced provider inventory) surfaced by clicking its harbour/outpost node at
   // the map margin. Inspect-only (provider/type/name/status) — no secret, no
   // spawn action in this phase.
@@ -206,11 +206,9 @@ function humanizeStatus(slug: string): string {
   return titleCase(slug);
 }
 
-// TECH LIVERY (F4): human label for a provider slug. Known providers get a clean
-// brand name; any future slug falls back to a title-cased form (extensible).
+/** Human label for a provider/external slug (monuments use "monument"). */
 function providerLabel(slug: string): string {
-  if (slug === "cloudflare") return "Cloudflare";
-  if (slug === "scaleway") return "Scaleway";
+  if (slug === "monument") return "Monument";
   return titleCase(slug);
 }
 
@@ -1338,7 +1336,7 @@ function ConnTarget({
 }
 
 // ---------------------------------------------------------------------------
-// External cloud service popup — a REAL Scaleway/Cloudflare resource surfaced
+// External service popup — era monument (or legacy outpost) surfaced
 // from its harbour/outpost node at the map margin.
 //
 // HONESTY: every field comes straight from `city.externalServices`, which the
@@ -1434,6 +1432,8 @@ function ExternalServicePopup({
     );
   }
 
+  // Legacy non-monument external service (pre-removal cloud outpost JSON).
+  // Not rendered on the map; inspect only if somehow selected.
   const Icon = externalTypeIcon(service.type);
   const tone = externalStatusTone(service.status);
 
@@ -1446,16 +1446,13 @@ function ExternalServicePopup({
       )}`}
       onClose={onClose}
     >
-      {/* What this is — an honest one-liner, no invented prose. */}
       <section className="rounded-xl border border-terracotta-200 bg-white px-3 py-2.5">
         <h4 className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-terracotta-500">
-          <Cloud className="h-3.5 w-3.5" /> Cloud resource
+          Legacy external service
         </h4>
         <p className="text-[12px] leading-5 text-cream-600">
-          A live {providerLabel(service.provider)} {externalTypeLabel(
-            service.type,
-          ).toLowerCase()}{" "}
-          from your synced cloud inventory, moored at the city’s harbour.
+          This entry comes from an older city snapshot. Cloud-provider outposts
+          are no longer managed in Devboule; only era monuments are active.
         </p>
       </section>
 

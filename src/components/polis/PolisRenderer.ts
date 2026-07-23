@@ -223,8 +223,9 @@ export interface PolisRendererCallbacks {
   /** A merchant porter (or its road) was clicked — surface the REAL import edge
    *  `from` (importer/consumer) imports `to` (imported/supplier). */
   onSelectConnection?: (from: string, to: string) => void;
-  /** A cloud outpost ("harbour" node) was clicked — surface the REAL external
-   *  service (provider/type/name/status) in the inspect sidebar. Null clears. */
+  /** An era monument was clicked — surface the REAL external service
+   *  (provider "monument" / wonder type / honest stats name) in the inspect
+   *  sidebar. Null clears. */
   onSelectExternalService?: (service: ExternalService | null) => void;
   /** A resource site (quarry/mine) was clicked — surface in the inspect sidebar. Null clears. */
   onSelectResource?: (site: import("./resources").ResourceSite | null) => void;
@@ -1316,12 +1317,6 @@ export class PolisRenderer {
   setFilter(sets: FilterSets | null): void {
     this.filterSets = sets;
     this.applyFilter();
-  }
-
-  /** T1b — set which external providers are visible. Delegates to the
-   *  ExternalServiceLayer which composes it with LOD visibility. */
-  setVisibleProviders(providers: ReadonlySet<string>): void {
-    this.externalLayer.setVisibleProviders(providers);
   }
 
   /** Apply the current filter to all built nodes. ONE PASS over building nodes

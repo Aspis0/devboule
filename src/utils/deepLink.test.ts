@@ -10,16 +10,16 @@ import {
 
 describe("parseViewTarget", () => {
   it("parses a bare view with no tab", () => {
-    expect(parseViewTarget("providers")).toEqual({
-      view: "providers",
+    expect(parseViewTarget("projects")).toEqual({
+      view: "projects",
       tab: null,
     });
   });
 
   it("parses a view#tab target", () => {
-    expect(parseViewTarget("providers#cloudflare")).toEqual({
-      view: "providers",
-      tab: "cloudflare",
+    expect(parseViewTarget("settings#secrets")).toEqual({
+      view: "settings",
+      tab: "secrets",
     });
   });
 
@@ -31,23 +31,23 @@ describe("parseViewTarget", () => {
   });
 
   it("trims surrounding whitespace", () => {
-    expect(parseViewTarget("  providers#budget  ")).toEqual({
-      view: "providers",
-      tab: "budget",
+    expect(parseViewTarget("  settings#devices  ")).toEqual({
+      view: "settings",
+      tab: "devices",
     });
   });
 
   it("treats an empty tab after # as no tab", () => {
-    expect(parseViewTarget("providers#")).toEqual({
-      view: "providers",
+    expect(parseViewTarget("settings#")).toEqual({
+      view: "settings",
       tab: null,
     });
   });
 
   it("ignores extra # segments, keeping only the first tab", () => {
-    expect(parseViewTarget("providers#cloudflare#zones")).toEqual({
-      view: "providers",
-      tab: "cloudflare",
+    expect(parseViewTarget("settings#secrets#extra")).toEqual({
+      view: "settings",
+      tab: "secrets",
     });
   });
 
@@ -438,15 +438,13 @@ describe("bell deep-link A→B end-to-end (clear bridge + work-mode coherence)",
 
 describe("formatViewTarget", () => {
   it("formats a view with no tab as the bare view", () => {
-    expect(formatViewTarget("providers")).toBe("providers");
-    expect(formatViewTarget("providers", null)).toBe("providers");
-    expect(formatViewTarget("providers", "")).toBe("providers");
+    expect(formatViewTarget("projects")).toBe("projects");
+    expect(formatViewTarget("projects", null)).toBe("projects");
+    expect(formatViewTarget("projects", "")).toBe("projects");
   });
 
   it("formats a view#tab target", () => {
-    expect(formatViewTarget("providers", "cloudflare")).toBe(
-      "providers#cloudflare",
-    );
+    expect(formatViewTarget("settings", "secrets")).toBe("settings#secrets");
   });
 
   it("round-trips with parseViewTarget", () => {

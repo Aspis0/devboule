@@ -138,7 +138,10 @@ fn refresh_semantic_cache(project_root: &std::path::Path) -> Result<bool, String
 /// `eras/` archive folder) and the optional live filesystem `watch` handle.
 pub struct PolisState {
     pub city: Arc<Mutex<CityState>>,
-    last_project_path: Mutex<Option<PathBuf>>,
+    /// Shared with the live watcher so a late rescan on an OLD root is ignored
+    /// after the active project path has moved (e.g. `generate_city_state`
+    /// switched roots). `Arc` so the watcher thread can observe updates.
+    last_project_path: Arc<Mutex<Option<PathBuf>>>,
     /// Live-mode filesystem watcher handle, if watching. `None` when stopped.
     /// Dropping the handle (here, on stop, or on a re-start) tears the watcher
     /// + its debounce thread down cleanly. Guarded by its own mutex so start/
@@ -156,7 +159,7 @@ impl PolisState {
     pub fn new() -> Self {
         Self {
             city: Arc::new(Mutex::new(CityState::empty("", "Alpha"))),
-            last_project_path: Mutex::new(None),
+            last_project_path: Arc::new(Mutex::new(None)),
             watch: Mutex::new(None),
         }
     }
@@ -175,6 +178,30 @@ impl PolisState {
 
     fn project_path(&self) -> Option<PathBuf> {
         self.last_project_path.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// Cloneable handle to the active project path (shared with the fs-watcher).
+    fn project_path_handle(&self) -> Arc<Mutex<Option<PathBuf>>> {
+        Arc::clone(&self.last_project_path)
+    }
+
+    /// If a watcher is running on a root other than `new_root`, stop it so a
+    /// late debounced rescan cannot clobber a city for a different project.
+    fn stop_watcher_if_root_differs(&self, new_root: &Path) -> Result<(), String> {
+        let previous = {
+            let mut guard = self
+                .watch
+                .lock()
+                .map_err(|_| "Polis watch state lock poisoned".to_string())?;
+            match guard.as_ref() {
+                Some(h) if h.root() != new_root => guard.take(),
+                _ => None,
+            }
+        };
+        if let Some(old) = previous {
+            old.stop();
+        }
+        Ok(())
     }
 }
 
@@ -214,30 +241,31 @@ pub fn generate_city_state(
 
     // DEFAULT MAP TARGET: empty/None -> the Devboule root (this repo),
     // resolved the same way projects/workspace do
-    // (`backend::agents::management_root_for_mcp`).
-    let path = resolve_scan_path(project_path, &app, &live);
+    // (`backend::agents::management_root_for_mcp`). Confined to registered
+    // project roots (CRIT-8).
+    let path = resolve_scan_path(project_path, &app, &backend_state, &live)?;
 
-    if !path.is_dir() {
-        return Err(format!(
-            "Project path is not a directory: {}",
-            path.display()
-        ));
-    }
-
+    // Scan first so a failed scan leaves the previously-published path and
+    // watcher untouched. Only after a successful store publish the new root
+    // (single set) and stop any watcher still bound to the old one.
+    let switching = polis.project_path().as_ref().map(|p| p.as_path()) != Some(path.as_path());
     let city = scan_and_store(&path, &app, &backend_state, &polis, live)?;
-    polis.set_project_path(path);
+    polis.set_project_path(path.clone());
+    if switching {
+        polis.stop_watcher_if_root_differs(&path)?;
+    }
     Ok(city)
 }
 
 /// Shared scan core: run the deterministic scanner on `path`, fold REAL agents +
-/// suspects + cloud sources on top of the pure scanner output, store the result
+/// suspects + era monuments on top of the pure scanner output, store the result
 /// as the shared `CityState`, and return it. Does NOT touch `last_project_path`
 /// (callers set it). Holds the city lock only briefly — never across the scan.
 ///
-/// P7 assembly refactor: the hardcoded attach chain (agents → suspects → cloud)
-/// is now a [`source::fold_sources`] over a [`Vec<Box<dyn source::CityDataSource>>`].
-/// The pure scanner produces scanner truth; sources decorate it in order.  Each
-/// source failure is recorded in `city.scan_note` and never aborts the fold.
+/// P7 assembly refactor: the attach chain is a [`source::fold_sources`] over a
+/// [`Vec<Box<dyn source::CityDataSource>>`]. The pure scanner produces scanner
+/// truth; sources decorate it in order. Each source failure is recorded in
+/// `city.scan_note` and never aborts the fold.
 fn scan_and_store(
     path: &Path,
     app: &tauri::AppHandle,
@@ -245,7 +273,7 @@ fn scan_and_store(
     polis: &State<'_, PolisState>,
     live: Option<AgentLiveState>,
 ) -> Result<CityState, String> {
-    use crate::polis::source::{self, AgentsSource, CloudSource, ScanContext, SuspectCardsSource};
+    use crate::polis::source::{self, ScanContext};
 
     // EXPLICIT/USER-INITIATED scan path: use the metrics-returning builder so we can
     // emit the payload-composition debug line ONCE per scan, AFTER sources are
@@ -254,22 +282,32 @@ fn scan_and_store(
     // file-save storm never pays a full `serde_json::to_vec` + a log write per save.
     let (mut city, mut metrics) = scanner::generate_city_state_with_metrics(path)?;
 
+    // Carry era monuments across the scan so a full rebuild never wipes them.
+    // The pure scanner starts with empty `external_services`; MonumentsSource
+    // re-attaches only `provider == "monument"` entries from the previous city.
+    let preserved_monuments: Vec<ExternalService> = {
+        let guard = polis.lock_city()?;
+        guard
+            .external_services
+            .iter()
+            .filter(|s| s.provider == "monument")
+            .cloned()
+            .collect()
+    };
+
     // Build the one-shot context for all data sources.
     let project_roots = project_root_map(app, backend_state);
     let open_bug_suspects = crate::backend::projects::gather_open_bug_suspects(app);
-    let inventories = backend_state
-        .cached_provider_inventories()
-        .unwrap_or_default();
 
     let ctx = ScanContext {
         project_root: path,
         live: live.as_ref(),
         project_roots: &project_roots,
         open_bug_suspects: &open_bug_suspects,
-        inventories: &inventories,
+        preserved_monuments: &preserved_monuments,
     };
 
-    // Ordered source fold: agents → suspect-cards → cloud.
+    // Ordered source fold: agents → suspect-cards → monuments.
     // TODO(D2): when the typed-patch surface lands, the P6 semantic refresh
     // becomes an OracleSource in this vector; today it remains a post-fold
     // background task.
@@ -383,32 +421,87 @@ fn clear_city_agents(city: &mut CityState) {
 }
 
 /// Resolve the scan TARGET path the same way `generate_city_state` does: an
-/// empty/None `project_path` maps THIS repo (the Devboule root); a
-/// non-empty path is used verbatim. Shared by the scan command and the live
-/// watcher so both target the same directory.
+/// empty/None `project_path` maps THIS repo (the Devboule root); a non-empty
+/// path must canonicalize under a registered project root or the management
+/// root (CRIT-8). Shared by the scan command, live watcher, and meta/kin paths.
 fn resolve_scan_path(
     project_path: Option<String>,
     app: &tauri::AppHandle,
+    backend_state: &State<'_, BackendState>,
     live: &Option<AgentLiveState>,
-) -> PathBuf {
+) -> Result<PathBuf, String> {
     let raw = project_path.unwrap_or_default();
-    if raw.trim().is_empty() {
+    let path = if raw.trim().is_empty() {
         let projects_dir = live
             .as_ref()
             .map(|l| projects_dir_from_state_path(&l.state_path))
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("projects"));
-        crate::backend::agents::management_root_for_mcp(app, &projects_dir).unwrap_or_else(|e| {
-            // UI map scan only — never use an unvalidated parent for MCP launch.
-            // Prefer cwd so Polis still opens something useful in dev.
-            eprintln!(
-                "[polis] MCP management root unavailable ({e}); scanning cwd. Set DEVBOULE_ROOT."
-            );
-            std::env::current_dir().unwrap_or_else(|_| projects_dir.clone())
-        })
+        crate::backend::agents::management_root_for_mcp(app, &projects_dir).map_err(|e| {
+            format!(
+                "MCP management root unavailable ({e}); set DEVBOULE_ROOT."
+            )
+        })?
     } else {
         PathBuf::from(raw.trim())
+    };
+    confine_project_path(&path, app, backend_state, live)
+}
+
+/// Collect allowed project roots: every registered project `root_path` that is a
+/// real directory, plus the management root (this repo / empty-path default).
+fn allowed_project_roots(
+    app: &tauri::AppHandle,
+    backend_state: &State<'_, BackendState>,
+    live: &Option<AgentLiveState>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = project_root_map(app, backend_state).into_values().collect();
+    let projects_dir = live
+        .as_ref()
+        .map(|l| projects_dir_from_state_path(&l.state_path))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("projects"));
+    if let Ok(mgmt) = crate::backend::agents::management_root_for_mcp(app, &projects_dir) {
+        roots.push(mgmt);
     }
+    roots
+}
+
+/// Pure containment check: `canonical` equals or is under any of the already-
+/// canonicalized allowed roots. Component-aware `starts_with` (not string prefix).
+pub(crate) fn is_path_confined(canonical: &Path, allowed_canonical: &[PathBuf]) -> bool {
+    allowed_canonical
+        .iter()
+        .any(|root| canonical == root.as_path() || canonical.starts_with(root))
+}
+
+/// Canonicalize `path` and refuse unless it equals/starts-with a registered
+/// project root or the management root. Returns the canonical path on success.
+fn confine_project_path(
+    path: &Path,
+    app: &tauri::AppHandle,
+    backend_state: &State<'_, BackendState>,
+    live: &Option<AgentLiveState>,
+) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Err(format!(
+            "Project path is not a directory: {}",
+            path.display()
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project path: {e}"))?;
+    let allowed_canonical: Vec<PathBuf> = allowed_project_roots(app, backend_state, live)
+        .into_iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .collect();
+    if !is_path_confined(&canonical, &allowed_canonical) {
+        return Err(
+            "Project path is not a registered project root; refusing access.".to_string(),
+        );
+    }
+    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -460,13 +553,16 @@ pub struct SinRecordWire {
 #[tauri::command]
 pub fn polis_list_sins(
     project_path: String,
+    app: tauri::AppHandle,
     backend_state: State<'_, BackendState>,
 ) -> Result<Vec<SinRecordWire>, String> {
     backend_state.ensure_unlocked()?;
-    let root = std::path::PathBuf::from(project_path.trim());
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()));
-    }
+    let root = confine_project_path(
+        Path::new(project_path.trim()),
+        &app,
+        &backend_state,
+        &None,
+    )?;
     let records = crate::polis::augure::ledger::load_all_sins(&root);
     Ok(records
         .into_iter()
@@ -499,13 +595,16 @@ pub fn polis_dispose_sin(
     rel_path: Option<String>,
     sin_id: String,
     disposition: String,
+    app: tauri::AppHandle,
     backend_state: State<'_, BackendState>,
 ) -> Result<bool, String> {
     backend_state.ensure_unlocked()?;
-    let root = std::path::PathBuf::from(project_path.trim());
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()));
-    }
+    let root = confine_project_path(
+        Path::new(project_path.trim()),
+        &app,
+        &backend_state,
+        &None,
+    )?;
     let disp = match disposition.as_str() {
         "open" => crate::polis::augure::Disposition::Open,
         "ignored" => crate::polis::augure::Disposition::Ignored,
@@ -701,19 +800,19 @@ pub fn polis_fix_sin(
     rel_path: String,
     sin_id: String,
 ) -> Result<String, String> {
-    // 1. Unlocked vault + root dir check (mirror polis_dispose_sin).
+    // 1. Unlocked vault + confined to a registered project root (CRIT-8).
     backend_state.ensure_unlocked()?;
-    let root = std::path::PathBuf::from(project_path.trim());
-    if !root.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()));
-    }
+    let root = confine_project_path(
+        Path::new(project_path.trim()),
+        &app,
+        &backend_state,
+        &None,
+    )?;
 
-    // 2. Resolve project_id: canonicalize the given root, walk project_root_map,
-    //    canonicalize each candidate root, first match wins. Fallback: plain string
-    //    equality when canonicalize fails (matches polis_open_in_editor pattern).
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve project root: {e}"))?;
+    // 2. Resolve project_id: walk project_root_map, canonicalize each candidate
+    //    root, first match wins. Fallback: plain string equality when
+    //    canonicalize fails (matches polis_open_in_editor pattern).
+    let canon_root = root.clone(); // already canonical from confine_project_path
     let root_map = project_root_map(&app, &backend_state);
     let project_id = root_map
         .iter()
@@ -923,7 +1022,7 @@ pub fn polis_get_scan_extensions(
     backend_state.ensure_unlocked()?;
     let live =
         crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
-    let path = resolve_scan_path(project_path, &app, &live);
+    let path = resolve_scan_path(project_path, &app, &backend_state, &live)?;
     let meta = crate::polis::meta_store::MetaStore::load(&path);
     let available = scanner::default_extensions();
     let enabled = meta
@@ -947,13 +1046,7 @@ pub fn polis_set_scan_extensions(
     backend_state.ensure_unlocked()?;
     let live =
         crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
-    let path = resolve_scan_path(project_path, &app, &live);
-    if !path.is_dir() {
-        return Err(format!(
-            "Project path is not a directory: {}",
-            path.display()
-        ));
-    }
+    let path = resolve_scan_path(project_path, &app, &backend_state, &live)?;
     let mut seen = std::collections::HashSet::new();
     let cleaned: Vec<String> = extensions
         .into_iter()
@@ -991,8 +1084,10 @@ pub fn polis_set_scan_extensions(
 pub fn trigger_file_disaster(
     file_id: String,
     disaster_type: String,
+    backend_state: State<'_, BackendState>,
     polis: State<'_, PolisState>,
 ) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let severity = normalize_severity(&disaster_type)?;
     let mut city = polis.lock_city()?;
     let building = city
@@ -1010,7 +1105,12 @@ pub fn trigger_file_disaster(
 }
 
 #[tauri::command]
-pub fn resolve_file_disaster(file_id: String, polis: State<'_, PolisState>) -> Result<(), String> {
+pub fn resolve_file_disaster(
+    file_id: String,
+    backend_state: State<'_, BackendState>,
+    polis: State<'_, PolisState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let mut city = polis.lock_city()?;
     let building = city
         .building_mut(&file_id)
@@ -1038,8 +1138,10 @@ pub fn set_agent_location(
     agent_id: String,
     file_id: Option<String>,
     task: Option<String>,
+    backend_state: State<'_, BackendState>,
     polis: State<'_, PolisState>,
 ) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let mut city = polis.lock_city()?;
 
     // Clear any previous `agent_present` marker for this agent.
@@ -1072,8 +1174,10 @@ pub fn set_agent_location(
 pub fn update_agent_status(
     agent_id: String,
     status: String,
+    backend_state: State<'_, BackendState>,
     polis: State<'_, PolisState>,
 ) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let normalized = normalize_agent_status(&status)?;
     let mut city = polis.lock_city()?;
     let agent = city
@@ -1098,32 +1202,99 @@ fn normalize_agent_status(input: &str) -> Result<String, String> {
 // Notes / log
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn append_city_note(
-    file_id: String,
-    log_text: String,
-    polis: State<'_, PolisState>,
-) -> Result<(), String> {
+/// Max UTF-8 byte length of a single city/building note (4 KiB).
+const CITY_NOTE_MAX_BYTES: usize = 4096;
+/// Max notes retained per city or building (ring buffer drops oldest).
+const CITY_NOTES_MAX_COUNT: usize = 64;
+
+/// Push a note with length + count caps. Pure (testable) core of `append_city_note`.
+pub(crate) fn push_capped_note(notes: &mut Vec<String>, log_text: &str) -> Result<(), String> {
     let trimmed = log_text.trim();
     if trimmed.is_empty() {
         return Err("Log text is empty".into());
     }
+    if trimmed.len() > CITY_NOTE_MAX_BYTES {
+        return Err(format!(
+            "Note too long (max {CITY_NOTE_MAX_BYTES} bytes)"
+        ));
+    }
+    if notes.len() >= CITY_NOTES_MAX_COUNT {
+        let overflow = notes.len() + 1 - CITY_NOTES_MAX_COUNT;
+        notes.drain(0..overflow);
+    }
+    notes.push(trimmed.to_string());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn append_city_note(
+    file_id: String,
+    log_text: String,
+    backend_state: State<'_, BackendState>,
+    polis: State<'_, PolisState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let mut city = polis.lock_city()?;
     // An empty file_id targets the city-level note log.
     if file_id.is_empty() {
-        city.notes.push(trimmed.to_string());
-        return Ok(());
+        return push_capped_note(&mut city.notes, &log_text);
     }
     let building = city
         .building_mut(&file_id)
         .ok_or_else(|| format!("No building with file_id {file_id}"))?;
-    building.notes.push(trimmed.to_string());
-    Ok(())
+    push_capped_note(&mut building.notes, &log_text)
 }
 
 // ---------------------------------------------------------------------------
 // Era / Prestige
 // ---------------------------------------------------------------------------
+
+/// Strict era-name validation (CRIT-7): only `[A-Za-z0-9_-]`, length 1..=64.
+/// Rejects path separators, dots, `..`, empty, and anything that could escape
+/// the `eras/` snapshot directory when used as a filename component.
+pub(crate) fn validate_era_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("New era name is empty".into());
+    }
+    if name.len() > 64 {
+        return Err("Era name too long (max 64 characters)".into());
+    }
+    if name == "." || name == ".." {
+        return Err("Invalid era name".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('.') {
+        return Err(
+            "Era name may only contain letters, digits, '_' and '-'".into(),
+        );
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(
+            "Era name may only contain letters, digits, '_' and '-'".into(),
+        );
+    }
+    Ok(name.to_string())
+}
+
+/// Defensive filesystem slug for era snapshot paths: keep only `[A-Za-z0-9_-]`,
+/// lowercase, length 1..=64; fallback `"era"` if nothing remains (so a pre-fix
+/// hostile era string can never escape `eras/`).
+pub(crate) fn era_slug_for_path(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(64)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if s.is_empty() || s == "." || s == ".." {
+        "era".to_string()
+    } else {
+        s
+    }
+}
 
 #[tauri::command]
 pub fn reset_city_to_new_era(
@@ -1135,10 +1306,7 @@ pub fn reset_city_to_new_era(
     // so require unlock like the other file-touching commands.
     backend_state.ensure_unlocked()?;
 
-    let new_era = new_era_name.trim().to_string();
-    if new_era.is_empty() {
-        return Err("New era name is empty".into());
-    }
+    let new_era = validate_era_name(&new_era_name)?;
     let project_path = polis
         .project_path()
         .ok_or_else(|| "No project scanned yet; nothing to reset".to_string())?;
@@ -1165,9 +1333,12 @@ pub fn reset_city_to_new_era(
     };
 
     // Filesystem writes happen AFTER the city lock is released.
+    // Defensive: re-slug the old era so a pre-fix hostile value cannot escape
+    // `eras/` even if it was already stored in city state.
+    let safe_slug = era_slug_for_path(&prepared.old_era_slug);
     let eras_dir = project_path.join("eras");
     std::fs::create_dir_all(&eras_dir).map_err(|e| format!("Failed to create eras dir: {e}"))?;
-    let snapshot_path = eras_dir.join(format!("{}_snapshot.json", prepared.old_era_slug));
+    let snapshot_path = eras_dir.join(format!("{safe_slug}_snapshot.json"));
     std::fs::write(&snapshot_path, &prepared.snapshot_bytes)
         .map_err(|e| format!("Failed to write era snapshot: {e}"))?;
 
@@ -1201,7 +1372,8 @@ struct PreparedEraReset {
 /// grounded coords/tiers. Monuments (derived from real archived stats) persist.
 fn reset_city_in_place(city: &mut CityState, new_era: &str) -> PreparedEraReset {
     let old_era = city.era.clone();
-    let old_era_slug = old_era.to_ascii_lowercase();
+    // Defensive slug: never embed raw era text in paths / service ids.
+    let old_era_slug = era_slug_for_path(&old_era);
 
     // 1) Serialize the immutable snapshot bytes (written to disk by the caller,
     //    outside the lock). `to_string_pretty` on a CityState cannot fail.
@@ -1213,12 +1385,10 @@ fn reset_city_in_place(city: &mut CityState, new_era: &str) -> PreparedEraReset 
     // disasters present at era close, NOT "resolved" ones (#11).
     let n_disasters_active = city.buildings.iter().filter(|b| !b.sins.is_empty()).count();
     // Deterministic MARGIN placement (PURE, no rand): cumulative era monuments
-    // form a column on the LANDWARD (west, -x) edge of the building grid — a
-    // DIFFERENT edge from the seaward cloud harbour (east, +x; see
-    // `cloud::place_external_services`), so a monument can never collide with a
-    // cloud outpost. The column is derived from the OLD-era building extent
-    // (computed BEFORE the buildings are cleared below), so it always sits OUTSIDE
-    // the grid. Each successive monument is offset one row down from the previous,
+    // form a column on the LANDWARD (west, -x) edge of the building grid.
+    // The column is derived from the OLD-era building extent (computed BEFORE
+    // the buildings are cleared below), so it always sits OUTSIDE the grid.
+    // Each successive monument is offset one row down from the previous,
     // indexed by how many monuments already stand, so they line up cumulatively
     // without overlapping each other.
     let monument_index = city
@@ -1255,9 +1425,8 @@ fn reset_city_in_place(city: &mut CityState, new_era: &str) -> PreparedEraReset 
     // bridges) is derived from the now-cleared buildings + roads, so the previous
     // era's water would otherwise be returned over an empty grid until the next
     // scan. Clear it to an honest empty frame; the next real scan
-    // (`generate_city_state` → `attach_external_services`) rebuilds it from the new
-    // layout. Keep this AFTER the roads clear so it reads as "terrain follows the
-    // (now-empty) layout".
+    // (`generate_city_state`) rebuilds it from the new layout. Keep this AFTER
+    // the roads clear so it reads as "terrain follows the (now-empty) layout".
     city.terrain = crate::polis::terrain::TerrainData::empty();
     city.districts.clear();
     city.agents.clear();
@@ -1308,60 +1477,23 @@ const WONDER_SLUGS: &[&str] = &[
 
 /// PURE, DETERMINISTIC margin placement for the cumulative era monuments (NO
 /// rand). Monuments form a column on the LANDWARD (west, -x) edge of the
-/// building grid — the OPPOSITE edge from the seaward cloud harbour (east, +x;
-/// `cloud::place_external_services`) — so a monument never collides with a cloud
-/// outpost. `index` is how many monuments already stand (0 for the first), and
-/// each monument steps one `MONUMENT_ROW_PITCH` row down from the previous so the
-/// column lines up cumulatively without self-overlap.
+/// building grid. `index` is how many monuments already stand (0 for the first),
+/// and each monument steps one `MONUMENT_ROW_PITCH` row down from the previous so
+/// the column lines up cumulatively without self-overlap.
 ///
-/// The column anchors off the OLD-era building extent (`scanner::map_extent`, the
-/// same helper the cloud harbour uses) so it always sits OUTSIDE the grid: the
-/// column x is `min_x - GAP`, and the first row anchors at the grid's `min_y`.
-/// With no buildings (extent `None`) the column anchors at a small fixed offset
-/// on the negative-x side of the origin, mirroring the harbour's no-building
-/// fallback but on the opposite edge.
+/// The column anchors off the OLD-era building extent (`scanner::map_extent`) so
+/// it always sits OUTSIDE the grid: the column x is `min_x - GAP`, and the first
+/// row anchors at the grid's `min_y`. With no buildings (extent `None`) the
+/// column anchors at a small fixed offset on the negative-x side of the origin.
 fn era_monument_coords(buildings: &[Building], index: usize) -> Coords {
-    // Landward gap (tiles) between the city's west edge and the monument column —
-    // the same GAP the cloud harbour uses for its seaward gap (symmetric margins).
+    // Landward gap (tiles) between the city's west edge and the monument column.
     let land_gap = scanner::GAP as f64;
     let (col_x, top_y) = match scanner::map_extent(buildings) {
         Some((min_x, min_y, _max_x, _max_y)) => (min_x - land_gap, min_y),
-        // No buildings: anchor a fixed offset to the WEST of the origin (negative
-        // x), opposite the harbour's positive-x no-building anchor.
+        // No buildings: anchor a fixed offset to the WEST of the origin.
         None => (-land_gap, 0.0),
     };
     Coords::new(col_x, top_y + (index as f64) * MONUMENT_ROW_PITCH)
-}
-
-// ---------------------------------------------------------------------------
-// Scaleway — STUBBED (deferred)
-// ---------------------------------------------------------------------------
-
-// POLIS FOLLOW-UP: wire these to the existing Scaleway provider integration
-// (IAM API, container/VM status). Until then they return a clear error so the
-// frontend can show "not yet implemented" rather than silently no-op.
-
-#[tauri::command]
-pub fn spawn_scaleway_resource(
-    _service_id: String,
-    _polis: State<'_, PolisState>,
-) -> Result<ExternalService, String> {
-    Err("spawn_scaleway_resource is not yet implemented (Scaleway integration deferred)".into())
-}
-
-#[tauri::command]
-pub fn stop_scaleway_resource(
-    _service_id: String,
-    _polis: State<'_, PolisState>,
-) -> Result<(), String> {
-    Err("stop_scaleway_resource is not yet implemented (Scaleway integration deferred)".into())
-}
-
-#[tauri::command]
-pub fn refresh_scaleway_status(
-    _polis: State<'_, PolisState>,
-) -> Result<Vec<ExternalService>, String> {
-    Err("refresh_scaleway_status is not yet implemented (Scaleway integration deferred)".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,16 +1525,10 @@ pub fn polis_start_watch(
     // Posture match: the watcher re-scans arbitrary local files -> require unlock.
     backend_state.ensure_unlocked()?;
 
-    // Resolve the target root the same way the scan command does.
+    // Resolve the target root the same way the scan command does (confined).
     let live =
         crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
-    let path = resolve_scan_path(project_path, &app, &live);
-    if !path.is_dir() {
-        return Err(format!(
-            "Project path is not a directory: {}",
-            path.display()
-        ));
-    }
+    let path = resolve_scan_path(project_path, &app, &backend_state, &live)?;
 
     // Idempotency: if a watcher is already running on this exact root, do nothing.
     {
@@ -1427,9 +1553,22 @@ pub fn polis_start_watch(
         project_roots,
     };
 
-    // Build the new watcher BEFORE swapping it in, so a setup failure leaves any
-    // existing watcher intact and returns a clear error.
-    let handle = watcher::start_watch(app.clone(), path.clone(), polis.city.clone(), attach)?;
+    // Publish the active root BEFORE starting the new watcher. Order matters:
+    // set the path first so (1) a late rescan from the OLD handle sees a
+    // mismatched root and bails before store/emit, and (2) the new watcher's
+    // first rescan is not dropped by is_active_watch_root (path not yet set).
+    polis.set_project_path(path.clone());
+
+    // Build the new watcher AFTER the path is published, so a setup failure
+    // still leaves the path correct for any subsequent generate/start retry
+    // (old watcher is neutralized by the path guard until stopped below).
+    let handle = watcher::start_watch(
+        app.clone(),
+        path,
+        polis.city.clone(),
+        polis.project_path_handle(),
+        attach,
+    )?;
 
     // Install the new watcher, taking out any previous one on a different root.
     // We STOP the old handle explicitly OUTSIDE the lock (WARNING 3): `stop()`
@@ -1448,14 +1587,17 @@ pub fn polis_start_watch(
     if let Some(old) = previous {
         old.stop();
     }
-    polis.set_project_path(path);
     Ok(())
 }
 
 /// Stop the live filesystem watcher cleanly (drop the watcher + join its thread).
 /// Idempotent: stopping when not watching is a successful no-op.
 #[tauri::command]
-pub fn polis_stop_watch(polis: State<'_, PolisState>) -> Result<(), String> {
+pub fn polis_stop_watch(
+    backend_state: State<'_, BackendState>,
+    polis: State<'_, PolisState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
     let handle = {
         let mut guard = polis
             .watch
@@ -2266,16 +2408,10 @@ pub fn polis_get_kin(
     // Gated like generate_city_state (reads local files).
     backend_state.ensure_unlocked()?;
 
-    // Resolve the project root the same way the scan command does.
+    // Resolve the project root the same way the scan command does (confined).
     let live =
         crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
-    let path = resolve_scan_path(project_path, &app, &live);
-    if !path.is_dir() {
-        return Err(format!(
-            "Project path is not a directory: {}",
-            path.display()
-        ));
-    }
+    let path = resolve_scan_path(project_path, &app, &backend_state, &live)?;
 
     // Read from the persisted cache only.
     use crate::polis::meta_store::MetaStore;
@@ -2387,6 +2523,120 @@ mod tests {
         assert!(normalize_severity("bogus").is_err());
         assert!(normalize_agent_status("Working").is_ok());
         assert!(normalize_agent_status("flying").is_err());
+    }
+
+    // CRIT-7: era names must be strict slugs — path traversal / absolute
+    // components rejected at the INPUT boundary.
+    #[test]
+    fn validate_era_name_accepts_strict_slugs() {
+        assert_eq!(validate_era_name("Beta").unwrap(), "Beta");
+        assert_eq!(validate_era_name("  alpha_1-2  ").unwrap(), "alpha_1-2");
+        assert_eq!(validate_era_name(&"a".repeat(64)).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn validate_era_name_rejects_path_traversal_and_junk() {
+        assert!(validate_era_name("").is_err());
+        assert!(validate_era_name("   ").is_err());
+        assert!(validate_era_name(".").is_err());
+        assert!(validate_era_name("..").is_err());
+        assert!(validate_era_name("../../tmp/pwn").is_err());
+        assert!(validate_era_name("/tmp/pwn").is_err());
+        assert!(validate_era_name(r"..\..\Windows").is_err());
+        assert!(validate_era_name("era.name").is_err());
+        assert!(validate_era_name("has space").is_err());
+        assert!(validate_era_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn era_slug_for_path_strips_hostile_components() {
+        // Defensive path builder: hostile stored era cannot escape eras/.
+        assert_eq!(era_slug_for_path("Alpha"), "alpha");
+        assert_eq!(era_slug_for_path("../../tmp/pwn"), "tmppwn");
+        assert_eq!(era_slug_for_path("/tmp/pwn"), "tmppwn");
+        assert_eq!(era_slug_for_path("..."), "era");
+        assert_eq!(era_slug_for_path(""), "era");
+    }
+
+    // CRIT-8: pure confinement matcher — accept under allowed roots, reject
+    // siblings / absolute outsiders.
+    #[test]
+    fn is_path_confined_accepts_under_allowed_root() {
+        let root = PathBuf::from(if cfg!(windows) {
+            r"C:\projects\app"
+        } else {
+            "/projects/app"
+        });
+        let under = root.join("src");
+        let allowed = vec![root.clone()];
+        assert!(is_path_confined(&root, &allowed));
+        assert!(is_path_confined(&under, &allowed));
+    }
+
+    #[test]
+    fn is_path_confined_rejects_outside_allowed_roots() {
+        let root = PathBuf::from(if cfg!(windows) {
+            r"C:\projects\app"
+        } else {
+            "/projects/app"
+        });
+        let sibling = PathBuf::from(if cfg!(windows) {
+            r"C:\projects\other"
+        } else {
+            "/projects/other"
+        });
+        let outsider = PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\pwn"
+        } else {
+            "/tmp/pwn"
+        });
+        let allowed = vec![root];
+        assert!(!is_path_confined(&sibling, &allowed));
+        assert!(!is_path_confined(&outsider, &allowed));
+        assert!(!is_path_confined(
+            &PathBuf::from(if cfg!(windows) {
+                r"C:\projects\app2"
+            } else {
+                "/projects/app2"
+            }),
+            &allowed
+        ));
+    }
+
+    // HIGH: note length + count caps.
+    #[test]
+    fn push_capped_note_rejects_oversize_and_empty() {
+        let mut notes = Vec::new();
+        assert!(push_capped_note(&mut notes, "").is_err());
+        assert!(push_capped_note(&mut notes, "   ").is_err());
+        let big = "x".repeat(CITY_NOTE_MAX_BYTES + 1);
+        assert!(push_capped_note(&mut notes, &big).is_err());
+        assert!(notes.is_empty());
+        assert!(push_capped_note(&mut notes, "ok").is_ok());
+        assert_eq!(notes, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn push_capped_note_ring_buffers_when_full() {
+        let mut notes = Vec::new();
+        for i in 0..CITY_NOTES_MAX_COUNT {
+            push_capped_note(&mut notes, &format!("n{i}")).unwrap();
+        }
+        assert_eq!(notes.len(), CITY_NOTES_MAX_COUNT);
+        push_capped_note(&mut notes, "overflow").unwrap();
+        // Cap is 64; overflow must drop oldest, keep mid + newest (not truncate-newest).
+        assert_eq!(notes.len(), 64);
+        assert_eq!(notes.len(), CITY_NOTES_MAX_COUNT);
+        assert_eq!(notes[0], "n1");
+        assert_eq!(notes.last().unwrap(), "overflow");
+        assert!(
+            !notes.iter().any(|n| n == "n0"),
+            "oldest note n0 must be dropped on overflow"
+        );
+        assert!(
+            notes.iter().any(|n| n == "n32"),
+            "a mid-window note must survive ring eviction"
+        );
     }
 
     #[test]
@@ -2636,16 +2886,15 @@ mod tests {
             "placement is deterministic"
         );
 
-        // Cross-check: the landward column is on the OPPOSITE edge from the cloud
-        // harbour. The harbour places at max_x + GAP (east); monuments at
-        // min_x - GAP (west). With any non-empty grid, west margin < east margin.
-        let east_harbour_x = {
+        // Cross-check: the landward monument column sits west of the building
+        // grid's east extent (min_x - GAP < max_x + GAP for any non-empty grid).
+        let east_edge_x = {
             let (_, _, max_x, _) = crate::polis::scanner::map_extent(&mk_city().buildings).unwrap();
             max_x + crate::polis::scanner::GAP as f64
         };
         assert!(
-            m_alpha.coords.x < east_harbour_x,
-            "monument (west) must never collide with the cloud harbour (east)"
+            m_alpha.coords.x < east_edge_x,
+            "monument (west) must sit west of the building grid's east margin"
         );
     }
 

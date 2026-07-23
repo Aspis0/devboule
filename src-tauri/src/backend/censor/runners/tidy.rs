@@ -36,7 +36,7 @@
 
 use super::super::severity::severity_from_tidy;
 use super::DEFAULT_RUNNER_TIMEOUT;
-use super::{cap, redact_secrets, run_capture_stderr_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture_stderr_with_timeout, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -161,9 +161,9 @@ fn tidy_argv(file_rel_path: &str) -> Vec<&str> {
 /// file path is the orchestrator-validated project-relative path (a leading-`-`
 /// component is rejected upstream by `validate_rel_path`, so it can't be mistaken for a
 /// flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("tidy") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let args = tidy_argv(&target.file_rel_path);
     let stderr = run_capture_stderr_with_timeout(
@@ -173,8 +173,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stderr {
-        Some(s) => parse_tidy(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_tidy(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -313,7 +313,7 @@ line 2 column 1 - Warning: <blink> is not approved by W3C
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("tidy") {
             assert!(
                 !findings.is_empty(),

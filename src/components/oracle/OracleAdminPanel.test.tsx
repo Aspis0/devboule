@@ -37,7 +37,6 @@ function baseCtx(): Ctx {
     oracleLlmSettings: null,
     oracleIndexPreferences: null,
     oracleIndexStatus: null,
-    secretStatuses: [],
     refreshOracleRuntime: vi.fn(async () => undefined),
     refreshOracleLlmSettings: vi.fn(async () => undefined),
     refreshOracleIndexStatus,

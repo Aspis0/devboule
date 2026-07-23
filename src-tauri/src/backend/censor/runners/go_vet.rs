@@ -26,7 +26,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_go_vet;
-use super::{cap, redact_secrets, run_capture_stderr_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_stderr_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use std::path::Path;
 use std::time::Duration;
 
@@ -114,14 +114,14 @@ fn parse_vet_line(line: &str) -> Option<(String, u32, &str)> {
 /// is heavy/thermal. It is a COARSE runner: the orchestrator invokes it once per
 /// coarse debounce, NEVER per keystroke. Diagnostics go to stderr, so we capture the
 /// stderr stream (stdout is drained) with the longer compile-aware timeout.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("go") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stderr = run_capture_stderr_with_timeout("go", &["vet", "./..."], root, GO_VET_TIMEOUT);
     match stderr {
-        Some(s) => parse_go_vet(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_go_vet(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -207,7 +207,7 @@ pkg/qux.go:9:1: another real one
         )
         .unwrap();
 
-        let findings = run(&dir);
+        let findings = run(&dir).into_findings();
         if crate::backend::projects::command_exists("go") {
             // Clean code → no vet diagnostics. (If the local toolchain emits an
             // environment diagnostic we tolerate it, but assert no panic + the source.)

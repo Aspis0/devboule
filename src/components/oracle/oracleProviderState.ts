@@ -1,19 +1,22 @@
-import type { OracleLlmSettingsStatus, SecretStatus } from "../../types/backend";
+import type { OracleLlmSettingsStatus } from "../../types/backend";
 
 // Shared, pure derivation of "is an answer-provider configured?" used by BOTH
-// the Oracle admin panel (Settings → Workspace) and the future Polis ask-panel,
+// the Oracle admin panel (Settings → Workspace) and the Polis ask-panel,
 // so the two surfaces always agree. Lifted verbatim from the original OracleView
 // `providerConfigured` memo to avoid duplicating the rule.
 //
 // Lightweight only — no model load. Primary signal is the Oracle LLM settings
 // status. Local providers (oMLX/Ollama) are keyless and signal via status.
 // Remote providers (OpenAI, OpenRouter, DeepSeek) require an API key.
+//
+// IMPORTANT: a former cloud-provider secret (Cloudflare/Scaleway inventory
+// token) must NEVER make Oracle appear configured — those were unrelated vault
+// entries. Configuration is derived solely from Oracle LLM settings status.
 export function deriveProviderConfigured(
   oracleLlmSettings: OracleLlmSettingsStatus | null,
-  // Reserved (kept for a stable 2-arg signature shared by the admin panel and
-  // the Polis ask-panel). The Scaleway-token fallback that consumed it is gone;
-  // configuration is now derived solely from the Oracle LLM settings status.
-  _secretStatuses: SecretStatus[] | undefined,
+  // Reserved second arg kept for a stable signature shared by callers.
+  // Intentionally ignored — never use vault inventory secrets for Oracle.
+  _unused?: unknown,
 ): boolean {
   if (oracleLlmSettings?.apiKeyConfigured) return true;
   // LOCAL providers (oMLX/Ollama) are KEYLESS by design — the Rust vault

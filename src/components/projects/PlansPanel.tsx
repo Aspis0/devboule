@@ -203,11 +203,19 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // Monotonic generation: only the latest list response may write state
+  // (a slow interval tick must not overwrite a fresher post-approve refresh).
+  const fetchGenRef = useRef(0);
+  const inFlightRef = useRef(false);
 
   // `showSpinner` is true only for the initial mount load; background poll refetches
   // run silently so the panel does not flash "Loading plans…" every interval.
+  // `force` bypasses the in-flight guard so a post-approve refresh always runs.
   const fetch = useCallback(
-    async (showSpinner: boolean) => {
+    async (showSpinner: boolean, force = false) => {
+      if (inFlightRef.current && !force) return;
+      inFlightRef.current = true;
+      const gen = ++fetchGenRef.current;
       if (showSpinner) setLoading(true);
       setError(null);
       try {
@@ -215,10 +223,10 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
           "list_project_plans",
           { projectId },
         );
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || gen !== fetchGenRef.current) return;
         setPlans(data ?? []);
       } catch (e) {
-        if (mountedRef.current) {
+        if (mountedRef.current && gen === fetchGenRef.current) {
           // Tauri rejections are often plain strings, not Error.
           const message =
             typeof e === "string"
@@ -229,7 +237,12 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
           setError(message);
         }
       } finally {
-        if (showSpinner && mountedRef.current) setLoading(false);
+        if (gen === fetchGenRef.current) {
+          inFlightRef.current = false;
+          // Always clear loading for the latest gen (a force refresh can supersede
+          // the mount spinner fetch; only the winner may leave loading stuck).
+          if (mountedRef.current) setLoading(false);
+        }
       }
     },
     [projectId],
@@ -244,13 +257,15 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
       if (document.visibilityState === "visible") void fetch(false);
     }, PLANS_POLL_INTERVAL_MS);
     // F05: PlanApprovalCard fires this after approve/deny so history updates
-    // immediately instead of waiting for the 12s poll.
+    // immediately instead of waiting for the 12s poll. Force so a mid-interval
+    // tick cannot make this a no-op; gen tokens drop any older response.
     const onRefresh = () => {
-      if (document.visibilityState === "visible") void fetch(false);
+      if (document.visibilityState === "visible") void fetch(false, true);
     };
     window.addEventListener("devboule:plans-refresh", onRefresh);
     return () => {
       mountedRef.current = false;
+      fetchGenRef.current++;
       window.clearInterval(id);
       window.removeEventListener("devboule:plans-refresh", onRefresh);
     };

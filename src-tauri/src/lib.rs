@@ -58,13 +58,9 @@ pub fn run_claude_consent_hook() -> i32 {
 const ALLOWED_EXTERNAL_HOSTS: &[&str] = &[
     "aspis-bio.com",
     "console.nebius.ai",
-    "console.scaleway.com",
-    "dash.cloudflare.com",
-    "developers.cloudflare.com",
     "docs.aspis-bio.com",
     "github.com",
     "manager.infomaniak.com",
-    "www.scaleway.com",
 ];
 
 #[derive(Serialize)]
@@ -216,10 +212,10 @@ mod tests {
 
     #[test]
     fn external_url_gate_allows_known_https_hosts_only() {
-        assert!(validate_external_url("https://dash.cloudflare.com").is_ok());
-        assert!(validate_external_url("http://dash.cloudflare.com").is_err());
+        assert!(validate_external_url("https://github.com").is_ok());
+        assert!(validate_external_url("http://github.com").is_err());
         assert!(validate_external_url("https://evil.example").is_err());
-        assert!(validate_external_url("https://user:pass@dash.cloudflare.com").is_err());
+        assert!(validate_external_url("https://user:pass@github.com").is_err());
     }
 
     fn bootstrap_tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -421,6 +417,15 @@ pub fn run() {
         // app's webviews; the app CSP grants it via `frame-src` in tauri.conf.json.
         .register_uri_scheme_protocol("artifact", backend::artifact_protocol::handle_artifact_request)
         .setup(|app| {
+            // DEV ONLY: register the ui-pilot ACL at runtime. The `pilot.json` capability lives
+            // OUTSIDE the auto-discovered `capabilities/` dir (in `capabilities-optional/`) so the
+            // tauri build script never validates `pilot:default` — a bare/release build (no
+            // `ui-pilot` feature) therefore compiles AND ships zero pilot surface. It is added here
+            // only when the pilot plugin (which provides `pilot:default`) is compiled in.
+            #[cfg(all(debug_assertions, feature = "ui-pilot"))]
+            {
+                app.add_capability(include_str!("../capabilities-optional/pilot.json"))?;
+            }
             // Record the bundled, read-only `oracle/` location so release builds
             // run Oracle Python only from there, never from a user "drop" dir.
             if let Ok(dir) = app.path().resource_dir() {
@@ -539,19 +544,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             open_external_url,
-            backend::commands::audit_provider_connection,
-            backend::commands::audit_saved_provider_connection,
             backend::cli_agents::configure_cli_agents,
             backend::cli_agents::cli_agents_status,
             backend::cli_agents::unconfigure_cli_agents,
-            backend::commands::cloudflare_smoke_dry_run,
-            backend::commands::delete_cloudflare_agent_token_profile,
             backend::devices::approve_device_invite,
-            backend::commands::delete_provider_token,
-            backend::commands::delete_provider_scope,
             backend::commands::delete_oracle_llm_api_key,
-            backend::commands::delete_scaleway_object_access_key,
-            backend::commands::delete_scaleway_object_secret_key,
 
             backend::commands::get_censor_cloud_key_status,
             backend::commands::save_censor_cloud_key,
@@ -609,15 +606,9 @@ pub fn run() {
             backend::mini_activity::mini_activity_snapshot,
             backend::page_preview::fetch_page_preview,
             backend::token_usage::get_agent_token_usage,
-            backend::commands::get_cloud_dashboard_snapshot,
-            backend::commands::get_cloudflare_agent_token_profiles,
             backend::devices::get_devices_invites_snapshot,
-            backend::commands::get_provider_scope_status,
             backend::commands::get_oracle_index_preferences,
             backend::commands::get_oracle_llm_settings,
-            backend::commands::get_scaleway_object_access_key_status,
-            backend::commands::get_scaleway_object_secret_key_status,
-            backend::commands::get_secret_status,
             backend::workspace::get_workspace_hygiene_snapshot,
             backend::workspace::get_workspace_package_snapshot,
             backend::commands::lock_app,
@@ -663,25 +654,7 @@ pub fn run() {
             backend::plan_approval::reply_to_agent,
             backend::projects::prepare_project_agent_prompt,
             backend::projects::detect_project_language,
-            backend::commands::perform_scaleway_resource_action,
-            backend::commands::create_scaleway_block_volume,
-            backend::commands::resize_scaleway_block_volume,
-            backend::commands::create_scaleway_block_snapshot,
-            backend::commands::delete_scaleway_block_storage,
-            backend::commands::create_scaleway_filesystem,
-            backend::commands::delete_scaleway_filesystem,
-            backend::commands::create_scaleway_object_bucket,
-            backend::commands::delete_scaleway_object_bucket,
-            backend::commands::set_scaleway_object_bucket_lifecycle,
-            backend::commands::create_scaleway_sql_database,
-            backend::commands::delete_scaleway_sql_database,
-            backend::commands::scaleway_instance_create_dry_run,
-            backend::commands::create_scaleway_instance,
-            backend::commands::create_scaleway_function,
-            backend::commands::delete_scaleway_function,
-            backend::commands::create_scaleway_container,
-            backend::commands::delete_scaleway_container,
-            backend::projects::refresh_project_live_status,
+
             backend::projects::remove_project_milestone,
             backend::projects::set_censor_local_ai,
             backend::projects::set_custom_agent_clients,
@@ -693,33 +666,10 @@ pub fn run() {
             backend::commands::request_unlock,
             backend::agent_notifications::read_agent_notification_state,
             backend::agent_notifications::write_agent_notification_state,
-            backend::commands::fetch_cloudflare_worker_settings,
-            backend::commands::fetch_cloudflare_billing,
-            backend::commands::fetch_scaleway_billing,
-            backend::commands::cloudflare_env_dry_run,
-            backend::commands::cloudflare_set_worker_env,
-            backend::commands::fetch_cloudflare_ai_gateway_settings,
-            backend::commands::set_cloudflare_ai_gateway_settings,
-            backend::commands::cloudflare_autorag_reindex,
-            backend::commands::fetch_cloudflare_kv_keys,
-            backend::commands::fetch_cloudflare_kv_value,
-            backend::commands::set_cloudflare_kv_value,
-            backend::commands::delete_cloudflare_kv_value,
-            backend::commands::cloudflare_d1_query,
-            backend::commands::fetch_cloudflare_r2_config,
-            backend::commands::set_cloudflare_r2_lifecycle,
-            backend::commands::set_cloudflare_r2_cors,
-            backend::commands::rotate_cloudflare_worker_secret,
-            backend::commands::save_provider_scope,
-            backend::commands::save_provider_token,
-            backend::commands::save_cloudflare_agent_token_profile,
             backend::commands::save_oracle_index_preferences,
             backend::commands::save_oracle_llm_settings,
-            backend::commands::save_scaleway_object_access_key,
-            backend::commands::save_scaleway_object_secret_key,
             backend::workspace::scan_workspace_hygiene,
             backend::workspace::create_workspace_bootstrap_package,
-            backend::commands::sync_provider_inventory,
             backend::projects::update_project_metadata,
             backend::projects::delete_project,
             oracle::commands::get_oracle_coverage,
@@ -747,9 +697,6 @@ pub fn run() {
             polis::commands::append_city_note,
             polis::commands::reset_city_to_new_era,
             polis::commands::polis_open_in_editor,
-            polis::commands::spawn_scaleway_resource,
-            polis::commands::stop_scaleway_resource,
-            polis::commands::refresh_scaleway_status,
             polis::commands::polis_start_watch,
             polis::commands::polis_stop_watch,
             polis::commands::polis_refresh_agents,

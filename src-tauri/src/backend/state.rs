@@ -1,16 +1,10 @@
 use super::auth;
-use super::model::{
-    ActivityEvent, AuthState, ProviderHealth, ProviderId, ProviderScopeSelection,
-    ScalewayOfferSummary, ScalewayResourceSummary, ScalewayStorageSummary,
-};
-use super::providers::ProviderInventory;
+use super::model::AuthState;
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 
 const UNLOCK_TTL_MINUTES: i64 = 15;
-const ACTIVITY_HISTORY_LIMIT: usize = 80;
 
 /// DEV ONLY: skip Touch ID / Hello and idle soft-lock so agents can drive the
 /// app overnight without a human at the keyboard.
@@ -66,37 +60,27 @@ pub struct BackendState {
     /// Captured once at construction from `dev_unlock_enabled()` so AuthState
     /// reports a stable `devUnlock` without re-reading the env on every poll.
     dev_unlock: bool,
-    scaleway_compute: RwLock<Vec<ScalewayResourceSummary>>,
-    scaleway_compute_initialized: RwLock<bool>,
-    /// Last synced Instance offer catalog. Read by the Instance create dry-run to
-    /// price a chosen `commercial_type` WITHOUT a network call. Empty until the
-    /// first successful sync; cleared on lock / inventory clear.
-    scaleway_offers: RwLock<Vec<ScalewayOfferSummary>>,
-    cached_cloudflare: RwLock<Option<ProviderInventory>>,
-    cached_scaleway: RwLock<Option<ProviderInventory>>,
-    activity_history: RwLock<Vec<ActivityEvent>>,
-    // TODO/SECURITY: this shared client has NO redirect policy set, so it follows the
-    // reqwest default (up to 10 redirects). Any callers that send secrets/tokens (Scaleway,
-    // GitHub) could in principle have a 3xx redirect them off the intended host. This is
-    // flagged for a later dedicated review — do NOT change it here, as those paths may rely
-    // on the current behavior. The design-generation HTTP path deliberately does NOT use
-    // this client; it uses its own redirect-disabled, loopback-only client (see
-    // backend::design_generate::DesignGenState::http_client).
+    /// Shared HTTP client for credentialed outbound calls (pigeon, censor/gemma).
+    /// Redirects are DISABLED (`Policy::none`) so a cross-host 3xx cannot replay
+    /// Authorization headers off the intended host. Callers that need redirects
+    /// without auth must use a separate non-auth client.
     pub http: reqwest::Client,
 }
 
-pub struct ScalewayComputeReplacement {
-    pub previous: Vec<ScalewayResourceSummary>,
-    pub had_previous_snapshot: bool,
+/// Builds the shared authed HTTP client. Redirects are always off so credentialed
+/// requests cannot be 3xx-replayed onto a different host.
+fn build_shared_authed_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Devboule/0.1")
+        .timeout(StdDuration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build reqwest client")
 }
 
 impl BackendState {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent("Devboule/0.1")
-            .timeout(StdDuration::from_secs(15))
-            .build()
-            .expect("failed to build reqwest client");
+        let http = build_shared_authed_http_client();
 
         let dev = dev_unlock_enabled();
         if dev {
@@ -117,12 +101,6 @@ impl BackendState {
             auth_retry_after: Mutex::new(None),
             hello_available: OnceLock::new(),
             dev_unlock: dev,
-            scaleway_compute: RwLock::new(Vec::new()),
-            scaleway_compute_initialized: RwLock::new(false),
-            scaleway_offers: RwLock::new(Vec::new()),
-            cached_cloudflare: RwLock::new(None),
-            cached_scaleway: RwLock::new(None),
-            activity_history: RwLock::new(Vec::new()),
             http,
         }
     }
@@ -302,101 +280,6 @@ impl BackendState {
         Ok(())
     }
 
-    pub fn replace_scaleway_compute(
-        &self,
-        current: Vec<ScalewayResourceSummary>,
-    ) -> Result<ScalewayComputeReplacement, String> {
-        let mut previous = self.scaleway_compute.write().map_err(|e| e.to_string())?;
-        let mut initialized = self
-            .scaleway_compute_initialized
-            .write()
-            .map_err(|e| e.to_string())?;
-        let old = previous.clone();
-        *previous = current;
-        let had_previous_snapshot = *initialized;
-        *initialized = true;
-        Ok(ScalewayComputeReplacement {
-            previous: old,
-            had_previous_snapshot,
-        })
-    }
-
-    /// Replace the cached Instance offer catalog after a successful sync.
-    pub fn replace_scaleway_offers(&self, offers: Vec<ScalewayOfferSummary>) -> Result<(), String> {
-        *self.scaleway_offers.write().map_err(|e| e.to_string())? = offers;
-        Ok(())
-    }
-
-    /// Snapshot of the cached Instance offer catalog (empty until first sync). Read
-    /// by the create dry-run to price a chosen offer without a network call.
-    pub fn scaleway_offers(&self) -> Result<Vec<ScalewayOfferSummary>, String> {
-        self.scaleway_offers
-            .read()
-            .map(|offers| offers.clone())
-            .map_err(|e| e.to_string())
-    }
-
-    pub fn record_activity_events(&self, events: &[ActivityEvent]) -> Result<(), String> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        let mut history = self.activity_history.write().map_err(|e| e.to_string())?;
-        let mut seen = history
-            .iter()
-            .map(|event| event.id.clone())
-            .collect::<HashSet<_>>();
-        for event in events {
-            if seen.insert(event.id.clone()) {
-                history.push(event.clone());
-            }
-        }
-        history.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
-        history.truncate(ACTIVITY_HISTORY_LIMIT);
-        Ok(())
-    }
-
-    pub fn recent_activity(&self) -> Result<Vec<ActivityEvent>, String> {
-        self.activity_history
-            .read()
-            .map(|history| history.clone())
-            .map_err(|e| e.to_string())
-    }
-
-    pub fn replace_provider_inventory(&self, inventory: ProviderInventory) -> Result<(), String> {
-        let target = match inventory.health.id {
-            ProviderId::Cloudflare => &self.cached_cloudflare,
-            ProviderId::Scaleway => &self.cached_scaleway,
-        };
-        *target.write().map_err(|e| e.to_string())? = Some(inventory);
-        Ok(())
-    }
-
-    pub fn clear_provider_inventory(&self, provider: ProviderId) -> Result<(), String> {
-        let target = match provider {
-            ProviderId::Cloudflare => &self.cached_cloudflare,
-            ProviderId::Scaleway => &self.cached_scaleway,
-        };
-        *target.write().map_err(|e| e.to_string())? = None;
-
-        if provider == ProviderId::Scaleway {
-            self.scaleway_compute
-                .write()
-                .map_err(|e| e.to_string())?
-                .clear();
-            *self
-                .scaleway_compute_initialized
-                .write()
-                .map_err(|e| e.to_string())? = false;
-            self.scaleway_offers
-                .write()
-                .map_err(|e| e.to_string())?
-                .clear();
-        }
-
-        Ok(())
-    }
-
     pub fn clear_sensitive_runtime_data(&self) -> Result<(), String> {
         // LIFECYCLE: the resident Oracle server, its supervisor, and the discovery
         // file are tied to the APP PROCESS — NOT the vault lock — so agents keep
@@ -404,116 +287,9 @@ impl BackendState {
         // lock / idle-expiry / startup-clear therefore MUST NOT kill the server or
         // delete the discovery file; that teardown happens only on app exit
         // (`oracle_service::on_app_exit`, wired into the Tauri exit handler + Drop).
-        // `on_lock` is now a no-op hook kept only to mark the lock event. We still
-        // clear the app's OWN in-memory provider caches/secrets below (re-auth).
+        // `on_lock` is now a no-op hook kept only to mark the lock event.
         super::oracle_service::on_lock();
-        *self.cached_cloudflare.write().map_err(|e| e.to_string())? = None;
-        *self.cached_scaleway.write().map_err(|e| e.to_string())? = None;
-        self.scaleway_compute
-            .write()
-            .map_err(|e| e.to_string())?
-            .clear();
-        *self
-            .scaleway_compute_initialized
-            .write()
-            .map_err(|e| e.to_string())? = false;
-        self.scaleway_offers
-            .write()
-            .map_err(|e| e.to_string())?
-            .clear();
-        self.activity_history
-            .write()
-            .map_err(|e| e.to_string())?
-            .clear();
         Ok(())
-    }
-
-    pub fn cached_provider_inventories(&self) -> Result<Vec<ProviderInventory>, String> {
-        let cloudflare = self
-            .cached_cloudflare
-            .read()
-            .map_err(|e| e.to_string())?
-            .clone();
-        let scaleway = self
-            .cached_scaleway
-            .read()
-            .map_err(|e| e.to_string())?
-            .clone();
-        Ok([cloudflare, scaleway].into_iter().flatten().collect())
-    }
-
-    pub fn has_cloudflare_worker(
-        &self,
-        account_id: &str,
-        worker_name: &str,
-    ) -> Result<bool, String> {
-        Ok(self
-            .cached_cloudflare
-            .read()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .map(|inventory| {
-                inventory.workers.iter().any(|worker| {
-                    worker.account_id == account_id.trim() && worker.name == worker_name.trim()
-                })
-            })
-            .unwrap_or(false))
-    }
-
-    pub fn cloudflare_selected_scope(&self) -> Result<Option<ProviderScopeSelection>, String> {
-        Ok(self
-            .cached_cloudflare
-            .read()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .and_then(|inventory| inventory.selected_scope.clone()))
-    }
-
-    pub fn scaleway_health(&self) -> Result<Option<ProviderHealth>, String> {
-        Ok(self
-            .cached_scaleway
-            .read()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .map(|inventory| inventory.health.clone()))
-    }
-
-    pub fn scaleway_resource(
-        &self,
-        resource_id: &str,
-    ) -> Result<Option<ScalewayResourceSummary>, String> {
-        let resource_id = resource_id.trim();
-        Ok(self
-            .cached_scaleway
-            .read()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .and_then(|inventory| {
-                inventory
-                    .compute
-                    .iter()
-                    .find(|resource| resource.id == resource_id)
-                    .cloned()
-            }))
-    }
-
-    pub fn scaleway_storage_resource(
-        &self,
-        resource_id: &str,
-    ) -> Result<Option<ScalewayStorageSummary>, String> {
-        let resource_id = resource_id.trim();
-        Ok(self
-            .cached_scaleway
-            .read()
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .and_then(|inventory| {
-                inventory
-                    .storage
-                    .iter()
-                    .find(|resource| resource.id == resource_id)
-                    .cloned()
-            }))
     }
 
     fn expire_if_needed(auth: &mut AuthSession) -> bool {
@@ -790,31 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_gate_expiry_clears_runtime_provider_cache() {
-        with_dev_unlock_env_off(|| {
-            let state = BackendState::new();
-            state.unlock_after_verification().unwrap();
-            state
-                .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
-                .unwrap();
-            {
-                let mut auth = state.auth.write().unwrap();
-                auth.last_unlocked_at =
-                    Some(Utc::now() - Duration::minutes(UNLOCK_TTL_MINUTES + 1));
-                // D2: drive expiry via the monotonic instant.
-                auth.unlocked_instant = Some(
-                    Instant::now()
-                        - StdDuration::from_secs((UNLOCK_TTL_MINUTES as u64 + 1) * 60),
-                );
-            }
-
-            assert!(state.ensure_unlocked().is_err());
-
-            assert!(state.cached_provider_inventories().unwrap().is_empty());
-        });
-    }
-
-    #[test]
     fn sensitive_session_rejects_operations_after_relock() {
         with_dev_unlock_env_off(|| {
             let state = BackendState::new();
@@ -829,235 +580,42 @@ mod tests {
     }
 
     #[test]
-    fn activity_history_keeps_recent_events_newest_first_without_duplicates() {
-        let state = BackendState::new();
-        let first = ActivityEvent {
-            id: "scw_spawn_gpu-1_running".into(),
-            message: "gpu-1 appeared as running GPU in fr-par-1.".into(),
-            timestamp: "2026-05-27T10:00:00Z".into(),
-            event_type: "spawn".into(),
-            source: "Scaleway".into(),
-        };
-        let second = ActivityEvent {
-            id: "scw_state_vm-1_stopped_running".into(),
-            message: "vm-1 changed state stopped -> running.".into(),
-            timestamp: "2026-05-27T10:01:00Z".into(),
-            event_type: "scale".into(),
-            source: "Scaleway".into(),
-        };
+    fn shared_authed_http_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
 
-        state.record_activity_events(&[first.clone()]).unwrap();
-        state
-            .record_activity_events(&[second.clone(), first.clone()])
-            .unwrap();
-
-        let history = state.recent_activity().unwrap();
-
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].id, second.id);
-        assert_eq!(history[1].id, first.id);
-    }
-
-    #[test]
-    fn first_scaleway_inventory_replacement_is_baseline_not_live_change() {
-        let state = BackendState::new();
-        let resource = ScalewayResourceSummary {
-            id: "gpu-1".into(),
-            name: "gpu-1".into(),
-            resource_type: "GPU".into(),
-            region: "fr-par-1".into(),
-            project_id: Some("bio-project".into()),
-            project_name: Some("Aspis Bio".into()),
-            state: "running".into(),
-            commercial_type: Some("GPU-3070-S".into()),
-            runtime: None,
-            min_scale: None,
-            max_scale: None,
-            domain_name: None,
-            endpoint: None,
-            privacy: None,
-            purpose: "model-training".into(),
-            purpose_source: "tag".into(),
-            tags: Vec::new(),
-            image: None,
-            public_ip: None,
-            created_at: None,
-            updated_at: None,
-            oracle_query: "gpu-1 model-training".into(),
-            available_actions: Vec::new(),
-            idle_cost_risk: false,
-        };
-
-        let first = state
-            .replace_scaleway_compute(vec![resource.clone()])
-            .unwrap();
-        let second = state.replace_scaleway_compute(vec![resource]).unwrap();
-
-        assert!(!first.had_previous_snapshot);
-        assert!(first.previous.is_empty());
-        assert!(second.had_previous_snapshot);
-        assert_eq!(second.previous.len(), 1);
-    }
-
-    #[test]
-    fn provider_inventory_cache_preserves_other_provider_during_partial_sync() {
-        let state = BackendState::new();
-        let cloudflare = ProviderInventory::missing(ProviderId::Cloudflare);
-        let mut scaleway = ProviderInventory::missing(ProviderId::Scaleway);
-        scaleway.health.status = "healthy".into();
-
-        state
-            .replace_provider_inventory(cloudflare.clone())
-            .unwrap();
-        state.replace_provider_inventory(scaleway.clone()).unwrap();
-
-        let cached = state.cached_provider_inventories().unwrap();
-
-        assert_eq!(cached.len(), 2);
-        assert_eq!(cached[0].health.id, ProviderId::Cloudflare);
-        assert_eq!(cached[1].health.id, ProviderId::Scaleway);
-        assert_eq!(cached[1].health.status, "healthy");
-    }
-
-    #[test]
-    fn clearing_provider_inventory_removes_stale_cache_and_resets_scaleway_baseline() {
-        let state = BackendState::new();
-        let cloudflare = ProviderInventory::missing(ProviderId::Cloudflare);
-        let mut scaleway = ProviderInventory::missing(ProviderId::Scaleway);
-        scaleway.health.status = "healthy".into();
-        scaleway.compute.push(ScalewayResourceSummary {
-            id: "gpu-1".into(),
-            name: "gpu-1".into(),
-            resource_type: "GPU".into(),
-            region: "fr-par-1".into(),
-            project_id: Some("bio-project".into()),
-            project_name: Some("Aspis Bio".into()),
-            state: "running".into(),
-            commercial_type: Some("GPU-3070-S".into()),
-            runtime: None,
-            min_scale: None,
-            max_scale: None,
-            domain_name: None,
-            endpoint: None,
-            privacy: None,
-            purpose: "model-training".into(),
-            purpose_source: "tag".into(),
-            tags: Vec::new(),
-            image: None,
-            public_ip: None,
-            created_at: None,
-            updated_at: None,
-            oracle_query: "gpu-1 model-training".into(),
-            available_actions: Vec::new(),
-            idle_cost_risk: false,
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "HTTP/1.1 302 Found\r\n\
+                        Location: http://127.0.0.1:9/exfil\r\n\
+                        Content-Length: 0\r\n\
+                        Connection: close\r\n\r\n";
+            let _ = stream.write_all(body.as_bytes());
         });
 
-        state.replace_provider_inventory(cloudflare).unwrap();
-        state.replace_provider_inventory(scaleway.clone()).unwrap();
-        state
-            .replace_scaleway_compute(scaleway.compute.clone())
-            .unwrap();
-
-        state
-            .clear_provider_inventory(ProviderId::Scaleway)
-            .unwrap();
-
-        let cached = state.cached_provider_inventories().unwrap();
-        assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0].health.id, ProviderId::Cloudflare);
-        let replacement = state
-            .replace_scaleway_compute(scaleway.compute.clone())
-            .unwrap();
-        assert!(!replacement.had_previous_snapshot);
-        assert!(replacement.previous.is_empty());
-    }
-
-    #[test]
-    fn locking_clears_runtime_provider_cache() {
-        with_dev_unlock_env_off(|| {
-            let state = BackendState::new();
-            state.unlock_after_verification().unwrap();
-            state
-                .replace_provider_inventory(ProviderInventory::missing(ProviderId::Cloudflare))
-                .unwrap();
-            assert_eq!(state.cached_provider_inventories().unwrap().len(), 1);
-
-            state.lock("manual").unwrap();
-
-            assert!(state.cached_provider_inventories().unwrap().is_empty());
-            assert!(state.ensure_unlocked().is_err());
+        let client = build_shared_authed_http_client();
+        let url = format!("http://{addr}/probe");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let status = rt.block_on(async {
+            client
+                .get(&url)
+                .send()
+                .await
+                .expect("request completes without following off-host")
+                .status()
         });
-    }
-
-    #[test]
-    fn cloudflare_worker_lookup_is_bound_to_cached_inventory() {
-        let state = BackendState::new();
-        let mut inventory = ProviderInventory::missing(ProviderId::Cloudflare);
-        inventory
-            .workers
-            .push(super::super::model::CloudflareWorkerSummary {
-                id: "worker-1".into(),
-                account_id: "023e105f4ecef8ad9ca31a8372d0c353".into(),
-                account_name: None,
-                name: "worker-1".into(),
-                status: "healthy".into(),
-                purpose: "test".into(),
-                purpose_source: "test".into(),
-                routes: Vec::new(),
-                last_deploy: None,
-                usage_model: None,
-                compatibility_date: None,
-                compatibility_flags: Vec::new(),
-                handlers: Vec::new(),
-                tags: Vec::new(),
-                oracle_query: "worker-1".into(),
-            });
-        state.replace_provider_inventory(inventory).unwrap();
-
-        assert!(state
-            .has_cloudflare_worker("023e105f4ecef8ad9ca31a8372d0c353", "worker-1")
-            .unwrap());
-        assert!(!state
-            .has_cloudflare_worker("023e105f4ecef8ad9ca31a8372d0c353", "other-worker")
-            .unwrap());
-    }
-
-    #[test]
-    fn scaleway_resource_lookup_is_bound_to_cached_inventory() {
-        let state = BackendState::new();
-        let mut inventory = ProviderInventory::missing(ProviderId::Scaleway);
-        inventory.compute.push(ScalewayResourceSummary {
-            id: "srv-1".into(),
-            name: "cpu-a".into(),
-            resource_type: "CPU VM".into(),
-            region: "fr-par-1".into(),
-            project_id: Some("bio-project".into()),
-            project_name: Some("Aspis Bio".into()),
-            state: "running".into(),
-            commercial_type: Some("DEV1-S".into()),
-            runtime: None,
-            min_scale: None,
-            max_scale: None,
-            domain_name: None,
-            endpoint: None,
-            privacy: None,
-            purpose: "test".into(),
-            purpose_source: "test".into(),
-            tags: Vec::new(),
-            image: None,
-            public_ip: None,
-            created_at: None,
-            updated_at: None,
-            oracle_query: "cpu-a".into(),
-            available_actions: vec!["poweroff".into(), "reboot".into(), "terminate".into()],
-            idle_cost_risk: false,
-        });
-        state.replace_provider_inventory(inventory).unwrap();
-
         assert_eq!(
-            state.scaleway_resource("srv-1").unwrap().unwrap().name,
-            "cpu-a"
+            status.as_u16(),
+            302,
+            "authed client must surface the 3xx instead of following Location"
         );
-        assert!(state.scaleway_resource("missing").unwrap().is_none());
+        server.join().expect("server thread");
     }
 }

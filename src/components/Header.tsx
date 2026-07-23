@@ -1,4 +1,4 @@
-import { Search, Bell, Lock, AlertTriangle, AlertCircle, Info, UserCircle2, X } from "lucide-react";
+import { Search, Bell, Lock, UserCircle2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   invokeBackendCommand,
@@ -9,11 +9,9 @@ import { attentionBellTarget, parseViewTarget } from "../utils/deepLink";
 import type {
   AgentSession,
   LocalRoleStatus,
-  RiskFlag,
   Role,
 } from "../types/backend";
 import { useAgentAttentionStore } from "../store/agentAttentionStore";
-import { useDismissedRisks, dismissRisk, clearRisks } from "../store/dismissedRisks";
 import {
   useDismissedAttention,
   dismissAttention,
@@ -22,12 +20,9 @@ import {
 } from "../store/dismissedAttention";
 import { attentionSessions } from "./agents/agentFleet";
 import { stripSpoofChars } from "./agents/attentionNotifier";
-import { combineBadgeCount } from "./headerBadge";
 import { useNow } from "../hooks/useNow";
-import { ALPHA_HIDDEN_PROVIDERS } from "../lib/alphaHidden";
 
 const viewTitles: Record<string, string> = {
-  providers: "Providers & Cloud",
   projects: "Projects & Agents",
   settings: "Settings",
   polis: "Polis",
@@ -38,20 +33,17 @@ const viewTitles: Record<string, string> = {
   help: "Help",
   // Re-homed views still resolve a title for any lingering deep-link.
   secrets: "Secrets & API Keys",
-  compute: "Infrastructure & Compute",
-  cloudflare: "Cloudflare",
-  budget: "Budget & Consumption",
   devices: "Devices",
   workspace: "Workspace",
 };
 
 export { viewTitles };
 
-// Jump-search targets after the sidebar was compressed. Includes the re-homed
-// pages as "view#tab" deep-links so search still reaches Secrets, Cloudflare,
-// Compute, Budget, Devices and Workspace. The standalone Agents page was
-// dissolved (Phase G): agents now live inside a project's Work mode, reached by
-// opening a project from the Board — so there is no separate Agents jump target.
+// Jump-search targets after the sidebar was compressed. Includes re-homed
+// pages as "view#tab" deep-links so search still reaches Secrets, Devices and
+// Workspace. The standalone Agents page was dissolved (Phase G): agents now
+// live inside a project's Work mode, reached by opening a project from the
+// Board — so there is no separate Agents jump target.
 export const JUMP_TARGETS: { label: string; target: string }[] = [
   { label: "Projects", target: "projects" },
   // The standalone Oracle page (search + info + admin) is the primary target.
@@ -64,44 +56,6 @@ export const JUMP_TARGETS: { label: string; target: string }[] = [
   { label: "Workspace", target: "settings#workspace" },
   { label: "Devices", target: "settings#devices" },
 ];
-
-const riskIconConfig = {
-  high: { icon: AlertTriangle, text: "text-coral-dark", bg: "bg-coral/10" },
-  medium: { icon: AlertCircle, text: "text-amber-dark", bg: "bg-amber/10" },
-  low: { icon: Info, text: "text-teal", bg: "bg-teal/10" },
-};
-
-// Map a risk flag to a deep-link "view#tab" target. The re-homed pages now live
-// under Settings (secrets) and Providers (cloudflare/scaleway/budget).
-function viewForRisk(flag: RiskFlag): string {
-  const source = `${flag.source} ${flag.title} ${flag.description}`.toLowerCase();
-  if (source.includes("object storage") || source.includes("access key")) {
-    return "settings#secrets";
-  }
-  if (source.includes("secret") || source.includes("token") || source.includes("rotation")) {
-    return "settings#secrets";
-  }
-  if (source.includes("scaleway") || source.includes("gpu") || source.includes("cpu")) {
-    return "providers#scaleway";
-  }
-  if (source.includes("budget") || source.includes("cost")) {
-    return "providers#budget";
-  }
-  if (source.includes("cloudflare") || source.includes("worker")) {
-    return "providers#cloudflare";
-  }
-  return "providers";
-}
-
-// The provider a risk resolves to (the deep-link tab, e.g. "scaleway" from
-// "providers#scaleway"). Used to drop risk flags whose target provider is in
-// ALPHA_HIDDEN_PROVIDERS so a hidden-tab risk can't inflate the badge nor
-// deep-link to a tab that no longer exists.
-function riskTargetProvider(flag: RiskFlag): string {
-  const target = viewForRisk(flag);
-  const hash = target.indexOf("#");
-  return hash === -1 ? "" : target.slice(hash + 1);
-}
 
 // Compact "how long ago" label for an agent's needsUser.since timestamp. Returns
 // "" for a missing/unparsable value so the caller can omit the age.
@@ -118,7 +72,7 @@ function formatSinceAge(since: string | null | undefined, nowMs: number): string
 }
 
 export function Header() {
-  const { activeView, cloudSnapshot, roleStatus } = useAppContext();
+  const { activeView, roleStatus } = useAppContext();
   const { requestView, lock, refreshRole } = useAppActions();
 
   // DEV-only role impersonation. The backend `set_debug_role` is compiled to a
@@ -136,21 +90,6 @@ export function Header() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationsRef = useRef<HTMLDivElement | null>(null);
   const cleanQuery = query.trim().toLowerCase();
-  const risks = cloudSnapshot?.risks ?? [];
-  // Risk flags are advisory warnings with stable ids — a user may dismiss them.
-  // A risk whose target provider is hidden by ALPHA_HIDDEN_PROVIDERS is also
-  // dropped: it would otherwise deep-link to a tab that no longer exists.
-  const dismissed = useDismissedRisks();
-  const visibleRisks = useMemo(
-    () =>
-      risks.filter(
-        (r) =>
-          !dismissed.has(r.id) &&
-          !ALPHA_HIDDEN_PROVIDERS.has(riskTargetProvider(r)),
-      ),
-    [risks, dismissed],
-  );
-  const riskCount = visibleRisks.length;
 
   // Agents needing the human. Fed by the existing agent-live-state pollers via
   // the attention store (no new poller). A live clock keeps stale/lost health
@@ -168,7 +107,7 @@ export function Header() {
     [attentionStoreSessions, now, dismissedAttention],
   );
   const attentionCount = attention.length;
-  const badgeCount = combineBadgeCount(riskCount, attentionCount);
+  const badgeCount = attentionCount;
   const matches = useMemo(() => {
     if (!cleanQuery) return [];
     return JUMP_TARGETS.filter((item) =>
@@ -273,8 +212,8 @@ export function Header() {
           <button
             type="button"
             onClick={() => setNotificationsOpen((open) => !open)}
-            data-help-title="This opens risk flags and agents that need you."
-            data-help-lines="A risk flag is a warning produced by the last provider sync; click it to jump to the page that can fix it.|An 'agent needs you' entry means a launched agent is waiting on a human answer (a question, an allow/deny, or a block).|Click an agent to open its project's Work mode where its terminal lives.|The count combines risk flags and agents waiting on you."
+            data-help-title="This opens agents that need you."
+            data-help-lines="An 'agent needs you' entry means a launched agent is waiting on a human answer (a question, an allow/deny, or a block).|Click an agent to open its project's Work mode where its terminal lives."
             className="relative p-2.5 rounded-2xl hover:bg-cream-100 transition-colors"
             title={badgeCount > 0 ? `${badgeCount} notification${badgeCount === 1 ? "" : "s"}` : "No notifications"}
             aria-label="Notifications"
@@ -370,82 +309,11 @@ export function Header() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center justify-between border-b border-cream-100 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-                  Risk Flags
+              {attentionCount === 0 && (
+                <p className="px-4 py-3 text-[12px] text-cream-400">
+                  No agents waiting on you.
                 </p>
-                <div className="flex items-center gap-3">
-                  {visibleRisks.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => clearRisks(visibleRisks.map((r) => r.id))}
-                      className="text-[11px] font-medium text-cream-400 hover:text-terracotta transition-colors"
-                    >
-                      Clear all
-                    </button>
-                  )}
-                  <span className="text-[11px] font-medium text-cream-400">
-                    {riskCount}
-                  </span>
-                </div>
-              </div>
-              <div className="max-h-80 overflow-y-auto py-1">
-                {visibleRisks.map((risk) => {
-                  const cfg =
-                    riskIconConfig[risk.severity as keyof typeof riskIconConfig] ??
-                    riskIconConfig.low;
-                  const Icon = cfg.icon;
-
-                  return (
-                    <div
-                      key={risk.id}
-                      className="group flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-cream-50"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => openView(viewForRisk(risk))}
-                        className="flex min-w-0 flex-1 items-start gap-3 text-left"
-                      >
-                        <span
-                          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${cfg.bg}`}
-                        >
-                          <Icon className={`h-3.5 w-3.5 ${cfg.text}`} />
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[13px] font-semibold text-cream-800">
-                            {risk.title}
-                          </span>
-                          <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-cream-500">
-                            {risk.description}
-                          </span>
-                          <span className="mt-1 block text-[10px] text-cream-400">
-                            {risk.source} · {risk.timestamp}
-                          </span>
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Dismiss ${risk.title}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          dismissRisk(risk.id);
-                        }}
-                        className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-cream-300 opacity-0 transition-opacity hover:bg-cream-100 hover:text-coral group-hover:opacity-100 focus:opacity-100"
-                        title="Dismiss this risk flag"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  );
-                })}
-                {riskCount === 0 && (
-                  <p className="px-4 py-3 text-[12px] text-cream-400">
-                    {risks.length === 0
-                      ? "No provider risks reported."
-                      : "No visible risk flags."}
-                  </p>
-                )}
-              </div>
+              )}
             </div>
           )}
         </div>
@@ -471,7 +339,7 @@ export function Header() {
           type="button"
           onClick={lock}
           data-help-title="This locks the app again."
-          data-help-lines="Locking hides the dashboard behind device authentication (Windows Hello or Touch ID).|It does not stop background provider data already loaded in memory.|Use it before leaving the computer unattended.|Unlock again with PIN, face, or fingerprint depending on your system setup."
+          data-help-lines="Locking hides the dashboard behind device authentication (Windows Hello or Touch ID).|It seals the vault until you unlock again.|Use it before leaving the computer unattended.|Unlock again with PIN, face, or fingerprint depending on your system setup."
           className="p-2.5 rounded-2xl hover:bg-cream-100 transition-colors"
           title="Lock app"
           aria-label="Lock app"

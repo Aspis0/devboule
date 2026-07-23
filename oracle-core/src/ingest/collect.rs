@@ -558,15 +558,10 @@ pub fn chunk_path_allowed(path: &Path, root: &Path, ignore_policy: &IgnorePolicy
         }
     }
 
-    if workspace_ignore_matches(relative, false, ignore_policy) {
-        if rescued {
-            return true;
-        }
+    // Ignore-policy match: rescue may override ignore rules, but NEVER the
+    // security denylists below (fail-closed).
+    if workspace_ignore_matches(relative, false, ignore_policy) && !rescued {
         return false;
-    }
-
-    if rescued {
-        return true;
     }
 
     let name = path
@@ -581,6 +576,7 @@ pub fn chunk_path_allowed(path: &Path, root: &Path, ignore_policy: &IgnorePolicy
     if name.ends_with(".min.js") || name.ends_with(".min.css") {
         return false;
     }
+    // Security denylists always apply — including for explicitly rescued paths.
     if EXCLUDED_RELATIVE_PREFIXES
         .iter()
         .any(|p| relative_text.starts_with(p))
@@ -680,12 +676,19 @@ fn walk_recursive(
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
             // DirEntry::file_type never follows links; classify by target.
+            // Symlink-to-dir: list but never descend (os.walk parity).
+            // Symlink-to-file: only accept if the resolved target is a regular
+            // file that stays under the workspace root (no index poisoning).
             match fs::metadata(entry.path()) {
                 Ok(m) if m.is_dir() => {
                     no_descend.insert(name.clone());
                     dirnames.push(name);
                 }
-                Ok(m) if m.is_file() => filenames.push(name),
+                Ok(m) if m.is_file() => {
+                    if resolved_file_under_root(&entry.path(), root) {
+                        filenames.push(name);
+                    }
+                }
                 _ => {}
             }
         } else if ft.is_dir() {
@@ -721,6 +724,11 @@ fn walk_recursive(
         if !chunk_path_allowed(&path, root, ignore_policy) {
             continue;
         }
+        // Canonicalize: refuse non-regular files and anything whose target
+        // escapes the workspace root (symlink index poisoning).
+        if !resolved_file_under_root(&path, root) {
+            continue;
+        }
         if let Ok(metadata) = path.metadata() {
             if metadata.len() > chunking::CHUNK_MAX_FILE_BYTES {
                 continue;
@@ -741,9 +749,27 @@ fn walk_recursive(
     }
 }
 
+/// True when `path` resolves to a regular file whose canonical target stays
+/// under the workspace `root`. Refuses broken links, non-files, and escapes.
+fn resolved_file_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(canon_root) = fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(canon) = fs::canonicalize(path) else {
+        return false;
+    };
+    // Must be a regular file after resolution (not a dir / device / etc.).
+    match fs::metadata(&canon) {
+        Ok(m) if m.is_file() => {}
+        _ => return false,
+    }
+    canon.starts_with(&canon_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// Ground truth from Python `fnmatch.fnmatchcase` (probed 2026-07-11):
     /// a `]` right after `[` (or `[!`) is a literal class member.
@@ -771,5 +797,69 @@ mod tests {
         assert!(EXCLUDED_DIRS.contains(&".aspis-censor"));
         assert!(EXCLUDED_DIRS.contains(&".pi"));
         assert!(EXCLUDED_DIRS.contains(&"oracle-data"));
+    }
+
+    #[test]
+    fn rescue_does_not_bypass_sensitive_denylist() {
+        // Negated ignore rule rescues a path that still matches SENSITIVE_NAME_PARTS.
+        let policy = IgnorePolicy {
+            rules: vec![IgnoreRule {
+                negated: true,
+                anchored: true,
+                dir_only: false,
+                pattern: "secrets/private-key-backup.txt".into(),
+            }],
+        };
+        let root = Path::new("/workspace");
+        let path = root.join("secrets/private-key-backup.txt");
+        // relative contains "private-key" → denylist wins over rescue.
+        assert!(!chunk_path_allowed(&path, root, &policy));
+    }
+
+    #[test]
+    fn rescue_does_not_bypass_excluded_prefix() {
+        let policy = IgnorePolicy {
+            rules: vec![IgnoreRule {
+                negated: true,
+                anchored: true,
+                dir_only: false,
+                pattern: "aspis-biovision/data/notes.md".into(),
+            }],
+        };
+        let root = Path::new("/workspace");
+        let path = root.join("aspis-biovision/data/notes.md");
+        assert!(!chunk_path_allowed(&path, root, &policy));
+    }
+
+    #[test]
+    fn symlink_escape_outside_workspace_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside_secret.txt");
+        {
+            let mut f = fs::File::create(&outside).unwrap();
+            writeln!(f, "ssh-key-material").unwrap();
+        }
+        let link = root.join("safe_name.txt");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: skip if symlink creation is restricted.
+            if std::os::windows::fs::symlink_file(&outside, &link).is_err() {
+                return;
+            }
+        }
+        assert!(
+            !resolved_file_under_root(&link, &root),
+            "symlink target outside workspace must be refused"
+        );
+        // In-tree regular file is accepted.
+        let ok = root.join("ok.md");
+        fs::write(&ok, "hello").unwrap();
+        assert!(resolved_file_under_root(&ok, &root));
     }
 }

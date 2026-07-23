@@ -85,11 +85,17 @@ export function McpServerList({ scope, projectRoot }: McpServerListProps) {
       setBusy(true);
       setActionError(null);
       try {
-        await invokeBackendCommand<void>("user_mcp_set_enabled", {
+        // Enabling a global server re-runs its command on launch. Backend requires
+        // confirmGlobalCommand; the server was already consented at add-time.
+        const args: Record<string, unknown> = {
           ...baseArgs(),
           name,
           enabled,
-        });
+        };
+        if (scope === "global" && enabled) {
+          args.confirmGlobalCommand = true;
+        }
+        await invokeBackendCommand<void>("user_mcp_set_enabled", args);
         if (!mountedRef.current) return;
         // Optimistic local update, then re-fetch for consistency.
         setServers((prev) =>
@@ -107,7 +113,7 @@ export function McpServerList({ scope, projectRoot }: McpServerListProps) {
         if (mountedRef.current) setBusy(false);
       }
     },
-    [baseArgs, load],
+    [baseArgs, load, scope],
   );
 
   const removeServer = useCallback(

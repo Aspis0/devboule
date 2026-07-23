@@ -706,8 +706,6 @@ mod tests {
                 assert_eq!(env["TRANSFORMERS_OFFLINE"], json!("1"));
                 assert_eq!(env["ORACLE_REQUIRE_REAL_EMBEDDER"], json!("1"));
                 // Dual-write Devboule + legacy Aspis profile-mode keys (P0 branding).
-                assert_eq!(env["DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
-                assert_eq!(env["ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"], json!("1"));
                 // No token of any kind is baked in.
                 assert!(env.get("ORACLE_AGENT_AUTH_TOKEN").is_none());
                 assert!(env.get("ORACLE_AUTH_TOKEN").is_none());

@@ -31,8 +31,6 @@ pub const ENV_BACKEND: &str = "DEVBOULE_MCP_BACKEND";
 /// Optional absolute path to the Rust MCP binary.
 pub const ENV_BIN: &str = "DEVBOULE_MCP_BIN";
 
-pub const ENV_CF_PROFILE_MODE: &str = "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE";
-pub const LEGACY_ENV_CF_PROFILE_MODE: &str = "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE";
 pub const ENV_APP_BIN: &str = "DEVBOULE_APP_BIN";
 pub const LEGACY_ENV_APP_BIN: &str = "ASPIS_APP_BIN";
 
@@ -320,8 +318,6 @@ fn bin_name() -> &'static str {
 
 /// Insert Devboule + legacy Aspis env keys for MCP children (one release dual-write).
 pub fn insert_dual_mcp_env(env: &mut Map<String, Value>, app_bin: Option<&str>) {
-    env.insert(ENV_CF_PROFILE_MODE.into(), json!("1"));
-    env.insert(LEGACY_ENV_CF_PROFILE_MODE.into(), json!("1"));
     if let Some(bin) = app_bin.map(str::trim).filter(|s| !s.is_empty()) {
         env.insert(ENV_APP_BIN.into(), json!(bin));
         env.insert(LEGACY_ENV_APP_BIN.into(), json!(bin));
@@ -519,8 +515,6 @@ mod tests {
     fn dual_env_writes_both_keys() {
         let mut env = Map::new();
         insert_dual_mcp_env(&mut env, Some("/tmp/app"));
-        assert_eq!(env.get(ENV_CF_PROFILE_MODE), Some(&json!("1")));
-        assert_eq!(env.get(LEGACY_ENV_CF_PROFILE_MODE), Some(&json!("1")));
         assert_eq!(env.get(ENV_APP_BIN), Some(&json!("/tmp/app")));
         assert_eq!(env.get(LEGACY_ENV_APP_BIN), Some(&json!("/tmp/app")));
     }
@@ -541,8 +535,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|a| a == "oracle.server.aspis_mcp"));
-        assert!(entry["env"].get(ENV_CF_PROFILE_MODE).is_some());
-        assert!(entry["env"].get(LEGACY_ENV_CF_PROFILE_MODE).is_some());
         // Dual-write keys present; app bin omitted when None.
         assert!(entry["env"].get(ENV_APP_BIN).is_none());
         assert!(entry["env"].get(LEGACY_ENV_APP_BIN).is_none());
@@ -583,8 +575,6 @@ mod tests {
         assert_eq!(env.get("ASPIS_MCP_PROJECTS_DIR"), Some(&json!("/projects")));
         assert_eq!(env.get(ENV_APP_BIN), Some(&json!("/tmp/app")));
         assert_eq!(env.get(LEGACY_ENV_APP_BIN), Some(&json!("/tmp/app")));
-        assert_eq!(env.get(ENV_CF_PROFILE_MODE), Some(&json!("1")));
-        assert_eq!(env.get(LEGACY_ENV_CF_PROFILE_MODE), Some(&json!("1")));
 
         // Must not look like the Python module launch.
         let args = entry["args"].as_array().unwrap();

@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_clippy;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -128,9 +128,9 @@ fn truncate_body(msg: &str) -> String {
 
 /// Run clippy from the project root using the project's own clippy config. Absent
 /// `cargo` → empty (no error). Coarse: ignores `target.file_rel_path`.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("cargo") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // No `--` extra args: let the project's clippy.toml / lints config drive.
     // A full clippy compile is slow on a cold target; allow a generous budget.
@@ -141,8 +141,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(300),
     );
     match stdout {
-        Some(s) => parse_clippy(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_clippy(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

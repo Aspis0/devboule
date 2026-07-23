@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_format_checker;
-use super::{cap, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -53,9 +53,9 @@ pub fn parse_prettier(stdout: &str, file_rel: &str) -> Vec<RawFinding> {
 /// Run prettier --check on a single file from the project root. Absent
 /// `prettier` → empty. `--` ends flag parsing so a file whose name begins with
 /// `-` is never interpreted as an option.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("prettier") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture(
         "prettier",
@@ -63,8 +63,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_prettier(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_prettier(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 

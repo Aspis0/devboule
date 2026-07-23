@@ -112,6 +112,11 @@ export function UserMcpConsentDialog({
     if (scope === "project" && projectRoot) {
       args.projectRoot = projectRoot;
     }
+    // Global command is RCE-capable; backend requires explicit confirmGlobalCommand.
+    // Reuse the consent checkbox the user already ticked to enable Add.
+    if (scope === "global") {
+      args.confirmGlobalCommand = consentAck;
+    }
     try {
       await invokeBackendCommand<void>("user_mcp_add", args);
       if (mountedRef.current) onAdded();

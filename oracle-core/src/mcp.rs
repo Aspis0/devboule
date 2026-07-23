@@ -27,7 +27,7 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::{
-    config::OracleDataPaths,
+    config::{self, OracleDataPaths},
     embed::{BackendChoice, EmbedderPool},
     model_download,
     query::engine::QueryEngine,
@@ -86,7 +86,7 @@ impl OracleMcp {
         let kind = none_if_empty(&args.kind);
         let lang = none_if_empty(&args.language);
         let syms = none_if_empty_vec(&args.symbols);
-        let limit = args.limit.unwrap_or(5);
+        let limit = clamp_limit(args.limit.unwrap_or(5));
         let resp = engine
             .ask(
                 &args.query,
@@ -121,7 +121,7 @@ impl OracleMcp {
         let syms = none_if_empty_vec(&args.symbols);
         let imports = none_if_empty_vec(&args.imports);
         let module = none_if_empty(&args.module);
-        let limit = args.limit.unwrap_or(8);
+        let limit = clamp_limit(args.limit.unwrap_or(8));
         let chunks = engine
             .context(
                 &args.query,
@@ -151,7 +151,7 @@ impl OracleMcp {
         let emb = self.inner.embedder();
         let kind = none_if_empty(&args.kind);
         let lang = none_if_empty(&args.language);
-        let limit = args.limit.unwrap_or(10);
+        let limit = clamp_limit(args.limit.unwrap_or(10));
         let chunks = engine
             .context(
                 &args.query,
@@ -196,7 +196,7 @@ impl OracleMcp {
         Parameters(args): Parameters<SimilarArgs>,
     ) -> Result<CallToolResult, McpError> {
         let engine = self.inner.engine().map_err(internal)?;
-        let limit = args.limit.unwrap_or(5);
+        let limit = clamp_limit(args.limit.unwrap_or(5));
         let entries = engine.similar(&args.id, limit).await.map_err(internal)?;
         let value = serde_json::to_value(&entries).map_err(|e| internal_msg(&e))?;
         let text = serde_json::to_string(&value).map_err(|e| internal_msg(&e))?;
@@ -324,6 +324,11 @@ fn default_limit10() -> Option<usize> {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Clamp every public MCP `limit` to `1..=MAX_BOUNDED_LIMIT` at the edge.
+fn clamp_limit(limit: usize) -> usize {
+    limit.clamp(1, config::MAX_BOUNDED_LIMIT)
+}
+
 fn none_if_empty(s: &str) -> Option<&str> {
     if s.is_empty() {
         None
@@ -377,6 +382,9 @@ fn resolve_model_dir(oracle_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Build `OracleInner` from the environment (`ORACLE_DIR` required).
+///
+/// `ORACLE_DIR` is the Oracle **data directory** itself (not a workspace root
+/// to join with another `ORACLE_DIR`); resolve it once to an absolute path.
 fn inner_from_env() -> Result<OracleInner> {
     let oracle_dir = std::env::var("ORACLE_DIR")
         .context("ORACLE_DIR is unset")?;
@@ -387,10 +395,14 @@ fn inner_from_env() -> Result<OracleInner> {
     if !oracle_dir_path.exists() {
         anyhow::bail!("ORACLE_DIR does not exist: {}", oracle_dir_path.display());
     }
+    // Resolve once: absolute + canonical. Treat as the data dir (no double-join).
+    let data_dir = oracle_dir_path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing ORACLE_DIR {}", oracle_dir_path.display()))?;
 
-    let paths = OracleDataPaths::from_root(&oracle_dir_path);
+    let paths = OracleDataPaths::from_data_dir(&data_dir);
 
-    let model_dir = resolve_model_dir(&oracle_dir_path)?;
+    let model_dir = resolve_model_dir(&data_dir)?;
 
     // The shared ONNX model lives at the runtime data root (int8 quantized).
     let pool = EmbedderPool::new(BackendChoice::Ort {

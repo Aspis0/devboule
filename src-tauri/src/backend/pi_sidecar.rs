@@ -44,6 +44,47 @@ struct SessionSlot {
     inner: Option<PiSession>,
 }
 
+/// Owns a just-spawned `Child` until pipes are taken and the session is built.
+/// Drop kills+waits so a failed post-spawn setup never orphans a process that
+/// holds vault API keys in its env (CRIT-11).
+struct KillOnDrop {
+    child: Option<Child>,
+}
+
+impl KillOnDrop {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("KillOnDrop already disarmed")
+    }
+
+    /// Release ownership without killing (caller now owns the Child).
+    fn disarm(mut self) -> Child {
+        self.child.take().expect("KillOnDrop already disarmed")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Remove a reserved-but-not-yet-filled session slot after a failed spawn so the
+/// same id is not stuck "spawning forever" (CRIT-12).
+fn release_spawn_reservation(state: &PiSidecarState, id: &str) {
+    let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    // Only drop a placeholder — a concurrent stop may already have removed it.
+    if matches!(guard.get(id), Some(SessionSlot { inner: None })) {
+        guard.remove(id);
+    }
+}
+
 // ---- console injection queue (BLOCKER fix: single-writer invariant) ----------
 //
 // EventMapper is the ONLY writer to MiniActivityStore — it rebuilds the full
@@ -1649,21 +1690,30 @@ fn spawn_pi_session_inner(
         }
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;
+    // Kill+wait on any early return after spawn (stdin/stdout take failure, …)
+    // so a child with vault keys in env is never orphaned untracked (CRIT-11).
+    let mut guard = KillOnDrop::new(child);
 
-    let raw_stdin = child
+    let raw_stdin = guard
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| "pi sidecar stdin not captured".to_string())?;
-    let stdout = child
+    let stdout = guard
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| "pi sidecar stdout not captured".to_string())?;
     // #4: capture stderr only when we piped it (release build), so the forwarder
     // thread has a stream to read.
-    let stderr = if stderr_piped { child.stderr.take() } else { None };
+    let stderr = if stderr_piped {
+        guard.child_mut().stderr.take()
+    } else {
+        None
+    };
 
     // Shared, mutex-guarded stdin: both `spike_pi_prompt` (prompt commands) and
     // the reader thread (`classified` responses) write here. The Arc lets the
@@ -1677,8 +1727,8 @@ fn spawn_pi_session_inner(
     let _gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
 
     // Wrap the child so the reader thread can call `try_wait()` on EOF without
-    // owning the only handle (#1).
-    let child = Arc::new(Mutex::new(child));
+    // owning the only handle (#1). Disarm KillOnDrop — session now owns the child.
+    let child = Arc::new(Mutex::new(guard.disarm()));
     let timed_out = Arc::new(AtomicBool::new(false));
     let spawned_at = Instant::now();
 
@@ -1984,8 +2034,17 @@ fn get_or_spawn_session(
     };
     // Lock is now DROPPED — spawn happens without holding the lock.
 
-    // Phase 2: spawn outside the lock.
-    let (new_session, resolved_model) = spawn_pi_session_inner(app, &id, prev_gen, role, project_id, project_root)?;
+    // Phase 2: spawn outside the lock. On ANY Err, release the reserved placeholder
+    // so the id is not stuck "spawning forever" and a retry can proceed (CRIT-12).
+    // KillOnDrop inside spawn_pi_session_inner reaps a post-spawn orphan on Err.
+    let (new_session, resolved_model) =
+        match spawn_pi_session_inner(app, &id, prev_gen, role, project_id, project_root) {
+            Ok(pair) => pair,
+            Err(e) => {
+                release_spawn_reservation(&state, &id);
+                return Err(e);
+            }
+        };
 
     // Fix 2: a fresh child process = a fresh generation. Reset this session's
     // anti-loop cap AND delivered-finding set (censor_session_state_reset) so a
@@ -3699,11 +3758,29 @@ fn run_pi_censor_review(
 
     // 3c: read the findings back from the shard, keep only confirmed-tier ones
     // (the voted Gemma promotion) for the edited files.
-    let findings: Vec<Finding> = crate::backend::censor::commands::wait_for_censor_findings(
+    // The per-file review above ran synchronously, so there is no live scan to wait on:
+    // pass registry = None (a timeout with no findings is then Clean, not Pending).
+    let findings: Vec<Finding> = match crate::backend::censor::commands::wait_for_censor_findings(
         &root,
         &rel_files,
         CENSOR_REVIEW_WAIT_TIMEOUT,
-    );
+        None,
+        Some(project_id),
+    ) {
+        crate::backend::censor::commands::CensorWaitOutcome::Findings(v) => v,
+        crate::backend::censor::commands::CensorWaitOutcome::Clean => Vec::new(),
+        crate::backend::censor::commands::CensorWaitOutcome::Pending => {
+            // Unknown, not clean: a shard read failed on the final poll (registry is None here,
+            // so Pending cannot come from a still-running scan). We inject no findings this pass,
+            // but surface the uncertainty instead of silently treating it as "clean".
+            eprintln!(
+                "pi censor review: findings status unknown (shard read failed) for {} file(s); \
+                 injecting no findings this pass",
+                rel_files.len()
+            );
+            Vec::new()
+        }
+    };
     let confirmed: Vec<Finding> = findings
         .iter()
         .filter(|f| f.verdict == Verdict::Confirmed)
@@ -5076,6 +5153,84 @@ mod tests {
         let slot_none: Option<PiSession> = None;
         let slot = SessionSlot { inner: slot_none };
         assert!(slot.inner.is_none());
+    }
+
+    #[test]
+    fn release_spawn_reservation_removes_placeholder_slot() {
+        // CRIT-12: a failed spawn must drop the reserved SessionSlot{inner:None}
+        // so a retry on the same id is not blocked forever.
+        let state = PiSidecarState {
+            inner: Mutex::new(HashMap::new()),
+            session_counter: AtomicU64::new(0),
+            persisted: Mutex::new(HashMap::new()),
+            restored: Mutex::new(Vec::new()),
+        };
+        {
+            let mut g = state.inner.lock().unwrap();
+            g.insert("pi-stuck".to_string(), SessionSlot { inner: None });
+        }
+        release_spawn_reservation(&state, "pi-stuck");
+        assert!(
+            !state.inner.lock().unwrap().contains_key("pi-stuck"),
+            "placeholder must be removed on spawn Err"
+        );
+        // Idempotent when already gone (concurrent stop).
+        release_spawn_reservation(&state, "pi-stuck");
+    }
+
+    #[test]
+    fn kill_on_drop_reaps_child_when_not_disarmed() {
+        // CRIT-11: post-spawn early return must kill the child (vault keys in env).
+        #[cfg(unix)]
+        let child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        #[cfg(windows)]
+        let child = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawn ping")
+        };
+        let pid = child.id();
+        drop(KillOnDrop::new(child));
+        #[cfg(unix)]
+        {
+            let still_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+            assert!(!still_alive, "KillOnDrop must kill the child on drop");
+        }
+        #[cfg(windows)]
+        {
+            // After Drop's kill+wait the process object is gone; OpenProcess must fail.
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            let still_alive = unsafe {
+                match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    Ok(h) => {
+                        let _ = CloseHandle(h);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            };
+            assert!(!still_alive, "KillOnDrop must kill the child on drop");
+        }
+    }
+
+    #[test]
+    fn kill_on_drop_disarm_releases_without_double_reap() {
+        #[cfg(unix)]
+        let child = Command::new("true").spawn().expect("spawn true");
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd");
+        let mut child = KillOnDrop::new(child).disarm();
+        let _ = child.wait();
     }
 
     // -- Task 2: _devboule parsing + devboule custom messages --------------------

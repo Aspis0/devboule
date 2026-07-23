@@ -58,7 +58,7 @@ pub struct LocalRoleStatus {
 /// with NO provider-side enforcement behind them, so app-level gating is the only
 /// control: managing the collaborator roster, issuing grants, and creating the
 /// master workspace package. Cloud actions are deliberately NOT here — a
-/// collaborator's agents operate Cloudflare/Scaleway, bounded by their SCOPED
+/// collaborator's agents operate within the product, bounded by their SCOPED
 /// token (which the provider enforces), not by hidden UI or app gates. When a
 /// future role needs PARTIAL cloud access, add a `WriteSecrets`/`DestructiveCloud`
 /// variant here and gate the relevant commands.

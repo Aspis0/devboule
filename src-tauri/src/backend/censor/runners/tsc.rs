@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_tsc;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -118,9 +118,9 @@ fn find_location(line: &str) -> Option<(usize, usize, u32)> {
 
 /// Run tsc from the project root using the project's tsconfig.json. Absent `tsc`
 /// → empty.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("tsc") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // `--incremental` caches the program graph (`.tsbuildinfo`) so re-runs on the
     // coarse debounce skip unchanged files — a large win for a project-wide tsc.
@@ -133,8 +133,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         root,
     );
     match stdout {
-        Some(s) => parse_tsc(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_tsc(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

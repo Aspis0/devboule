@@ -203,7 +203,9 @@ fn git_output_timeout(path: &Path, args: &[&str]) -> Option<String> {
         .args(args)
         .current_dir(path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // stderr piped (not null) so the concurrent drain helper can own both
+        // handles; read-only probes discard it after drain.
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -212,22 +214,14 @@ fn git_output_timeout(path: &Path, args: &[&str]) -> Option<String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().ok()?;
-    let started_at = Instant::now();
-    loop {
-        if child.try_wait().ok()?.is_some() {
-            let output = child.wait_with_output().ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        }
-        if started_at.elapsed() >= Duration::from_secs(3) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(Duration::from_millis(25));
+    let child = command.spawn().ok()?;
+    // Drain stdout concurrently while waiting so a large porcelain status (or any
+    // probe that fills the OS pipe buffer) cannot deadlock the child and false-
+    // negative as "not a git repo" after the 3s kill.
+    let drained = wait_with_drained_output(child, Duration::from_secs(3)).ok()?;
+    match drained.exit_code {
+        Some(0) => Some(String::from_utf8_lossy(&drained.stdout).trim().to_string()),
+        _ => None,
     }
 }
 
@@ -448,9 +442,15 @@ fn join_with_deadline(handle: thread::JoinHandle<Vec<u8>>, deadline: Duration) -
 /// `timeout` bounds the wait before the hung process is killed. It is per-call so a
 /// network push (slow) can be given a longer budget than a local commit/add.
 fn git_run(path: &Path, args: &[&str], timeout: Duration) -> Result<GitRunOutcome, String> {
+    // Hooks off: app-driven local mutations (add/commit) must not execute a
+    // planted pre-commit/post-commit under the app process. Prepended by us,
+    // never via caller args.
+    let mut full_args = hooks_disabled_config_args();
+    full_args.extend(args.iter().map(|a| (*a).to_string()));
+
     let mut command = Command::new("git");
     command
-        .args(args)
+        .args(&full_args)
         .current_dir(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -653,6 +653,35 @@ fn internal_git_config_args() -> Vec<String> {
     vec!["-c".into(), "core.longpaths=true".into()]
 }
 
+/// Path used for `core.hooksPath` so app-driven / authenticated git never runs
+/// client-side hooks (pre-push, pre-commit, …). A null-device / nonexistent path
+/// means git finds no hook scripts — critical when the child env carries the
+/// ASKPASS PAT (hooks inherit the full env and could exfiltrate it).
+#[cfg(windows)]
+const HOOKS_DISABLED_PATH: &str = "NUL";
+#[cfg(not(windows))]
+const HOOKS_DISABLED_PATH: &str = "/dev/null";
+
+/// Shared `-c core.hooksPath=<null>` prefix for every mutating / authenticated
+/// git invocation. Pure string helper so the hooks-off invariant is unit-tested.
+fn hooks_disabled_config_args() -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!("core.hooksPath={HOOKS_DISABLED_PATH}"),
+    ]
+}
+
+/// PURE: internal `-c remote.<name>.url=<validated_url>` so authenticated push/pull
+/// use the URL we already resolved + validated as github.com, regardless of a
+/// concurrent `git remote set-url` between check and spawn (command-line `-c`
+/// overrides the config file). Never passed through caller `args`.
+fn remote_url_pin_args(remote: &str, url: &str) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!("remote.{remote}.url={url}"),
+    ]
+}
+
 /// FIX 4 (defense-in-depth identity redaction): replace every literal occurrence
 /// of the live token in `text` with a fixed placeholder. `github::sanitize_error`
 /// only catches the documented token PREFIXES, but git can surface the token in a
@@ -674,26 +703,46 @@ fn redact_token(token: &str, text: &str) -> String {
 ///   - mentions `http.extraHeader` (an Authorization header on argv),
 ///   - mentions `credential.helper` (could re-enable an ambient helper; ours is the
 ///     ONLY credential.helper, and it is prepended internally, never via `args`),
+///   - mentions `hooksPath` / `core.hooksPath` (could re-enable client-side hooks
+///     after our prepended `core.hooksPath=/dev/null`; last-value-wins),
 ///   - looks like a credentialed URL (`://` together with a later `@`, e.g.
 ///     `https://x-access-token:TOKEN@github.com/...`),
-///   - is a stray `-c` (only OUR internal `-c credential.helper=` is allowed; a
-///     caller-supplied `-c` could set an arbitrary config override).
+///   - starts with `-c` (exact token OR glued short option like `-ccore.hooksPath=…`;
+///     only OUR internal `-c …` is allowed, and those are prepended after this guard
+///     runs on caller `args` only).
 ///
 /// Returns the offending reason so the caller surfaces a clean error.
 fn reject_unsafe_git_args(args: &[&str]) -> Result<(), String> {
     for arg in args {
         let lowered = arg.to_ascii_lowercase();
-        if lowered.contains("http.extraheader") {
+        // The dangerous config keys are only honoured by git as a config assignment
+        // (`-c key=value`, glued `-ckey=value`, or a bare `key=value`). Gate the
+        // substring checks on a config-assignment shape so a legitimate refspec /
+        // branch name that merely contains the substring (e.g. pushing `fix-hookspath`)
+        // is NOT rejected, while any real override still is. The `-c` prefix below is
+        // the primary guard (it is the only CLI way git reads these at all).
+        let config_shaped = arg.starts_with('-') || arg.contains('=');
+        if config_shaped && lowered.contains("http.extraheader") {
             return Err(
                 "Refusing to run authenticated git: http.extraHeader is not allowed.".into(),
             );
         }
-        if lowered.contains("credential.helper") {
+        if config_shaped && lowered.contains("credential.helper") {
             return Err(
                 "Refusing to run authenticated git: credential.helper is not allowed.".into(),
             );
         }
-        if *arg == "-c" {
+        // Reject both `core.hooksPath=…` and a bare `hooksPath=…` (case-insensitive),
+        // matching the credential.helper / http.extraHeader substring discipline.
+        if config_shaped && lowered.contains("hookspath") {
+            return Err(
+                "Refusing to run authenticated git: hooksPath override is not allowed.".into(),
+            );
+        }
+        // git accepts both `-c key=value` and the glued short form `-ckey=value`.
+        // Any arg starting with `-c` could override our prepended hooks-off /
+        // credential neutralization (last-value-wins) — refuse before spawn.
+        if arg.starts_with("-c") {
             return Err("Refusing to run authenticated git: a -c override is not allowed.".into());
         }
         // A credentialed URL embeds the userinfo before an `@` that follows the
@@ -720,16 +769,33 @@ fn reject_unsafe_git_args(args: &[&str]) -> Result<(), String> {
 /// is prepended automatically. `timeout` bounds the wait before a hung child is
 /// killed (a network push gets a longer budget than a local op).
 ///
+/// `remote_url_pin` — when `Some((remote_name, validated_url))`, prepends
+/// `-c remote.<name>.url=<validated_url>` so git uses the URL we already resolved
+/// + validated as github.com, closing a TOCTOU where a concurrent
+/// `git remote set-url` between check and spawn would send the PAT to an evil host.
+/// Pass `None` for ops that already pin the URL on argv (e.g. clone).
+///
 /// Fails closed: if no GitHub token is configured we return a clean error and do
 /// NOT fall back to ambient credentials for an authenticated operation.
 fn git_run_authenticated(
     path: &Path,
     args: &[&str],
     timeout: Duration,
+    remote_url_pin: Option<(&str, &str)>,
 ) -> Result<GitRunOutcome, String> {
     // 0) FIX 6: reject any caller args that could smuggle a credential onto argv or
     //    override our credential neutralization — BEFORE we touch the vault or spawn.
     reject_unsafe_git_args(args)?;
+    // 0b) CRIT-2: any URL-shaped caller arg must be github.com so the ASKPASS PAT
+    //     is never offered to a non-GitHub host (clone path pins the rebuilt URL).
+    for arg in args {
+        if arg_looks_like_remote_url(arg) && !is_github_remote_url(arg) {
+            return Err(format!(
+                "Refusing authenticated git: remote URL is not github.com ({}).",
+                sanitize_git_remote(arg)
+            ));
+        }
+    }
 
     // 1) Token from the vault. No token → fail closed (never silently use ambient
     //    creds for an op the caller explicitly asked to authenticate). No git is run.
@@ -742,11 +808,19 @@ fn git_run_authenticated(
     let askpass_path = guard.path.clone();
 
     // 3) Assemble argv: our INTERNAL `-c` config (credential-helper neutralizer +
-    //    FIX 6 `core.longpaths=true`) then the caller's args. The token is NEVER on
-    //    argv. These internal `-c` entries are prepended by US and are deliberately
-    //    NOT run through reject_unsafe_git_args (which guards only caller `args`).
+    //    FIX 6 `core.longpaths=true` + CRIT-1 hooks-off + optional remote URL pin)
+    //    then the caller's args. The token is NEVER on argv. These internal `-c`
+    //    entries are prepended by US and are deliberately NOT run through
+    //    reject_unsafe_git_args (which guards only caller `args`). Hooks MUST be
+    //    disabled: a planted pre-push inherits ASPIS_GIT_ASKPASS_TOKEN and can
+    //    exfiltrate the live PAT. The remote URL pin closes TOCTOU against a
+    //    concurrent `git remote set-url` after ensure_github_remote_for_auth.
     let mut full_args: Vec<String> = credential_neutralizing_args();
     full_args.extend(internal_git_config_args());
+    full_args.extend(hooks_disabled_config_args());
+    if let Some((remote, url)) = remote_url_pin {
+        full_args.extend(remote_url_pin_args(remote, url));
+    }
     full_args.extend(args.iter().map(|a| a.to_string()));
 
     let mut command = Command::new("git");
@@ -903,6 +977,135 @@ fn validate_push_remote(remote: Option<&str>) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+/// PURE: true when `arg` looks like a remote URL (scheme://… or scp-like
+/// `user@host:path`). Used to gate authenticated argv so a non-github URL never
+/// receives the PAT. Bare remote names / flags / refs must NOT match.
+fn arg_looks_like_remote_url(arg: &str) -> bool {
+    let arg = arg.trim();
+    if arg.contains("://") || arg.starts_with("git@") {
+        return true;
+    }
+    // scp-like `user@host:path`: `@` present, and a `:` after it before any `/`.
+    // Does not match bare names (`origin`), flags (`--ff-only`), or refs
+    // (`refs/heads/x`). The segment before the first `/` must look like
+    // `user@host:path_head` with non-empty user, host, and path head.
+    let head = arg.split('/').next().unwrap_or(arg);
+    if let Some((user, rest)) = head.split_once('@') {
+        if !user.is_empty() {
+            if let Some((host, path_head)) = rest.split_once(':') {
+                return !host.is_empty() && !path_head.is_empty();
+            }
+        }
+    }
+    false
+}
+
+/// PURE: true when `url` is a GitHub remote over HTTPS or SSH.
+/// Accepts `https://github.com/...`, `http://github.com/...`,
+/// `git@github.com:owner/repo` (host case-insensitive), `ssh://git@github.com/...`.
+/// Rejects every other host (evil forges, lookalikes like `github.com.evil`).
+fn is_github_remote_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty() {
+        return false;
+    }
+
+    // scp-like: git@github.com:owner/repo.git — host match is case-insensitive
+    // so a legitimate `git@GitHub.com:owner/repo.git` is accepted.
+    {
+        let lower = url.to_ascii_lowercase();
+        if let Some(path) = lower.strip_prefix("git@github.com:") {
+            return !path.trim().is_empty();
+        }
+    }
+
+    // URL schemes are case-insensitive (RFC 3986), so accept `HTTPS://`, `Ssh://`, etc.
+    // Detect the scheme from a lowercased copy, then slice the ORIGINAL by that length so
+    // the host/path keep their real bytes for the checks below.
+    let lower_url = url.to_ascii_lowercase();
+    let rest = if let Some(n) = ["https://", "http://", "ssh://"]
+        .iter()
+        .find(|p| lower_url.starts_with(**p))
+        .map(|p| p.len())
+    {
+        &url[n..]
+    } else {
+        return false;
+    };
+
+    // Optional userinfo (git@ / token@) — first `@` separates userinfo from host.
+    let host_and_path = match rest.split_once('@') {
+        Some((_, after)) => after,
+        None => rest,
+    };
+    if host_and_path.is_empty() {
+        return false;
+    }
+
+    // host[:port][/path...]
+    let host_port = host_and_path.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    if !host.eq_ignore_ascii_case("github.com") {
+        return false;
+    }
+
+    // Require a non-empty path (owner/repo at minimum).
+    let path = host_and_path.split_once('/').map(|(_, p)| p).unwrap_or("");
+    !path.trim().is_empty()
+}
+
+/// Resolve `git remote get-url <remote>` unauthenticated, hooks-off (via `git_run`).
+/// Returns the raw URL string or a clear error.
+fn resolve_remote_url(repo_root: &Path, remote: &str) -> Result<String, String> {
+    let outcome = git_run(
+        repo_root,
+        &["remote", "get-url", remote],
+        GIT_LOCAL_TIMEOUT,
+    )?;
+    if outcome.exit_code != 0 {
+        return Err(if outcome.stderr.is_empty() {
+            format!("Could not resolve remote URL for '{remote}'.")
+        } else {
+            outcome.stderr
+        });
+    }
+    let url = outcome.stdout.trim().to_string();
+    if url.is_empty() {
+        return Err(format!("Remote '{remote}' has an empty URL."));
+    }
+    Ok(url)
+}
+
+/// CRIT-2: resolve `<remote>`'s actual URL and refuse unless the host is github.com.
+/// Returns the resolved URL on success so callers can re-check it later if needed.
+fn ensure_github_remote_for_auth(repo_root: &Path, remote: &str) -> Result<String, String> {
+    let url = resolve_remote_url(repo_root, remote)?;
+    if !is_github_remote_url(&url) {
+        return Err(format!(
+            "Refusing authenticated git: remote '{remote}' is not github.com ({}).",
+            sanitize_git_remote(&url)
+        ));
+    }
+    Ok(url)
+}
+
+/// Best-effort remote name that `git pull` (no remote arg) will contact: the
+/// upstream tracking remote of the current branch, else `origin`.
+fn resolve_pull_remote_name(repo_root: &Path) -> String {
+    if let Some(upstream) = git_output_timeout(
+        repo_root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    ) {
+        if let Some((remote, _)) = upstream.split_once('/') {
+            let remote = remote.trim();
+            if !remote.is_empty() {
+                return remote.to_string();
+            }
+        }
+    }
+    "origin".to_string()
+}
+
 /// True when an argv vector contains any force-push flag. Used by the no-force
 /// invariant test and as a defensive runtime guard before a push spawn.
 fn args_contain_force(args: &[String]) -> bool {
@@ -1008,10 +1211,20 @@ pub async fn project_git_push(
         if args_contain_force(&push_args) {
             return Err("Refusing to force-push from the app.".into());
         }
+        // CRIT-2: resolve origin's real URL and refuse unless github.com — never
+        // hand the ASKPASS PAT to a remote an agent rewrote to an attacker host.
+        // Pin the validated URL at spawn via internal `-c remote.origin.url=…` so a
+        // concurrent `git remote set-url` cannot redirect the PAT (TOCTOU close).
+        let origin_url = ensure_github_remote_for_auth(&repo_root, "origin")?;
         let push_argv: Vec<&str> = push_args.iter().map(String::as_str).collect();
         // Authenticated push: the GitHub PAT is injected via GIT_ASKPASS (off argv,
         // off .git/config, off the PTY/logs). Fails closed if no token is configured.
-        let push = git_run_authenticated(&repo_root, &push_argv, GIT_PUSH_TIMEOUT)?;
+        let push = git_run_authenticated(
+            &repo_root,
+            &push_argv,
+            GIT_PUSH_TIMEOUT,
+            Some(("origin", origin_url.as_str())),
+        )?;
         if push.exit_code != 0 {
             return Err(if push.stderr.is_empty() {
                 "git push failed.".into()
@@ -1329,6 +1542,16 @@ fn run_approved_push(app: &tauri::AppHandle, request: &GitPushRequest) -> GitPus
         Err(e) => return GitPushResult::push_failed(None, e),
     };
 
+    // CRIT-2: re-resolve the remote URL immediately before the authenticated
+    // spawn and refuse unless host is github.com. (Request has no remote_url
+    // snapshot field in-scope; this still blocks PAT delivery to a rewritten
+    // non-github origin between card display and approve.) Pin the validated
+    // URL at spawn via internal `-c remote.<name>.url=…` (TOCTOU close).
+    let remote_url = match ensure_github_remote_for_auth(&repo_root, &remote) {
+        Ok(u) => u,
+        Err(e) => return GitPushResult::push_failed(None, e),
+    };
+
     let push_args = git_push_request_args(&remote, request.force);
     // Defense in depth: if the human did NOT approve a force, the argv must be
     // force-free. (For an approved force, --force-with-lease IS expected.)
@@ -1339,7 +1562,12 @@ fn run_approved_push(app: &tauri::AppHandle, request: &GitPushRequest) -> GitPus
         );
     }
     let push_argv: Vec<&str> = push_args.iter().map(String::as_str).collect();
-    match git_run_authenticated(&repo_root, &push_argv, GIT_PUSH_TIMEOUT) {
+    match git_run_authenticated(
+        &repo_root,
+        &push_argv,
+        GIT_PUSH_TIMEOUT,
+        Some((remote.as_str(), remote_url.as_str())),
+    ) {
         Ok(outcome) if outcome.exit_code == 0 => {
             let msg = if outcome.stdout.is_empty() {
                 if outcome.stderr.is_empty() {
@@ -1558,10 +1786,13 @@ pub async fn project_git_clone(
         //    verbatim-prefix-stripped path (git clone chokes on `\\?\C:\...`).
         let clone_url = plain_clone_url(&owner, &repo);
         let dest_str = strip_verbatim_prefix(&dest.to_string_lossy());
+        // Clone pins the URL on argv (rebuilt plain github.com URL); no remote-
+        // name TOCTOU window, so remote_url_pin is None.
         let clone = match git_run_authenticated(
             &base,
             &["clone", "--", &clone_url, &dest_str],
             GIT_CLONE_TIMEOUT,
+            None,
         ) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -1645,9 +1876,20 @@ pub async fn project_git_pull(
         let project = read_project_by_id(&app, &project_id)?;
         let repo_root = resolve_project_repo_root(&project)?;
 
+        // CRIT-2: pin the remote pull will contact to github.com before injecting
+        // the ASKPASS PAT (default tracking remote, else origin). Flow the
+        // validated URL into spawn as `-c remote.<name>.url=…` (TOCTOU close).
+        let pull_remote = resolve_pull_remote_name(&repo_root);
+        let pull_url = ensure_github_remote_for_auth(&repo_root, &pull_remote)?;
+
         let pull_args = git_pull_args();
         let pull_argv: Vec<&str> = pull_args.iter().map(String::as_str).collect();
-        let pull = git_run_authenticated(&repo_root, &pull_argv, GIT_PULL_TIMEOUT)?;
+        let pull = git_run_authenticated(
+            &repo_root,
+            &pull_argv,
+            GIT_PULL_TIMEOUT,
+            Some((pull_remote.as_str(), pull_url.as_str())),
+        )?;
         if pull.exit_code != 0 {
             return Err(if pull.stderr.is_empty() {
                 if pull.stdout.is_empty() {
@@ -1934,6 +2176,100 @@ mod tests {
         assert!(validate_push_remote(Some(&"x".repeat(200))).is_err());
     }
 
+    // --- CRIT-1 / CRIT-2: hooks-off + github.com remote pin ---------------------
+
+    #[test]
+    fn hooks_disabled_config_args_set_hooks_path_to_os_null() {
+        let args = hooks_disabled_config_args();
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                format!("core.hooksPath={HOOKS_DISABLED_PATH}"),
+            ]
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("core.hooksPath=")),
+            "must set core.hooksPath so client-side hooks never run"
+        );
+        // The path must be the OS null device (not a real hooks dir under the repo).
+        #[cfg(windows)]
+        assert!(args.iter().any(|a| a == "core.hooksPath=NUL"));
+        #[cfg(not(windows))]
+        assert!(args.iter().any(|a| a == "core.hooksPath=/dev/null"));
+    }
+
+    #[test]
+    fn is_github_remote_url_accepts_https_and_ssh_github_forms() {
+        assert!(is_github_remote_url("https://github.com/owner/repo.git"));
+        assert!(is_github_remote_url("https://github.com/owner/repo"));
+        assert!(is_github_remote_url("http://github.com/owner/repo"));
+        assert!(is_github_remote_url("HTTPS://GitHub.com/Owner/Repo.git"));
+        assert!(is_github_remote_url("git@github.com:owner/repo.git"));
+        // scp host match is case-insensitive (legitimate capitalized GitHub.com).
+        assert!(is_github_remote_url("git@GitHub.com:owner/repo.git"));
+        assert!(is_github_remote_url("git@GITHUB.COM:Owner/Repo.git"));
+        assert!(is_github_remote_url("ssh://git@github.com/owner/repo.git"));
+        assert!(is_github_remote_url("ssh://github.com/owner/repo"));
+        // Optional userinfo still points at github.com.
+        assert!(is_github_remote_url(
+            "https://x-access-token:tok@github.com/owner/repo.git"
+        ));
+    }
+
+    #[test]
+    fn is_github_remote_url_rejects_evil_hosts_and_lookalikes() {
+        assert!(!is_github_remote_url("https://evil.example/steal.git"));
+        assert!(!is_github_remote_url("https://evil.com/owner/repo"));
+        assert!(!is_github_remote_url("https://github.com.evil.com/o/r"));
+        assert!(!is_github_remote_url("https://github.com@evil.com/o/r"));
+        assert!(!is_github_remote_url("git@evil.com:owner/repo.git"));
+        assert!(!is_github_remote_url("ssh://git@evil.com/owner/repo.git"));
+        assert!(!is_github_remote_url("https://gitlab.com/owner/repo"));
+        assert!(!is_github_remote_url("https://github.com")); // no path
+        assert!(!is_github_remote_url(""));
+        assert!(!is_github_remote_url("not-a-url"));
+        assert!(!is_github_remote_url("origin"));
+        // Credentialed non-github must also fail the host pin.
+        assert!(!is_github_remote_url(
+            "https://x-access-token:tok@evil.com/steal.git"
+        ));
+    }
+
+    #[test]
+    fn arg_looks_like_remote_url_detects_url_shaped_argv() {
+        assert!(arg_looks_like_remote_url("https://github.com/o/r.git"));
+        assert!(arg_looks_like_remote_url("git@github.com:o/r.git"));
+        assert!(arg_looks_like_remote_url("ssh://git@github.com/o/r"));
+        // scp-like user@host:path (not only the git@ prefix form).
+        assert!(arg_looks_like_remote_url("user@github.com:owner/repo.git"));
+        assert!(arg_looks_like_remote_url("git@GitHub.com:Owner/Repo.git"));
+        assert!(!arg_looks_like_remote_url("origin"));
+        assert!(!arg_looks_like_remote_url("HEAD"));
+        assert!(!arg_looks_like_remote_url("push"));
+        assert!(!arg_looks_like_remote_url("--ff-only"));
+        assert!(!arg_looks_like_remote_url("refs/heads/x"));
+        // No colon after @ → not scp (e.g. a bare email-ish token).
+        assert!(!arg_looks_like_remote_url("user@host"));
+    }
+
+    #[test]
+    fn remote_url_pin_args_override_validated_remote_url() {
+        // TOCTOU close: authenticated spawn prepends `-c remote.<name>.url=<url>`
+        // so git uses the already-validated github.com URL at spawn time.
+        let args = remote_url_pin_args("origin", "https://github.com/o/r.git");
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "remote.origin.url=https://github.com/o/r.git".to_string(),
+            ]
+        );
+        let upstream = remote_url_pin_args("upstream", "git@github.com:o/r.git");
+        assert!(upstream.iter().any(|a| a == "remote.upstream.url=git@github.com:o/r.git"));
+        assert!(upstream.iter().any(|a| a == "-c"));
+    }
+
     // --- P2: secure GIT_ASKPASS token injection (token OFF argv/disk/logs) ------
 
     #[test]
@@ -2126,6 +2462,14 @@ mod tests {
         assert!(reject_unsafe_git_args(&["-c", "credential.helper=store"]).is_err());
         // A stray -c (could set any config override) is rejected.
         assert!(reject_unsafe_git_args(&["-c", "core.pager=less"]).is_err());
+        // Glued short option `-ckey=value` (git parses as `-c key=value`) — must
+        // NOT bypass the bare-token `-c` guard and re-enable hooks/helpers.
+        assert!(reject_unsafe_git_args(&["-ccore.hooksPath=/tmp/evil_hooks"]).is_err());
+        assert!(reject_unsafe_git_args(&["-ccredential.helper=store"]).is_err());
+        // hooksPath / core.hooksPath anywhere on a caller arg (case-insensitive).
+        assert!(reject_unsafe_git_args(&["core.hooksPath=/tmp/evil"]).is_err());
+        assert!(reject_unsafe_git_args(&["CORE.HOOKSPATH=/tmp/evil"]).is_err());
+        assert!(reject_unsafe_git_args(&["hooksPath=/tmp/evil"]).is_err());
         // A credentialed URL (userinfo before @ after ://).
         assert!(
             reject_unsafe_git_args(&["push", "https://x-access-token:tok@github.com/o/r"]).is_err()
@@ -2393,6 +2737,7 @@ mod tests {
                     Path::new("."),
                     &["push", "origin", "HEAD"],
                     GIT_PUSH_TIMEOUT,
+                    None,
                 );
                 let err = res.expect_err("must fail closed when no token is configured");
                 assert!(
@@ -2415,12 +2760,34 @@ mod tests {
             Path::new("."),
             &["-c", "http.extraHeader=Authorization: Basic x", "push"],
             GIT_PUSH_TIMEOUT,
+            None,
         );
         let err = res.expect_err("unsafe args must be rejected");
         assert!(
             err.contains("Refusing to run authenticated git"),
             "must reject the smuggled credential arg: {err}"
         );
+    }
+
+    #[test]
+    fn git_run_authenticated_rejects_non_github_url_before_vault() {
+        // CRIT-2: a URL-shaped arg that is not github.com is refused before any
+        // vault read / spawn — the ASKPASS PAT must never be offered off-github.
+        let res = git_run_authenticated(
+            Path::new("."),
+            &["clone", "--", "https://evil.example/steal.git", "dest"],
+            GIT_CLONE_TIMEOUT,
+            None,
+        );
+        let err = res.expect_err("non-github URL must be rejected");
+        assert!(
+            err.contains("not github.com"),
+            "must refuse non-github host: {err}"
+        );
+        // A legitimate github clone URL is NOT rejected by the host pin (it may
+        // still fail closed later for a missing token — either outcome is fine).
+        // We only assert the pure host check here via is_github_remote_url.
+        assert!(is_github_remote_url("https://github.com/o/r.git"));
     }
 
     #[test]
@@ -2650,6 +3017,7 @@ mod tests {
                         .map(String::as_str)
                         .collect::<Vec<_>>(),
                     GIT_PUSH_TIMEOUT,
+                    None,
                 );
                 let err = push.expect_err("must fail closed without a token");
                 assert!(
@@ -2692,6 +3060,7 @@ mod tests {
                         .map(String::as_str)
                         .collect::<Vec<_>>(),
                     GIT_PUSH_TIMEOUT,
+                    None,
                 )
                 .expect("authenticated push to a file:// remote should run");
                 // No token value (or any prefix) may leak into the surfaced output.

@@ -3,8 +3,8 @@
 // The cloud "Providers" area is hidden from the sidebar until the
 // provider-agnostic refactor (S1). It must NOT render as a nav button for the
 // default config, nor for a stale persisted config that still lists a
-// "providers" nav entry (defensive HIDDEN_NAV_IDS filter in Sidebar). The view
-// itself stays reachable by deep link (requestView("providers")).
+// "providers" nav entry (defensive HIDDEN_NAV_IDS filter in Sidebar). Deep
+// links to removed cloud views redirect via mapLegacyViewTarget.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, createElement } from "react";
@@ -19,9 +19,9 @@ function makeConfig(navigation: NavItem[]): AppConfig {
     bookmarks: [],
     secrets: [],
     compute: {
-      gpus: { active: 0, total: 0, provider: "Scaleway" },
-      cpus: { active: 0, total: 0, provider: "Scaleway" },
-      workers: { active: 0, total: 0, provider: "Cloudflare" },
+      gpus: { active: 0, total: 0, provider: "" },
+      cpus: { active: 0, total: 0, provider: "" },
+      workers: { active: 0, total: 0, provider: "" },
     },
     budget: { monthly_limit: 0, currency: "EUR", categories: [] },
     customAgentClients: [],

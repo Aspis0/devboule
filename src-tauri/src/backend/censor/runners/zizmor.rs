@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -152,9 +152,9 @@ pub fn parse_zizmor(stdout: &str) -> Vec<RawFinding> {
 ///
 /// zizmor exits non-zero when findings exist — that is fine, stdout is still
 /// the JSON. The scan can be slow on large repos, so the timeout is generous.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("zizmor") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "zizmor",
@@ -163,8 +163,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(120),
     );
     match stdout {
-        Some(s) => parse_zizmor(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_zizmor(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

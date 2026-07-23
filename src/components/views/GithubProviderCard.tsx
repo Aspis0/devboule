@@ -38,7 +38,7 @@ const pillIcon: Record<GithubPillTone, typeof CheckCircle2> = {
 };
 
 /**
- * GitHub provider card. Mirrors the Cloudflare/Scaleway token rows in
+ * GitHub provider card. Lives on the Secrets page alongside other vault
  * SecretsView: a WRITE-ONLY token paste field, Save, Disconnect, and an
  * "Import from GitHub CLI" button gated on `cliAvailable`. The token value is
  * NEVER read back into the field — `get_github_connection_status` returns only
@@ -199,7 +199,7 @@ export function GithubProviderCard() {
             )}
           </div>
           <p className="text-[11px] text-cream-400 mt-1">
-            Stored in the OS keychain (same as Cloudflare and Scaleway). The
+            Stored in the OS keychain (same vault as other app secrets). The
             token enables in-app Clone, Pull, and Push. Use a fine-grained token
             scoped to the repositories you coordinate.
           </p>

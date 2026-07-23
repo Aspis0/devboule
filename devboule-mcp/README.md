@@ -47,9 +47,7 @@ Manual Claude/Codex entry shape (what the app writes):
       "args": [],
       "env": {
         "DEVBOULE_MCP_ROOT": "/path/to/devboule",
-        "DEVBOULE_MCP_PROJECTS_DIR": "/path/to/devboule/projects",
-        "DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE": "1",
-        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
+        "DEVBOULE_MCP_PROJECTS_DIR": "/path/to/devboule/projects"
       }
     }
   }
@@ -105,7 +103,6 @@ When the app builds MCP server entries it sets **both**:
 
 | Devboule | Legacy Aspis |
 |----------|--------------|
-| `DEVBOULE_MCP_CLOUDFLARE_PROFILE_MODE` | `ASPIS_MCP_CLOUDFLARE_PROFILE_MODE` |
 | `DEVBOULE_APP_BIN` | `ASPIS_APP_BIN` |
 | `DEVBOULE_MCP_ROOT` / `DEVBOULE_MCP_PROJECTS_DIR` | `ASPIS_MCP_*` (rust backend) |
 

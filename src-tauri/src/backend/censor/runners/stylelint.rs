@@ -33,7 +33,7 @@
 
 use super::super::severity::severity_from_stylelint;
 use super::DEFAULT_RUNNER_TIMEOUT;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -143,9 +143,9 @@ fn parse_json_sources(stdout: &str) -> Option<Vec<StylelintSource>> {
 /// path (a leading-`-` component is rejected upstream by `validate_rel_path`, so it can't
 /// be mistaken for a flag). A project with no stylelint config makes stylelint error out
 /// with no JSON → empty Vec (see the CONFIG NOTE in the module header).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("stylelint") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture_with_timeout(
         "stylelint",
@@ -154,8 +154,8 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
         DEFAULT_RUNNER_TIMEOUT,
     );
     match stdout {
-        Some(s) => parse_stylelint(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_stylelint(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -283,7 +283,7 @@ mod tests {
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("stylelint") {
             // No config → stylelint errors → empty (expected). If a global config DID make
             // it produce findings, they must be advisory (never High) and correctly sourced.

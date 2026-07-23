@@ -100,6 +100,62 @@ describe("DesignCanvas — rendering", () => {
     act(() => root.unmount());
   });
 
+  it("HG-3: anchor clicks inside node markup are preventDefault'd (no webview navigate)", () => {
+    const project = baseProject({
+      components: {
+        hero: '<section><a href="https://evil.example/phish">click me</a></section>',
+      },
+    });
+    const { container, root } = mount(project);
+    const anchor = container.querySelector(
+      ".node-content a[href]",
+    ) as HTMLAnchorElement;
+    expect(anchor).toBeTruthy();
+    expect(anchor.getAttribute("href")).toContain("https://evil.example");
+    // Capture-phase handler on .node-card must cancel navigation.
+    let defaultPrevented = false;
+    const evt = new MouseEvent("click", { bubbles: true, cancelable: true });
+    // React 17+ attaches root listeners; dispatch through the DOM so capture runs.
+    anchor.addEventListener("click", (e) => {
+      defaultPrevented = e.defaultPrevented;
+    });
+    act(() => {
+      anchor.dispatchEvent(evt);
+    });
+    // React's onClickCapture calls preventDefault on the synthetic event; the
+    // native event's defaultPrevented is set when the React listener runs.
+    expect(evt.defaultPrevented || defaultPrevented).toBe(true);
+    act(() => root.unmount());
+  });
+
+  it("HG-3 fix: middle-click (auxclick) on anchors is also preventDefault'd", () => {
+    const project = baseProject({
+      components: {
+        hero: '<section><a href="https://evil.example/phish">middle me</a></section>',
+      },
+    });
+    const { container, root } = mount(project);
+    const anchor = container.querySelector(
+      ".node-content a[href]",
+    ) as HTMLAnchorElement;
+    expect(anchor).toBeTruthy();
+    let defaultPrevented = false;
+    // button: 1 = middle button
+    const evt = new MouseEvent("auxclick", {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    });
+    anchor.addEventListener("auxclick", (e) => {
+      defaultPrevented = e.defaultPrevented;
+    });
+    act(() => {
+      anchor.dispatchEvent(evt);
+    });
+    expect(evt.defaultPrevented || defaultPrevented).toBe(true);
+    act(() => root.unmount());
+  });
+
   it("B2: renders an inner position:absolute node inside the containing .node-card", () => {
     // The CSS containment (.node-card { position:relative; overflow:hidden }) is what
     // actually CLIPS an absolutely-positioned overlay. jsdom does no layout, so we

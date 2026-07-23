@@ -21,9 +21,9 @@ const config: AppConfig = {
   bookmarks: [],
   secrets: [],
   compute: {
-    gpus: { active: 0, total: 0, provider: "Scaleway" },
-    cpus: { active: 0, total: 0, provider: "Scaleway" },
-    workers: { active: 0, total: 0, provider: "Cloudflare" },
+    gpus: { active: 0, total: 0, provider: "" },
+    cpus: { active: 0, total: 0, provider: "" },
+    workers: { active: 0, total: 0, provider: "" },
   },
   budget: { monthly_limit: 0, currency: "EUR", categories: [] },
   customAgentClients: [],

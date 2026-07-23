@@ -36,7 +36,7 @@
 
 use super::super::severity::severity_from_ktlint;
 use super::{
-    cap, redact_secrets, run_capture, split_file_and_coord, Granularity, RawFinding, RunTarget,
+    cap, redact_secrets, run_capture, split_file_and_coord, Granularity, RawFinding, RunnerOutcome, RunTarget,
 };
 use std::path::Path;
 
@@ -142,14 +142,14 @@ fn parse_ktlint_line(line: &str) -> Option<RawFinding> {
 /// defensively. The file path is the orchestrator-validated project-relative path (a
 /// leading-`-` component is rejected upstream by `validate_rel_path`, so it can't be
 /// mistaken for a flag).
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("ktlint") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture("ktlint", &[&target.file_rel_path], root);
     match stdout {
-        Some(s) => parse_ktlint(&s, root),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_ktlint(&s, root)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -307,7 +307,7 @@ Summary error count (descending) by rule:
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("ktlint") {
             for f in &findings {
                 assert_eq!(f.source, "ktlint");

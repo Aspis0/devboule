@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_cargo_check;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -113,9 +113,9 @@ pub fn parse_cargo_check(stdout: &str) -> Vec<RawFinding> {
 }
 
 /// Run cargo check from the project root. Absent `cargo` → empty.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("cargo") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     // A full crate compile is slow on a cold target; allow a generous budget.
     let stdout = run_capture_with_timeout(
@@ -125,8 +125,8 @@ pub fn run(root: &Path) -> Vec<RawFinding> {
         Duration::from_secs(300),
     );
     match stdout {
-        Some(s) => parse_cargo_check(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_cargo_check(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

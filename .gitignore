@@ -85,8 +85,10 @@ src-tauri/binaries/devboule-mcp-*
 # scripts/stage-oracle-embedder.sh). Keep `.bundle-kind` + README tracked.
 src-tauri/resources/oracle-models/qwen3-onnx/
 
-# devboule-pilot DEV capability (copied only for pilot runs; never production)
+# devboule-pilot DEV capability (loaded at runtime only under the ui-pilot feature; never
+# auto-discovered by the tauri build, never shipped in the alpha).
 src-tauri/capabilities/pilot.json
+src-tauri/capabilities-optional/
 
 # Agent/workspace local state (must not be committed from attached project roots — F13)
 .aspis/

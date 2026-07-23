@@ -24,12 +24,14 @@
 //! LIFECYCLE: the orchestrator NEVER touches Tauri `State` and NEVER holds a map
 //! lock — the caller (the watch thread / a command) clones out the root + app +
 //! kinds first. Each unit of work is a plain function over a `&Path` root, so it
-//! is testable against a tempdir with no tools installed (→ empty, no error).
+//! is testable against a tempdir with no tools installed (→ Skipped, no refresh).
 
 use super::detect::{detect_project_kinds, FileLang, ProjectKind};
 use super::gemma::{self, GemmaClient};
 use super::ledger::read_supersede_write_shard;
-use super::runners::{self, applicable_runners, Granularity, RawFinding, RunTarget, RunnerId};
+use super::runners::{
+    self, applicable_runners, Granularity, RawFinding, RunTarget, RunnerId, RunnerOutcome,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -263,8 +265,9 @@ pub fn group_by_file(raw: Vec<RawFinding>) -> BTreeMap<String, Vec<RawFinding>> 
 
 /// Dispatch one runner against the project. FINE runners receive the changed
 /// file's `target`; COARSE runners ignore it and inspect the whole project. An
-/// absent tool yields an empty vec (each `run` presence-detects internally).
-fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+/// absent tool yields [`RunnerOutcome::Skipped`] (each `run` presence-detects
+/// internally); spawn/timeout failures yield [`RunnerOutcome::Failed`].
+fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> RunnerOutcome {
     match id {
         RunnerId::Clippy => runners::clippy::run(root),
         RunnerId::CargoCheck => runners::cargo_check::run(root),
@@ -305,6 +308,28 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
         RunnerId::Zizmor => runners::zizmor::run(root),
+    }
+}
+
+/// Fail-closed trust gate for every orchestrator entry that may spawn runners.
+/// Returns `true` only when the project is explicitly trusted. On `false` /
+/// lookup error, logs identity-only and the caller must not dispatch runners.
+fn assert_project_censor_trusted(app: &AppHandle, project_id: &str) -> bool {
+    match crate::backend::projects::project_censor_trusted(app, project_id) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "censor orchestrator: refusing runners for untrusted project {project_id}"
+            );
+            false
+        }
+        Err(e) => {
+            // Fail-closed: an unreadable trust flag must never open the spawn path.
+            eprintln!(
+                "censor orchestrator: trust check failed for {project_id} ({e}); refusing runners"
+            );
+            false
+        }
     }
 }
 
@@ -637,6 +662,10 @@ fn run_fine_batch_inner(
     if !running.load(Ordering::SeqCst) {
         return;
     }
+    // H4-2: trust is enforced at every spawn entry, not only `censor_review_now`.
+    if !assert_project_censor_trusted(app, project_id) {
+        return;
+    }
     // Only the LIVE watcher lights the "linters running…" indicator. The verdict gate and the async
     // Censor review reuse this pass too, but they must NOT flicker the indicator (findings-updated
     // still fires below so their findings surface).
@@ -656,13 +685,16 @@ fn run_fine_batch_inner(
     // cache for immediate delivery, but do NOT enqueue to persistent queue.
     let steer_dir = root.join(".aspis");
     let _ = std::fs::create_dir_all(&steer_dir);
-    let steer_findings = collect_open_findings(root, &changed);
-    if !steer_findings.is_empty() {
-        let text = format!(
-            "=== [Censor fine Check] ===\n{}\n=== [End Censor] ===\n",
-            crate::backend::censor::commands::format_findings_text(&steer_findings)
-        );
-        std::fs::write(steer_dir.join("steer_censor"), text).ok();
+    // Steer is best-effort: on shard-read failure (unknown, not clear) skip the
+    // write — never emit an empty steer that implies "all clean".
+    if let Ok(steer_findings) = collect_open_findings(root, &changed) {
+        if !steer_findings.is_empty() {
+            let text = format!(
+                "=== [Censor fine Check] ===\n{}\n=== [End Censor] ===\n",
+                crate::backend::censor::commands::format_findings_text(&steer_findings)
+            );
+            std::fs::write(steer_dir.join("steer_censor"), text).ok();
+        }
     }
     // TRAINING RAIL: record findings for every changed file while the project is
     // still running. Agent-state snapshot is read under its lock, cloned to owned
@@ -766,24 +798,29 @@ fn fine_batch_collect(
             }
         };
 
-        let mut refreshed: BTreeSet<String> = fp
-            .runners
-            .iter()
-            .map(|r| runner_source(*r).to_string())
-            .collect();
+        // Fail-closed (H4-1): only sources whose runner returned Ok may enter
+        // `refreshed`. Skipped/Failed leave prior Open findings for that source.
+        let mut refreshed: BTreeSet<String> = BTreeSet::new();
         let target = RunTarget {
             file_rel_path: fp.file_rel_path.clone(),
         };
         let mut raw_for_file: Vec<RawFinding> = Vec::new();
         for id in &fp.runners {
-            let mut produced = dispatch_runner(*id, root, &target);
-            // A fine runner is invoked with the changed file; keep only findings
-            // it attributed to THAT file (a fine tool may, defensively, mention
-            // an imported file — those belong to that other file's shard, but the
-            // fine pass is scoped to the changed file, so we ignore cross-file
-            // fine output here; coarse passes own cross-file attribution).
-            produced.retain(|f| f.file.replace('\\', "/") == fp.file_rel_path);
-            raw_for_file.append(&mut produced);
+            match dispatch_runner(*id, root, &target) {
+                RunnerOutcome::Ok(mut produced) => {
+                    // A fine runner is invoked with the changed file; keep only findings
+                    // it attributed to THAT file (a fine tool may, defensively, mention
+                    // an imported file — those belong to that other file's shard, but the
+                    // fine pass is scoped to the changed file, so we ignore cross-file
+                    // fine output here; coarse passes own cross-file attribution).
+                    produced.retain(|f| f.file.replace('\\', "/") == fp.file_rel_path);
+                    raw_for_file.append(&mut produced);
+                    refreshed.insert(runner_source(*id).to_string());
+                }
+                RunnerOutcome::Skipped | RunnerOutcome::Failed => {
+                    // Do not refresh this source — leave existing Open findings.
+                }
+            }
         }
 
         // GEMMA (A4): additive, deterministic-clobber-protected.
@@ -847,12 +884,19 @@ pub fn run_coarse_pass(app: &AppHandle, project_id: &str, root: &Path, running: 
     if !running.load(Ordering::SeqCst) {
         return;
     }
+    // H4-2: trust is enforced at every spawn entry, not only `censor_review_now`.
+    if !assert_project_censor_trusted(app, project_id) {
+        return;
+    }
     let _guard = emit_scan_started(app, project_id, "coarse", 0, running);
     let changed = coarse_pass_collect(root);
     // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
     // and write a steer file so the main coder sees them next turn.
-    let steer_findings = collect_open_findings(root, &changed);
-    enqueue_censor_findings(root, &steer_findings, &changed, "coarse");
+    // On shard-read failure (unknown, not clear) skip enqueue — never queue an
+    // empty batch that implies "all clean".
+    if let Ok(steer_findings) = collect_open_findings(root, &changed) {
+        enqueue_censor_findings(root, &steer_findings, &changed, "coarse");
+    }
     // TRAINING RAIL: same lock-ordering discipline as run_fine_batch.
     if running.load(Ordering::SeqCst) && !changed.is_empty() {
         record_findings_for_batch(app, root, &changed);
@@ -870,10 +914,9 @@ fn coarse_pass_collect(root: &Path) -> Vec<String> {
         return Vec::new();
     }
     let now = super::now_stamp();
-    let refreshed: BTreeSet<String> = coarse
-        .iter()
-        .map(|r| runner_source(*r).to_string())
-        .collect();
+    // Fail-closed (H4-1): only sources whose runner returned Ok may enter
+    // `refreshed`. Built while dispatching — never pre-populated from the plan.
+    let mut refreshed: BTreeSet<String> = BTreeSet::new();
 
     // Run every coarse runner once; coarse runners ignore the target.
     let empty_target = RunTarget {
@@ -881,8 +924,19 @@ fn coarse_pass_collect(root: &Path) -> Vec<String> {
     };
     let mut all_raw: Vec<RawFinding> = Vec::new();
     for id in &coarse {
-        let mut produced = dispatch_runner(*id, root, &empty_target);
-        all_raw.append(&mut produced);
+        match dispatch_runner(*id, root, &empty_target) {
+            RunnerOutcome::Ok(mut produced) => {
+                all_raw.append(&mut produced);
+                refreshed.insert(runner_source(*id).to_string());
+            }
+            RunnerOutcome::Skipped | RunnerOutcome::Failed => {
+                // Do not refresh this source — leave existing Open findings.
+            }
+        }
+    }
+    // No successful coarse runner → nothing to refresh (fail-closed).
+    if refreshed.is_empty() {
+        return Vec::new();
     }
     let grouped = group_by_file(all_raw);
 
@@ -944,6 +998,11 @@ pub fn run_review_now(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
 ) {
+    // H4-2: belt-and-braces — fine/coarse entries also gate, but review-now is a
+    // public dispatch surface that must refuse untrusted projects itself.
+    if !assert_project_censor_trusted(app, project_id) {
+        return;
+    }
     match file {
         // A single-file recheck IS a fine pass, so it runs Gemma too (additive).
         Some(rel) => run_fine_batch(app, project_id, root, &[rel.to_string()], gemma, running),
@@ -1144,17 +1203,40 @@ fn emit_scan_started(
 }
 
 /// Collect all Open findings for the given files by reading their Censor shards.
-pub fn collect_open_findings(root: &Path, files: &[String]) -> Vec<Finding> {
-    files
-        .iter()
-        .filter_map(|file| {
-            crate::backend::censor::ledger::read_shard(root, file)
-                .ok()
-                .flatten()
-        })
-        .flat_map(|shard| shard.findings)
-        .filter(|f| f.disposition == Disposition::Open)
-        .collect()
+///
+/// Fail-closed for gate paths (H4-6): returns `Err` if ANY shard read fails
+/// (IO / corrupt). Callers must NOT treat `Err` as "zero findings / clean" —
+/// only `Ok(vec![])` means every readable file had no Open findings (absent
+/// shard = no findings for that file, which is fine).
+pub fn collect_open_findings(
+    root: &Path,
+    files: &[String],
+) -> Result<Vec<Finding>, std::io::Error> {
+    let mut out = Vec::new();
+    for file in files {
+        match crate::backend::censor::ledger::read_shard(root, file) {
+            Ok(Some(shard)) => {
+                out.extend(
+                    shard
+                        .findings
+                        .into_iter()
+                        .filter(|f| f.disposition == Disposition::Open),
+                );
+            }
+            Ok(None) => {
+                // Shard genuinely absent → no findings for this file.
+            }
+            Err(e) => {
+                // Path/kind only — never finding contents (privacy).
+                eprintln!(
+                    "censor orchestrator: shard read failed for {file} ({}): treating as unknown, not clear",
+                    e.kind()
+                );
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Emit a steer file so the main coder sees deep-check findings next turn.
@@ -1781,6 +1863,156 @@ mod tests {
         assert!(changed.is_empty());
         // No shard dir is created for an empty batch.
         assert!(!root.join(super::super::CENSOR_DIR).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_ok_runner_outcomes_enter_refreshed_sources() {
+        // H4-1 contract (mirrors fine_batch_collect / coarse_pass_collect):
+        // Skipped/Failed must not refresh a source; only Ok may drop Open by absence.
+        let outcomes = [
+            (RunnerId::Eslint, RunnerOutcome::Skipped),
+            (RunnerId::Lizard, RunnerOutcome::Ok(Vec::new())),
+            (RunnerId::Semgrep, RunnerOutcome::Failed),
+        ];
+        let mut refreshed: BTreeSet<String> = BTreeSet::new();
+        for (id, outcome) in outcomes {
+            if outcome.is_ok() {
+                refreshed.insert(runner_source(id).to_string());
+            }
+        }
+        assert!(refreshed.contains("lizard"));
+        assert!(
+            !refreshed.contains("eslint"),
+            "Skipped must not refresh eslint"
+        );
+        assert!(
+            !refreshed.contains("semgrep"),
+            "Failed must not refresh semgrep"
+        );
+    }
+
+    #[test]
+    fn skipped_source_not_in_refreshed_leaves_open_finding() {
+        // H4-1 end-to-end through the ledger merge: an empty refresh that OMITs
+        // "eslint" leaves a prior Open eslint finding (the orchestrator fix is
+        // building refreshed only from Ok outcomes so this path is taken).
+        use crate::backend::censor::ledger::{read_shard, write_shard};
+        use crate::backend::censor::schema::{CensorShard, Disposition, Verdict};
+
+        let dir = unique_temp_root("h4-skip-keep");
+        let root = dir.as_path();
+        let hash = "content-hash-1";
+        let open = Finding {
+            id: Finding::compute_id(
+                "src/app.ts",
+                Some(1),
+                Category::Correctness,
+                "eslint",
+                "prior open",
+            ),
+            file: "src/app.ts".into(),
+            content_hash: hash.into(),
+            line: Some(1),
+            severity: Severity::High,
+            category: Category::Correctness,
+            source: "eslint".into(),
+            title: "prior open".into(),
+            body: "must survive non-refresh".into(),
+            verdict: Verdict::Suspected,
+            disposition: Disposition::Open,
+            provenance: vec![],
+            created_at: "t0".into(),
+            commit: None,
+        };
+        write_shard(
+            root,
+            &CensorShard {
+                file_rel_path: "src/app.ts".into(),
+                content_hash: hash.into(),
+                updated_at: "t0".into(),
+                findings: vec![open],
+            },
+        )
+        .unwrap();
+
+        // Simulate a fine pass where eslint was Skipped: refreshed has other
+        // sources only (or is empty). Empty refreshed = pure no-op on sources.
+        let refreshed: BTreeSet<String> = BTreeSet::new();
+        assert!(commit_shard(
+            root,
+            "src/app.ts",
+            HashOutcome::Hashed(hash.into()),
+            Vec::new(),
+            &refreshed,
+            "t1",
+        ));
+
+        let shard = read_shard(root, "src/app.ts")
+            .expect("shard read ok")
+            .expect("shard still present");
+        let still_open: Vec<_> = shard
+            .findings
+            .iter()
+            .filter(|f| f.source == "eslint" && f.disposition == Disposition::Open)
+            .collect();
+        assert_eq!(
+            still_open.len(),
+            1,
+            "Open eslint finding must survive when eslint is not in refreshed; got {:?}",
+            shard.findings
+        );
+
+        // Contrast: if eslint WERE incorrectly added to refreshed with empty
+        // findings, the Open finding would drop. Prove that path still works so
+        // the test would fail if the orchestrator re-pre-populated all sources.
+        let mut bad_refresh = BTreeSet::new();
+        bad_refresh.insert("eslint".to_string());
+        assert!(commit_shard(
+            root,
+            "src/app.ts",
+            HashOutcome::Hashed(hash.into()),
+            Vec::new(),
+            &bad_refresh,
+            "t2",
+        ));
+        let shard2 = read_shard(root, "src/app.ts").unwrap().unwrap();
+        assert!(
+            !shard2
+                .findings
+                .iter()
+                .any(|f| f.source == "eslint" && f.disposition == Disposition::Open),
+            "control: empty Ok refresh of eslint must drop Open (same-hash drop)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_open_findings_errors_on_corrupt_shard() {
+        // H4-6: corrupt/unreadable shard must return Err (unknown, not clear),
+        // never Ok([]) which gates would treat as clean.
+        use crate::backend::censor::ledger::shard_path;
+
+        let dir = unique_temp_root("h4-collect-corrupt");
+        let root = dir.as_path();
+        let rel = "src/bad.rs";
+        let path = shard_path(root, rel).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not valid json ").unwrap();
+
+        let err = collect_open_findings(root, &[rel.to_string()]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_open_findings_absent_is_ok_empty() {
+        let dir = unique_temp_root("h4-collect-absent");
+        let root = dir.as_path();
+        let got = collect_open_findings(root, &["src/none.rs".to_string()]).unwrap();
+        assert!(got.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

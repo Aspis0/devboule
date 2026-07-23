@@ -797,6 +797,19 @@ pub trait GemmaClient: Send + Sync {
     }
 }
 
+/// Build a blocking HTTP client that NEVER follows redirects (H4-5).
+///
+/// A redirect could send the request body off-box; loopback Ollama/oMLX never
+/// legitimately redirects. Must not fall back to [`reqwest::blocking::Client::new`],
+/// which follows redirects by default. Fail-closed: if the hardened builder
+/// cannot construct a client, panic — a same-builder "retry" would fail identically.
+fn build_no_redirect_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("censor gemma: cannot build redirect-hardened HTTP client (redirect::none)")
+}
+
 /// The real loopback Ollama client. Holds a `reqwest::blocking::Client` with no
 /// global timeout — each request sets its own (probe vs generate have different
 /// budgets), mirroring `python_oracle.rs`. Blocking is fine: it runs on the Censor
@@ -862,12 +875,10 @@ impl OllamaClient {
             );
             OLLAMA_BASE.to_string()
         };
-        // A builder failure (TLS init, etc.) is implausible for a plain loopback
-        // client; fall back to the default client so we never panic at startup.
-        let http = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // NEVER fall back to Client::new() — the default client follows redirects
+        // and would break the loopback-only privacy guarantee. Rebuild with the
+        // same hardening; if that also fails, panic (tier cannot run safely).
+        let http = build_no_redirect_client();
         Self {
             http,
             base,
@@ -1077,10 +1088,9 @@ impl OmlxClient {
             eprintln!("censor gemma: refusing invalid oMLX base; falling back to loopback default");
             OMLX_DEFAULT_BASE.to_string()
         };
-        let http = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // NEVER fall back to Client::new() — the default client follows redirects
+        // and would break the loopback-only privacy guarantee (H4-5).
+        let http = build_no_redirect_client();
         Self {
             http,
             base,

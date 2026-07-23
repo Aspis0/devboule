@@ -547,20 +547,23 @@ pub async fn design_generate(
     Ok(())
 }
 
-/// Signal cancellation for an in-flight generation. Idempotent and never errors: an
-/// unknown/finished id is a no-op (returns silently). The running path observes the flag
-/// on its next chunk poll, tears down its source, and emits `Cancelled`.
+/// Signal cancellation for an in-flight generation. Idempotent for unknown/finished
+/// ids (returns silently). The running path observes the flag on its next chunk poll,
+/// tears down its source, and emits `Cancelled`. Requires an unlocked vault — same
+/// gate as `design_generate` so a locked session cannot cancel a paid generation.
 #[tauri::command]
 pub fn design_cancel_generation(
     app: AppHandle,
+    state: tauri::State<'_, BackendState>,
     gen_id: String,
 ) -> Result<(), String> {
+    state.ensure_unlocked()?;
     let gen_id = gen_id.trim();
     if gen_id.is_empty() {
         return Ok(());
     }
-    if let Some(state) = app.try_state::<DesignGenState>() {
-        state.cancel(gen_id);
+    if let Some(gen_state) = app.try_state::<DesignGenState>() {
+        gen_state.cancel(gen_id);
     }
     Ok(())
 }

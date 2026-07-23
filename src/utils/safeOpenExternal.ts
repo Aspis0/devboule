@@ -3,13 +3,9 @@ import { invokeBackendCommand, isTauriRuntime } from "../context/AppContext";
 const allowedHosts = new Set([
   "aspis-bio.com",
   "console.nebius.ai",
-  "console.scaleway.com",
-  "dash.cloudflare.com",
-  "developers.cloudflare.com",
   "docs.aspis-bio.com",
   "github.com",
   "manager.infomaniak.com",
-  "www.scaleway.com",
 ]);
 
 export async function safeOpenExternal(url: string): Promise<void> {

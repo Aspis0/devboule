@@ -107,16 +107,12 @@ describe("findHelpTarget", () => {
 
 describe("pageUseLineFor", () => {
 	// Coverage for the page-context line used in the banner and single tooltip.
-	// Keys should match Sidebar nav ids plus the legacy provider/ops views.
+	// Keys should match Sidebar nav ids and surviving settings sub-views.
 	const expectedViews = [
-		"cloudflare",
-		"compute",
 		"secrets",
 		"oracle",
 		"projects",
 		"agents",
-		"providers",
-		"budget",
 		"graph",
 		"design",
 		"polis",

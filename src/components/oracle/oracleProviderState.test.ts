@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { OracleLlmSettingsStatus, SecretStatus } from "../../types/backend";
+import type { OracleLlmSettingsStatus } from "../../types/backend";
 import { deriveProviderConfigured } from "./oracleProviderState";
 
 // Table-driven test for the shared provider-configured derivation. This pure fn
@@ -8,15 +8,8 @@ import { deriveProviderConfigured } from "./oracleProviderState";
 // answer provider is available.
 //
 // Rule: apiKeyConfigured || status === "configured" (for local providers).
-// A Cloudflare secret alone MUST NOT make Oracle appear configured — Cloudflare
-// is unrelated to Oracle LLM.
-
-function secret(
-  provider: SecretStatus["provider"],
-  configured: boolean,
-): SecretStatus {
-  return { provider, configured } as SecretStatus;
-}
+// A former cloud-provider inventory secret (Cloudflare/Scaleway) alone MUST NOT
+// make Oracle appear configured — those vault entries were unrelated to Oracle LLM.
 
 function llm(apiKeyConfigured: boolean): OracleLlmSettingsStatus {
   return {
@@ -75,45 +68,36 @@ describe("deriveProviderConfigured", () => {
   });
 
   it("is configured when the API key is set even if no secrets exist", () => {
-    expect(
-      deriveProviderConfigured(llm(true), []),
-    ).toBe(true);
+    expect(deriveProviderConfigured(llm(true), [])).toBe(true);
   });
 
   it("is NOT configured when neither a key nor configured status exists", () => {
-    expect(
-      deriveProviderConfigured(llm(false), []),
-    ).toBe(false);
+    expect(deriveProviderConfigured(llm(false), [])).toBe(false);
   });
 
-  it("is NOT configured with null settings and no secrets", () => {
+  it("is NOT configured with null settings", () => {
     expect(deriveProviderConfigured(null, [])).toBe(false);
   });
 
-  it("is NOT configured with null settings and no secrets", () => {
-    expect(
-      deriveProviderConfigured(null, [secret("cloudflare", true)]),
-    ).toBe(false);
-  });
-
-  it("tolerates an undefined secrets list", () => {
+  it("tolerates an undefined second arg", () => {
     expect(deriveProviderConfigured(llm(false), undefined)).toBe(false);
     expect(deriveProviderConfigured(llm(true), undefined)).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Regression: Cloudflare-only secret must NOT configure Oracle
+// Regression: unrelated vault / inventory secrets must NOT configure Oracle
 // ---------------------------------------------------------------------------
-describe("deriveProviderConfigured — Cloudflare must not bleed (regression)", () => {
+describe("deriveProviderConfigured — inventory secrets must not bleed (regression)", () => {
   it("apiKeyConfigured=true → true (primary signal)", () => {
     expect(deriveProviderConfigured(llm(true), [])).toBe(true);
   });
 
-  it("only cloudflare configured → false (unrelated provider, must not bleed)", () => {
-    expect(
-      deriveProviderConfigured(llm(false), [secret("cloudflare", true)]),
-    ).toBe(false);
+  it("a cloudflare-shaped leftover secret bag alone → false (must not bleed)", () => {
+    // Second arg is intentionally ignored; pass a decoy so a future regression
+    // that re-reads inventory secrets would still fail this test when llm is off.
+    const decoy = [{ provider: "cloudflare", configured: true }];
+    expect(deriveProviderConfigured(llm(false), decoy)).toBe(false);
   });
 
   it("nothing configured → false", () => {

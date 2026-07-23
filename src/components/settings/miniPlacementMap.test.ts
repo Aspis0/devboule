@@ -10,6 +10,7 @@ import {
 	miniPlacementFromKind,
 	type MiniPlacement,
 } from "./miniPlacementMap";
+import type { MiniCoderBackendKind } from "../../types/config";
 
 const PLACEMENTS: MiniPlacement[] = ["On this Mac", "Cloud API", "Agent CLI"];
 
@@ -33,7 +34,7 @@ describe("miniPlacementFromKind / engines", () => {
 			openai: "Agent CLI",
 		};
 		for (const [kind, placement] of Object.entries(table)) {
-			expect(miniPlacementFromKind(kind as keyof typeof table)).toBe(placement);
+			expect(miniPlacementFromKind(kind as MiniCoderBackendKind)).toBe(placement);
 		}
 	});
 

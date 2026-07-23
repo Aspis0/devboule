@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_gofmt;
-use super::{cap, run_capture, Granularity, RawFinding, RunTarget};
+use super::{cap, run_capture, Granularity, RawFinding, RunnerOutcome, RunTarget};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -60,14 +60,14 @@ pub fn parse_gofmt(stdout: &str, file_hint: &str) -> Vec<RawFinding> {
 /// an error). `--` is NOT used (gofmt has no `--` end-of-flags marker); instead the
 /// path is validated/normalized by the orchestrator before it reaches here, and a
 /// leading-`-` component is rejected upstream by `validate_rel_path`.
-pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
+pub fn run(root: &Path, target: &RunTarget) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("gofmt") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture("gofmt", &["-l", &target.file_rel_path], root);
     match stdout {
-        Some(s) => parse_gofmt(&s, &target.file_rel_path),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_gofmt(&s, &target.file_rel_path)),
+        None => RunnerOutcome::Failed,
     }
 }
 
@@ -130,7 +130,7 @@ mod tests {
         let target = RunTarget {
             file_rel_path: rel.to_string(),
         };
-        let findings = run(&dir, &target);
+        let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("gofmt") {
             assert_eq!(findings.len(), 1, "gofmt should flag the unformatted file");
             assert_eq!(findings[0].source, "gofmt");

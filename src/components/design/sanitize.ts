@@ -104,6 +104,34 @@ const SAFE_HREF_RE = /^(?:(?:https?|mailto|tel):|#|\/(?![/\\])|\.{0,2}\/)/i;
 const SVG_IMAGE_TAG = "image";
 const SAFE_SVG_IMAGE_HREF_RE = /^(?:data:image\/|#)/i;
 
+// HG-2: HTML resource-loading attributes (`src`/`srcset`/`poster` on <img>, <video>,
+// <source>, …). DOMPurify's ALLOWED_URI_REGEXP permits https for safe *anchors*,
+// which would also let `<img src="https://evil/x">` load as a tracking pixel /
+// referer leak in the parent webview. Resource attrs get the stricter style/SVG
+// policy: only an in-document `data:image/` payload is kept (forceKeep so it
+// survives ALLOWED_URI_REGEXP, which otherwise rejects the `data:` scheme).
+const RESOURCE_URI_ATTRS = new Set(["src", "srcset", "poster"]);
+const SAFE_RESOURCE_URI_RE = /^data:image\//i;
+
+/**
+ * Extract URL tokens from a srcset value without splitting inside `data:` URIs.
+ * A data URI always contains a comma (`data:image/…;base64,…`); naive
+ * `value.split(",")` would chop that URI and over-strip a safe srcset.
+ * Non-data candidates are the usual comma-separated URL tokens (descriptors
+ * like `1x`/`2x` sit after whitespace and are not returned).
+ */
+function srcsetCandidateUrls(value: string): string[] {
+  const urls: string[] = [];
+  // data:header,payload (payload = non-whitespace) OR a plain non-comma token.
+  const re = /(?:^|,)\s*(data:[^\s,]+,\S+|[^\s,]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(value)) !== null) {
+    const url = m[1] ?? "";
+    if (url.length > 0) urls.push(url);
+  }
+  return urls;
+}
+
 // --- Inline-style neutralization -------------------------------------------
 // DOMPurify's `ALLOWED_URI_REGEXP` clamps href/src-style URI attributes, but it
 // does NOT inspect URIs embedded inside an inline `style` attribute. That leaves
@@ -186,6 +214,26 @@ function ensureNodeIdHook(): void {
       data.forceKeepAttr = NODE_ID_CHARSET.test(data.attrValue ?? "");
       return;
     }
+    // HG-2: resource-loading attrs — only data:image/ (block remote beacons).
+    // Attr names are lowercased by DOMPurify for HTML; lowercase defensively.
+    const attrName = (data.attrName ?? "").toLowerCase();
+    if (RESOURCE_URI_ATTRS.has(attrName) && typeof data.attrValue === "string") {
+      const value = data.attrValue.trim();
+      if (attrName === "srcset") {
+        // srcset: "url1 1x, url2 2x" — every URL candidate must be data:image/.
+        // Parse data-URI-aware so the comma inside `data:image/…,…` is not a split.
+        const urls = srcsetCandidateUrls(value);
+        const ok =
+          urls.length > 0 &&
+          urls.every((u) => u.length > 0 && SAFE_RESOURCE_URI_RE.test(u));
+        if (ok) data.forceKeepAttr = true;
+        else data.keepAttr = false;
+        return;
+      }
+      if (SAFE_RESOURCE_URI_RE.test(value)) data.forceKeepAttr = true;
+      else data.keepAttr = false;
+      return;
+    }
     if (data.attrName === HREF_ATTR && typeof data.attrValue === "string") {
       const value = data.attrValue.trim();
       // M2: an SVG <image> href is a RESOURCE fetch — apply the stricter
@@ -195,7 +243,9 @@ function ensureNodeIdHook(): void {
       // defensively for the browser path.
       const tag = (node as Element)?.nodeName?.toLowerCase?.() ?? "";
       if (tag === SVG_IMAGE_TAG) {
-        if (!SAFE_SVG_IMAGE_HREF_RE.test(value)) data.keepAttr = false;
+        // forceKeep so data:image/ survives ALLOWED_URI_REGEXP (rejects bare data:).
+        if (SAFE_SVG_IMAGE_HREF_RE.test(value)) data.forceKeepAttr = true;
+        else data.keepAttr = false;
         return;
       }
       // Clamp the scheme of a PLAIN `href` (HTML <a> and SVG <a>/<use>). Anything
@@ -243,8 +293,9 @@ const BASE_CONFIG = {
   FORBID_TAGS,
   FORBID_ATTR,
   ALLOW_DATA_ATTR: false,
-  // Only http(s), mailto, tel are safe link/resource schemes. This clamp blocks
-  // `javascript:`, `data:` (data:text/html mutation-XSS), `vbscript:`, etc.
+  // Safe *link* schemes for href (anchors). Resource-loading attrs (src/srcset/
+  // poster) are further clamped in uponSanitizeAttribute to data:image/ only
+  // (HG-2). This regexp still blocks javascript:/vbscript:/data:text/html etc.
   ALLOWED_URI_REGEXP: /^(?:https?|mailto|tel):/i,
   // Keep markup only (no full documents); never return a Node.
   RETURN_DOM: false,

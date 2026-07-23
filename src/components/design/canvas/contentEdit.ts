@@ -6,10 +6,48 @@
 // returns `innerHTML`. It is NOT a sanitizer — the CALLER (DesignView) MUST re-run
 // the serialized markup through `sanitizeNodeMarkup` before it is persisted or
 // re-rendered. CE edits happen on already-sanitized DOM, and `startInlineTextEdit`
-// intercepts PASTE to insert plain text only (so rich HTML — `<img onerror>` — can
+// forces PLAIN TEXT on paste/drop/beforeinput (so rich HTML — `<img onerror>` — can
 // never land in the live editable DOM and fire before the commit-time sanitize). The
 // upstream sanitize on commit stays the authoritative boundary regardless: serialize
 // here, sanitize upstream.
+
+// Plain typing / IME / spellcheck / line breaks / deletions / undo — allowed
+// through beforeinput (browser inserts plain text only). Everything else
+// (paste/drop/format/…) is blocked so rich HTML cannot enter live DOM.
+// insertReplacementText = spellcheck/autocorrect; insertFromComposition = IME commit.
+const PLAIN_BEFOREINPUT_TYPES = new Set([
+  "insertText",
+  "insertCompositionText",
+  "insertFromComposition",
+  "insertReplacementText",
+  "insertLineBreak",
+  "insertParagraph",
+]);
+
+// Feature-detect once: unsupported engines treat an unknown contenteditable value
+// as non-editable, so we only opt into plaintext-only when the engine honors it.
+const SUPPORTS_PLAINTEXT_ONLY: boolean = (() => {
+  if (typeof document === "undefined") return false;
+  const probe = document.createElement("div");
+  probe.setAttribute("contenteditable", "plaintext-only");
+  return probe.contentEditable === "plaintext-only";
+})();
+
+/** Insert `text` at the current selection as a text node (no HTML parse). */
+function insertPlainTextAtCaret(text: string): void {
+  if (!text) return;
+  const selection = window.getSelection();
+  if (selection && selection.rangeCount > 0) {
+    const r = selection.getRangeAt(0);
+    r.deleteContents();
+    r.insertNode(document.createTextNode(text));
+    r.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(r);
+  } else {
+    document.execCommand("insertText", false, text);
+  }
+}
 
 // The transient helper classes CE adds to live elements during editing. They must
 // never survive into persisted markup (and the sanitizer would strip `class`
@@ -81,7 +119,12 @@ export function startInlineTextEdit(
   if (!el) return () => {};
   // Snapshot the original content so Esc can revert (the typed-but-abandoned edit).
   const original = el.innerHTML;
-  el.setAttribute("contenteditable", "true");
+  // Defense-in-depth: plaintext-only where the engine supports it (blocks rich
+  // drop/paste at the editing host). Unsupported engines keep "true" + event guards.
+  el.setAttribute(
+    "contenteditable",
+    SUPPORTS_PLAINTEXT_ONLY ? "plaintext-only" : "true",
+  );
   el.setAttribute("spellcheck", "false");
   el.focus();
   // Select-all then collapse to the end (caret at end of existing content).
@@ -107,30 +150,43 @@ export function startInlineTextEdit(
       el.blur();
     }
   };
-  // SECURITY: a contenteditable element accepts rich HTML on paste, and the browser
-  // inserts it into the LIVE DOM *before* anything we do — an `<img onerror>` (or a
-  // `<script>` in browsers that keep it) would fire on that live insertion, BEFORE the
-  // commit path ever reaches `sanitizeNodeMarkup`. So we intercept paste, take the
-  // PLAIN-TEXT clipboard payload only, and insert it as text. No markup ever lands in
-  // the live editable DOM via paste.
+  // SECURITY: contenteditable accepts rich HTML on paste/drop/beforeinput, and the
+  // browser inserts it into the LIVE DOM *before* commit-time sanitize — an
+  // `<img onerror>` would fire on that insertion. Force plain text on every path.
   const onPaste = (e: ClipboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    const text = e.clipboardData?.getData("text/plain") ?? "";
-    if (!text) return;
-    // Prefer the Selection API (range-based) so the caret position is honored; fall
-    // back to execCommand("insertText") where a selection isn't available.
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const r = selection.getRangeAt(0);
-      r.deleteContents();
-      r.insertNode(document.createTextNode(text));
-      r.collapse(false); // caret after the inserted text
-      selection.removeAllRanges();
-      selection.addRange(r);
-    } else {
-      document.execCommand("insertText", false, text);
+    insertPlainTextAtCaret(e.clipboardData?.getData("text/plain") ?? "");
+  };
+  // dragover must preventDefault so the drop event fires (and so the browser does
+  // not navigate / open the dragged resource).
+  const onDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    insertPlainTextAtCaret(e.dataTransfer?.getData("text/plain") ?? "");
+  };
+  // Block HTML-bearing / non-text beforeinput types (insertFromDrop / formatBold /
+  // …). Plain typing, IME, and spellcheck replacement are in PLAIN_BEFOREINPUT_TYPES
+  // and pass through. Paste and drop have dedicated handlers that insert plain
+  // text — do not re-insert here for those types (would double). Other insert*
+  // types still get plain text when the event carries it.
+  const onBeforeInput = (e: InputEvent) => {
+    const t = e.inputType ?? "";
+    if (
+      PLAIN_BEFOREINPUT_TYPES.has(t) ||
+      t.startsWith("delete") ||
+      t.startsWith("history")
+    ) {
+      return;
     }
+    e.preventDefault();
+    if (t === "insertFromPaste" || t === "insertFromDrop") return;
+    const text = e.dataTransfer?.getData("text/plain") ?? e.data ?? "";
+    insertPlainTextAtCaret(text);
   };
   const end = () => {
     if (ended) return;
@@ -140,10 +196,16 @@ export function startInlineTextEdit(
     el.removeEventListener("blur", end);
     el.removeEventListener("keydown", onKeyDown);
     el.removeEventListener("paste", onPaste);
+    el.removeEventListener("dragover", onDragOver);
+    el.removeEventListener("drop", onDrop);
+    el.removeEventListener("beforeinput", onBeforeInput);
     onDone?.();
   };
   el.addEventListener("blur", end);
   el.addEventListener("keydown", onKeyDown);
   el.addEventListener("paste", onPaste);
+  el.addEventListener("dragover", onDragOver);
+  el.addEventListener("drop", onDrop);
+  el.addEventListener("beforeinput", onBeforeInput);
   return end;
 }

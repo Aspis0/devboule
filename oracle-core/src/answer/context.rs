@@ -467,8 +467,10 @@ fn secret_patterns() -> Vec<Regex> {
         Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}").unwrap(),
         // JWT-shaped strings (three base64url segments).
         Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b").unwrap(),
-        // Generic key=value secret assignments.
-        Regex::new(r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key)\b\s*[:=]\s*['"]?[A-Za-z0-9/_+\-]{16,}['"]?"#).unwrap(),
+        // Generic key=value secret assignments (charset-restricted, lowered floor).
+        Regex::new(r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key)\b\s*[:=]\s*['"]?[A-Za-z0-9/_+\-]{8,}['"]?"#).unwrap(),
+        // Assignment patterns with any charset above a small minimum (quoted or bare).
+        Regex::new(r#"(?i)\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key)\b\s*[:=]\s*(?:['"][^'"]{4,}['"]|\S{4,})"#).unwrap(),
     ]
 }
 
@@ -521,3 +523,24 @@ pub fn term_weight_pub(term: &str) -> i64 {
 
 /// Alias used by guardrails.rs.
 pub use excerpt_query_terms_set as focused_excerpt_query_terms_pub;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_short_password_assignment() {
+        let text = r#"password = "hunter2""#;
+        let out = redact_secret_tokens(text);
+        assert!(!out.contains("hunter2"), "short password survived: {out}");
+        assert!(out.contains(SECRET_REDACTION));
+    }
+
+    #[test]
+    fn redacts_assignment_any_charset() {
+        let text = r#"api_key = "p@ss!word""#;
+        let out = redact_secret_tokens(text);
+        assert!(!out.contains("p@ss!word"), "special-char secret survived: {out}");
+        assert!(out.contains(SECRET_REDACTION));
+    }
+}

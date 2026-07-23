@@ -47,6 +47,9 @@ function inviteTone(invite: DeviceInviteRecord) {
     : "bg-cream-100 text-cream-500";
 }
 
+/** Privileged actions that require a second click before IPC fires. */
+type PendingDanger = "bake" | "reset" | "admin-approve";
+
 export function DevicesView() {
   const [snapshot, setSnapshot] = useState<DevicesInvitesSnapshot | null>(null);
   const [collaboratorName, setCollaboratorName] = useState("");
@@ -56,11 +59,18 @@ export function DevicesView() {
   const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  // Two-click arm for bake / reset / admin approve (disarms after a few seconds).
+  const [pendingDanger, setPendingDanger] = useState<PendingDanger | null>(
+    null,
+  );
   const requestId = useRef(0);
+  // Sync busy: React `isBusy` commits a tick late — double-clicks can stack IPC.
+  const busyRef = useRef(false);
 
   const loadSnapshot = useCallback(async () => {
     const id = requestId.current + 1;
     requestId.current = id;
+    busyRef.current = true;
     setIsBusy(true);
     setError(null);
     try {
@@ -73,7 +83,10 @@ export function DevicesView() {
         setError(e instanceof Error ? e.message : "Device snapshot failed.");
       }
     } finally {
-      if (requestId.current === id) setIsBusy(false);
+      if (requestId.current === id) {
+        busyRef.current = false;
+        setIsBusy(false);
+      }
     }
   }, []);
 
@@ -81,11 +94,19 @@ export function DevicesView() {
     void loadSnapshot();
   }, [loadSnapshot]);
 
+  // Auto-disarm two-click confirm so a forgotten arm does not surprise later.
+  useEffect(() => {
+    if (!pendingDanger) return;
+    const t = window.setTimeout(() => setPendingDanger(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [pendingDanger]);
+
   const runSnapshotCommand = async (
     command: string,
     args?: Record<string, unknown>,
   ) => {
-    if (isBusy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setIsBusy(true);
     setError(null);
     try {
@@ -97,6 +118,7 @@ export function DevicesView() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Device operation failed.");
     } finally {
+      busyRef.current = false;
       setIsBusy(false);
     }
   };
@@ -110,6 +132,15 @@ export function DevicesView() {
 
   const approveInvite = async () => {
     if (!collaboratorName.trim() || !joinRequest.trim()) return;
+    if (busyRef.current) return;
+    // Admin role is high-privilege — require a second click before approving.
+    if (inviteRole === "admin") {
+      if (pendingDanger !== "admin-approve") {
+        setPendingDanger("admin-approve");
+        return;
+      }
+      setPendingDanger(null);
+    }
     const input: DeviceInviteInput = {
       collaboratorName: collaboratorName.trim(),
       joinRequest: joinRequest.trim(),
@@ -133,7 +164,8 @@ export function DevicesView() {
       );
       return;
     }
-    if (isBusy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setIsBusy(true);
     setError(null);
     try {
@@ -153,15 +185,22 @@ export function DevicesView() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Issuing the role grant failed.");
     } finally {
+      busyRef.current = false;
       setIsBusy(false);
     }
   };
 
-  // One-click admin setup: bake THIS device's signing public key into config.json
-  // as the trust anchor. Only the public half is written; the private key stays in
-  // the vault. Run in the dev build, then package + distribute.
+  // Admin setup: bake THIS device's signing public key into config.json as the
+  // trust anchor. Two-click confirm — first arms, second runs. Only the public
+  // half is written; the private key stays in the vault.
   const bakeTrustAnchor = async () => {
-    if (isBusy) return;
+    if (busyRef.current) return;
+    if (pendingDanger !== "bake") {
+      setPendingDanger("bake");
+      return;
+    }
+    setPendingDanger(null);
+    busyRef.current = true;
     setIsBusy(true);
     setError(null);
     try {
@@ -174,8 +213,19 @@ export function DevicesView() {
         e instanceof Error ? e.message : "Could not set the trust anchor.",
       );
     } finally {
+      busyRef.current = false;
       setIsBusy(false);
     }
+  };
+
+  const resetLocalDevice = async () => {
+    if (busyRef.current) return;
+    if (pendingDanger !== "reset") {
+      setPendingDanger("reset");
+      return;
+    }
+    setPendingDanger(null);
+    await runSnapshotCommand("reset_local_device_identity");
   };
 
   const localDevice = snapshot?.localDevice;
@@ -251,9 +301,11 @@ export function DevicesView() {
           device={localDevice}
           copied={copied}
           isBusy={isBusy}
+          pendingBake={pendingDanger === "bake"}
+          pendingReset={pendingDanger === "reset"}
           onCopy={(id, value) => void copy(id, value)}
           onBakeAnchor={() => void bakeTrustAnchor()}
-          onReset={() => void runSnapshotCommand("reset_local_device_identity")}
+          onReset={() => void resetLocalDevice()}
         />
 
         <section
@@ -297,7 +349,14 @@ export function DevicesView() {
               </span>
               <select
                 value={inviteRole}
-                onChange={(event) => setInviteRole(event.target.value as Role)}
+                onChange={(event) => {
+                  const next = event.target.value as Role;
+                  setInviteRole(next);
+                  // Drop a pending admin confirm if the role is no longer admin.
+                  if (next !== "admin" && pendingDanger === "admin-approve") {
+                    setPendingDanger(null);
+                  }
+                }}
                 data-help-title="The access role this device gets after onboarding."
                 data-help-lines="Collaborator: work surfaces only (projects, agents, workspace, oracle), no admin pages or credential writes.|Admin: full access — grant sparingly.|The role is bound to the device's signing key in a grant you sign and send back.|Real cloud limits come from the scoped token you give them, not this setting alone."
                 className="rounded-md border border-cream-200 bg-white px-2 py-1 text-[12px] font-semibold text-cream-700 outline-none focus:border-terracotta-200"
@@ -313,11 +372,15 @@ export function DevicesView() {
                 isBusy || !collaboratorName.trim() || !joinRequest.trim()
               }
               data-help-title="This approves the pasted device for future packages."
-              data-help-lines="Approve stores the public key and fingerprint locally.|It does not upload a package or share source code yet.|Future package encryption should target approved fingerprints only.|Revoke the invite if the laptop is lost or the collaborator leaves."
+              data-help-lines="Approve stores the public key and fingerprint locally.|It does not upload a package or share source code yet.|Future package encryption should target approved fingerprints only.|Revoke the invite if the laptop is lost or the collaborator leaves.|Admin role requires a second click to confirm."
               className="inline-flex items-center justify-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
             >
               <ShieldCheck className="h-3.5 w-3.5" />
-              Approve device
+              {pendingDanger === "admin-approve"
+                ? "Click again to confirm admin"
+                : inviteRole === "admin"
+                  ? "Approve as admin"
+                  : "Approve device"}
             </button>
           </div>
         </section>
@@ -396,6 +459,8 @@ function LocalDeviceCard({
   device,
   copied,
   isBusy,
+  pendingBake,
+  pendingReset,
   onCopy,
   onBakeAnchor,
   onReset,
@@ -403,6 +468,8 @@ function LocalDeviceCard({
   device: DeviceVaultStatus | null | undefined;
   copied: string | null;
   isBusy: boolean;
+  pendingBake: boolean;
+  pendingReset: boolean;
   onCopy: (id: string, value: string | null | undefined) => void;
   onBakeAnchor: () => void;
   onReset: () => void;
@@ -484,22 +551,26 @@ function LocalDeviceCard({
           onClick={onBakeAnchor}
           disabled={isBusy || !device?.signingPublicKey}
           data-help-title="Write this device's public key into config.json as the trust anchor."
-          data-help-lines="One click instead of copy-paste: bakes YOUR signing public key into config.json.|Only the public half is written — your private key stays in the OS vault.|Run this in the dev build, then package and distribute that build to collaborators.|In a packaged (read-only) build it will report that it cannot write — that is expected."
+          data-help-lines="One click instead of copy-paste: bakes YOUR signing public key into config.json.|Only the public half is written — your private key stays in the OS vault.|Run this in the dev build, then package and distribute that build to collaborators.|In a packaged (read-only) build it will report that it cannot write — that is expected.|Requires a second click to confirm."
           className="inline-flex items-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
         >
           <ShieldCheck className="h-3.5 w-3.5" />
-          {anchorBaked ? "Anchor set ✓" : "Set this device as admin"}
+          {anchorBaked
+            ? "Anchor set ✓"
+            : pendingBake
+              ? "Click again to confirm"
+              : "Set this device as admin"}
         </button>
         <button
           type="button"
           onClick={onReset}
           disabled={isBusy}
           data-help-title="This regenerates this app install's device keypair."
-          data-help-lines="Reset only when this device is compromised, reinstalled, or incorrectly created.|Old packages encrypted to the previous public key will not unlock here anymore.|Tell admins to approve the new fingerprint and revoke the old one.|This does not affect GitHub, Cloudflare, Scaleway, or project files."
+          data-help-lines="Reset only when this device is compromised, reinstalled, or incorrectly created.|Old packages encrypted to the previous public key will not unlock here anymore.|Tell admins to approve the new fingerprint and revoke the old one.|This does not affect GitHub, Cloudflare, Scaleway, or project files.|Requires a second click to confirm."
           className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-coral-dark disabled:opacity-60"
         >
           <RefreshCw className="h-3.5 w-3.5" />
-          Reset key
+          {pendingReset ? "Click again to confirm reset" : "Reset key"}
         </button>
       </div>
     </section>

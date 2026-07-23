@@ -5,9 +5,11 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue};
 
 use crate::answer::AnswerError;
 
@@ -325,7 +327,107 @@ fn validate_host_for_remote_llm(url: &str) -> Result<(), AnswerError> {
         ));
     }
 
+    // Post-DNS SSRF gate: resolve the host and reject private/loopback/
+    // link-local/metadata ranges (lexical checks alone are rebinding-unsafe).
+    let port_u16: u16 = port
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(443);
+    reject_blocked_resolved_ips(host, port_u16)?;
+
     Ok(())
+}
+
+/// Resolve `host:port` and reject any address in blocked ranges (fail-closed).
+fn reject_blocked_resolved_ips(host: &str, port: u16) -> Result<(), AnswerError> {
+    let addrs = match (host, port).to_socket_addrs() {
+        Ok(iter) => iter.collect::<Vec<_>>(),
+        Err(_) => {
+            return Err(AnswerError::Validation(
+                "Remote Oracle LLM base URL host could not be resolved.".to_string(),
+            ));
+        }
+    };
+    if addrs.is_empty() {
+        return Err(AnswerError::Validation(
+            "Remote Oracle LLM base URL host resolved to no addresses.".to_string(),
+        ));
+    }
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(AnswerError::PrivacyGate(
+                "Remote Oracle LLM base URL must not resolve to a private, loopback, \
+                 link-local, or metadata address."
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
+    if v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_multicast()
+    {
+        return true;
+    }
+    let o = v4.octets();
+    // CGNAT 100.64.0.0/10
+    if o[0] == 100 && (o[1] & 0xc0) == 64 {
+        return true;
+    }
+    // 0.0.0.0/8
+    if o[0] == 0 {
+        return true;
+    }
+    // IETF protocol assignments 192.0.0.0/24 (excl. documentation already covered)
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return true;
+    }
+    false
+}
+
+fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+        return true;
+    }
+    let s = v6.segments();
+    // Unique local fc00::/7
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return true;
+    }
+    // Link-local fe80::/10
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return true;
+    }
+    // IPv4-mapped ::ffff:0:0/96 — re-check the embedded v4.
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0xffff {
+        let v4 = Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        );
+        return is_blocked_ipv4(v4);
+    }
+    // Deprecated IPv4-compatible ::a.b.c.d
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        if let Some(v4) = v6.to_ipv4() {
+            return is_blocked_ipv4(v4);
+        }
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -352,15 +454,20 @@ pub fn generate_with_openai_compatible(
 
     body["response_format"] = serde_json::json!({"type": "json_object"});
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-    headers.insert("HTTP-Referer", "https://aspis-bio.com".parse().unwrap());
-    headers.insert("X-Title", "Devboule Oracle".parse().unwrap());
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+    headers.insert(
+        "HTTP-Referer",
+        HeaderValue::from_static("https://aspis-bio.com"),
+    );
+    headers.insert("X-Title", HeaderValue::from_static("Devboule Oracle"));
     if !config.api_key.is_empty() {
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", config.api_key).parse().unwrap(),
-        );
+        let auth = HeaderValue::try_from(format!("Bearer {}", config.api_key)).map_err(|_| {
+            AnswerError::Validation(
+                "Remote Oracle LLM API key contains invalid header characters.".to_string(),
+            )
+        })?;
+        headers.insert("Authorization", auth);
     }
 
     let url = chat_completions_url(&config.base_url);
@@ -449,5 +556,37 @@ fn truncate_err(s: &str) -> String {
         cleaned[..220].to_string()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_ipv4_ranges() {
+        assert!(is_blocked_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(is_blocked_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_blocked_ipv4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(is_blocked_ipv4(Ipv4Addr::new(169, 254, 169, 254)));
+        assert!(is_blocked_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_blocked_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn authorization_header_rejects_crlf_key() {
+        // Production path: HeaderValue::try_from(...).map_err(|_| Validation).
+        // CR/LF in the key must never panic via .parse().unwrap().
+        assert!(
+            HeaderValue::try_from("Bearer key\r\ninjected").is_err(),
+            "CR/LF in Authorization value must be rejected"
+        );
+        assert!(HeaderValue::try_from("Bearer key\ninjected").is_err());
+    }
+
+    #[test]
+    fn authorization_header_accepts_clean_key() {
+        let ok = HeaderValue::try_from("Bearer sk-clean-key-value").expect("valid header");
+        assert!(ok.to_str().unwrap().starts_with("Bearer "));
     }
 }

@@ -5,7 +5,7 @@
 //!   1. A PURE `parse_<tool>(stdout, ...) -> Vec<RawFinding>` — no IO. Fed captured
 //!      sample output in tests.
 //!   2. A thin `run(root, target) -> Vec<RawFinding>` that presence-detects the
-//!      tool (absent → empty, never an error), spawns it FROM the project root
+//!      tool (absent → [`RunnerOutcome::Skipped`]), spawns it FROM the project root
 //!      (so it picks up the project's OWN config), pipes stdout, and parses.
 //!
 //! Every spawned `Command` is built via `build_command`, which centralizes the
@@ -116,6 +116,40 @@ impl RawFinding {
             created_at: now.to_string(),
             commit: None,
         }
+    }
+}
+
+
+/// Result of a deterministic runner invocation.
+///
+/// Fail-closed contract for the orchestrator: only [`RunnerOutcome::Ok`] may
+/// refresh that runner's source in a shard (an empty `Ok` is a genuine clean
+/// run and may drop prior Open findings by absence). [`Skipped`] (tool absent /
+/// not applicable) and [`Failed`] (spawn/timeout/overrun/unreadable output) must
+/// NOT refresh the source — prior Open findings stay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerOutcome {
+    /// Tool ran and output was consumed successfully. Findings may be empty.
+    Ok(Vec<RawFinding>),
+    /// Tool is not installed / not applicable. Leave existing Open findings.
+    Skipped,
+    /// Spawn failure, timeout, overrun, or unreadable/unparseable output.
+    /// Leave existing Open findings.
+    Failed,
+}
+
+impl RunnerOutcome {
+    /// Findings when `Ok`, empty otherwise.
+    pub fn into_findings(self) -> Vec<RawFinding> {
+        match self {
+            RunnerOutcome::Ok(v) => v,
+            RunnerOutcome::Skipped | RunnerOutcome::Failed => Vec::new(),
+        }
+    }
+
+    /// True only for a clean successful run (may still have zero findings).
+    pub fn is_ok(&self) -> bool {
+        matches!(self, RunnerOutcome::Ok(_))
     }
 }
 
@@ -955,6 +989,17 @@ mod tests {
 
     fn kinds(list: &[ProjectKind]) -> HashSet<ProjectKind> {
         list.iter().copied().collect()
+    }
+
+    #[test]
+    fn runner_outcome_only_ok_is_ok_and_yields_findings() {
+        // H4-1: Skipped/Failed must not be treated as clean empty findings.
+        assert!(RunnerOutcome::Ok(Vec::new()).is_ok());
+        assert!(!RunnerOutcome::Skipped.is_ok());
+        assert!(!RunnerOutcome::Failed.is_ok());
+        assert!(RunnerOutcome::Skipped.into_findings().is_empty());
+        assert!(RunnerOutcome::Failed.into_findings().is_empty());
+        assert!(RunnerOutcome::Ok(Vec::new()).into_findings().is_empty());
     }
 
     #[test]

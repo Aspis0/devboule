@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use super::super::severity::knip_category;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding};
+use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunnerOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -136,14 +136,14 @@ pub fn parse_knip(stdout: &str) -> Vec<RawFinding> {
 
 /// Run knip from the project root using the project's knip config. Absent `knip`
 /// → empty. knip is project-wide; A3 may dedupe/limit by the changed file.
-pub fn run(root: &Path) -> Vec<RawFinding> {
+pub fn run(root: &Path) -> RunnerOutcome {
     if !crate::backend::projects::command_exists("knip") {
-        return Vec::new();
+        return RunnerOutcome::Skipped;
     }
     let stdout = run_capture("knip", &["--reporter", "json", "--no-progress"], root);
     match stdout {
-        Some(s) => parse_knip(&s),
-        None => Vec::new(),
+        Some(s) => RunnerOutcome::Ok(parse_knip(&s)),
+        None => RunnerOutcome::Failed,
     }
 }
 

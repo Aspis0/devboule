@@ -24,13 +24,16 @@ use crate::tools::oracle::{
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const APP_BIN_ENVS: &[&str] = &["DEVBOULE_APP_BIN", "ASPIS_APP_BIN"];
 const PROJECT_STRUCTURE_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Wall-clock kill for the structure bridge subprocess (Python PROJECT_STRUCTURE_TIMEOUT_S).
+const PROJECT_STRUCTURE_TIMEOUT: Duration = Duration::from_secs(60);
 const STRUCTURE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 // ── structure bridge ────────────────────────────────────────────────────────
@@ -78,23 +81,67 @@ fn resolve_structure_bridge_binary() -> ToolResult<PathBuf> {
 }
 
 fn run_structure_bridge(app_bin: &Path, root: &Path) -> ToolResult<Value> {
-    let output = Command::new(app_bin)
+    let mut child = Command::new(app_bin)
         .args(["structure", "--root"])
         .arg(root)
-        .output();
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(ToolError::new(format!(
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ToolError::new(format!(
                 "project_structure could not run the structure bridge: {e}"
-            )));
+            ))
+        })?;
+    // Drain pipes on side threads so a large graph cannot fill the OS pipe buffer
+    // and deadlock while we poll try_wait.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + PROJECT_STRUCTURE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_h.join();
+                    let _ = stderr_h.join();
+                    return Err(ToolError::new(format!(
+                        "project_structure timed out after {}s (structure bridge killed).",
+                        PROJECT_STRUCTURE_TIMEOUT.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_h.join();
+                let _ = stderr_h.join();
+                return Err(ToolError::new(format!(
+                    "project_structure could not wait on the structure bridge: {e}"
+                )));
+            }
         }
     };
-    // Note: Command::output has no built-in timeout on all platforms without
-    // extra crates; the Rust bridge is bounded (MAX_FILES). We still reject
-    // oversized stdout post-hoc.
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+    let stdout = stdout_h.join().unwrap_or_default();
+    let stderr = stderr_h.join().unwrap_or_default();
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         let line = detail
             .lines()
             .next()
@@ -104,15 +151,15 @@ fn run_structure_bridge(app_bin: &Path, root: &Path) -> ToolResult<Value> {
             .collect::<String>();
         return Err(ToolError::new(format!(
             "project_structure bridge failed (exit {}): {line}",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )));
     }
-    if output.stdout.len() > PROJECT_STRUCTURE_MAX_OUTPUT_BYTES {
+    if stdout.len() > PROJECT_STRUCTURE_MAX_OUTPUT_BYTES {
         return Err(ToolError::new(
             "project_structure graph output exceeded the size limit.",
         ));
     }
-    let graph: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+    let graph: Value = serde_json::from_slice(&stdout).map_err(|_| {
         ToolError::new("project_structure bridge returned unparseable JSON.")
     })?;
     if !graph.is_object() {

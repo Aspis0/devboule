@@ -72,9 +72,6 @@ export interface PolisHandle {
   flyTo: (fileId: string) => void;
   /** P3.2 — set the filter state (null = clear). Applied in one pass. */
   setFilter: (sets: import("./filterModel").FilterSets | null) => void;
-  /** T1b — set which external providers are visible on the map.
-   *  Providers not in the set (except "monument") are hidden. */
-  setVisibleProviders: (providers: ReadonlySet<string>) => void;
   destroy: () => void;
 }
 
@@ -85,8 +82,8 @@ export interface CreatePolisOptions {
   /** A trade-route porter (or its road) was clicked — surface the REAL import
    *  edge `from` (importer/consumer) imports `to` (imported/supplier). */
   onSelectConnection?: (from: string, to: string) => void;
-  /** A cloud outpost ("harbour" node) was clicked — surface the REAL external
-   *  service (provider/type/name/status) in the inspect sidebar. */
+  /** An era monument was clicked — surface the REAL external service
+   *  (provider "monument" / wonder type / honest stats) in the inspect sidebar. */
   onSelectExternalService?: (service: ExternalService | null) => void;
   onSelectResource?: (site: import("./resources").ResourceSite | null) => void;
   background?: number;
@@ -291,7 +288,6 @@ export async function createPolis(
       renderer.onCensorFindings(payload, performance.now()),
     setCensorGemmaStatus: (status) => renderer.setCensorGemmaStatus(status),
     setFilter: (sets) => renderer.setFilter(sets),
-    setVisibleProviders: (provs) => renderer.setVisibleProviders(provs),
     flyTo: (fileId) => renderer.flyTo(fileId),
     destroy,
   };

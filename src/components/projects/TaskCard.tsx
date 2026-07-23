@@ -144,7 +144,7 @@ export function TaskCard({
 				"aria-label": `Launch coder for ${taskId}`,
 				"data-help-title": "This launches a cloud coder for the task.",
 				"data-help-lines":
-					"A coder is allowed to edit code and use scoped provider write tools when configured.|The app opens a terminal at the project root and gives it a task prompt plus MCP config.|It should claim the task through MCP and move it toward Review when done.|Cloudflare role tokens may be injected only for matching coder profiles.",
+					"A coder is allowed to edit code when configured.|The app opens a terminal at the project root and gives it a task prompt plus MCP config.|It should claim the task through MCP and move it toward Review when done.",
 			},
 			{
 				key: "verifier",
@@ -155,7 +155,7 @@ export function TaskCard({
 				"aria-label": `Launch verifier for ${taskId}`,
 				"data-help-title": "This launches a cloud verifier for the task.",
 				"data-help-lines":
-					"A verifier audits work and should not modify provider resources.|It can read Oracle, project state, and provider inventory.|It should mark the task done only when evidence supports closure.|Read-only Cloudflare and Scaleway access is the intended profile.",
+					"A verifier audits work and should not modify production systems.|It can read Oracle and project state.|It should mark the task done only when evidence supports closure.",
 			},
 			{
 				key: "manual",

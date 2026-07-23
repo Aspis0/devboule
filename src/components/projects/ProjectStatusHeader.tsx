@@ -192,8 +192,8 @@ export function ProjectStatusHeader({
       <button
         onClick={onRefreshLiveStatus}
         disabled={isBusy}
-        data-help-title="This refreshes live cloud status linked to the project."
-        data-help-lines="Live status checks provider resources mentioned by the project when possible.|It is meant to show whether Cloudflare or Scaleway resources still match the task state.|It should be a read operation, not a provider mutation.|Use it before launching verifier or closing work."
+        data-help-title="This refreshes live status linked to the project."
+        data-help-lines="Live status re-checks project-linked state when possible.|Cloud-provider inventory resolution was removed; the result may be empty.|It should be a read operation, not a mutation.|Use it before launching verifier or closing work."
         className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-sage-dark disabled:opacity-60"
       >
         <ShieldCheck className="h-3.5 w-3.5" />

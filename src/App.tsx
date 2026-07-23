@@ -1,12 +1,8 @@
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { Header } from "./components/Header";
-import { CloudflareView } from "./components/views/CloudflareView";
-import { ProvidersView } from "./components/views/ProvidersView";
 import { ProjectsView } from "./components/views/ProjectsView";
 import { SecretsView } from "./components/views/SecretsView";
-import { ComputeView } from "./components/views/ComputeView";
-import { BudgetView } from "./components/views/BudgetView";
 import { WorkspaceView } from "./components/views/WorkspaceView";
 import { DevicesView } from "./components/views/DevicesView";
 import { OracleView } from "./components/views/OracleView";
@@ -67,7 +63,6 @@ function ViewFallback() {
 
 function AppShell() {
   const {
-    config,
     activeView,
     isLoading,
     unlockRetryBlocked,
@@ -185,10 +180,6 @@ function AppShell() {
       );
     }
     switch (activeView) {
-      case "providers":
-        return <ProvidersView config={config} />;
-      case "cloudflare":
-        return <CloudflareView />;
       case "projects":
         return <ProjectsView />;
       case "devices":
@@ -197,10 +188,6 @@ function AppShell() {
         return <WorkspaceView />;
       case "secrets":
         return <SecretsView />;
-      case "compute":
-        return <ComputeView />;
-      case "budget":
-        return <BudgetView />;
       case "oracle":
         return <OracleView />;
       case "labs":

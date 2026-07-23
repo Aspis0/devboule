@@ -190,6 +190,11 @@ pub fn split_text(text: &str, max_chars: usize, overlap: usize) -> Vec<(usize, u
 // ── Read text file ───────────────────────────────────────────────────────────
 
 pub fn read_text_file(path: &Path) -> Option<String> {
+    // Refuse non-regular files (devices, dirs) before following content.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {}
+        _ => return None,
+    }
     let raw = std::fs::read(path).ok()?;
     if raw.contains(&0u8) {
         return None;
@@ -197,9 +202,27 @@ pub fn read_text_file(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&raw).to_string())
 }
 
+/// True when `path` resolves to a regular file under `root` (symlink-safe).
+fn path_resolves_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(canon_root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    match std::fs::metadata(&canon) {
+        Ok(m) if m.is_file() => canon.starts_with(&canon_root),
+        _ => false,
+    }
+}
+
 // ── Build chunks for file (the main entry point) ────────────────────────────
 
 pub fn build_chunks_for_file(path: &Path, root: &Path) -> Vec<serde_json::Value> {
+    // Fail-closed: never index content whose resolved target escapes the workspace.
+    if !path_resolves_under_root(path, root) {
+        return vec![];
+    }
     let text = match read_text_file(path) {
         Some(t) => t,
         None => return vec![],

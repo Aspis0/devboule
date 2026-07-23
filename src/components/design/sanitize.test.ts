@@ -341,6 +341,53 @@ describe("sanitizeNodeMarkup — preserves legitimate markup", () => {
     );
     expect(out).toContain("data:image/png");
   });
+
+  it("HG-2: drops a REMOTE https img src (tracking pixel / referer leak)", () => {
+    const out = clean('<img src="https://evil.example/pixel.gif" alt="x">');
+    expect(out).not.toContain("evil.example");
+    expect(out).not.toContain("https://");
+    // Element may remain; the resource-loading attr must not.
+    expect(out).not.toMatch(/src\s*=\s*["']?https/i);
+  });
+
+  it("HG-2: keeps a data:image/ img src (inline asset)", () => {
+    const out = clean(
+      '<img src="data:image/png;base64,iVBORw0KGgg==" alt="ok">',
+    );
+    expect(out).toContain("data:image/png");
+  });
+
+  it("HG-2: drops remote srcset and poster resource loads", () => {
+    const out = clean(
+      '<img srcset="https://evil.example/a.png 1x, https://evil.example/b.png 2x">' +
+        '<video poster="https://evil.example/poster.jpg"></video>',
+    );
+    expect(out).not.toContain("evil.example");
+    expect(out).not.toContain("https://");
+  });
+
+  it("HG-2 fix: keeps data:image srcset whose URI contains a comma (base64)", () => {
+    // Naive split-on-comma would chop `data:image/png;base64,PAYLOAD` and drop the attr.
+    const payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const srcset = `data:image/png;base64,${payload} 1x, data:image/png;base64,${payload} 2x`;
+    const out = clean(`<img srcset="${srcset}" alt="x">`);
+    expect(out).toContain("data:image/png;base64,");
+    expect(out).toMatch(/srcset\s*=/i);
+  });
+
+  it("HG-2 fix: still drops mixed srcset (data:image + remote)", () => {
+    const out = clean(
+      '<img srcset="data:image/png;base64,iVBORw0KGgg== 1x, https://evil.example/b.png 2x">',
+    );
+    expect(out).not.toContain("evil.example");
+    // Mixed candidates are unsafe as a whole — attr dropped.
+    expect(out).not.toMatch(/srcset\s*=\s*["'][^"']*evil/i);
+  });
+
+  it("HG-2: still keeps safe https anchors (link policy unchanged)", () => {
+    const out = clean('<a href="https://example.com">go</a>');
+    expect(out).toContain("https://example.com");
+  });
 });
 
 describe("sanitizeNodeMarkup — total / defensive", () => {

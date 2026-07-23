@@ -80,7 +80,9 @@ describe("startInlineTextEdit lifecycle", () => {
   it("makes the element contenteditable and selects its content", () => {
     const el = mountEl();
     startInlineTextEdit(el);
-    expect(el.getAttribute("contenteditable")).toBe("true");
+    // "plaintext-only" when the engine supports it; otherwise "true".
+    const ce = el.getAttribute("contenteditable");
+    expect(ce === "true" || ce === "plaintext-only").toBe(true);
     expect(el.getAttribute("spellcheck")).toBe("false");
   });
 
@@ -153,6 +155,87 @@ describe("startInlineTextEdit lifecycle", () => {
     expect(el.innerHTML).not.toContain("onerror");
     expect(el.textContent).toContain("hello");
     expect(evt.defaultPrevented).toBe(true);
+  });
+
+  it("HG-1: drop inserts ONLY plain text — rich HTML drag payload is blocked", () => {
+    const el = mountEl("<p></p>");
+    startInlineTextEdit(el);
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    const dataTransfer = {
+      getData: (type: string) =>
+        type === "text/html"
+          ? '<img src=x onerror="window.__pwned=1">'
+          : type === "text/plain"
+            ? "dropped"
+            : "",
+    };
+    const over = new Event("dragover", { bubbles: true, cancelable: true });
+    el.dispatchEvent(over);
+    expect(over.defaultPrevented).toBe(true);
+
+    const drop = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", { value: dataTransfer });
+    el.dispatchEvent(drop);
+
+    expect(drop.defaultPrevented).toBe(true);
+    expect(el.querySelector("img")).toBeNull();
+    expect(el.innerHTML).not.toContain("onerror");
+    expect(el.textContent).toContain("dropped");
+  });
+
+  it("HG-1: beforeinput blocks non-text insert types (insertFromDrop)", () => {
+    const el = mountEl("<p></p>");
+    startInlineTextEdit(el);
+    const evt = new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      inputType: "insertFromDrop",
+    });
+    // jsdom may not populate dataTransfer on InputEvent; attach a stub.
+    Object.defineProperty(evt, "dataTransfer", {
+      value: {
+        getData: (type: string) =>
+          type === "text/plain" ? "via-beforeinput" : "",
+      },
+    });
+    el.dispatchEvent(evt);
+    // Rich default path blocked; plain text is handled by the drop listener, so
+    // insertFromDrop here only preventDefaults (no double-insert).
+    expect(evt.defaultPrevented).toBe(true);
+    expect(el.querySelector("img")).toBeNull();
+  });
+
+  it("HG-1 fix: insertReplacementText (spellcheck) is allowed through beforeinput", () => {
+    const el = mountEl("<p>teh</p>");
+    startInlineTextEdit(el);
+    const evt = new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      inputType: "insertReplacementText",
+      data: "the",
+    });
+    el.dispatchEvent(evt);
+    // Must NOT preventDefault — browser applies the plain-text replacement.
+    expect(evt.defaultPrevented).toBe(false);
+  });
+
+  it("HG-1 fix: insertFromComposition (IME) is allowed through beforeinput", () => {
+    const el = mountEl("<p></p>");
+    startInlineTextEdit(el);
+    const evt = new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      inputType: "insertFromComposition",
+      data: "あ",
+    });
+    el.dispatchEvent(evt);
+    expect(evt.defaultPrevented).toBe(false);
   });
 
   it("paste listener is torn down on edit end (no paste handling after exit)", () => {
