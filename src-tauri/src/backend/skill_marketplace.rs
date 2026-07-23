@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -27,8 +27,9 @@ const RESERVED_SKILL_NAMES: &[&str] = &[
     "skill",
 ];
 
-/// True if `v4` is one we must NOT fetch from (private / link-local / loopback / CGNAT / doc / bench).
-fn is_disallowed_v4(v4: &Ipv4Addr) -> bool {
+/// True if `v4` is one we must NOT fetch from (private / link-local / loopback / CGNAT / doc / bench / class-E).
+/// Shared with [`super::page_preview`] SSRF guards.
+pub(crate) fn is_disallowed_v4(v4: &Ipv4Addr) -> bool {
     let o = v4.octets();
     v4.is_private()
         || v4.is_link_local()         // 169.254/16
@@ -39,11 +40,13 @@ fn is_disallowed_v4(v4: &Ipv4Addr) -> bool {
         || (o[0] == 100 && (64..=127).contains(&o[1]))   // 100.64/10 CGNAT
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19))   // 198.18/15 benchmark
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)       // 192.0.0/24 IETF protocol assignments
+        || o[0] >= 240                // 240.0.0.0/4 class-E / reserved
 }
 
 /// True if `ip` is internal/disallowed. SSRF core: a marketplace URL that resolves to an internal
 /// address (incl. a private v4 SMUGGLED inside a v6 mapped/compatible/NAT64/6to4 form) is refused.
-fn is_disallowed_ip(ip: &IpAddr) -> bool {
+/// Shared with [`super::page_preview`] SSRF guards.
+pub(crate) fn is_disallowed_ip(ip: &IpAddr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return true;
     }
@@ -51,8 +54,12 @@ fn is_disallowed_ip(ip: &IpAddr) -> bool {
         IpAddr::V4(v4) => is_disallowed_v4(v4),
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
-                return true; // ULA fc00::/7 + link-local fe80::/10
+            // ULA fc00::/7 + link-local fe80::/10 + deprecated site-local fec0::/10
+            if (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfec0
+            {
+                return true;
             }
             // Any v6 form that wraps a v4 → re-check the embedded v4 so a private v4 can't be smuggled.
             let embedded = |a: u16, b: u16| Ipv4Addr::new((a >> 8) as u8, a as u8, (b >> 8) as u8, b as u8);
@@ -269,6 +276,28 @@ mod tests {
         ] {
             assert!(validate_public_url(u).is_err(), "{u} must be rejected");
         }
+    }
+
+    #[test]
+    fn is_disallowed_ip_blocks_fec0_site_local_and_class_e() {
+        // Deprecated IPv6 site-local fec0::/10 (alongside ULA fc00::/7 + link-local fe80::/10).
+        let fec0: Ipv6Addr = "fec0::1".parse().unwrap();
+        assert!(
+            is_disallowed_ip(&IpAddr::V6(fec0)),
+            "fec0::/10 site-local must be blocked"
+        );
+        let fe80: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(is_disallowed_ip(&IpAddr::V6(fe80)));
+        let fc00: Ipv6Addr = "fc00::1".parse().unwrap();
+        assert!(is_disallowed_ip(&IpAddr::V6(fc00)));
+        // Public-ish global unicast must still pass (e.g. 2001:db8 is documentation —
+        // use a real global: 2606:4700:: is Cloudflare-ish public range).
+        let public_v6: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        assert!(!is_disallowed_ip(&IpAddr::V6(public_v6)));
+        // Class-E / reserved 240.0.0.0/4
+        assert!(is_disallowed_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(is_disallowed_ip(&IpAddr::V4(Ipv4Addr::new(250, 1, 2, 3))));
+        assert!(!is_disallowed_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
     #[test]

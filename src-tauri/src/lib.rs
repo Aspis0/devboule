@@ -581,6 +581,7 @@ pub fn run() {
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,
             backend::mini_activity::mini_activity_snapshot,
+            backend::page_preview::fetch_page_preview,
             backend::token_usage::get_agent_token_usage,
             backend::commands::get_cloud_dashboard_snapshot,
             backend::commands::get_cloudflare_agent_token_profiles,

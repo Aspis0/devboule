@@ -58,6 +58,7 @@ pub mod model;
 pub mod model_registry;
 pub mod oracle_coordinator;
 pub mod oracle_service;
+pub mod page_preview;
 pub mod pigeon_client;
 pub mod pigeon_service;
 pub mod pi_extensions;
