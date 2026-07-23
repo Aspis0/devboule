@@ -1,6 +1,6 @@
 # Devboule
 
-**Alpha** — local desktop control plane for development workspaces: projects board, AI agents, cloud inventory, secrets in the OS vault, Oracle code memory.
+**Alpha** — local desktop control plane for development workspaces: projects board, AI agents, secrets in the OS vault, Oracle code memory.
 
 Built with **Tauri + React + Rust**.
 
@@ -22,7 +22,7 @@ cargo run
 # or: npm run tauri dev   # if configured
 ```
 
-Secrets stay in the OS keyring. Prefer scoped cloud actions. Do not put API keys in project Markdown, prompts, or logs.
+Secrets stay in the OS keyring. Do not put API keys in project Markdown, prompts, or logs.
 
 ## License
 
