@@ -321,6 +321,10 @@ function planOuterRingPatches(
 
 /**
  * Plan 5–8 forest patches on the countryside (+ optional outer district ring).
+ *
+ * GROUND COHERENCE: forests have NO colored floor slab — trees/props alone
+ * carry the patch so the meadow carpet stays continuous (Caesar III: no
+ * hard-edged green diamonds under groves).
  * Pure function of extent + blockers (+ optional districts/tier).
  * Deterministic: hash-based seeds from the lattice scan, no Math.random.
  *

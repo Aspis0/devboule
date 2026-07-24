@@ -17,7 +17,7 @@
 
 import { Container, Graphics, TilingSprite } from "pixi.js";
 import { cartToIso } from "./iso";
-import { DERIVED } from "./palette";
+import { ALPHA, DERIVED } from "./palette";
 import { valueNoise } from "./rng";
 import { texFillStyle, type SpriteBank } from "./spriteAssets";
 import type { TerrainData } from "../../types/city";
@@ -116,12 +116,13 @@ const MAX_DIRT = 500;
  */
 // A3 — real-art ground. The seamless grass/dirt textures repeat in the
 // Graphics' LOCAL space; TEX_SCALE shrinks the 256px source so one repeat
-// spans ~1.7 tiles (reads as ground detail, not wallpaper). The multiply
-// tint pulls the stock green toward the muted olive of the palette so
-// textured and procedural (fallback) ground stay the same family.
+// spans ~1.7 tiles (reads as ground detail, not wallpaper). Multiply tints
+// come from DERIVED (palette is the only color source).
 const TEX_SCALE = 0.35;
-const GRASS_TINT = 0xd9d6a4;
-const DIRT_TINT = 0xe0d5b8;
+
+// Soft-edge layers for accent/dirt diamonds: 3 overlapping offset diamonds at
+// decreasing alpha break hard rectangle edges (Caesar III continuous ground).
+const SOFT_LAYERS = 3;
 
 /** Shared repeating-texture fill helper (see spriteAssets.texFillStyle). */
 function texFill(
@@ -131,6 +132,53 @@ function texFill(
   alpha: number,
 ) {
   return texFillStyle(bank, key, tint, alpha, TEX_SCALE);
+}
+
+/** Flat or textured fill style for a soft-edge ground diamond layer. */
+type SoftFill = { color: number; alpha: number } | NonNullable<ReturnType<typeof texFill>>;
+
+/**
+ * Draw `SOFT_LAYERS` overlapping iso-diamonds at `cc` with seeded offsets and
+ * decreasing scale/alpha. Deterministic from (tx, ty, salt). Each layer is one
+ * fill (counts toward CHUNK_FILLS). Returns fills drawn.
+ */
+function softDiamonds(
+  g: Graphics,
+  cc: { x: number; y: number },
+  s: number,
+  tx: number,
+  ty: number,
+  salt: number,
+  peakAlpha: number,
+  fillAt: (alpha: number) => SoftFill,
+): number {
+  let fills = 0;
+  for (let layer = 0; layer < SOFT_LAYERS; layer++) {
+    const ls = s * (1 - layer * 0.2);
+    const a = peakAlpha * (1 - layer * 0.32);
+    if (a < 0.02) continue;
+    // Seeded sub-tile jitter so edges don't stack into one hard diamond.
+    const ox =
+      (valueNoise(tx ^ (0x51 + salt + layer * 17), ty ^ (0x2b + salt)) - 0.5) *
+      HW *
+      s *
+      0.45;
+    const oy =
+      (valueNoise(tx ^ (0x9e + salt), ty ^ (0x37 + salt + layer * 13)) - 0.5) *
+      HH *
+      s *
+      0.45;
+    const x = cc.x + ox;
+    const y = cc.y + oy;
+    g.poly([
+      x, y - HH * ls,
+      x + HW * ls, y,
+      x, y + HH * ls,
+      x - HW * ls, y,
+    ]).fill(fillAt(a));
+    fills++;
+  }
+  return fills;
 }
 
 export function drawTerrain(
@@ -146,20 +194,20 @@ export function drawTerrain(
   const c = cartToIso(ext.maxX + 0.5, ext.maxY + 0.5);
   const d = cartToIso(ext.minX - 0.5, ext.maxY + 0.5);
   const base = new Graphics();
-  // VALUE SCHEME (Caesar III): the base is the LIGHTEST layer — dry
-  // Mediterranean grassland (tex:grassdry) tinted toward the palette olive —
-  // and the accents are DARKER green meadow patches on top. A multiply tint
-  // can only darken, so the base must start from the lightest texture; a dark
-  // base can never be tinted back up to the T6 olive.
+  // VALUE SCHEME (Caesar III): the base is the continuous Mediterranean
+  // grassland (tex:grassdry) tinted toward the palette olive. Accents/dirt
+  // are SOFT low-alpha overlays only — never hard-edged slabs of a different
+  // color. Base path left intact: textured carpet already blends; offenders
+  // were the overlays.
   base.poly([a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y]).fill(
-    texFill(bank, "tex:grassdry", GRASS_TINT, 1) ?? {
+    texFill(bank, "tex:grassdry", DERIVED.groundTexBase, 1) ?? {
       color: DERIVED.groundMid,
       alpha: 1,
     },
   );
   out.push(base);
 
-  // --- 2. Accent + dirt patches on an interleaved coarse lattice.
+  // --- 2. Soft accent + dirt patches on an interleaved coarse lattice.
   const cols = Math.max(1, Math.floor((ext.maxX - ext.minX + 1) / ACCENT_STEP));
   const rows = Math.max(1, Math.floor((ext.maxY - ext.minY + 1) / ACCENT_STEP));
   const latticeN = cols * rows;
@@ -190,66 +238,78 @@ export function drawTerrain(
       const hi = valueNoise(tx, ty);
       const n = lo * 0.62 + hi * 0.38;
 
-      // Meadow tone patch (dark or light band only — mid IS the base).
+      // Soft meadow tone patch (dark or light band only — mid IS the base).
+      // 2–3 overlapping offset diamonds at decreasing alpha kill hard edges.
       if ((n < 0.36 || n > 0.68) && accentTotal < MAX_ACCENTS) {
         accentTotal++;
         const cc = cartToIso(tx, ty);
         // Patch radius 1.2..2.4 tiles — reads as a meadow, not tile noise.
         const s = 1.2 + valueNoise(tx ^ 0x51ed, ty ^ 0x2b9c) * 1.2;
-        if (accentFills >= CHUNK_FILLS) {
+        const dark = n < 0.36;
+        // Reserve room for SOFT_LAYERS fills before rotating the chunk.
+        if (accentFills + SOFT_LAYERS > CHUNK_FILLS) {
           out.push(accentG);
           accentG = new Graphics();
           accentFills = 0;
         }
-        accentG
-          .poly([
-            cc.x, cc.y - HH * s,
-            cc.x + HW * s, cc.y,
-            cc.x, cc.y + HH * s,
-            cc.x - HW * s, cc.y,
-          ])
-          .fill(
-            // Textured accents read as meadow-tone variation of the SAME
-            // grass carpet (shared local space keeps the pattern continuous);
-            // the flat-color version over a textured base read as glass panes.
-            (n < 0.36
-              ? texFill(bank, "tex:grass", 0xc2c496, 0.55)
-              : texFill(bank, "tex:grassdark", 0xdcd8ae, 0.5)) ?? {
-              color: n < 0.36 ? DERIVED.groundDark : DERIVED.groundLight,
-              alpha: 0.55,
+        const nFills = softDiamonds(
+          accentG,
+          cc,
+          s,
+          tx,
+          ty,
+          dark ? 0x11 : 0x22,
+          ALPHA.groundAccent,
+          (alpha) =>
+            (dark
+              ? texFill(bank, "tex:grass", DERIVED.groundTexAccentDark, alpha)
+              : texFill(
+                  bank,
+                  "tex:grassdark",
+                  DERIVED.groundTexAccentLight,
+                  alpha,
+                )) ?? {
+              color: dark ? DERIVED.groundDark : DERIVED.groundLight,
+              alpha,
             },
-          );
-        accentFills++;
-        count++;
+        );
+        accentFills += nFills;
+        count += nFills;
       }
 
-      // Dirt patch — sparse, warm contrast on the green.
+      // Soft dirt patch — sparse warm sandy variation of the same carpet.
       const rRoll = valueNoise(tx ^ 0x5bd1, ty ^ 0x9e37);
       if (rRoll < 0.1 && dirtTotal < MAX_DIRT) {
         dirtTotal++;
         const cc = cartToIso(tx, ty);
         const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
         const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
-        if (dirtFills >= CHUNK_FILLS) {
+        if (dirtFills + SOFT_LAYERS > CHUNK_FILLS) {
           out.push(dirtG);
           dirtG = new Graphics();
           dirtFills = 0;
         }
-        dirtG
-          .poly([
-            cc.x, cc.y - HH * s,
-            cc.x + HW * s, cc.y,
-            cc.x, cc.y + HH * s,
-            cc.x - HW * s, cc.y,
-          ])
-          .fill(
-            texFill(bank, "tex:dirtolive", worn ? 0xe8d8b8 : DIRT_TINT, 0.85) ?? {
+        const nFills = softDiamonds(
+          dirtG,
+          cc,
+          s,
+          tx,
+          ty,
+          worn ? 0x33 : 0x44,
+          ALPHA.groundDirt,
+          (alpha) =>
+            texFill(
+              bank,
+              "tex:dirtolive",
+              worn ? DERIVED.groundTexDirtWorn : DERIVED.groundTexDirt,
+              alpha,
+            ) ?? {
               color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
-              alpha: 0.7,
+              alpha,
             },
-          );
-        dirtFills++;
-        count++;
+        );
+        dirtFills += nFills;
+        count += nFills;
       }
     }
   }

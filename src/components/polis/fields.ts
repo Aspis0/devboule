@@ -9,6 +9,7 @@
 
 import { Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
+import { ALPHA, DERIVED } from "./palette";
 import { hashString, Rng } from "./rng";
 import type { TerrainExtent } from "./terrain";
 import type { Bounds, TerrainData } from "../../types/city";
@@ -339,14 +340,16 @@ export function drawFields(
   const g = new Graphics();
 
   // A4 — per-kind textured parcel bases (null ⇒ each primitive's flat base).
-  // Multiply tints pull the stock textures toward each kind's tone: fresh
-  // green for gardens/orchards, worked earth for crops/vineyard/fallow.
+  // LOW alpha so the continuous meadow shows through — kind identity is carried
+  // by crop rows / vines / trees / tufts, not by a differently-colored slab.
+  // All tints from DERIVED (same tight meadow family; no raw hex).
+  const a = ALPHA.fieldParcel;
   const baseByKind = {
-    garden: texFillStyle(bank, "tex:grass", 0xc6cf96, 1),
-    crops: texFillStyle(bank, "tex:dirtolive", 0xd8d0a8, 1),
-    vineyard: texFillStyle(bank, "tex:dirt", 0xe4d9b4, 1),
-    orchard: texFillStyle(bank, "tex:grass", 0xaeb886, 1),
-    fallow: texFillStyle(bank, "tex:dirt", 0xd4c8a4, 1),
+    garden: texFillStyle(bank, "tex:grass", DERIVED.fieldTexGarden, a),
+    crops: texFillStyle(bank, "tex:dirtolive", DERIVED.fieldTexCrops, a),
+    vineyard: texFillStyle(bank, "tex:dirt", DERIVED.fieldTexVineyard, a),
+    orchard: texFillStyle(bank, "tex:grass", DERIVED.fieldTexOrchard, a),
+    fallow: texFillStyle(bank, "tex:dirt", DERIVED.fieldTexFallow, a),
   } as const;
 
   for (const parcel of parcels) {

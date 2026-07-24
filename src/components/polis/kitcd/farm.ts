@@ -20,7 +20,15 @@ import { olive } from "./detail";
  */
 export type ParcelBaseFill = import("pixi.js").FillInput;
 
-/** Paint the parcel base quad: textured when `baseFill` given, flat otherwise. */
+// Parcel base / border alphas — low enough that the continuous meadow shows
+// through. Kind identity is carried by rows/vines/trees, not a colored slab.
+// Mirrors ALPHA.fieldParcel / ALPHA.fieldBorder in palette.ts (kit stays free
+// of the main palette import; keep these in lockstep).
+const PARCEL_BASE_ALPHA = 0.15;
+const PARCEL_BORDER_ALPHA = 0.22;
+
+/** Paint the parcel base quad: textured when `baseFill` given, flat otherwise.
+ *  Flat path uses low alpha so the meadow carpet shows through. */
 function parcelBase(
   g: Graphics,
   pts: { x: number; y: number }[],
@@ -30,7 +38,7 @@ function parcelBase(
   if (baseFill) {
     g.poly(pts.flatMap((p) => [p.x, p.y])).fill(baseFill);
   } else {
-    isoPoly(g, pts, flatColor);
+    isoPoly(g, pts, flatColor, PARCEL_BASE_ALPHA);
   }
 }
 
@@ -53,7 +61,7 @@ function drawParcelBorder(
   const b = proj.p(gx + w, gy, 0.01);
   const c = proj.p(gx + w, gy + d, 0.01);
   const e = proj.p(gx, gy + d, 0.01);
-  outlinePoly(g, [a, b, c, e], S(MAT.earthDk, 0.85), 1.2, 0.45);
+  outlinePoly(g, [a, b, c, e], S(MAT.earthDk, 0.85), 1.2, PARCEL_BORDER_ALPHA);
 }
 
 /**
@@ -76,7 +84,8 @@ export function cropRows(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  parcelBase(g, [a, b, c, e], baseFill, S(MAT.earth, 0.95));
+  // Warm sandy earth, same family as meadow — rows (not the slab) carry crop ID.
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.ground, 0.98));
 
   // Furrow rows along the parcel's x-axis (long axis).
   const rowCount = Math.round(w * 3.5 + rnd(seed) * 1.5);
@@ -133,7 +142,8 @@ export function vineyard(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  parcelBase(g, [a, b, c, e], baseFill, S(MAT.sand, 0.9));
+  // Bare earth base — low-alpha sandy tone (same meadow family as crops).
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.ground, 0.96));
 
   // Vine rows — fewer than crops (1 per ~1.5 tiles of depth).
   const rowCount = Math.max(2, Math.round(d / 1.5));
@@ -188,7 +198,8 @@ export function orchardGrid(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  parcelBase(g, [a, b, c, e], baseFill, S(MAT.grassDk, 0.95));
+  // Light grass base — muted olive close to meadow (not a bright green slab).
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.ground, 1.0));
 
   // Tree grid — ~1 tree per 1.5 tiles.
   const spacing = 1.5;
@@ -223,7 +234,8 @@ export function fallowField(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  parcelBase(g, [a, b, c, e], baseFill, S(MAT.earth, 0.88));
+  // Bare earth base — same sandy family as other parcels.
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.ground, 0.94));
 
   // Sparse dry-grass tufts.
   const tufts = Math.round(w * d * 3);

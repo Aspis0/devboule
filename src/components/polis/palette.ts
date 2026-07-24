@@ -64,18 +64,54 @@ const MEADOW = saturate(blend(PALETTE.grass, HUE_MEADOW, 0.38), 0.22);
 const SEA = saturate(blend(PALETTE.water, HUE_SEA, 0.52), 0.18);
 
 export const DERIVED = {
-  // Terrain value-noise band (chunky retro mottling of the ground). Widened
-  // contrast: a sun-bleached light grass, a meadow mid, and a deep olive-shadow
-  // dark so the three flat bands actually read as distinct patches (Zeus-style
-  // mottling) instead of one mud sheet.
-  groundLight: saturate(lighten(MEADOW, 0.16), 0.12),
+  // Terrain value-noise band — Caesar III unified sandy-green: every ground
+  // cover tone lives in ONE tight family around MEADOW (max ~8–10% luminance
+  // delta, low saturation). Accents read as soft tonal variation of the same
+  // carpet, never as distinct colored rectangles.
+  groundLight: saturate(lighten(MEADOW, 0.08), 0.04),
   groundMid: MEADOW,
-  groundDark: saturate(darken(MEADOW, 0.2), 0.16),
-  // Earth/sand patches: warm sandy tones that CONTRAST the green so the ground
-  // reads as grass + bare earth, not a uniform field.
-  groundDirt: saturate(lighten(PALETTE.sandDark, 0.06), 0.16),
-  groundWorn: saturate(darken(PALETTE.sandDark, 0.14), 0.18),
-  seam: darken(MEADOW, 0.34),
+  groundDark: saturate(darken(MEADOW, 0.09), 0.04),
+  // Warm sandy earth still on the meadow family (blend sand into MEADOW so dirt
+  // never goes cold grey or high-contrast brown).
+  groundDirt: saturate(
+    blend(MEADOW, lighten(PALETTE.sandDark, 0.08), 0.48),
+    0.02,
+  ),
+  groundWorn: saturate(
+    blend(MEADOW, darken(PALETTE.sandDark, 0.06), 0.42),
+    0.02,
+  ),
+  // Texture multiply tints (multiply can only darken — keep these LIGHT, same
+  // family). Sole source for terrain.ts / fields.ts texture fills — no raw hex
+  // outside this file.
+  groundTexBase: saturate(lighten(MEADOW, 0.26), -0.04),
+  groundTexAccentDark: saturate(lighten(MEADOW, 0.14), -0.02),
+  groundTexAccentLight: saturate(lighten(MEADOW, 0.3), -0.04),
+  groundTexDirt: saturate(
+    blend(lighten(MEADOW, 0.22), lighten(PALETTE.sandDark, 0.14), 0.45),
+    -0.02,
+  ),
+  groundTexDirtWorn: saturate(
+    blend(lighten(MEADOW, 0.16), lighten(PALETTE.sandDark, 0.06), 0.4),
+    -0.02,
+  ),
+  // Field parcel texture tints — same family; crop rows / vines / trees carry
+  // the kind identity, not a differently-colored slab.
+  fieldTexGarden: saturate(lighten(MEADOW, 0.14), 0.02),
+  fieldTexCrops: saturate(
+    blend(lighten(MEADOW, 0.16), lighten(PALETTE.sandDark, 0.1), 0.4),
+    0.0,
+  ),
+  fieldTexVineyard: saturate(
+    blend(lighten(MEADOW, 0.18), lighten(PALETTE.sandDark, 0.12), 0.48),
+    0.0,
+  ),
+  fieldTexOrchard: saturate(lighten(MEADOW, 0.1), 0.02),
+  fieldTexFallow: saturate(
+    blend(lighten(MEADOW, 0.14), lighten(PALETTE.sandDark, 0.08), 0.42),
+    0.0,
+  ),
+  seam: darken(MEADOW, 0.28),
 
   // Vegetation (olive micro-flora): the meadow base nudged toward a deeper,
   // richer olive green so bushes pop off the lighter ground.
@@ -297,6 +333,12 @@ export const ALPHA = {
   districtStroke: 0.5,
   seam: 0.3,
   vignette: 0.22, // peak darkness at screen edges (was 0.42 — was drowning the scene)
+  // Ground overlays — low enough that the continuous meadow base shows through
+  // (Caesar III: soft tonal variation, never hard-edged colored slabs).
+  groundAccent: 0.16, // peak alpha of the outermost soft accent diamond
+  groundDirt: 0.14, // peak alpha of soft dirt patches
+  fieldParcel: 0.15, // parcel base slab (rows/vines/trees carry kind identity)
+  fieldBorder: 0.22, // parcel boundary ridge (subtle, not a hard frame)
 } as const;
 
 export type RoofStyle = "flat" | "pitched" | "cone" | "dome" | "merlon";
