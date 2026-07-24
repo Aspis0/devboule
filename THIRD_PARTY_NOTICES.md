@@ -7,6 +7,13 @@ covers everything third-party and open source:
   attributed library by library.
 - **Part 2 — Bundled dependency inventory**: the full list of npm packages and Rust crates the
   built app depends on, with their SPDX license identifiers.
+- **Part 3 — Bundled art & fonts**: sprite art and typefaces shipped inside the app.
+- **Part 4 — AI models & inference runtimes**: the embedding model (fetched at runtime) and the
+  libraries that run it; plus the model families the app can target but does not distribute.
+- **Part 5 — Integrated external tools & agents**: programs the app orchestrates but the user
+  installs separately (pi and its extensions, Claude Code, Codex, Ollama, oMLX, Censor linters, …).
+- **Part 6 — External services & APIs**: network services the app can call when configured.
+- **Part 7 — Adapted algorithm/pattern credits**: prior work whose behavior/patterns were modeled.
 
 ---
 
@@ -1354,3 +1361,110 @@ This section inventories the open-source dependencies bundled into Devboule's di
 | `zvariant` | 5.12.0 | MIT |
 | `zvariant_derive` | 5.12.0 | MIT |
 | `zvariant_utils` | 3.4.0 | MIT |
+
+---
+
+## Part 3 — Bundled art & fonts
+
+Assets shipped inside the app, each under its own license. **CC-BY / CC-BY-SA assets require
+attribution; they are credited here (and in `public/polis/CREDITS.md`).**
+
+### Polis isometric art
+
+The "Polis" city view renders open-licensed sprite art (curated, sometimes rescaled/recolored to fit
+the palette). Full per-source notes live in [`public/polis/CREDITS.md`](./public/polis/CREDITS.md).
+
+- **Screaming Brain Studios — "Tiny Texture Pack"** — seamless terrain/material textures (`tex:*`:
+  grass, dirt, stone, plaster, brick, marble, wood, roof tile, thatch, water, …).
+  <https://opengameart.org/content/tiny-texture-pack> — **CC0 1.0** (public domain; credited with thanks).
+- **Unknown Horizons team** — tree/cypress sprites, the ambient citizen walk cycles, and countryside
+  resource art (mines, quarries, rocks). <https://github.com/unknown-horizons/unknown-horizons>
+  (content/gfx; multiple artists, see their `doc/AUTHORS.md`) — **CC-BY-SA 3.0**. Sprites were
+  rescaled/re-packed; the modified art files remain CC-BY-SA (share-alike applies to those art files,
+  not to the application).
+- **FoshyTakashi** — 9-frame fire animation (burning-building flip-book, `fx:fire:*`).
+  <https://opengameart.org/content/9-frame-fire-animation-16x-32x-64x> — **CC-BY 3.0** (frames cut,
+  rescaled, tinted per fire severity).
+
+### Fonts
+
+Bundled via the npm `@fontsource-variable/*` packages (also listed in Part 2):
+
+- **Instrument Sans (Variable)** — UI/design typeface. <https://github.com/fontsource/font-files> —
+  **SIL Open Font License 1.1**.
+- **Source Serif 4 (Variable)** — serif typeface (Adobe / Google Fonts). — **SIL Open Font License 1.1**.
+
+(Other font families named in CSS — Inter, JetBrains Mono, Cascadia Code, SF Mono, Menlo — are
+system/fallback references only and are **not** bundled.)
+
+---
+
+## Part 4 — AI models & inference runtimes
+
+- **Qwen3-Embedding-0.6B** (Qwen team, Alibaba) — the Oracle code-memory semantic embedder. The model
+  weights are **not committed to this repo**; they are downloaded on first use from the Hugging Face
+  Hub (`onnx-community/Qwen3-Embedding-0.6B-ONNX` and `Qwen/Qwen3-Embedding-0.6B`) into a local,
+  git-ignored cache. Model + tokenizer are used under the **Apache-2.0** license stated on the model
+  card. <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B>
+- **ONNX Runtime** (Microsoft) via the `ort` crate, **fastembed** (Qdrant), and **candle** +
+  **tokenizers** (Hugging Face) — the inference/embedding libraries that load and run the model above.
+  These are Rust crates and are also covered by the Part 2 inventory (MIT / Apache-2.0).
+
+Other model families are only **referenced** (selectable by the user, supplied through their own
+Ollama / oMLX / Apple-Foundation-Models install or a cloud API key) and are **not distributed by this
+repository** — e.g. Google **Gemma**, **Qwen2.5-Coder**, NVIDIA **Nemotron**, OpenAI **GPT-4o**,
+**Claude**, **DeepSeek**, **GLM**, **MiMo**. Each is governed by its own model license/terms; this
+project ships none of their weights.
+
+---
+
+## Part 5 — Integrated external tools & agents (not bundled)
+
+Devboule orchestrates external programs that the **user installs separately**. Their code is not
+included or redistributed here; each is used under its own license/terms. They are acknowledged
+because the product is built around integrating them:
+
+**Agent CLIs / runtimes**
+- **pi** — the [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+  coding-agent CLI/SDK — the default agent harness (Node sidecar).
+- **Claude Code** (`claude`, Anthropic), **OpenAI Codex** (`codex`, OpenAI), **Grok** (xAI, as an MCP
+  client) — cloud coding agents the app can drive.
+- **Ollama**, **oMLX** (OpenAI-compatible MLX server), **Apple Foundation Models** (`fm`, macOS) —
+  local model runners the app can target.
+- **Node.js**, **Python 3**, **Git** — required host toolchain the backend shells out to.
+
+**pi extensions the app can install for you** (fetched from the npm registry / GitHub on request):
+`@tintinweb/pi-subagents` (multi-agent orchestration), `pi-lens` (real-time LSP/lint feedback),
+`@pi-unipi/compactor` (context compaction), `pi-web-access` (web search). Each is under its own
+publisher's license.
+
+**Censor code-quality runners** — the optional local review pass invokes whichever of these are
+installed; none are bundled: `ruff`, `bandit`, `oxlint`, `eslint`, `pyright`, `clippy` / `cargo`
+(`check`/`fmt`/`audit`/`deny`), `shellcheck`, `semgrep`, `gitleaks`, `tsc`, `prettier`, `stylelint`,
+`hadolint`, `actionlint`, `yamllint`, `sqlfluff`, `tidy`, `cppcheck`, `go vet`/`gofmt`, `ktlint`,
+`lizard`, `jscpd`, `knip`, `npm audit`, `pip audit`, `vulture`, `zizmor`, and `xh`. Each is used under
+its own license.
+
+---
+
+## Part 6 — External services & APIs
+
+Network services the app can call when the user configures/enables them (used under each provider's
+Terms of Service; no code of theirs is included):
+
+- **LLM / inference APIs**: OpenAI (`api.openai.com`), Anthropic (`api.anthropic.com`), OpenRouter
+  (`openrouter.ai`), DeepSeek (`api.deepseek.com`), Scaleway AI, Infomaniak AI, Mistral AI, Nebius.
+- **Web search**: Exa, and (via `pi-web-access`) Brave, Tavily, Perplexity, Gemini, Parallel.
+- **Model / package hosts**: Hugging Face Hub (embedding-model download), the npm registry (pi
+  extension marketplace), and the GitHub API (auth + in-app git push).
+
+---
+
+## Part 7 — Adapted algorithm/pattern credits
+
+Not copied source, but behavior/patterns modeled on prior work, acknowledged for good faith:
+
+- **terax-ai** — the app-hosted agent PTY handling (open/spawn/reader/kill-on-failure via
+  `portable-pty`) follows terax-ai's patterns; noted **Apache-2.0** in `src-tauri/src/backend/agent_pty.rs`.
+- **Aider** — the mini-editor's fuzzy "near-miss" edit fallback (a `difflib.SequenceMatcher`-style
+  ratio threshold, computed with the `similar` crate) mirrors Aider's approach.
