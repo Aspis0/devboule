@@ -161,6 +161,25 @@ describe("liveryTint — model family → tunic colour", () => {
     expect(liveryTint("anthropic/claude-sonnet-4")).toBe(base);
   });
 
+  it("matches bare Claude aliases via matchExact (sonnet/opus/haiku)", () => {
+    const claude = liveryTint("claude-sonnet-4");
+    expect(claude).toBeDefined();
+    // Bare family tokens from some Agent.model paths.
+    expect(liveryTint("sonnet")).toBe(claude);
+    expect(liveryTint("opus")).toBe(claude);
+    expect(liveryTint("haiku")).toBe(claude);
+  });
+
+  it("does not substring-match Claude on 'sonnet' inside another family id", () => {
+    const claude = liveryTint("claude-sonnet-4");
+    expect(claude).toBeDefined();
+    // "sonnet" is matchExact only — a deepseek-prefixed id must resolve via
+    // the DeepSeek substring, not Claude terracotta.
+    const hybrid = liveryTint("deepseek-sonnet-hypothetical");
+    expect(hybrid).toBe(liveryTint("deepseek-chat"));
+    expect(hybrid).not.toBe(claude);
+  });
+
   it("returns teal for OpenAI / gpt family (same-family equality)", () => {
     const openai = liveryTint("openai/gpt-4o-mini");
     expect(openai).toBeDefined();

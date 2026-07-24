@@ -202,7 +202,11 @@ export interface ModelLivery {
 export const MODEL_LIVERIES: readonly ModelLivery[] = [
   {
     family: "Claude",
+    // Bare aliases ("sonnet"/"opus"/"haiku") can reach Agent.model from some
+    // paths; exact-token match avoids substring false-positives (e.g. a model
+    // id that merely contains "sonnet" under another family prefix).
     match: ["anthropic", "claude", "opus", "fable"],
+    matchExact: ["sonnet", "opus", "haiku"],
     tint: DERIVED.liveryClaude,
   },
   {

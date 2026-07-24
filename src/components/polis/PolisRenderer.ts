@@ -666,7 +666,7 @@ export class PolisRenderer {
   // trunk cobble lives in its own sub-container that is always visible.
   private roadMinorLayer: Container | null = null;
   // District walls: baked static Graphics (chunked), redrawn with districts.
-  // LOD-gated with LOD_FIELDS so far overview stays a clean tint diamond.
+  // LOD-gated with LOD_WALLS so far overview stays a clean tint diamond.
   private districtWallsLayer: Container | null = null;
 
   // Dirty-flag for the cull/LOD recompute: the ticker early-returns unless the
@@ -1536,8 +1536,12 @@ export class PolisRenderer {
     for (const b of next.buildings) nextById.set(b.fileId, b);
 
     let addedOrRemoved = false;
-    // Phase 4: any visual building change can retarget smoke/flags/windows/forums.
-    let buildingsTouched = false;
+    // Phase 4 ambient life: true only when a changed building differs in an
+    // ambient-planner input (purpose / visualTier / agentPresent / lastModified).
+    // Sin-only, status-only, and suspect-only churn must NOT force the O(N)
+    // views marshal + AmbientLifeManager.rebuild. Membership add/remove and
+    // graph rebuilds already imply a re-sync via the gate below.
+    let ambientRelevantChanged = false;
 
     // 1) ADDED / CHANGED. Walk the next buildings; compare to the current node.
     //    L2 growth visuals are keyed on deltas computed HERE (old vs new) and
@@ -1555,8 +1559,17 @@ export class PolisRenderer {
       }
       // CHANGED? Update only if a visual input differs.
       if (buildingChanged(node.building, b)) {
-        buildingsTouched = true;
         const old = node.building;
+        // Ambient planners key on purpose, tier, agent presence, recency —
+        // not sins/status/suspect (those rebuild the node but not ambient life).
+        if (
+          old.purpose !== b.purpose ||
+          old.visualTier !== b.visualTier ||
+          (old.agentPresent ?? null) !== (b.agentPresent ?? null) ||
+          old.lastModified !== b.lastModified
+        ) {
+          ambientRelevantChanged = true;
+        }
         // Capture the growth deltas from the OLD node BEFORE it mutates.
         const oldTier = tierRank(old.visualTier);
         const newTier = tierRank(b.visualTier);
@@ -1691,10 +1704,11 @@ export class PolisRenderer {
     // the agent reconcile so a newly-active agent claims from the up-to-date crowd.
     if (graphRebuilt) this.syncAmbient();
 
-    // Phase 4 ambient life: feed city data on building/road diffs. Per-subsystem
-    // input signatures inside AmbientLifeManager.rebuild skip work when that
-    // system's inputs are unchanged (F7). Birds only update bounds (F12).
-    if (addedOrRemoved || graphRebuilt || buildingsTouched) {
+    // Phase 4 ambient life: feed city data only when ambient inputs may have
+    // changed (add/remove, nav graph rebuild, or ambient-relevant building
+    // fields). Per-subsystem signatures inside AmbientLifeManager.rebuild are
+    // a second line of defense (F7). Birds only update bounds (F12).
+    if (addedOrRemoved || graphRebuilt || ambientRelevantChanged) {
       this.syncAmbientLife(next.roads);
     }
 
