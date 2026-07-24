@@ -23,7 +23,9 @@ vi.mock("./OracleAskPanel", () => ({
 
 // Shared mock values so individual tests can inspect/mutate them.
 const mockSetFilter = vi.fn();
+const mockSetShowWalls = vi.fn();
 const mockCityState = { externalServices: [] as unknown[] };
+let mockShowWalls = true;
 
 // useCityStore: return values from the shared mock objects.
 vi.mock("../../store/cityStore", () => ({
@@ -38,6 +40,8 @@ vi.mock("../../store/cityStore", () => ({
       filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
       setFilter: mockSetFilter,
       resetFilter: vi.fn(),
+      showWalls: mockShowWalls,
+      setShowWalls: mockSetShowWalls,
     }),
 }));
 
@@ -52,6 +56,8 @@ let PolisBottomBar: typeof import("./PolisBottomBar").PolisBottomBar;
 
 beforeEach(async () => {
   mockSetFilter.mockClear();
+  mockSetShowWalls.mockClear();
+  mockShowWalls = true;
   mockCityState.externalServices = [];
   ({ PolisBottomBar } = await import("./PolisBottomBar"));
 });
@@ -210,6 +216,31 @@ describe("PolisBottomBar", () => {
     expect(mockSetFilter).toHaveBeenCalled();
     const lastCall = mockSetFilter.mock.calls[mockSetFilter.mock.calls.length - 1][0];
     expect(lastCall.categories).toContain("complexity");
+  });
+
+  it("Filters panel renders District walls toggle and calls setShowWalls", () => {
+    const { container } = renderBar();
+
+    const filtersBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Filters"),
+    )!;
+    act(() => {
+      filtersBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const wallsBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.getAttribute("aria-label") === "District walls",
+    );
+    expect(wallsBtn).toBeDefined();
+    expect(wallsBtn!.textContent).toMatch(/District walls/i);
+    expect(wallsBtn!.textContent).toMatch(/decor/i);
+    expect(wallsBtn!.getAttribute("aria-checked")).toBe("true");
+
+    act(() => {
+      wallsBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(mockSetShowWalls).toHaveBeenCalledWith(false);
   });
 
   it("legend shows era monuments section without cloud harbour toggles", () => {

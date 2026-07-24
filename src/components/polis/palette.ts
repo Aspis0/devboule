@@ -104,19 +104,59 @@ export const DERIVED = {
   pole: PALETTE.stoneDark,
   roofTile: PALETTE.terracottaDark,
   roofTileLight: PALETTE.terracotta,
-  crenellation: PALETTE.stoneDark,
+  // Merlon tops — warm stoneDark nudged toward terracotta (Caesar III sandstone).
+  crenellation: saturate(blend(PALETTE.stoneDark, PALETTE.terracotta, 0.12), 0.02),
 
-  // District boundary walls — sit ON the bounds diamond. Must read clearly
-  // against meadow/dirt (stonier / warmer-wood) but stay LIGHTER than building
-  // `outline` so walls never overpower roofs/silhouettes. All pure functions of
-  // existing PALETTE entries (COLOR CONTRACT).
-  wallStone: saturate(darken(PALETTE.stone, 0.04), -0.14),
-  wallStoneDark: saturate(darken(PALETTE.stoneDark, 0.14), -0.12),
-  wallStoneLight: saturate(lighten(PALETTE.stone, 0.14), -0.1),
-  wallWood: saturate(blend(PALETTE.terracottaDark, PALETTE.sandDark, 0.35), 0.04),
-  wallWoodDark: darken(PALETTE.terracottaDark, 0.22),
-  wallAqueduct: saturate(blend(PALETTE.stone, PALETTE.sandDark, 0.3), -0.1),
-  wallAqueductDark: saturate(darken(PALETTE.stoneDark, 0.1), -0.08),
+  // District boundary walls — Caesar III sandstone: warm sand/stucco family
+  // blended ~12% toward terracotta (NOT cold grey Lego). Sit ON the bounds
+  // diamond, readable against meadow, but LIGHTER than building `outline`.
+  // All pure functions of existing PALETTE entries (COLOR CONTRACT).
+  // Base sand = blend(sandDark, cream) so we have a warm mid without a separate
+  // PALETTE.sand entry.
+  wallStone: saturate(
+    blend(
+      blend(PALETTE.sandDark, PALETTE.stone, 0.4),
+      PALETTE.terracotta,
+      0.12,
+    ),
+    0.04,
+  ),
+  wallStoneDark: saturate(
+    blend(
+      darken(blend(PALETTE.sandDark, PALETTE.stoneDark, 0.45), 0.12),
+      PALETTE.terracottaDark,
+      0.14,
+    ),
+    0.02,
+  ),
+  wallStoneLight: saturate(
+    blend(
+      lighten(blend(PALETTE.sandDark, PALETTE.cream, 0.35), 0.08),
+      PALETTE.terracotta,
+      0.08,
+    ),
+    0.04,
+  ),
+  // Palisade timber — warm wood from terracotta + sand (no cold brown).
+  wallWood: saturate(blend(PALETTE.terracottaDark, PALETTE.sandDark, 0.42), 0.06),
+  wallWoodDark: darken(blend(PALETTE.terracottaDark, PALETTE.sandDark, 0.28), 0.16),
+  // Aqueduct — same warm sandstone family as roman walls.
+  wallAqueduct: saturate(
+    blend(
+      blend(PALETTE.sandDark, PALETTE.stone, 0.45),
+      PALETTE.terracotta,
+      0.1,
+    ),
+    0.03,
+  ),
+  wallAqueductDark: saturate(
+    blend(
+      darken(blend(PALETTE.sandDark, PALETTE.stoneDark, 0.5), 0.1),
+      PALETTE.terracottaDark,
+      0.12,
+    ),
+    0.02,
+  ),
 
   // Water variants for harbor shimmer (discrete stepped states). The cream-ish
   // PALETTE.water is pulled toward the sea-blue anchor and saturated so harbor

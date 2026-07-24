@@ -2,13 +2,20 @@
 //
 // The backend already emits District.wallStyle ("roman_wall" | "aqueduct" |
 // "palisade" | "none"); this module is the FIRST renderer code that reads it.
-// Walls sit ON the district bounds diamond as FILLED 2.5D bands (readable at
-// viewport scales 0.3–0.9) but stay subordinate to buildings. Baked once into
-// Graphics; redrawn only when districts rebuild.
+// Walls sit ON the district bounds diamond as thin warm sandstone 2.5D bands
+// (Caesar III sand/stucco, not cold grey Lego). Readable at viewport scales
+// 0.3–0.9 but subordinate to buildings (alpha ~0.8). Baked once into Graphics;
+// redrawn only when districts rebuild.
+//
+// SIZE GATE (by building count in district, not bounds):
+//   < 6  → null (clean meadow)
+//   6–9  → low field-stone kerb / hedge (variant "low")
+//   >=10 → full wallStyle fortification (variant "full")
+// Corner towers: roman_wall only, and only when building count >= 14.
 //
 // DETERMINISM: same (district, roads, buildings, water) → identical segments.
 // No Math.random(). Gate placement is derived from road crossings or a single
-// city-center-facing fallback gate. Palisade stake jitter uses a position hash.
+// city-center-facing fallback gate. Merlon/stake jitter uses a position hash.
 // HONESTY: walls decorate the bounds the backend already computed — never invent
 // a district or a road.
 
@@ -47,13 +54,30 @@ export interface WallGate {
   side: 0 | 1 | 2 | 3;
 }
 
+/** Full fortification vs rural low boundary (building-count gated). */
+export type WallPlanVariant = "full" | "low";
+
 export interface WallPlan {
   districtId: string;
   style: DrawableWallStyle;
+  /**
+   * "full" — wallStyle fortification (>= 10 buildings).
+   * "low"  — field-stone kerb / hedge (6–9 buildings).
+   * Districts with < 6 buildings never plan a wall (null).
+   */
+  variant: WallPlanVariant;
   segments: WallSegment[];
   towers: WallTower[];
   gates: WallGate[];
 }
+
+// Building-count thresholds for wall presence (counted by districtId).
+/** Below this: no wall at all (clean meadow). */
+const WALL_MIN_LOW = 6;
+/** At/above this: full wall per wallStyle; 6..full-1 is low boundary. */
+const WALL_MIN_FULL = 10;
+/** Corner towers only for roman_wall districts at/above this count. */
+const WALL_MIN_TOWERS = 14;
 
 /** Optional water tile set ("gx,gy") + city centre for fallback gate. */
 export interface WallPlanOptions {
@@ -388,9 +412,27 @@ function planEdgeSegments(
 }
 
 /**
+ * Count buildings belonging to a district (by districtId). Used for wall size
+ * thresholds — never inferred from bounds size.
+ */
+export function countBuildingsInDistrict(
+  districtId: string,
+  buildings: Building[],
+): number {
+  let n = 0;
+  for (const bld of buildings) {
+    if (bld.districtId === districtId) n += 1;
+  }
+  return n;
+}
+
+/**
  * Pure planner: wall segments along the district bounds diamond, with GATE
- * gaps where inter-district roads cross and water-tile skips. Corner towers
- * for roman_wall. Deterministic.
+ * gaps where inter-district roads cross and water-tile skips. Size-gated:
+ *   < 6 buildings  → null (clean meadow)
+ *   6–9            → low field-stone kerb (no gates/towers)
+ *   >= 10          → full wallStyle fortification
+ * Corner towers only for roman_wall with >= 14 buildings. Deterministic.
  */
 export function planDistrictWall(
   district: District,
@@ -406,15 +448,25 @@ export function planDistrictWall(
     return null;
   }
 
+  // Size threshold from actual building membership — not bounds area.
+  const buildingCount = countBuildingsInDistrict(district.districtId, buildings);
+  if (buildingCount < WALL_MIN_LOW) return null;
+  const variant: WallPlanVariant =
+    buildingCount < WALL_MIN_FULL ? "low" : "full";
+
   let byId = options.buildingsById;
   if (!byId) {
     byId = new Map<string, Building>();
     for (const bld of buildings) byId.set(bld.fileId, bld);
   }
 
-  let gates = findRoadGates(district, roads, byId);
-  if (gates.length === 0) {
-    gates = [fallbackGate(district, options.cityCenter, options.waterTiles)];
+  // Full walls punch road gates; low rural kerbs are continuous (no gates).
+  let gates: WallGate[] = [];
+  if (variant === "full") {
+    gates = findRoadGates(district, roads, byId);
+    if (gates.length === 0) {
+      gates = [fallbackGate(district, options.cityCenter, options.waterTiles)];
+    }
   }
 
   const segments: WallSegment[] = [];
@@ -424,10 +476,13 @@ export function planDistrictWall(
     );
   }
 
-  // Corner towers only for roman_wall (aqueduct uses piers-as-arches; palisade
-  // is a stake fence without towers).
+  // Corner towers: roman_wall only, and only on large districts (>= 14).
   const towers: WallTower[] = [];
-  if (style === "roman_wall") {
+  if (
+    variant === "full" &&
+    style === "roman_wall" &&
+    buildingCount >= WALL_MIN_TOWERS
+  ) {
     const corners = boundsCorners(b);
     for (let i = 0; i < 4; i++) {
       towers.push({ x: corners[i].x, y: corners[i].y, corner: i as 0 | 1 | 2 | 3 });
@@ -450,6 +505,7 @@ export function planDistrictWall(
   return {
     districtId: district.districtId,
     style,
+    variant,
     segments,
     towers,
     gates,
@@ -538,17 +594,21 @@ export function mapRoadVisualKind(
 // walls don't dissolve against meadow/dirt at world stroke widths.
 // ---------------------------------------------------------------------------
 
-/** Overall wall opacity — solid enough to read, still under building outlines. */
+/**
+ * Overall wall opacity — sits INTO the scene (~0.8), not on top of it.
+ * Low rural boundary is intentionally softer.
+ */
 const WALL_ALPHA = {
-  body: 0.92,
-  detail: 0.9,
-  top: 0.95,
-  tower: 0.94,
+  body: 0.8,
+  detail: 0.78,
+  top: 0.82,
+  tower: 0.8,
+  low: 0.6,
 } as const;
 
 /** Wall band thickness (world/screen px) and fake height (screen-up offset). */
-const BAND_W = 6;
-const WALL_H = 5;
+const BAND_W = 4;
+const WALL_H = 4;
 
 /** Deterministic 0..1 hash from screen/cart position (no Math.random). */
 function posHash(x: number, y: number): number {
@@ -572,9 +632,9 @@ function edgeFrame(
 }
 
 /**
- * Classic city-builder wall body: front face extruded screen-up + lighter top
- * face with thickness, grounded by a darker bottom strip.
- * Returns fill-op count.
+ * Classic city-builder wall body: thin front face extruded screen-up + lighter
+ * top face, grounded by a soft dark base line (ground-contact shadow).
+ * Returns fill/stroke-op count.
  */
 function drawWallBand(
   g: Graphics,
@@ -591,24 +651,17 @@ function drawWallBand(
   if (len < 0.5) return 0;
   const hw = width / 2;
 
-  // Darker bottom footprint (grounds the wall on the terrain).
-  g.poly([
-    from.x + nx * hw,
-    from.y + ny * hw,
-    to.x + nx * hw,
-    to.y + ny * hw,
-    to.x - nx * hw,
-    to.y - ny * hw,
-    from.x - nx * hw,
-    from.y - ny * hw,
-  ]).fill({ color: bottomColor, alpha: alpha * 0.95 });
+  // Soft dark base line — ground-contact shadow under the wall band.
+  g.moveTo(from.x, from.y + 1.2)
+    .lineTo(to.x, to.y + 1.2)
+    .stroke({ color: bottomColor, alpha: alpha * 0.75, width: 2 });
 
   // Front face — vertical band (screen-up = height).
   g.poly([
     from.x,
-    from.y + 1,
+    from.y + 0.5,
     to.x,
-    to.y + 1,
+    to.y + 0.5,
     to.x,
     to.y - height,
     from.x,
@@ -625,7 +678,7 @@ function drawWallBand(
     to.y - height - ny * hw,
     from.x - nx * hw,
     from.y - height - ny * hw,
-  ]).fill({ color: topColor, alpha: Math.min(1, alpha + 0.03) });
+  ]).fill({ color: topColor, alpha: Math.min(1, alpha + 0.02) });
 
   return 3;
 }
@@ -659,7 +712,7 @@ function strokeDashed(
   return ops;
 }
 
-/** Roman stone wall: filled band + merlon blocks along the top edge. */
+/** Roman sandstone wall: thin band + small sparse merlons along the top. */
 function drawRomanSegment(
   g: Graphics,
   from: IsoPoint,
@@ -679,21 +732,24 @@ function drawRomanSegment(
   );
   if (ops === 0) return 0;
 
-  // Crenellation merlons — filled rects ~6×5 along the top. Spacing grows on
-  // large perimeters so a single district stays under the ops budget.
+  // Small sparse merlons (~3×3) with deterministic height jitter so the
+  // rhythm is not mechanical Lego blocks. Spacing ~26–32px base.
   const total = dist(from, to);
   const spacing = merlonSpacing;
   const steps = Math.max(0, Math.floor(total / spacing));
-  const blockW = 6;
-  const blockH = 5;
+  const blockW = 3;
+  const blockH = 3;
   for (let i = 1; i < steps; i++) {
     const p = lerp(from, to, i / steps);
-    g.rect(p.x - blockW / 2, p.y - WALL_H - blockH, blockW, blockH).fill({
+    // Height jitter 0..2 px from position hash (deterministic).
+    const hJitter = Math.floor(posHash(p.x, p.y) * 3);
+    const bh = blockH + hJitter;
+    g.rect(p.x - blockW / 2, p.y - WALL_H - bh, blockW, bh).fill({
       color: DERIVED.crenellation,
       alpha: WALL_ALPHA.detail,
     });
     // Slight lit lip on the merlon.
-    g.rect(p.x - blockW / 2, p.y - WALL_H - blockH, blockW, 1.5).fill({
+    g.rect(p.x - blockW / 2, p.y - WALL_H - bh, blockW, 1).fill({
       color: DERIVED.wallStoneLight,
       alpha: WALL_ALPHA.top,
     });
@@ -702,28 +758,28 @@ function drawRomanSegment(
   return ops;
 }
 
-/** Corner tower: filled square ~16 world px with a darker cap (roman_wall). */
+/** Corner tower: compact square ~10 world px with a darker cap (roman_wall). */
 function drawRomanTower(g: Graphics, c: IsoPoint): number {
-  const s = 16;
+  const s = 10;
   const half = s / 2;
-  const h = 12;
+  const h = 8;
   // Body.
-  g.rect(c.x - half, c.y - h + 2, s, h).fill({
+  g.rect(c.x - half, c.y - h + 1, s, h).fill({
     color: DERIVED.wallStone,
     alpha: WALL_ALPHA.tower,
   });
   // Darker lower band (base plinth).
-  g.rect(c.x - half, c.y - 2, s, 5).fill({
+  g.rect(c.x - half, c.y - 1.5, s, 3.5).fill({
     color: DERIVED.wallStoneDark,
     alpha: WALL_ALPHA.tower,
   });
   // Darker cap slab.
-  g.rect(c.x - half - 1, c.y - h - 2, s + 2, 4).fill({
+  g.rect(c.x - half - 0.5, c.y - h - 1.5, s + 1, 3).fill({
     color: DERIVED.wallStoneDark,
     alpha: WALL_ALPHA.tower,
   });
   // Cap highlight.
-  g.rect(c.x - half - 1, c.y - h - 2, s + 2, 1.6).fill({
+  g.rect(c.x - half - 0.5, c.y - h - 1.5, s + 1, 1.2).fill({
     color: DERIVED.wallStoneLight,
     alpha: WALL_ALPHA.top,
   });
@@ -748,13 +804,13 @@ function drawGateJambs(g: Graphics, gate: WallGate): number {
   const j1 = cartToIso(gate.x + tCart.x * GATE_HALF, gate.y + tCart.y * GATE_HALF);
   let ops = 0;
   for (const p of [j0, j1]) {
-    const w = 7;
-    const h = 10;
+    const w = 5;
+    const h = 7;
     g.rect(p.x - w / 2, p.y - h + 1, w, h).fill({
       color: DERIVED.wallStoneDark,
       alpha: WALL_ALPHA.body,
     });
-    g.rect(p.x - w / 2, p.y - h + 1, w, 2.5).fill({
+    g.rect(p.x - w / 2, p.y - h + 1, w, 1.8).fill({
       color: DERIVED.wallStoneLight,
       alpha: WALL_ALPHA.top,
     });
@@ -763,7 +819,7 @@ function drawGateJambs(g: Graphics, gate: WallGate): number {
   return ops;
 }
 
-/** Palisade: filled short stakes with deterministic height jitter. */
+/** Palisade: fewer, thinner warm-wood stakes with deterministic height jitter. */
 function drawPalisadeSegment(
   g: Graphics,
   from: IsoPoint,
@@ -774,34 +830,27 @@ function drawPalisadeSegment(
   if (total < 0.5) return 0;
   const spacing = stakeSpacing;
   const steps = Math.max(1, Math.floor(total / spacing));
-  const stakeW = 3;
-  const baseH = 8;
+  const stakeW = 1.8;
+  const baseH = 7;
   let ops = 0;
 
-  // Dark baseline under the stakes.
-  g.poly([
-    from.x,
-    from.y + 1.5,
-    to.x,
-    to.y + 1.5,
-    to.x,
-    to.y - 1,
-    from.x,
-    from.y - 1,
-  ]).fill({ color: DERIVED.wallWoodDark, alpha: WALL_ALPHA.detail * 0.85 });
+  // Soft ground-contact shadow under the stakes.
+  g.moveTo(from.x, from.y + 1.2)
+    .lineTo(to.x, to.y + 1.2)
+    .stroke({ color: DERIVED.wallWoodDark, alpha: WALL_ALPHA.detail * 0.7, width: 1.6 });
   ops += 1;
 
   for (let i = 0; i <= steps; i++) {
     const p = lerp(from, to, i / steps);
-    const jitter = posHash(p.x, p.y) * 2.5 - 0.4; // ~-0.4 .. +2.1
+    const jitter = posHash(p.x, p.y) * 2.2 - 0.3; // ~-0.3 .. +1.9
     const h = baseH + jitter;
     const wood = i % 2 === 0 ? DERIVED.wallWood : DERIVED.wallWoodDark;
-    g.rect(p.x - stakeW / 2, p.y - h, stakeW, h + 1).fill({
+    g.rect(p.x - stakeW / 2, p.y - h, stakeW, h + 0.8).fill({
       color: wood,
       alpha: WALL_ALPHA.body,
     });
     // Lighter tip.
-    g.rect(p.x - stakeW / 2, p.y - h, stakeW, 2).fill({
+    g.rect(p.x - stakeW / 2, p.y - h, stakeW, 1.5).fill({
       color: DERIVED.wallWood,
       alpha: WALL_ALPHA.top,
     });
@@ -812,15 +861,16 @@ function drawPalisadeSegment(
 
 /**
  * Aqueduct: filled channel band on top + pier rects with arch gaps below.
+ * Warm sandstone family (same tokens as roman walls).
  */
 function drawAqueductSegment(g: Graphics, from: IsoPoint, to: IsoPoint): number {
   const total = dist(from, to);
   if (total < 0.5) return 0;
 
   const archSpan = 16;
-  const pierW = 5;
-  const pierH = 11;
-  const channelH = 4;
+  const pierW = 4;
+  const pierH = 10;
+  const channelH = 3.5;
   const channelY = pierH; // channel sits on top of piers
   let ops = 0;
 
@@ -851,15 +901,52 @@ function drawAqueductSegment(g: Graphics, from: IsoPoint, to: IsoPoint): number 
     DERIVED.wallStoneLight,
     DERIVED.wallAqueductDark,
     WALL_ALPHA.body,
-    BAND_W + 1,
+    BAND_W + 0.5,
     channelH,
   );
   return ops;
 }
 
+/**
+ * Low rural boundary (6–9 buildings): thin double-stroke kerb (stone + shadow)
+ * with tiny stone dots every ~20px. Reads as a field-stone hedge line, not a
+ * fortification. Alpha ~0.6.
+ */
+function drawLowBoundarySegment(g: Graphics, from: IsoPoint, to: IsoPoint): number {
+  const total = dist(from, to);
+  if (total < 0.5) return 0;
+  let ops = 0;
+
+  // Shadow stroke (ground contact).
+  g.moveTo(from.x, from.y + 0.8)
+    .lineTo(to.x, to.y + 0.8)
+    .stroke({ color: DERIVED.wallStoneDark, alpha: WALL_ALPHA.low, width: 2.2 });
+  ops += 1;
+  // Stone stroke on top.
+  g.moveTo(from.x, from.y)
+    .lineTo(to.x, to.y)
+    .stroke({ color: DERIVED.wallStone, alpha: WALL_ALPHA.low, width: 1.3 });
+  ops += 1;
+
+  // Tiny stone dots every ~20px along the kerb.
+  const DOT_SPACING = 20;
+  const steps = Math.max(0, Math.floor(total / DOT_SPACING));
+  for (let i = 1; i < steps; i++) {
+    const p = lerp(from, to, i / steps);
+    // Alternate size slightly via hash for organic rural look.
+    const s = 1.4 + posHash(p.x, p.y) * 0.8;
+    g.rect(p.x - s / 2, p.y - s / 2 - 0.4, s, s).fill({
+      color: i % 2 === 0 ? DERIVED.wallStoneDark : DERIVED.wallStoneLight,
+      alpha: WALL_ALPHA.low,
+    });
+    ops += 1;
+  }
+  return ops;
+}
+
 /** Base merlon / stake spacing (world px). Scaled up on long perimeters. */
-const BASE_MERLON_SPACING = 16;
-const BASE_STAKE_SPACING = 5;
+const BASE_MERLON_SPACING = 28; // sparse ~26–32 range
+const BASE_STAKE_SPACING = 9; // fewer stakes than before
 /**
  * Cap detail (merlon/stake) ops per district. Each detail unit costs ~2 ops;
  * band/towers/gates add a small fixed overhead. Target total ops/district ≈ 400.
@@ -891,12 +978,26 @@ function detailSpacing(base: number, isoPerimeter: number): number {
 /**
  * Draw a planned wall into `g`. Returns the number of fill/stroke ops so the
  * caller can rotate Graphics chunks (~300 ops for walls).
+ * Low-variant plans draw a rural kerb regardless of wallStyle.
  */
 export function drawWallPlan(g: Graphics, plan: WallPlan): number {
+  let ops = 0;
+
+  // Rural low boundary: field-stone kerb, no fortification details.
+  if (plan.variant === "low") {
+    for (const seg of plan.segments) {
+      ops += drawLowBoundarySegment(
+        g,
+        cartToIso(seg.ax, seg.ay),
+        cartToIso(seg.bx, seg.by),
+      );
+    }
+    return ops;
+  }
+
   const peri = planIsoPerimeter(plan);
   const merlonSp = detailSpacing(BASE_MERLON_SPACING, peri);
   const stakeSp = detailSpacing(BASE_STAKE_SPACING, peri);
-  let ops = 0;
   for (const seg of plan.segments) {
     const from = cartToIso(seg.ax, seg.ay);
     const to = cartToIso(seg.bx, seg.by);

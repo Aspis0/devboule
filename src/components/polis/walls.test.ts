@@ -8,6 +8,7 @@ import {
   waterTileSet,
   cityCenterFromBuildings,
   resolveWallStyle,
+  countBuildingsInDistrict,
 } from "./walls";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,27 @@ function mkBuilding(
   };
 }
 
+/** N buildings inside a district (for size-threshold fixtures). */
+function mkDistrictBuildings(
+  n: number,
+  districtId = "d1",
+  baseX = 11,
+  baseY = 11,
+): Building[] {
+  const out: Building[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(
+      mkBuilding(
+        `${districtId}-b${i}`,
+        districtId,
+        baseX + (i % 6),
+        baseY + Math.floor(i / 6),
+      ),
+    );
+  }
+  return out;
+}
+
 function mkRoad(overrides: Partial<Road> & Pick<Road, "roadId" | "from" | "to">): Road {
   return {
     type: "import",
@@ -79,23 +101,89 @@ describe("resolveWallStyle", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Size threshold (building count by districtId)
+// ---------------------------------------------------------------------------
+
+describe("planDistrictWall size threshold", () => {
+  it("returns null for districts with < 6 buildings (3-building meadow)", () => {
+    const buildings = mkDistrictBuildings(3);
+    expect(countBuildingsInDistrict("d1", buildings)).toBe(3);
+    expect(
+      planDistrictWall(mkDistrict(), [], buildings, { cityCenter: { x: 0, y: 0 } }),
+    ).toBeNull();
+  });
+
+  it("returns low variant for 6–9 buildings (8 → low kerb)", () => {
+    const buildings = mkDistrictBuildings(8);
+    const plan = planDistrictWall(mkDistrict(), [], buildings, {
+      cityCenter: { x: 0, y: 0 },
+    });
+    expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("low");
+    expect(plan!.segments.length).toBeGreaterThan(0);
+    expect(plan!.towers).toHaveLength(0);
+    expect(plan!.gates).toHaveLength(0);
+  });
+
+  it("returns full variant for >= 10 buildings (12 → full wall)", () => {
+    const buildings = mkDistrictBuildings(12);
+    const plan = planDistrictWall(mkDistrict(), [], buildings, {
+      cityCenter: { x: 0, y: 0 },
+    });
+    expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("full");
+    expect(plan!.segments.length).toBeGreaterThan(0);
+    // 12 < 14 → full wall but no corner towers.
+    expect(plan!.towers).toHaveLength(0);
+    // Full walls always have at least the fallback gate.
+    expect(plan!.gates.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("counts only buildings in this district (ignores foreign districtId)", () => {
+    // 4 local + 10 foreign → still under threshold.
+    const buildings = [
+      ...mkDistrictBuildings(4, "d1"),
+      ...mkDistrictBuildings(10, "other"),
+    ];
+    expect(countBuildingsInDistrict("d1", buildings)).toBe(4);
+    expect(
+      planDistrictWall(mkDistrict(), [], buildings, { cityCenter: { x: 0, y: 0 } }),
+    ).toBeNull();
+  });
+
+  it("does not use bounds size — tiny bounds with 12 buildings still full", () => {
+    const buildings = mkDistrictBuildings(12);
+    const plan = planDistrictWall(
+      mkDistrict({ bounds: { x: 10, y: 10, w: 2, h: 2 } }),
+      [],
+      buildings,
+      { cityCenter: { x: 0, y: 0 } },
+    );
+    expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("full");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // planDistrictWall — determinism
 // ---------------------------------------------------------------------------
 
 describe("planDistrictWall determinism", () => {
   it("same input → identical plan", () => {
     const d = mkDistrict();
+    // 12 in-district for a full wall + 1 foreign for the road endpoint.
     const buildings = [
-      mkBuilding("a", "d1", 12, 12),
-      mkBuilding("b", "d2", 30, 30),
+      ...mkDistrictBuildings(12),
+      mkBuilding("out", "d2", 30, 30),
     ];
+    // Road from first in-district building to the foreign one.
     const roads = [
       mkRoad({
         roadId: "r1",
-        from: "a",
-        to: "b",
+        from: "d1-b0",
+        to: "out",
         path: [
-          { x: 12, y: 12 },
+          { x: 11, y: 11 },
           { x: 18, y: 14 },
           { x: 30, y: 30 },
         ],
@@ -107,11 +195,14 @@ describe("planDistrictWall determinism", () => {
     };
     const a = planDistrictWall(d, roads, buildings, opts);
     const b = planDistrictWall(d, roads, buildings, opts);
+    expect(a).not.toBeNull();
     expect(a).toEqual(b);
   });
 
   it("returns null for wallStyle none", () => {
-    expect(planDistrictWall(mkDistrict({ wallStyle: "none" }), [], [])).toBeNull();
+    expect(
+      planDistrictWall(mkDistrict({ wallStyle: "none" }), [], mkDistrictBuildings(20)),
+    ).toBeNull();
   });
 });
 
@@ -122,15 +213,16 @@ describe("planDistrictWall determinism", () => {
 describe("planDistrictWall gates", () => {
   it("places a gate where an inter-district road crosses the boundary", () => {
     // District [10,10]..[18,18]. Road path exits east edge at x=18, y=14.
+    // 12 in-district buildings for full wall.
     const d = mkDistrict();
     const buildings = [
-      mkBuilding("in", "d1", 12, 14),
+      ...mkDistrictBuildings(12),
       mkBuilding("out", "other", 25, 14),
     ];
     const roads = [
       mkRoad({
         roadId: "cross",
-        from: "in",
+        from: "d1-b0",
         to: "out",
         path: [
           { x: 12, y: 14 },
@@ -143,6 +235,7 @@ describe("planDistrictWall gates", () => {
       cityCenter: { x: 0, y: 0 },
     });
     expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("full");
     expect(plan!.gates.length).toBeGreaterThanOrEqual(1);
     // At least one gate on the east edge (side 1) near y=14.
     const east = plan!.gates.filter((g) => g.side === 1);
@@ -162,7 +255,7 @@ describe("planDistrictWall gates", () => {
 
   it("adds a fallback gate facing the city center when no road crosses", () => {
     const d = mkDistrict(); // centre ~ (14, 14)
-    const buildings = [mkBuilding("in", "d1", 12, 12)];
+    const buildings = mkDistrictBuildings(12);
     // City centre far to the east → fallback gate on east side (1).
     const plan = planDistrictWall(d, [], buildings, {
       cityCenter: { x: 100, y: 14 },
@@ -170,6 +263,32 @@ describe("planDistrictWall gates", () => {
     expect(plan).not.toBeNull();
     expect(plan!.gates).toHaveLength(1);
     expect(plan!.gates[0].side).toBe(1);
+  });
+
+  it("low variant has no gates even when roads cross", () => {
+    const d = mkDistrict();
+    const buildings = [
+      ...mkDistrictBuildings(8),
+      mkBuilding("out", "other", 25, 14),
+    ];
+    const roads = [
+      mkRoad({
+        roadId: "cross",
+        from: "d1-b0",
+        to: "out",
+        path: [
+          { x: 12, y: 14 },
+          { x: 18, y: 14 },
+          { x: 25, y: 14 },
+        ],
+      }),
+    ];
+    const plan = planDistrictWall(d, roads, buildings, {
+      cityCenter: { x: 0, y: 0 },
+    });
+    expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("low");
+    expect(plan!.gates).toHaveLength(0);
   });
 });
 
@@ -191,7 +310,7 @@ describe("planDistrictWall water skip", () => {
       { gx: 4, gy: 0 },
       { gx: 5, gy: 0 },
     ]);
-    const plan = planDistrictWall(d, [], [], {
+    const plan = planDistrictWall(d, [], mkDistrictBuildings(12), {
       waterTiles: water,
       cityCenter: { x: 3, y: 100 }, // gate on south so north is free
     });
@@ -212,27 +331,59 @@ describe("planDistrictWall water skip", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Roman towers
+// Roman towers (gated by building count >= 14)
 // ---------------------------------------------------------------------------
 
 describe("planDistrictWall roman towers", () => {
-  it("roman_wall has exactly 4 corner towers", () => {
-    const plan = planDistrictWall(mkDistrict({ wallStyle: "roman_wall" }), [], [], {
-      cityCenter: { x: 0, y: 0 },
-    });
+  it("roman_wall with >= 14 buildings has exactly 4 corner towers", () => {
+    const plan = planDistrictWall(
+      mkDistrict({ wallStyle: "roman_wall" }),
+      [],
+      mkDistrictBuildings(14),
+      { cityCenter: { x: 0, y: 0 } },
+    );
     expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("full");
     expect(plan!.towers).toHaveLength(4);
     const corners = new Set(plan!.towers.map((t) => t.corner));
     expect(corners.size).toBe(4);
   });
 
-  it("palisade and aqueduct have no corner towers", () => {
+  it("roman_wall with 10–13 buildings is full but has no towers", () => {
+    const plan = planDistrictWall(
+      mkDistrict({ wallStyle: "roman_wall" }),
+      [],
+      mkDistrictBuildings(12),
+      { cityCenter: { x: 0, y: 0 } },
+    );
+    expect(plan).not.toBeNull();
+    expect(plan!.variant).toBe("full");
+    expect(plan!.towers).toHaveLength(0);
+  });
+
+  it("palisade and aqueduct have no corner towers even at 14+ buildings", () => {
     for (const style of ["palisade", "aqueduct"] as const) {
-      const plan = planDistrictWall(mkDistrict({ wallStyle: style }), [], [], {
-        cityCenter: { x: 0, y: 0 },
-      });
+      const plan = planDistrictWall(
+        mkDistrict({ wallStyle: style }),
+        [],
+        mkDistrictBuildings(16),
+        { cityCenter: { x: 0, y: 0 } },
+      );
+      expect(plan).not.toBeNull();
+      expect(plan!.variant).toBe("full");
       expect(plan!.towers).toHaveLength(0);
     }
+  });
+
+  it("low variant never has towers", () => {
+    const plan = planDistrictWall(
+      mkDistrict({ wallStyle: "roman_wall" }),
+      [],
+      mkDistrictBuildings(8),
+      { cityCenter: { x: 0, y: 0 } },
+    );
+    expect(plan!.variant).toBe("low");
+    expect(plan!.towers).toHaveLength(0);
   });
 });
 
@@ -315,12 +466,12 @@ describe("mapRoadVisualKind", () => {
 describe("planDistrictWall missing-endpoint roads", () => {
   it("roads with an endpoint missing from buildings punch no gate", () => {
     const d = mkDistrict();
-    // Only the "in" building exists — "ghost-out" is a stale road endpoint.
-    const buildings = [mkBuilding("in", "d1", 12, 14)];
+    // 12 in-district buildings for full wall; road to "ghost-out" is stale.
+    const buildings = mkDistrictBuildings(12);
     const roads = [
       mkRoad({
         roadId: "stale",
-        from: "in",
+        from: "d1-b0",
         to: "ghost-out",
         path: [
           { x: 12, y: 14 },
@@ -341,23 +492,40 @@ describe("planDistrictWall missing-endpoint roads", () => {
 
 describe("planDistrictWall degenerate bounds", () => {
   it("rejects zero / negative / non-finite bounds", () => {
+    const buildings = mkDistrictBuildings(12);
     expect(
-      planDistrictWall(mkDistrict({ bounds: { x: 0, y: 0, w: 0, h: 8 } }), [], []),
+      planDistrictWall(
+        mkDistrict({ bounds: { x: 0, y: 0, w: 0, h: 8 } }),
+        [],
+        buildings,
+      ),
     ).toBeNull();
     expect(
-      planDistrictWall(mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: 0 } }), [], []),
+      planDistrictWall(
+        mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: 0 } }),
+        [],
+        buildings,
+      ),
     ).toBeNull();
     expect(
-      planDistrictWall(mkDistrict({ bounds: { x: 0, y: 0, w: -2, h: 8 } }), [], []),
+      planDistrictWall(
+        mkDistrict({ bounds: { x: 0, y: 0, w: -2, h: 8 } }),
+        [],
+        buildings,
+      ),
     ).toBeNull();
     expect(
-      planDistrictWall(mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: -1 } }), [], []),
+      planDistrictWall(
+        mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: -1 } }),
+        [],
+        buildings,
+      ),
     ).toBeNull();
     expect(
       planDistrictWall(
         mkDistrict({ bounds: { x: 0, y: 0, w: Number.NaN, h: 8 } }),
         [],
-        [],
+        buildings,
       ),
     ).toBeNull();
   });
@@ -374,7 +542,7 @@ describe("planDistrictWall fallback gate water probe", () => {
       { gx: 10, gy: 5 }, // midpoint of east edge
       { gx: 9, gy: 5 },
     ]);
-    const plan = planDistrictWall(d, [], [], {
+    const plan = planDistrictWall(d, [], mkDistrictBuildings(12), {
       waterTiles: water,
       cityCenter: { x: 100, y: 5 },
     });

@@ -1230,6 +1230,8 @@ function FiltersPanel({ onClose, filterSets }: { onClose: () => void; filterSets
   const filter = useCityStore((s) => s.filter);
   const setFilter = useCityStore((s) => s.setFilter);
   const resetFilterAction = useCityStore((s) => s.resetFilter);
+  const showWalls = useCityStore((s) => s.showWalls);
+  const setShowWalls = useCityStore((s) => s.setShowWalls);
   const sinRecords = useCityStore((s) => s.sinRecords);
   const cityState = useCityStore((s) => s.cityState);
 
@@ -1367,6 +1369,38 @@ function FiltersPanel({ onClose, filterSets }: { onClose: () => void; filterSets
               );
             })}
           </div>
+        </fieldset>
+
+        {/* 2b. Aesthetic display — district walls (pure decor, no content filter) */}
+        <fieldset>
+          <legend className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Display
+          </legend>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showWalls}
+            aria-label="District walls"
+            title="Toggle district wall decorations (aesthetic only)"
+            onClick={() => setShowWalls(!showWalls)}
+            className={`flex w-full items-center justify-between rounded-lg border px-2 py-1.5 text-[11px] font-medium transition-colors ${
+              showWalls
+                ? "border-terracotta bg-terracotta text-white"
+                : "border-cream-200 bg-cream-50 text-cream-500 hover:bg-cream-100"
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <span>District walls</span>
+              <span
+                className={`rounded px-1 text-[9px] font-semibold uppercase tracking-wide ${
+                  showWalls ? "bg-white/20 text-white/90" : "bg-cream-200 text-cream-500"
+                }`}
+              >
+                decor
+              </span>
+            </span>
+            <span className="text-[10px] opacity-80">{showWalls ? "On" : "Off"}</span>
+          </button>
         </fieldset>
 
         {/* 3. Quarters (features) */}

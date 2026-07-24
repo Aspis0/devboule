@@ -671,7 +671,10 @@ export class PolisRenderer {
   private roadMinorLayer: Container | null = null;
   // District walls: baked static Graphics (chunked), redrawn with districts.
   // LOD-gated with LOD_WALLS so far overview stays a clean tint diamond.
+  // `showWalls` is a user aesthetic pref (default true) — pure visibility,
+  // never rebuilds geometry. Combined with the LOD gate at seed + cull.
   private districtWallsLayer: Container | null = null;
+  private showWalls = true;
 
   // Dirty-flag for the cull/LOD recompute: the ticker early-returns unless the
   // camera actually moved/zoomed (or the scene/size changed). Set by the
@@ -1381,6 +1384,24 @@ export class PolisRenderer {
   setFilter(sets: FilterSets | null): void {
     this.filterSets = sets;
     this.applyFilter();
+  }
+
+  /**
+   * Aesthetic district-walls visibility (user pref). Pure visibility — no
+   * rebuild. Combined with the existing LOD_WALLS zoom gate so far overview
+   * still hides walls even when the user wants them on.
+   */
+  setShowWalls(show: boolean): void {
+    if (this.showWalls === show) return;
+    this.showWalls = show;
+    this.applyWallsVisibility();
+  }
+
+  /** Resolve districtWallsLayer.visible from user pref × current zoom LOD. */
+  private applyWallsVisibility(): void {
+    if (!this.districtWallsLayer) return;
+    this.districtWallsLayer.visible =
+      this.showWalls && this.viewport.scale.x >= LOD_WALLS;
   }
 
   /** Apply the current filter to all built nodes. ONE PASS over building nodes
@@ -3044,8 +3065,8 @@ export class PolisRenderer {
     // Preserve filter dim if a ghost/hide filter is active (applyFilter sets
     // alpha; redraw must not restore opaque cages around ghosted buildings).
     wallsLayer.alpha = this.filterSets ? 0.25 : 1;
-    // Seed LOD from current zoom (cull runs next tick).
-    wallsLayer.visible = this.viewport.scale.x >= LOD_WALLS;
+    // Seed LOD × user aesthetic pref from current zoom (cull runs next tick).
+    this.applyWallsVisibility();
   }
 
   // ---------------------------------------------------------------------------
@@ -4117,9 +4138,10 @@ export class PolisRenderer {
       // Fields (farmland): soft LOD so parcels stay readable a bit further out.
       if (this.fieldsGraphics) this.fieldsGraphics.visible = scale >= LOD_FIELDS;
       // District walls: tighter band than fields (Phase 5 split) — walls get
-      // noisy sooner than soft field tints at far overview.
+      // noisy sooner than soft field tints at far overview. User aesthetic
+      // pref (`showWalls`) gates the LOD reveal without a rebuild.
       if (this.districtWallsLayer) {
-        this.districtWallsLayer.visible = scale >= LOD_WALLS;
+        this.districtWallsLayer.visible = this.showWalls && scale >= LOD_WALLS;
       }
       // T6a — terrain grid: sub-pixel below zoom 0.5, hide to save ~557 draw calls.
       if (this.terrainGridGraphics) this.terrainGridGraphics.visible = scale >= 0.5;

@@ -482,6 +482,13 @@ export function PolisView() {
     }
   }, [ready, filterSets]);
 
+  // Aesthetic district-walls visibility (user display pref — pure visibility).
+  const showWalls = useCityStore((s) => s.showWalls);
+  useEffect(() => {
+    if (!ready) return;
+    handleRef.current?.setShowWalls(showWalls);
+  }, [ready, showWalls]);
+
   const handleRefresh = useCallback(() => {
     void refresh();
   }, [refresh]);

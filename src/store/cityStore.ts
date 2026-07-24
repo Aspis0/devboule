@@ -21,6 +21,9 @@ import { invokeBackendCommand, isTauriRuntime } from "../context/AppContext";
 /** localStorage key for the last folder the user mapped (folder-agnostic reload). */
 const LAST_FOLDER_KEY = "polis:lastFolder";
 
+/** localStorage key for the aesthetic district-walls visibility preference. */
+const SHOW_WALLS_KEY = "polis:showWalls";
+
 /** Tauri event the backend fs-watcher emits with the full new CityState. Must
  *  match `CITY_UPDATED_EVENT` in `src-tauri/src/polis/watcher.rs`. */
 const CITY_UPDATED_EVENT = "polis://city-updated";
@@ -44,6 +47,32 @@ function writeLastFolder(path: string | null): void {
     else window.localStorage.removeItem(LAST_FOLDER_KEY);
   } catch {
     // Private mode / quota — non-fatal; the folder simply won't persist.
+  }
+}
+
+/**
+ * Read the aesthetic district-walls preference. Default `true` (walls shown).
+ * Only the literal string "false" hides them; missing/invalid ⇒ true.
+ */
+function readShowWalls(): boolean {
+  try {
+    const raw = window.localStorage.getItem(SHOW_WALLS_KEY);
+    if (raw === null) return true;
+    if (raw === "false") return false;
+    if (raw === "true") return true;
+    return true;
+  } catch {
+    // Private mode / quota / no window — fail open to the default.
+    return true;
+  }
+}
+
+/** Persist showWalls as the literal "true"/"false" string. Non-fatal. */
+function writeShowWalls(value: boolean): void {
+  try {
+    window.localStorage.setItem(SHOW_WALLS_KEY, value ? "true" : "false");
+  } catch {
+    // Private mode / quota — non-fatal; in-memory value still drives this session.
   }
 }
 
@@ -172,6 +201,14 @@ interface CityStoreState {
   filter: FilterState;
   setFilter: (patch: Partial<FilterState>) => void;
   resetFilter: () => void;
+
+  /**
+   * Aesthetic district-walls visibility (user display pref). Default true.
+   * Independent of FilterState (content filtering) — pure decor, no rebuild.
+   * Persisted to localStorage (`polis:showWalls`) like other Polis prefs.
+   */
+  showWalls: boolean;
+  setShowWalls: (value: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +836,13 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
 
   setFilter: (patch) => set((s) => ({ filter: { ...s.filter, ...patch } })),
   resetFilter: () => set({ filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" } }),
+
+  // Aesthetic district walls — independent of content filters; localStorage-backed.
+  showWalls: readShowWalls(),
+  setShowWalls: (value) => {
+    writeShowWalls(value);
+    set({ showWalls: value });
+  },
 
 
   startAgentPoll: () => {

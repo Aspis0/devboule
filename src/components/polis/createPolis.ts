@@ -72,6 +72,8 @@ export interface PolisHandle {
   flyTo: (fileId: string) => void;
   /** P3.2 — set the filter state (null = clear). Applied in one pass. */
   setFilter: (sets: import("./filterModel").FilterSets | null) => void;
+  /** Aesthetic district-walls visibility (user pref). Pure visibility, no rebuild. */
+  setShowWalls: (show: boolean) => void;
   destroy: () => void;
 }
 
@@ -288,6 +290,7 @@ export async function createPolis(
       renderer.onCensorFindings(payload, performance.now()),
     setCensorGemmaStatus: (status) => renderer.setCensorGemmaStatus(status),
     setFilter: (sets) => renderer.setFilter(sets),
+    setShowWalls: (show) => renderer.setShowWalls(show),
     flyTo: (fileId) => renderer.flyTo(fileId),
     destroy,
   };
