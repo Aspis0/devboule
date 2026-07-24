@@ -85,6 +85,10 @@ import {
   type TerrainChunk,
 } from "./terrain";
 import { occupiedTiles, drawProps, planForestPatches, basePropCap } from "./props";
+import {
+  extentMarginForBuildingCount,
+  smallCityDensityFactors,
+} from "./densityFloor";
 import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
 import { planResourceSites, resourceSiteTiles, type ResourceCity, type ResourceSite } from "./resources";
 import {
@@ -2628,11 +2632,12 @@ export class PolisRenderer {
     }
     this.pierGraphics = null; // destroyed with terrain layer children above
     this.clearResourceSites();
+    // Small-city floor: tighten margin so tiny clusters aren't lost in meadow.
     const ext = computeExtent(
       buildings.map((b) => b.coords),
       gridSize.w,
       gridSize.h,
-      4,
+      extentMarginForBuildingCount(buildings.length),
     );
     this.drawTerrainLayer(ext);
 
@@ -2835,7 +2840,9 @@ export class PolisRenderer {
     // Plan forest patches: 5–8 dense clusters + outer countryside ring.
     // Guard: only plan patches when the bank has tree sprites (no bank or
     // missing keys → no patches, base cap for this profile tier).
+    // Small-city density floor: more forests + props near the tiny cluster.
     const tier = this.profile?.tier ?? "rich";
+    const density = smallCityDensityFactors(buildings.length);
     const hasTreeSprites = this.spriteBank != null &&
       (this.spriteBank.pickVariant("prop:tree", "probe") != null ||
        this.spriteBank.pickVariant("prop:cypress", "probe") != null);
@@ -2843,9 +2850,19 @@ export class PolisRenderer {
       ? planForestPatches(ext, occupied, {
           tier,
           districts: districts?.map((d) => ({ bounds: d.bounds })),
+          buildingCount: buildings.length,
+          forestFactor: density.forestFactor,
         })
       : { patches: [], cap: basePropCap(tier) };
-    const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers, forestPatches, forestCap);
+    const { graphics } = drawProps(
+      ext,
+      occupied,
+      this.spriteBank,
+      tallBlockers,
+      forestPatches,
+      forestCap,
+      density.propFactor,
+    );
     for (const g of graphics) this.layers.terrain.addChild(g);
   }
 

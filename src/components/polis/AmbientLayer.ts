@@ -122,7 +122,8 @@ const AMBIENT_ALPHA = 0.88;
 // effective ceiling; weaker tiers still clamp via desiredAmbientCount's cap arg.
 const AMBIENT_PER_NODE = 0.4;
 const MAX_AMBIENT = 64;
-const MIN_AMBIENT = 4;
+/** Floor for tiny cities (e.g. 3-node graph would otherwise yield 1 walker). */
+const MIN_AMBIENT = 6;
 
 // Figure vocabulary for the DECORATIVE ambient crowd. Polis-P2 broadens this to
 // the 5 CLAIMABLE citizen types so the idle population visibly contains a

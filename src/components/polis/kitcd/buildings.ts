@@ -99,6 +99,84 @@ function wallCol(base: number, look: SaltLook): number {
   return ISO.shade(base, look.wallF);
 }
 
+/**
+ * Small masonry chimney stack — house-scale, tasteful:
+ *   1. lower body rect (stone)
+ *   2. slightly narrower upper stack
+ *   3. wider cap slab (stone/terracotta blend)
+ *   4. dark flue mouth lip
+ *
+ * `gx,gy` is the plan centre of the stack; `baseZ` should sit flush on the roof
+ * slope near the ridge (caller-chosen). `lateralDx` shifts along +gx.
+ * Returns the world-Z of the flue lip (for smoke placement).
+ * Materials from kit only — no raw hex.
+ */
+function drawChimneyStack(
+  bx: Setup["bx"],
+  gx: number,
+  gy: number,
+  baseZ: number,
+  scale = 1,
+  lateralDx = 0,
+): number {
+  const s = Math.max(0.55, Math.min(1.15, scale));
+  // Lower body
+  const bodyW = 0.13 * s;
+  const bodyD = 0.13 * s;
+  const bodyH = 0.15 * s;
+  // Upper stack (slightly narrower)
+  const neckW = 0.105 * s;
+  const neckD = 0.105 * s;
+  const neckH = 0.11 * s;
+  // Cap slab — slightly wider than body
+  const capW = 0.17 * s;
+  const capD = 0.17 * s;
+  const capH = 0.045 * s;
+  // Dark flue mouth
+  const flueW = 0.055 * s;
+  const flueD = 0.055 * s;
+  const flueH = 0.016 * s;
+
+  const ox = gx + lateralDx - bodyW / 2;
+  const oy = gy - bodyD / 2;
+
+  const body = ISO.shade(M.stone, 0.92);
+  const neck = ISO.shade(M.stone, 0.84);
+  const cap = ISO.mix(M.stone, M.terraDark, 0.28);
+  const flue = ISO.shade(M.plinthDk, 0.5);
+
+  bx(ox, oy, baseZ, bodyW, bodyD, bodyH, body);
+  bx(
+    ox + (bodyW - neckW) / 2,
+    oy + (bodyD - neckD) / 2,
+    baseZ + bodyH,
+    neckW,
+    neckD,
+    neckH,
+    neck,
+  );
+  bx(
+    ox + (bodyW - capW) / 2,
+    oy + (bodyD - capD) / 2,
+    baseZ + bodyH + neckH,
+    capW,
+    capD,
+    capH,
+    cap,
+  );
+  bx(
+    ox + (bodyW - flueW) / 2,
+    oy + (bodyD - flueD) / 2,
+    baseZ + bodyH + neckH + capH,
+    flueW,
+    flueD,
+    flueH,
+    flue,
+  );
+
+  return baseZ + bodyH + neckH + capH + flueH;
+}
+
 // shared registry (display + accent) --------------------------------------
 export const BUILD_META = {
   order: [
@@ -366,10 +444,16 @@ const house: Builder = function (L, opt) {
   const { proj, g, c, out, bx, anims } = s;
   const look = saltLook(opt?.salt ?? 0);
 
-  function smokeAt(gx: number, gy: number, z: number, sc?: number): void {
+  /**
+   * Masonry stack flush on the roof near the ridge + kit Smoke at the flue lip.
+   * `baseZ` is the roof-surface height under the stack (not the peak float).
+   */
+  function chimneyAt(gx: number, gy: number, baseZ: number, sc?: number): void {
     if (!look.hasChimney) return;
-    const p = proj.p(gx + look.lateralDx, gy, z);
-    const sm = new Smoke(p.x, p.y, sc || 1);
+    const scale = sc ?? 1;
+    const topZ = drawChimneyStack(bx, gx, gy, baseZ, scale, look.lateralDx);
+    const p = proj.p(gx + look.lateralDx, gy, topZ);
+    const sm = new Smoke(p.x, p.y, scale * 0.55);
     c.addChild(sm.node);
     anims.push(sm);
   }
@@ -382,7 +466,8 @@ const house: Builder = function (L, opt) {
       overhang: 0.12,
       outline: out,
     });
-    smokeAt(0.5, 0.5, 1.05, 0.7);
+    // Near hip ridge (centre), base slightly below peak so stack sits on slope
+    chimneyAt(0.48, 0.42, 0.92, 0.7);
   } else if (L === 1) {
     // casa piccola: mudbrick box + tile gable
     bx(0.12, 0.12, 0, 0.76, 0.76, 0.7, wallCol(M.mud, look));
@@ -392,7 +477,7 @@ const house: Builder = function (L, opt) {
       overhang: 0.14,
       outline: out,
     });
-    smokeAt(0.3, 0.3, 1.16, 0.8);
+    chimneyAt(0.38, 0.38, 1.02, 0.78);
   } else if (L === 2) {
     // casa: plastered 2x2, tile roof, windows
     bx(0.1, 0.1, 0, 1.8, 1.8, 0.95, wallCol(M.marbleWarm, look));
@@ -416,7 +501,8 @@ const house: Builder = function (L, opt) {
     if (look.hasAwning) {
       ISO.panelLeft(g, proj, 0.2, 1.92, 0.88, 1.4, 0.08, ISO.shade(look.accent, 0.9));
     }
-    smokeAt(0.4, 0.4, 1.6, 0.95);
+    // Inset from ridge peak toward back-left slope (not on eave edge)
+    chimneyAt(0.55, 0.48, 1.42, 0.9);
   } else if (L === 3) {
     // megaron: two storeys
     bx(0.1, 0.1, 0, 1.8, 1.8, 1.0, wallCol(M.marbleWarm, look));
@@ -436,7 +522,8 @@ const house: Builder = function (L, opt) {
       overhang: 0.14,
       outline: out,
     });
-    smokeAt(0.5, 0.5, 2.5, 0.9);
+    // On gable slope just off the y-ridge (rx = 0.18+0.82), mid-depth
+    chimneyAt(0.92, 0.85, 2.28, 0.88);
   } else {
     // mnemeion with courtyard (ring of rooms)
     const wings = [
@@ -460,7 +547,8 @@ const house: Builder = function (L, opt) {
       });
     });
     ISO.panelLeft(g, proj, 1.2, 3.0, 0, 0.6, 0.66, look.door);
-    smokeAt(0.45, 0.45, 1.7, 0.9);
+    // On north wing gable, near ridge (ridge-x for wide wing)
+    chimneyAt(1.5, 0.35, 1.32, 0.85);
   }
   // dooryard greenery (Caesar-style lived-in plots)
   if (L >= 1) {
@@ -833,19 +921,14 @@ const workshop: Builder = function (L, opt) {
       0.22,
       ISO.mix(M.bronze, M.ochre, 0.55),
     );
-    // chimney + smoke (salt may drop the stack)
+    // masonry chimney + smoke (salt may drop the stack)
     if (look.hasChimney) {
-      bx(
-        kx + 0.16 + look.lateralDx,
-        ky + 0.1,
-        0.77,
-        0.2,
-        0.2,
-        0.4,
-        ISO.shade(M.stone, 0.9),
-      );
-      const sp = proj.p(kx + 0.26 + look.lateralDx, ky + 0.2, 1.17);
-      const sm = new Smoke(sp.x, sp.y, 0.85);
+      // Sit on kiln roof (body top ~0.77); small stack aligned with house look
+      const cx = kx + 0.25;
+      const cy = ky + 0.2;
+      const topZ = drawChimneyStack(bx, cx, cy, 0.77, 0.85, look.lateralDx);
+      const sp = proj.p(cx + look.lateralDx, cy, topZ);
+      const sm = new Smoke(sp.x, sp.y, 0.55);
       c.addChild(sm.node);
       anims.push(sm);
     }
@@ -932,6 +1015,17 @@ const baths: Builder = function (L, opt) {
     tympanum: look.accent,
     outline: out,
   });
+  // Small masonry stack on the hall gable (near ridge-x midspan), salt-gated
+  if (look.hasChimney) {
+    const cx = W * 0.5;
+    const cy = hd * 0.45;
+    // Roof zt=1.1, rh=0.5 → peak 1.6; base on slope near ridge
+    const topZ = drawChimneyStack(bx, cx, cy, 1.42, 0.9, look.lateralDx);
+    const sp = proj.p(cx + look.lateralDx, cy, topZ);
+    const sm = new Smoke(sp.x, sp.y, 0.55);
+    c.addChild(sm.node);
+    anims.push(sm);
+  }
   // colonnade framing the pool (front)
   const poolY0 = hd + 0.15;
   const poolY1 = D - 0.25;

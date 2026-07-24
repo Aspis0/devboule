@@ -25,6 +25,12 @@ import type { SpriteBank } from "./spriteAssets";
 import type { TerrainExtent } from "./terrain";
 import type { Bounds } from "../../types/city";
 import type { RenderTier } from "./renderProfile";
+import {
+  SMALL_CITY_THRESHOLD,
+  smallCityDensityFactors,
+} from "./densityFloor";
+// Re-export so callers/tests can import density floor from props if needed.
+export { SMALL_CITY_THRESHOLD, smallCityDensityFactors } from "./densityFloor";
 
 /** Rich-tier base prop cap (Phase 5 countryside density). */
 export const MAX_PROPS_RICH = 3400;
@@ -235,6 +241,14 @@ export interface PlanForestOpts {
   tier?: RenderTier;
   /** District bounds for the outer sparse countryside ring. Absent → no outer ring. */
   districts?: readonly { bounds: Bounds }[];
+  /**
+   * Building count for the small-city density floor. When below
+   * {@link SMALL_CITY_THRESHOLD}, patch count is scaled up so tiny clusters
+   * still get olive/woodland near the buildings. Large cities unchanged.
+   */
+  buildingCount?: number;
+  /** Explicit forest density factor (≥1). Overrides buildingCount-derived. */
+  forestFactor?: number;
 }
 
 /** True when (tx, ty) lies strictly outside every district rectangle. */
@@ -320,8 +334,14 @@ export function planForestPatches(
 ): { patches: ForestPatch[]; cap: number } {
   const tier = opts?.tier ?? "rich";
   const base = basePropCap(tier);
+  // Small-city density floor: scale patch count when buildings are few.
+  const forestFactor =
+    opts?.forestFactor ??
+    smallCityDensityFactors(opts?.buildingCount ?? SMALL_CITY_THRESHOLD)
+      .forestFactor;
 
   // Candidate lattice: step 18 tiles gives ~4–6 candidates per map side.
+  // On tiny extents (small-city margin), lattice already hugs the cluster.
   const cols = Math.max(1, Math.ceil((ext.maxX - ext.minX + 1) / FOREST_LATTICE_STEP));
   const rows = Math.max(1, Math.ceil((ext.maxY - ext.minY + 1) / FOREST_LATTICE_STEP));
   const n = cols * rows;
@@ -344,12 +364,13 @@ export function planForestPatches(
     const hb = hashCoords(b.cx, b.cy);
     return ha - hb;
   });
-  const count = Math.min(
-    candidates.length,
+  const baseCount =
     FOREST_PATCH_COUNT_MIN +
-      (hashCoords(ext.minX, ext.minY) %
-        (FOREST_PATCH_COUNT_MAX - FOREST_PATCH_COUNT_MIN + 1)),
-  );
+    (hashCoords(ext.minX, ext.minY) %
+      (FOREST_PATCH_COUNT_MAX - FOREST_PATCH_COUNT_MIN + 1));
+  // Scale patch count by forest density factor (small city → more, large → 1×).
+  const want = Math.max(1, Math.round(baseCount * forestFactor));
+  const count = Math.min(candidates.length, want);
   const patches = candidates.slice(0, count);
 
   // Phase 5: second sparse scatter ring outside district bounds.
@@ -411,9 +432,16 @@ export function drawProps(
   // instead of the default base cap. This is the single source of truth for
   // the prop count limit when forest patches are active.
   capOverride?: number,
+  /**
+   * Prop density factor (≥1) from the small-city floor. Scales olive/rock
+   * scatter probability so tiny clusters don't look barren. Default 1.
+   */
+  propFactor = 1,
 ): { graphics: (Graphics | Container)[]; propCount: number } {
   const chunks: (Graphics | Container)[] = [];
-  const cap = capOverride ?? MAX_PROPS;
+  const density = Math.max(1, propFactor);
+  // Raise cap with density so higher probability can actually place more props.
+  const cap = Math.round((capOverride ?? MAX_PROPS) * density);
   // MAX-RECALL fix — tree Sprites are collected SEPARATELY and appended after
   // every Graphics chunk: interleaving them (all on the prop-0 atlas page)
   // between singles-textured Graphics broke the batch per tree — one draw
@@ -458,17 +486,22 @@ export function drawProps(
       const inForest = forestPatches != null && forestPatches.length > 0
         ? inForestPatch(forestPatches, tx, ty)
         : false;
-      const oliveThreshold = inForest ? P_OLIVE_FOREST : P_OLIVE;
+      // Density factor scales olive + rock (stalls stay sparse — honesty of
+      // "market" reading). Clamp so we never exceed a full-tile claim.
+      const oliveBase = inForest ? P_OLIVE_FOREST : P_OLIVE;
+      const oliveThreshold = Math.min(0.92, oliveBase * density);
+      const rockThreshold = Math.min(0.2, P_ROCK * density);
+      const stallThreshold = P_STALL;
 
-      if (roll < P_STALL) {
+      if (roll < stallThreshold) {
         drawStall(g, cx, cy, rng);
         placed++;
         chunkCount++;
-      } else if (roll < P_STALL + P_ROCK) {
+      } else if (roll < stallThreshold + rockThreshold) {
         drawRocks(g, cx, cy, rng);
         placed++;
         chunkCount++;
-      } else if (roll < P_STALL + P_ROCK + oliveThreshold) {
+      } else if (roll < stallThreshold + rockThreshold + oliveThreshold) {
         // Real tree sprite when the bank has one AND the tile sits in open
         // countryside (see TREE_CLEARANCE); otherwise the classic olive blobs.
         // MAX-RECALL fix — the tree/cypress rolls are drawn UNCONDITIONALLY

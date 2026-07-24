@@ -65,6 +65,22 @@ export const NIGHT_WINDOW_DARKNESS_THRESHOLD = 0.35;
 
 // Soft cool blue-gray smoke (distinct from warm disaster fire smoke).
 const CHIMNEY_SMOKE_TINT = darken(DERIVED.smokeCool, 0.06);
+
+/** Max sprite alpha for idle chimney puffs — thin wisp, not a plume. */
+export const CHIMNEY_SMOKE_MAX_ALPHA = 0.18;
+/** Rise speed (px per life unit) — slower than disaster smoke. */
+export const CHIMNEY_SMOKE_RISE = 14;
+/** Horizontal drift span (px) — tight column. */
+export const CHIMNEY_SMOKE_DRIFT = 6;
+/** Base puff scale range (half of historical ~0.35–0.60). */
+export const CHIMNEY_SMOKE_R0_MIN = 0.18;
+export const CHIMNEY_SMOKE_R0_SPAN = 0.12;
+/** Scale growth over life (half of historical 0.9). */
+export const CHIMNEY_SMOKE_SCALE_GROWTH = 0.45;
+/** Frames between emit ticks per emitter (longer → fewer concurrent). */
+export const CHIMNEY_SMOKE_EMIT_PERIOD = 16;
+/** Max concurrent live puffs per emitter (thin wisp). */
+export const CHIMNEY_SMOKE_MAX_CONCURRENT = 2;
 // Night window glow (warm gold — already on-palette).
 const WINDOW_GLOW_TINT = DERIVED.windowLit;
 // Traffic dust (faint sand).
@@ -857,6 +873,8 @@ interface SmokeParticle {
   driftX: number;
   r0: number;
   active: boolean;
+  /** Emitter index that spawned this puff (−1 when inactive). */
+  emitterIdx: number;
 }
 
 const SMOKE_POOL = 96;
@@ -897,6 +915,7 @@ export class ChimneySmokeSystem {
         driftX: 0,
         r0: 1,
         active: false,
+        emitterIdx: -1,
       });
     }
   }
@@ -916,6 +935,7 @@ export class ChimneySmokeSystem {
     // Park all particles
     for (const p of this.particles) {
       p.active = false;
+      p.emitterIdx = -1;
       p.sprite.visible = false;
       p.sprite.alpha = 0;
     }
@@ -926,6 +946,7 @@ export class ChimneySmokeSystem {
     if (!on) {
       for (const p of this.particles) {
         p.active = false;
+        p.emitterIdx = -1;
         p.sprite.visible = false;
         p.sprite.alpha = 0;
       }
@@ -938,50 +959,60 @@ export class ChimneySmokeSystem {
     if (!this.enabled || !this.tex || this.emitters.length === 0) return;
     if (halfRate && frame % 2 !== 0) return;
 
-    // Emit: each emitter every ~8 steps, staggered by phase.
+    // Emit: staggered thin wisps — few concurrent puffs per emitter.
     for (let ei = 0; ei < this.emitters.length; ei++) {
       const em = this.emitters[ei];
-      const period = 8;
+      const period = CHIMNEY_SMOKE_EMIT_PERIOD;
       const offset = Math.floor(em.phase * period);
       if ((frame + offset) % period !== 0) continue;
-      // Activate up to PUFFS_PER_EMITTER dead slots
-      let spawned = 0;
-      for (let i = 0; i < this.particles.length && spawned < 1; i++) {
+      // Cap concurrent puffs per emitter (thin column, not a plume).
+      let live = 0;
+      for (let j = 0; j < this.particles.length; j++) {
+        if (this.particles[j].active && this.particles[j].emitterIdx === ei) {
+          live++;
+        }
+      }
+      if (live >= CHIMNEY_SMOKE_MAX_CONCURRENT) continue;
+      // Activate one dead slot
+      for (let i = 0; i < this.particles.length; i++) {
         const p = this.particles[i];
         if (p.active) continue;
         const h = hashString(`puff:${ei}:${frame}`);
         const rng = mulberry32(h);
         p.active = true;
+        p.emitterIdx = ei;
         p.life = 0;
-        p.lifeRate = 0.35 + rng() * 0.2;
-        p.baseX = em.x + (rng() * 4 - 2);
+        // Slightly faster life → shorter wisps, fewer overlapping puffs
+        p.lifeRate = 0.5 + rng() * 0.25;
+        p.baseX = em.x + (rng() * 2 - 1); // tight spawn
         p.baseY = em.y;
-        p.driftX = (rng() * 14 - 5);
-        p.r0 = 0.35 + rng() * 0.25;
+        p.driftX = (rng() * CHIMNEY_SMOKE_DRIFT * 2 - CHIMNEY_SMOKE_DRIFT) * 0.6;
+        p.r0 = CHIMNEY_SMOKE_R0_MIN + rng() * CHIMNEY_SMOKE_R0_SPAN;
         p.sprite.visible = true;
         p.sprite.tint = CHIMNEY_SMOKE_TINT;
-        spawned++;
+        break;
       }
     }
 
-    // Advance particles (weaker/cooler than fire smoke).
+    // Advance particles (weaker/cooler/tighter than fire smoke).
     for (const p of this.particles) {
       if (!p.active) continue;
       p.life += p.lifeRate * (halfRate ? 2 : 1) * (1 / 30);
       if (p.life >= 1) {
         p.active = false;
+        p.emitterIdx = -1;
         p.sprite.visible = false;
         p.sprite.alpha = 0;
         continue;
       }
       const age = p.life;
-      // Rise slowly, slight drift; small soft puff.
+      // Slow rise, tight column; half-size soft puff.
       p.sprite.x = p.baseX + p.driftX * age;
-      p.sprite.y = p.baseY - age * 28;
-      const sc = p.r0 + age * 0.9;
+      p.sprite.y = p.baseY - age * CHIMNEY_SMOKE_RISE;
+      const sc = p.r0 + age * CHIMNEY_SMOKE_SCALE_GROWTH;
       p.sprite.scale.set(sc);
-      // Max alpha ~0.28 — clearly weaker than fire smoke (~0.5).
-      p.sprite.alpha = 0.28 * (1 - age);
+      // Max alpha ~0.18 — unmistakably weaker than fire smoke (~0.5).
+      p.sprite.alpha = CHIMNEY_SMOKE_MAX_ALPHA * (1 - age);
     }
   }
 
@@ -989,6 +1020,7 @@ export class ChimneySmokeSystem {
     this.emitters = [];
     for (const p of this.particles) {
       p.active = false;
+      p.emitterIdx = -1;
       p.sprite.visible = false;
       p.sprite.alpha = 0;
     }

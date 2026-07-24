@@ -463,11 +463,35 @@ describe("ambientLifeGates — budget demotion path", () => {
 // ---------------------------------------------------------------------------
 
 describe("F18 chimney smokeCool tint", () => {
-  it("DERIVED.smokeCool blends smoke toward water ~18%", () => {
-    const expected = blend(lighten(PALETTE.stoneDark, 0.28), PALETTE.water, 0.18);
+  it("DERIVED.smokeCool blends smoke toward water ~38% (blue-gray vs warm fire)", () => {
+    const expected = blend(lighten(PALETTE.stoneDark, 0.28), PALETTE.water, 0.38);
     expect(DERIVED.smokeCool).toBe(expected);
     // Distinct from warm disaster smoke
     expect(DERIVED.smokeCool).not.toBe(DERIVED.smoke);
+  });
+
+  it("idle chimney constants stay weaker/tighter than disaster smoke", async () => {
+    const {
+      CHIMNEY_SMOKE_MAX_ALPHA,
+      CHIMNEY_SMOKE_RISE,
+      CHIMNEY_SMOKE_MAX_CONCURRENT,
+      CHIMNEY_SMOKE_R0_MIN,
+      CHIMNEY_SMOKE_R0_SPAN,
+      CHIMNEY_SMOKE_SCALE_GROWTH,
+      CHIMNEY_SMOKE_EMIT_PERIOD,
+    } = await import("./ambientLife");
+    // Thin wisp: max alpha ~0.18 (disaster smoke alphaBase ~0.3–0.5)
+    expect(CHIMNEY_SMOKE_MAX_ALPHA).toBeLessThanOrEqual(0.18);
+    expect(CHIMNEY_SMOKE_MAX_ALPHA).toBeGreaterThan(0.1);
+    // Half-size puffs vs historical ~0.35–0.60 + growth 0.9
+    expect(CHIMNEY_SMOKE_R0_MIN + CHIMNEY_SMOKE_R0_SPAN).toBeLessThanOrEqual(0.32);
+    expect(CHIMNEY_SMOKE_SCALE_GROWTH).toBeLessThanOrEqual(0.5);
+    // Slow rise, few concurrent
+    expect(CHIMNEY_SMOKE_RISE).toBeLessThanOrEqual(16);
+    expect(CHIMNEY_SMOKE_MAX_CONCURRENT).toBeLessThanOrEqual(2);
+    expect(CHIMNEY_SMOKE_EMIT_PERIOD).toBeGreaterThanOrEqual(12);
+    // Warm disaster smoke stays distinct (palette identity check)
+    expect(DERIVED.smoke).toBe(lighten(PALETTE.stoneDark, 0.28));
   });
 });
 
