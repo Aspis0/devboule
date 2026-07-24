@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Container, Text } from "pixi.js";
+import { Container, Graphics } from "pixi.js";
 import { Disaster, Investigation } from "./growthEffects";
 import { buildingChanged } from "./diffCity";
 import { removeFromArrayByIdentity } from "./PolisRenderer";
@@ -7,16 +7,17 @@ import { DERIVED } from "./palette";
 import type { Building, SinSeverity, UrbanSin } from "../../types/city";
 
 // Bug-investigation P3 — the "under investigation" overlay (tinted kit Smoke + a
-// "?" marker) raised on a building an OPEN bug card's Oracle suspects resolve to.
-// It is DATA-DRIVEN (exists iff `suspectOfCardId` is set), AUTO-CLEARS via the diff
-// rebuild, and COEXISTS with the confirmed-disaster fire. These exercise:
-//   - the overlay composition (tinted smoke parts + a "?" Text present)
+// diegetic "?" stele) raised on a building an OPEN bug card's Oracle suspects
+// resolve to. It is DATA-DRIVEN (exists iff `suspectOfCardId` is set), AUTO-CLEARS
+// via the diff rebuild, and COEXISTS with the confirmed-disaster fire. These
+// exercise:
+//   - the overlay composition (tinted smoke parts + a stele Graphics marker)
 //   - the HONESTY/coexistence seam: a building with BOTH a worst-sin disaster AND a
 //     suspect marker builds BOTH overlays, neither clobbering the other
 //   - the diff seam: buildingChanged flips when suspectOfCardId appears/disappears
 //     and stays false when it is unchanged.
 //
-// PIXI v8 Container/Graphics/Text are plain scene-graph objects (no GL needed to
+// PIXI v8 Container/Graphics are plain scene-graph objects (no GL needed to
 // construct + record geometry), so the overlays drive headlessly.
 
 function sin(severity: SinSeverity, sinId = "s1"): UrbanSin {
@@ -44,20 +45,28 @@ function mkBuilding(overrides: Partial<Building> = {}): Building {
 }
 
 /** Collect the kit `Smoke` containers composed into an overlay (each is a child
- *  Container holding the smoke Graphics; the "?" marker is a Text, not a smoke). */
+ *  Container holding the smoke Graphics; the stele marker is a bare Graphics). */
 function smokeContainers(node: Container): Container[] {
   return node.children.filter(
-    (c): c is Container => c instanceof Container && !(c instanceof Text),
+    (c): c is Container => c instanceof Container && !(c instanceof Graphics),
   );
 }
 
-describe("Investigation overlay — tinted kit Smoke + '?' marker", () => {
-  it("builds tinted smoke wisps AND a '?' Text marker", () => {
+/** The diegetic stele + painted "?" glyph (static Graphics child). */
+function steleMarkers(node: Container): Graphics[] {
+  return node.children.filter((c): c is Graphics => c instanceof Graphics);
+}
+
+describe("Investigation overlay — tinted kit Smoke + diegetic '?' stele", () => {
+  it("builds tinted smoke wisps AND a stele Graphics marker (no system-font Text)", () => {
     const inv = new Investigation(40, 120);
-    // A "?" marker Text is present.
-    const marks = inv.node.children.filter((c) => c instanceof Text) as Text[];
+    // A stele Graphics marker is present (not a Text glyph).
+    const marks = steleMarkers(inv.node);
     expect(marks.length).toBe(1);
-    expect(marks[0].text).toBe("?");
+    // Non-empty geometry — a blank Graphics would pass a mere instanceof check.
+    const steleBounds = marks[0].getLocalBounds();
+    expect(steleBounds.width).toBeGreaterThan(0);
+    expect(steleBounds.height).toBeGreaterThan(0);
     // The smoke parts carry the investigative indigo/violet tint (DISTINCT from a
     // disaster's orange/red fire — the HONESTY invariant).
     const smokes = smokeContainers(inv.node);
@@ -101,13 +110,9 @@ describe("Investigation + Disaster coexistence (no clobber)", () => {
     expect(parent.children).toContain(disaster.node);
     expect(parent.children).toContain(investigation.node);
 
-    // The investigation overlay still carries its own "?" marker + tinted smoke —
+    // The investigation overlay still carries its own stele marker + tinted smoke —
     // the disaster did not strip or recolor it.
-    const marks = investigation.node.children.filter(
-      (c) => c instanceof Text,
-    ) as Text[];
-    expect(marks.length).toBe(1);
-    expect(marks[0].text).toBe("?");
+    expect(steleMarkers(investigation.node).length).toBe(1);
     for (const s of smokeContainers(investigation.node)) {
       expect(s.tint).toBe(DERIVED.investigate);
     }

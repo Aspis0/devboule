@@ -106,6 +106,18 @@ export const DERIVED = {
   roofTileLight: PALETTE.terracotta,
   crenellation: PALETTE.stoneDark,
 
+  // District boundary walls — sit ON the bounds diamond. Must read clearly
+  // against meadow/dirt (stonier / warmer-wood) but stay LIGHTER than building
+  // `outline` so walls never overpower roofs/silhouettes. All pure functions of
+  // existing PALETTE entries (COLOR CONTRACT).
+  wallStone: saturate(darken(PALETTE.stone, 0.04), -0.14),
+  wallStoneDark: saturate(darken(PALETTE.stoneDark, 0.14), -0.12),
+  wallStoneLight: saturate(lighten(PALETTE.stone, 0.14), -0.1),
+  wallWood: saturate(blend(PALETTE.terracottaDark, PALETTE.sandDark, 0.35), 0.04),
+  wallWoodDark: darken(PALETTE.terracottaDark, 0.22),
+  wallAqueduct: saturate(blend(PALETTE.stone, PALETTE.sandDark, 0.3), -0.1),
+  wallAqueductDark: saturate(darken(PALETTE.stoneDark, 0.1), -0.08),
+
   // Water variants for harbor shimmer (discrete stepped states). The cream-ish
   // PALETTE.water is pulled toward the sea-blue anchor and saturated so harbor
   // patches read as actual BLUE water against the green land — the land/water

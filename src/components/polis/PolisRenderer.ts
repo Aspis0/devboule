@@ -96,6 +96,17 @@ import { SlotAllocator } from "./locomotion";
 import { StepClock } from "./effects";
 import type { FilterSets } from "./filterModel";
 import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
+import {
+  planDistrictWall,
+  drawWallPlan,
+  waterTileSet,
+  cityCenterFromBuildings,
+  mapRoadVisualKind,
+  drawDirtDashed,
+  drawSemanticFaint,
+  drawTrunkEdgeStones,
+  type WallPlan,
+} from "./walls";
 import { EffectsBudget, type BudgetRung } from "./effectsBudget";
 import {
   bakeFireAtlas, destroyFireAtlas, createCrowdFire, stepCrowdFire,
@@ -629,6 +640,9 @@ export class PolisRenderer {
   // in the cull/LOD pass. Built ONCE in drawRoads; never rebuilt per frame. The
   // trunk cobble lives in its own sub-container that is always visible.
   private roadMinorLayer: Container | null = null;
+  // District walls: baked static Graphics (chunked), redrawn with districts.
+  // LOD-gated with LOD_FIELDS so far overview stays a clean tint diamond.
+  private districtWallsLayer: Container | null = null;
 
   // Dirty-flag for the cull/LOD recompute: the ticker early-returns unless the
   // camera actually moved/zoomed (or the scene/size changed). Set by the
@@ -993,7 +1007,7 @@ export class PolisRenderer {
     // Synchronous prelude — bounded cost (a handful of batched Graphics each).
     this.redrawTerrainProps(city.buildings, city.gridSize, city.terrain, city.districts, city.roads);
     this.debugLog("prelude: terrain done");
-    this.drawDistricts(city.districts);
+    this.drawDistricts(city.districts, city.roads, city.buildings, city.terrain);
     this.debugLog("prelude: districts done");
     this.drawRoads(city.roads, buildingById);
     this.debugLog("prelude: roads done");
@@ -1383,6 +1397,12 @@ export class PolisRenderer {
       this.redrawRoads(this.lastCity.roads, byId);
     }
 
+    // --- District walls: dim under ghost/hide so they don't form opaque cages
+    //     around translucent buildings. No rebuild — walls aren't per-fileId.
+    if (this.districtWallsLayer) {
+      this.districtWallsLayer.alpha = sets ? 0.25 : 1;
+    }
+
     // --- Agents: set ghost filter on AgentLayer ---
     this.agentLayer.setGhostFilter(sets ? ghosted : new Set<string>());
 
@@ -1599,8 +1619,13 @@ export class PolisRenderer {
       this.ambientLayer.setBlocked(this.blocked);
     }
 
-    // 4) Districts — cheap; rebuild so renamed/moved districts stay correct.
-    this.redrawDistricts(next.districts);
+    // 4) Districts (+ walls) — NOT cheap: planDistrictWall × findRoadGates is
+    //    O(D × R). Rebuild only when inputs walls actually depend on change:
+    //    districts (bounds/style/name), roads, buildings add/remove/move, or
+    //    terrain (water skips). Sin/status/agent-only diffs must NOT replan.
+    if (addedOrRemoved || roadsChanged || terrainChanged || districtsChanged) {
+      this.redrawDistricts(next.districts, next.roads, next.buildings, next.terrain);
+    }
 
     // 5) Terrain / props — redraw when the building set CHANGED size (added or
     //    removed; the extent + sea margin move), OR roads changed (a routed road
@@ -1714,13 +1739,14 @@ export class PolisRenderer {
   // reordering doesn't trigger a false positive. O(D log D).
   private static districtsHash(districts: readonly District[]): string {
     if (districts.length === 0) return "none";
-    // Include districtId, assetCensus, and bounds so census-only diffs
-    // (user adding asset files) are detected and trigger a terrain/props redraw.
+    // Include districtId, bounds, census, wallStyle, name, and color so
+    // census-only diffs (assets), renames, tint changes, and wall-style flips
+    // all trigger district/wall redraw. Walls depend on wallStyle + bounds.
     const parts = districts.map((d) => {
       const c = d.assetCensus;
       const census = c ? `${c.images}:${c.fonts}:${c.media}` : "0:0:0";
       const b = d.bounds;
-      return `${d.districtId}[${b.x},${b.y},${b.w},${b.h}|${census}]`;
+      return `${d.districtId}[${b.x},${b.y},${b.w},${b.h}|${census}|${d.wallStyle}|${d.name}|${d.colorAccent}]`;
     });
     parts.sort();
     return parts.join(";");
@@ -2654,14 +2680,26 @@ export class PolisRenderer {
   // ---------------------------------------------------------------------------
 
   /** Clear + redraw the districts layer (used by the live diff). */
-  private redrawDistricts(districts: District[]): void {
+  private redrawDistricts(
+    districts: District[],
+    roads: Road[],
+    buildings: Building[],
+    terrain?: TerrainData,
+  ): void {
     this.layers.districts
       .removeChildren()
       .forEach((c) => c.destroy({ children: true }));
-    this.drawDistricts(districts);
+    this.districtWallsLayer = null;
+    this.drawDistricts(districts, roads, buildings, terrain);
   }
 
-  private drawDistricts(districts: District[]): void {
+  private drawDistricts(
+    districts: District[],
+    roads: Road[],
+    buildings: Building[],
+    terrain?: TerrainData,
+  ): void {
+    // Tint diamonds + labels first (always visible).
     for (const d of districts) {
       const g = new Graphics();
       const { x, y, w, h } = d.bounds;
@@ -2700,6 +2738,47 @@ export class PolisRenderer {
       group.addChild(label);
       this.layers.districts.addChild(group);
     }
+
+    // District walls — planned once, baked into chunked Graphics. Sit on the
+    // bounds diamond; LOD-hidden with LOD_FIELDS so the far view stays clean.
+    // Water set + city centre + buildingsById computed once per draw (not per
+    // district). Caller already change-gates this whole rebuild.
+    const water = waterTileSet(terrain?.water);
+    const centre = cityCenterFromBuildings(buildings);
+    const buildingsById = new Map<string, Building>();
+    for (const b of buildings) buildingsById.set(b.fileId, b);
+    // Walls pack more ops/Graphics than roads; 300 keeps chunk count modest
+    // while staying well under PIXI v8's batch-friendly vertex budgets.
+    const WALL_CHUNK_OPS = 300;
+    const wallsLayer = new Container();
+    let wallG = new Graphics();
+    let wallOps = 0;
+    wallsLayer.addChild(wallG);
+    const rotateWall = (ops: number): void => {
+      wallOps += ops;
+      if (wallOps >= WALL_CHUNK_OPS) {
+        wallG = new Graphics();
+        wallsLayer.addChild(wallG);
+        wallOps = 0;
+      }
+    };
+    // Stable district order (wire order is already stable; no sort needed).
+    for (const d of districts) {
+      const plan: WallPlan | null = planDistrictWall(d, roads, buildings, {
+        waterTiles: water,
+        cityCenter: centre,
+        buildingsById,
+      });
+      if (!plan) continue;
+      rotateWall(drawWallPlan(wallG, plan));
+    }
+    this.layers.districts.addChild(wallsLayer);
+    this.districtWallsLayer = wallsLayer;
+    // Preserve filter dim if a ghost/hide filter is active (applyFilter sets
+    // alpha; redraw must not restore opaque cages around ghosted buildings).
+    wallsLayer.alpha = this.filterSets ? 0.25 : 1;
+    // Seed LOD from current zoom (cull runs next tick).
+    wallsLayer.visible = this.viewport.scale.x >= LOD_FIELDS;
   }
 
   // ---------------------------------------------------------------------------
@@ -2810,8 +2889,12 @@ export class PolisRenderer {
     };
 
     // Deterministic draw order: roads arrive stably ordered from the backend.
+    // Visual branch (walls.mapRoadVisualKind): clone/terra_battuta → dirt dash;
+    // semantic → faint dash; trunk import → cobble + edge stones; else hierarchy.
     for (const road of roads) {
       const heavyImport = road.weight >= ROAD_WEIGHT_TRUNK;
+      const am = roadAlphaMult(road.from, road.to);
+      if (am === 0) continue;
 
       // Prefer the WORLD-GRID street polyline (>=2 points): draw segment by
       // segment so each segment is classified by ITS OWN shared-ness — a road
@@ -2824,11 +2907,27 @@ export class PolisRenderer {
         for (let i = 0; i < pts.length - 1; i++) {
           const shared = segUsage.get(segKey(raw[i], raw[i + 1])) ?? 1;
           const isTrunk = heavyImport || shared >= ROAD_SHARED_TRUNK;
-          if (isTrunk) {
-            rotateTrunk(this.drawTrunk(trunkG, pts[i], pts[i + 1], road.weight, shared, roadAlphaMult(road.from, road.to)));
+          const kind = mapRoadVisualKind(road, isTrunk);
+          if (kind === "dirt_dashed") {
+            rotateMinor(drawDirtDashed(minorG, pts[i], pts[i + 1], am));
+          } else if (kind === "semantic_faint") {
+            rotateMinor(drawSemanticFaint(minorG, pts[i], pts[i + 1], am));
+          } else if (kind === "cobble_edged" || kind === "cobble") {
+            const edged = kind === "cobble_edged";
+            rotateTrunk(
+              this.drawTrunk(
+                trunkG,
+                pts[i],
+                pts[i + 1],
+                road.weight,
+                shared,
+                am,
+                edged,
+              ),
+            );
             anyTrunk = true;
           } else {
-            rotateMinor(this.drawMinorLane(minorG, pts[i], pts[i + 1], roadAlphaMult(road.from, road.to)));
+            rotateMinor(this.drawMinorLane(minorG, pts[i], pts[i + 1], am));
           }
         }
         // Only count junctions for trunk-bearing routes — minor kinks are not
@@ -2844,16 +2943,21 @@ export class PolisRenderer {
       // Fallback: no routed path. These straight `from`->`to` lines cut
       // corner-to-corner across the map and ARE the spiderweb — they don't
       // follow streets and can't share segments. So a straight fallback is
-      // ALWAYS a faint minor lane (never a cobbled trunk), regardless of
-      // weight: the cobbled-avenue read is reserved for the routed network
-      // that actually forms streets. This drops the long diagonal slashes out
-      // of the trunk layer and into the LOD-hidden minor layer.
+      // NEVER a cobbled trunk, regardless of weight. Clone/semantic still get
+      // their distinct dashed looks; everything else is a faint minor lane.
       const from = byId.get(road.from);
       const to = byId.get(road.to);
       if (!from || !to) continue; // only draw roads whose endpoints exist
       const a = cartToIso(from.coords.x, from.coords.y);
       const b = cartToIso(to.coords.x, to.coords.y);
-      rotateMinor(this.drawMinorLane(minorG, a, b, roadAlphaMult(road.from, road.to)));
+      const kind = mapRoadVisualKind(road, false);
+      if (kind === "dirt_dashed") {
+        rotateMinor(drawDirtDashed(minorG, a, b, am));
+      } else if (kind === "semantic_faint") {
+        rotateMinor(drawSemanticFaint(minorG, a, b, am));
+      } else {
+        rotateMinor(this.drawMinorLane(minorG, a, b, am));
+      }
     }
 
     // True trunk-hub discs. A single neutral disc tidies the overlap where many
@@ -2886,6 +2990,7 @@ export class PolisRenderer {
     weight: number,
     shared: number,
     alphaMult = 1,
+    edgeStones = false,
   ): number {
     // weight 1..5 and shared 1..~13 both push the trunk wider. Clamp so the
     // fattest avenue stays sane. Base 6, +~1.4/weight, +~0.8/extra-share.
@@ -2941,7 +3046,12 @@ export class PolisRenderer {
     g.moveTo(from.x + px, from.y + py).lineTo(to.x + px, to.y + py);
     g.moveTo(from.x - px, from.y - py).lineTo(to.x - px, to.y - py);
     g.stroke({ color: ROAD.trunkKerb, alpha: ROAD_ALPHA.trunkKerb * alphaMult, width: 1 });
-    return steps + 1; // fills + 1 stroke
+    let ops = steps + 1; // fills + 1 stroke
+    // Import trunk edge stones: two thin darker outlines outside the kerb.
+    if (edgeStones) {
+      ops += drawTrunkEdgeStones(g, from, to, roadWidth, alphaMult);
+    }
+    return ops;
   }
 
   // MINOR: a single faint desaturated earth line — a hint of a footpath, not a
@@ -3613,6 +3723,11 @@ export class PolisRenderer {
       this.externalLayer.setLodVisible(scale >= LOD_EXTERNAL);
       // Fields (farmland): hidden below LOD_FIELDS so the far view is clean.
       if (this.fieldsGraphics) this.fieldsGraphics.visible = scale >= LOD_FIELDS;
+      // District walls: same band as fields/labels detail — far overview keeps
+      // only the tint diamond, walls appear once the city is readable.
+      if (this.districtWallsLayer) {
+        this.districtWallsLayer.visible = scale >= LOD_FIELDS;
+      }
       // T6a — terrain grid: sub-pixel below zoom 0.5, hide to save ~557 draw calls.
       if (this.terrainGridGraphics) this.terrainGridGraphics.visible = scale >= 0.5;
     }
@@ -4105,7 +4220,10 @@ export class PolisRenderer {
     this.fieldsGraphics = null;
     this.terrainGridGraphics = null;
     this.clearResourceSites();
-    this.layers.districts.removeChildren().forEach((c) => c.destroy());
+    this.layers.districts
+      .removeChildren()
+      .forEach((c) => c.destroy({ children: true }));
+    this.districtWallsLayer = null;
     // Roads are now sub-containers (minor/trunk) each wrapping a Graphics, so
     // destroy children too. Drop the LOD handle.
     this.layers.roads

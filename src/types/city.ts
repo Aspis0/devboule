@@ -180,7 +180,8 @@ export interface Feature {
 
 export type WallStyle = "roman_wall" | "aqueduct" | "palisade" | "none" | string;
 
-export type RoadType = "import" | "semantic" | "infrastructure";
+/** Matches Rust `road_type` constants (incl. clone twin roads from P4.2). */
+export type RoadType = "import" | "semantic" | "infrastructure" | "clone";
 
 export type RoadStyle = "terra_battuta" | "lastricata" | "acquedotto";
 

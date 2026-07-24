@@ -30,7 +30,7 @@
 //     touch the chunked-build / diff / cull or the F0 idle|building|diffing state
 //     machine.
 
-import { Container, Graphics, Rectangle, Text, TextStyle } from "pixi.js";
+import { Container, Graphics, Rectangle } from "pixi.js";
 import { PALETTE, DERIVED } from "./palette";
 import { darken, lighten } from "./iso";
 import { Flame, Smoke, type AnimInstance } from "./kitcd/anims";
@@ -249,8 +249,8 @@ export class Disaster implements AnimInstance {
 // node container (pans/culls/destroys with the node — no removeFromParent leak)
 // and pushed into `node.kitAnims` so the renderer's visible-chunk-only step clock
 // drives it. It authors NO new fire/smoke geometry — it COMPOSES the kit `Smoke`
-// part, TINTED indigo/violet (`DERIVED.investigate`, on-palette) + a small "?"
-// `Text` marker above it.
+// part, TINTED indigo/violet (`DERIVED.investigate`, on-palette) + a small DIEGETIC
+// "?" stele (stone plinth + painted glyph strokes — no system-font Text).
 //
 // HONESTY (non-negotiable): a suspect is Oracle's GUESS, so the overlay must read
 // as DIFFERENT from a confirmed disaster — DIFFERENT COLOR FAMILY (blue/violet,
@@ -260,14 +260,41 @@ export class Disaster implements AnimInstance {
 // that is also a bug suspect honestly shows BOTH the fire and the question smoke.
 const INVESTIGATION_TINT = DERIVED.investigate; // indigo/violet smoke multiply
 
+/**
+ * Draw a tiny stone stele/plinth carrying a painted "?" (arc + dot) into a
+ * Graphics. Pure geometry, no Text — stays diegetic and on-palette.
+ * Anchor: base of the plinth at (0, 0); glyph sits above.
+ */
+function drawInvestigationStele(g: Graphics): void {
+  // Plinth base (wider foot).
+  g.rect(-5, -2, 10, 3).fill({ color: DERIVED.rockDark, alpha: 0.92 });
+  // Shaft.
+  g.rect(-3.5, -14, 7, 12).fill({ color: DERIVED.rock, alpha: 0.95 });
+  // Cap stone.
+  g.rect(-4.5, -17, 9, 3.5).fill({ color: DERIVED.rockLight, alpha: 0.95 });
+  // Painted "?" — curved stroke (polyline arc) + bottom dot, indigo mark color.
+  const ink = DERIVED.investigateMark;
+  // Hook of the question mark (open arc facing right, screen space).
+  g.moveTo(-1.6, -12.5)
+    .lineTo(-0.2, -13.6)
+    .lineTo(1.4, -13.2)
+    .lineTo(2.0, -11.8)
+    .lineTo(1.2, -10.6)
+    .lineTo(0.2, -10.0)
+    .lineTo(0.2, -8.6);
+  g.stroke({ color: ink, alpha: 0.95, width: 1.35 });
+  // Dot.
+  g.circle(0.2, -6.8, 0.9).fill({ color: ink, alpha: 0.95 });
+}
+
 export class Investigation implements AnimInstance {
   node: Container;
   kind = "investigation";
   /** The kit `Smoke` parts composed into this overlay, tinted investigative blue.
    *  Driven by this instance's `update` via the renderer's `node.kitAnims`. */
   private parts: AnimInstance[];
-  /** The "?" marker — a static `Text` drawn once (no per-frame work). */
-  private mark: Text;
+  /** The diegetic stele + "?" glyph — static Graphics drawn once (no per-frame work). */
+  private mark: Graphics;
 
   /**
    * @param hw    footprint half-width in px (BuiltBuilding.hw) — sizes/places the
@@ -295,24 +322,13 @@ export class Investigation implements AnimInstance {
     this.add(a);
     this.add(b);
 
-    // "?" marker — the HONEST cue that this is a SUSPECT (a question), distinct
-    // from a disaster's flames. A static Text drawn once, anchored above the smoke
-    // at roof height. Style mirrors the renderer's small in-world Text usage (Inter
-    // family, cream stroke for legibility) but coloured with the investigative
-    // shade so the marker matches the smoke family.
-    this.mark = new Text({
-      text: "?",
-      style: new TextStyle({
-        fontFamily: "Inter, system-ui, sans-serif",
-        fontSize: 13,
-        fontWeight: "700",
-        fill: DERIVED.investigateMark,
-        stroke: { color: PALETTE.cream, width: 3 },
-        align: "center",
-      }),
-    });
-    this.mark.anchor.set(0.5, 1);
-    // Above the smoke wisps, near the top of the silhouette.
+    // Diegetic "?" stele — stone plinth + painted glyph (Graphics strokes). The
+    // HONEST cue that this is a SUSPECT (a question), distinct from a disaster's
+    // flames. Static geometry drawn once; indigo family matches the smoke tint.
+    this.mark = new Graphics();
+    drawInvestigationStele(this.mark);
+    // Above the smoke wisps, near the top of the silhouette. Position is the
+    // plinth base; the stele extends upward in local space.
     this.mark.position.set(0, roofY - d * 0.14);
     this.node.addChild(this.mark);
   }
@@ -324,8 +340,8 @@ export class Investigation implements AnimInstance {
 
   /** Drive the composed kit smoke. LOD-gated like `Disaster`: when the renderer
    *  hides this overlay (far zoom) the per-step redraw is skipped entirely. The
-   *  "?" marker is static (drawn once) so it costs nothing per step. No per-frame
-   *  allocation beyond the kit Smoke's inherent clear/redraw. */
+   *  stele marker is static (drawn once) so it costs nothing per step. No
+   *  per-frame allocation beyond the kit Smoke's inherent clear/redraw. */
   update(t: number, dt: number): void {
     if (!this.node.visible) return;
     const parts = this.parts;
