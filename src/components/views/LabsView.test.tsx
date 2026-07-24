@@ -1,10 +1,8 @@
 // @vitest-environment jsdom
 //
-// Labs page: one experimental-feature card (Pigeon) with an on/off Switch
-// wired to its get/set Tauri command. Pigeon defaults OFF. The Oracle toggle
-// was moved to OracleAdminPanel.
-//
-// "coming soon" cards (SkillOpt, ORPO Night) are static and not tested here.
+// Labs page: Design toggle (local) + Pigeon card (build-locked OFF in alpha) +
+// "coming soon" cards (SkillOpt, ORPO Night). Pigeon must not be flipable from
+// the UI in this build — backend also hard-rejects enable writes.
 
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, createElement } from "react";
@@ -71,19 +69,33 @@ describe("LabsView", () => {
     expect(container.querySelector('[aria-label="Toggle Oracle"]')).toBeNull();
   });
 
-  it("loads Pigeon's enabled state on mount", async () => {
+  it("renders the Pigeon toggle disabled (hard-off in this build)", async () => {
     await mount();
-    expect(invokeMock).toHaveBeenCalledWith("get_pigeon_enabled");
-    // Pigeon defaults off.
-    expect(switchByLabel("Toggle Pigeon").getAttribute("aria-checked")).toBe("false");
+    const pigeon = switchByLabel("Toggle Pigeon");
+    expect(pigeon.disabled).toBe(true);
+    expect(pigeon.getAttribute("aria-checked")).toBe("false");
+    expect(pigeon.getAttribute("aria-disabled")).toBe("true");
+    expect(container.textContent).toContain("Disabled in this build");
+    // Build-locked: no get/set IPC for Pigeon at all.
+    expect(invokeMock).not.toHaveBeenCalledWith("get_pigeon_enabled");
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_pigeon_enabled",
+      expect.anything(),
+    );
   });
 
-  it("persists a toggle via set_pigeon_enabled when the Pigeon switch is clicked", async () => {
+  it("does not call set_pigeon_enabled when the Pigeon switch is clicked", async () => {
     await mount();
     const pigeon = switchByLabel("Toggle Pigeon");
     await act(async () => {
       pigeon.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    expect(invokeMock).toHaveBeenCalledWith("set_pigeon_enabled", { enabled: true });
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_pigeon_enabled",
+      expect.anything(),
+    );
+    // Still off after the click attempt.
+    expect(pigeon.getAttribute("aria-checked")).toBe("false");
+    expect(pigeon.disabled).toBe(true);
   });
 });

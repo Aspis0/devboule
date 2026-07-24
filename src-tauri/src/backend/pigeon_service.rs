@@ -73,6 +73,16 @@ fn pigeon_alpha_enable_override() -> bool {
         .unwrap_or(false)
 }
 
+/// Pure alpha-gate for the config setter. When `alpha_override` is false (public alpha),
+/// enabling is rejected. Disabling (`enabled=false`) is always allowed so a stale `true`
+/// from an older config can be cleaned up. Unit-tested without touching process env.
+pub fn pigeon_enable_write_allowed(enabled: bool, alpha_override: bool) -> Result<(), String> {
+    if enabled && !alpha_override {
+        return Err("Pigeon is disabled in this build and cannot be enabled.".to_string());
+    }
+    Ok(())
+}
+
 /// Read config.json and return whether Pigeon is enabled (default false on any error).
 pub fn read_pigeon_enabled(app: &AppHandle) -> bool {
     let Some(path) = crate::backend::projects::locate_config_path(app) else { return false; };
@@ -331,9 +341,7 @@ pub fn set_pigeon_enabled(
     // to persist `pigeon.enabled=true` so the UI/config path cannot arm a transport that
     // `pigeon_enabled_from_value` will ignore anyway. Disabling (writing `false`) is still allowed so
     // a stale `true` from an older config can be cleaned up. Internal builds bypass via the env override.
-    if enabled && !pigeon_alpha_enable_override() {
-        return Err("Pigeon is disabled in this build and cannot be enabled.".to_string());
-    }
+    pigeon_enable_write_allowed(enabled, pigeon_alpha_enable_override())?;
 
     let _lock = crate::backend::projects::config_write_lock()
         .lock()
@@ -368,7 +376,7 @@ pub fn set_pigeon_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::pigeon_enabled_from_value;
+    use super::{pigeon_enable_write_allowed, pigeon_enabled_from_value};
     use serde_json::json;
     #[test]
     fn default_false_when_absent() {
@@ -380,8 +388,26 @@ mod tests {
     fn alpha_hard_disable_ignores_explicit_true() {
         // ALPHA HARD-DISABLE: even an explicit `enabled: true` reads as false while the
         // DEVBOULE_ALPHA_PIGEON override is unset (the default for the public alpha build).
+        // Runtime gate coerces any stored true → false (defense in depth for old config.json).
         assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": true}})));
         assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": false}})));
+    }
+    #[test]
+    fn setter_rejects_true_without_override() {
+        // Public alpha (override=false): enabling must be rejected so IPC cannot arm the transport.
+        let err = pigeon_enable_write_allowed(true, false).expect_err("must reject enable");
+        assert!(
+            err.contains("disabled in this build"),
+            "unexpected error message: {err}"
+        );
+        // Disabling is always allowed (cleanup of stale true).
+        assert!(pigeon_enable_write_allowed(false, false).is_ok());
+    }
+    #[test]
+    fn setter_allows_true_with_internal_override() {
+        // Internal builds with DEVBOULE_ALPHA_PIGEON=1 may enable.
+        assert!(pigeon_enable_write_allowed(true, true).is_ok());
+        assert!(pigeon_enable_write_allowed(false, true).is_ok());
     }
     #[test]
     fn non_bool_is_false() {
