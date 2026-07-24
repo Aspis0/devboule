@@ -18,7 +18,7 @@ import {
   MAX_SHORE_PROPS,
   type PierBuilding,
 } from "./coast";
-import { LOD_FIELDS, LOD_WALLS } from "./lod";
+import { LOD_DISASTER, LOD_FIELDS, LOD_WALLS } from "./lod";
 import {
   planForestPatches,
   drawProps,
@@ -63,6 +63,11 @@ describe("LOD fields/walls split", () => {
     expect(LOD_FIELDS).toBe(0.22);
     expect(LOD_WALLS).toBe(0.3);
     expect(LOD_FIELDS).toBeLessThan(LOD_WALLS);
+  });
+
+  it("disaster LOD sits with the agent/outpost overview band", () => {
+    expect(LOD_DISASTER).toBe(0.35);
+    expect(LOD_DISASTER).toBeGreaterThan(LOD_WALLS);
   });
 });
 

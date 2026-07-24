@@ -23,6 +23,7 @@ import {
   lerp,
   type Proj,
 } from "./iso";
+import { CONTACT_SHADOW } from "../contactShadow";
 
 const M = MAT;
 const rnd = (seed: number): number => {
@@ -40,7 +41,12 @@ export function cypress(
 ): void {
   sc = sc || 1;
   const p = proj.p(gx, gy, z || 0);
-  g.ellipse(p.x + 4 * sc, p.y, 8 * sc, 3 * sc).fill({ color: M.shadow, alpha: 0.16 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX * sc,
+    p.y + CONTACT_SHADOW.offsetY * sc,
+    8 * sc,
+    3 * sc,
+  ).fill({ color: M.shadow, alpha: CONTACT_SHADOW.alpha });
   g.rect(p.x - 1.2 * sc, p.y - 8 * sc, 2.4 * sc, 8 * sc).fill({ color: M.woodDk });
   g.ellipse(p.x, p.y - 22 * sc, 6 * sc, 20 * sc).fill({ color: M.cypressDk });
   g.ellipse(p.x - 1.6 * sc, p.y - 24 * sc, 4 * sc, 18 * sc).fill({ color: M.cypress });
@@ -61,7 +67,12 @@ export function bush(
   sc = sc || 1;
   seed = seed || gx * 3 + gy;
   const p = proj.p(gx, gy, z || 0);
-  g.ellipse(p.x + 3 * sc, p.y, 9 * sc, 3.2 * sc).fill({ color: M.shadow, alpha: 0.16 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX * sc,
+    p.y + CONTACT_SHADOW.offsetY * sc,
+    9 * sc,
+    3.2 * sc,
+  ).fill({ color: M.shadow, alpha: CONTACT_SHADOW.alpha });
   const blobs = [
     [0, 0, 7],
     [-5, 2, 5],
@@ -91,7 +102,12 @@ export function olive(
 ): void {
   sc = sc || 1;
   const p = proj.p(gx, gy, z || 0);
-  g.ellipse(p.x + 5 * sc, p.y, 12 * sc, 4 * sc).fill({ color: M.shadow, alpha: 0.18 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX * sc,
+    p.y + CONTACT_SHADOW.offsetY * sc,
+    12 * sc,
+    4 * sc,
+  ).fill({ color: M.shadow, alpha: CONTACT_SHADOW.alpha });
   g.moveTo(p.x, p.y)
     .lineTo(p.x - 1 * sc, p.y - 11 * sc)
     .stroke({ width: 2.4 * sc, color: M.woodDk });
@@ -172,7 +188,12 @@ export function amphora(
   sc = sc || 1;
   color = color || M.terracotta;
   const p = proj.p(gx, gy, z || 0);
-  g.ellipse(p.x + 2 * sc, p.y, 4 * sc, 1.6 * sc).fill({ color: M.shadow, alpha: 0.16 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX * sc,
+    p.y + CONTACT_SHADOW.offsetY * sc,
+    4 * sc,
+    1.6 * sc,
+  ).fill({ color: M.shadow, alpha: CONTACT_SHADOW.alpha });
   g.ellipse(p.x, p.y - 7 * sc, 4 * sc, 7 * sc).fill({ color: S(color, 0.92) });
   g.ellipse(p.x - 1.3 * sc, p.y - 8 * sc, 1.6 * sc, 4.5 * sc).fill({
     color: S(color, 1.12),
@@ -214,7 +235,12 @@ export function statue(
   sc = sc || 1;
   mat = mat || M.marble;
   const p = proj.p(gx, gy, z || 0);
-  g.ellipse(p.x + 3 * sc, p.y, 7 * sc, 2.4 * sc).fill({ color: M.shadow, alpha: 0.16 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX * sc,
+    p.y + CONTACT_SHADOW.offsetY * sc,
+    7 * sc,
+    2.4 * sc,
+  ).fill({ color: M.shadow, alpha: CONTACT_SHADOW.alpha });
   g.rect(p.x - 4 * sc, p.y - 7 * sc, 8 * sc, 7 * sc).fill({ color: S(mat, 0.84) });
   g.rect(p.x - 4.6 * sc, p.y - 8.4 * sc, 9.2 * sc, 1.6 * sc).fill({ color: S(mat, 1.0) });
   // figure

@@ -32,6 +32,7 @@ import {
 import { darken, lighten } from "../iso";
 import { BUILDERS, type Builder } from "../kitcd/buildings";
 import { makeProj, MAT, TILE_W, TILE_H, shade } from "../kitcd/iso";
+import { CONTACT_SHADOW } from "../contactShadow";
 import type { BuiltBuilding } from "./types";
 
 const HALF_W = TILE_W / 2;
@@ -43,10 +44,10 @@ function getBuilder(purpose: string): Builder {
 }
 
 /**
- * Faithful contact-shadow port of the source harness (app.js `shadow()`): a
- * soft ellipse under the footprint centre. The renderer places the returned
- * Graphics at the building's iso anchor (front-bottom), so we bake the
- * front-bottom→centre offset into the geometry via the kit's own projection.
+ * Soft contact-shadow ellipse under the footprint centre (CONTACT_SHADOW policy).
+ * The renderer places the returned Graphics at the building's iso anchor
+ * (front-bottom), so we bake the front-bottom→centre offset into the geometry
+ * via the kit's own projection. Matched to UH tree art: soft centred pool.
  */
 function buildShadow(W: number, D: number): Graphics {
   const g = new Graphics();
@@ -54,7 +55,12 @@ function buildShadow(W: number, D: number): Graphics {
   const c = proj.p(W / 2, D / 2, 0); // centre, relative to front-bottom origin
   const rx = (W + D) * HALF_W * 0.42;
   const ry = (W + D) * HALF_H * 0.42;
-  g.ellipse(c.x, c.y, rx, ry).fill({ color: MAT.shadow, alpha: 0.13 });
+  g.ellipse(
+    c.x + CONTACT_SHADOW.offsetX,
+    c.y + CONTACT_SHADOW.offsetY,
+    rx,
+    ry,
+  ).fill({ color: MAT.shadow, alpha: CONTACT_SHADOW.alpha });
   return g;
 }
 

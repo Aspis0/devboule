@@ -4,11 +4,25 @@ import { describe, it, expect } from "vitest";
 import type { Building, District, Road } from "../../types/city";
 import {
   planDistrictWall,
+  planBoundaryMarkers,
   mapRoadVisualKind,
+  collectBuiltOutlines,
+  isSegmentUrban,
+  pointInBounds,
+  drawUrbanHub,
+  ROAD_GEOMETRY,
   waterTileSet,
   cityCenterFromBuildings,
   resolveWallStyle,
   countBuildingsInDistrict,
+  builtOutlineBounds,
+  builtFootprintArea,
+  builtToEnclosedRatio,
+  WALL_GEOMETRY,
+  STELE_GEOMETRY,
+  WALL_MIN_BUILT_RATIO,
+  WALL_OUTLINE_MARGIN,
+  buildingTileFootprint,
 } from "./walls";
 
 // ---------------------------------------------------------------------------
@@ -151,7 +165,9 @@ describe("planDistrictWall size threshold", () => {
     ).toBeNull();
   });
 
-  it("does not use bounds size — tiny bounds with 12 buildings still full", () => {
+  it("does not use reserved district bounds size — tiny bounds with 12 buildings still full", () => {
+    // CHANGED (step2): wall geometry follows built extents, not district.bounds.
+    // Degenerate/tiny reserved bounds must not kill a dense building cluster.
     const buildings = mkDistrictBuildings(12);
     const plan = planDistrictWall(
       mkDistrict({ bounds: { x: 10, y: 10, w: 2, h: 2 } }),
@@ -211,23 +227,31 @@ describe("planDistrictWall determinism", () => {
 // ---------------------------------------------------------------------------
 
 describe("planDistrictWall gates", () => {
-  it("places a gate where an inter-district road crosses the boundary", () => {
-    // District [10,10]..[18,18]. Road path exits east edge at x=18, y=14.
-    // 12 in-district buildings for full wall.
-    const d = mkDistrict();
-    const buildings = [
-      ...mkDistrictBuildings(12),
-      mkBuilding("out", "other", 25, 14),
-    ];
+  it("places a gate where an inter-district road crosses the wall outline", () => {
+    // CHANGED (step2): gates sit on built outline, not reserved district.bounds.
+    // Compact 4×3 of 1×1 houses at (10,10): footprint AABB [10,10]–[14,13],
+    // outline with margin 1 → [9,9] w=6 h=5. East edge x=15, y∈[9,14].
+    // Road exits east mid-edge at y=11.5.
+    const d = mkDistrict({ bounds: { x: 0, y: 0, w: 50, h: 50 } });
+    const buildings: Building[] = [];
+    for (let i = 0; i < 12; i++) {
+      buildings.push(
+        mkBuilding("d1-b" + i, "d1", 10 + (i % 4), 10 + Math.floor(i / 4)),
+      );
+    }
+    buildings.push(mkBuilding("out", "other", 30, 11.5));
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const eastX = outline.x + outline.w;
+    const midY = outline.y + outline.h / 2;
     const roads = [
       mkRoad({
         roadId: "cross",
         from: "d1-b0",
         to: "out",
         path: [
-          { x: 12, y: 14 },
-          { x: 18, y: 14 },
-          { x: 25, y: 14 },
+          { x: 12, y: midY },
+          { x: eastX, y: midY },
+          { x: 30, y: midY },
         ],
       }),
     ];
@@ -237,10 +261,9 @@ describe("planDistrictWall gates", () => {
     expect(plan).not.toBeNull();
     expect(plan!.variant).toBe("full");
     expect(plan!.gates.length).toBeGreaterThanOrEqual(1);
-    // At least one gate on the east edge (side 1) near y=14.
     const east = plan!.gates.filter((g) => g.side === 1);
     expect(east.length).toBeGreaterThanOrEqual(1);
-    expect(east.some((g) => Math.abs(g.y - 14) < 1)).toBe(true);
+    expect(east.some((g) => Math.abs(g.y - midY) < 1)).toBe(true);
     // Segments must not cover the gate gap on that side.
     for (const seg of plan!.segments) {
       if (seg.side !== 1) continue;
@@ -254,7 +277,7 @@ describe("planDistrictWall gates", () => {
   });
 
   it("adds a fallback gate facing the city center when no road crosses", () => {
-    const d = mkDistrict(); // centre ~ (14, 14)
+    const d = mkDistrict();
     const buildings = mkDistrictBuildings(12);
     // City centre far to the east → fallback gate on east side (1).
     const plan = planDistrictWall(d, [], buildings, {
@@ -271,15 +294,18 @@ describe("planDistrictWall gates", () => {
       ...mkDistrictBuildings(8),
       mkBuilding("out", "other", 25, 14),
     ];
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const eastX = outline.x + outline.w;
+    const midY = outline.y + outline.h / 2;
     const roads = [
       mkRoad({
         roadId: "cross",
         from: "d1-b0",
         to: "out",
         path: [
-          { x: 12, y: 14 },
-          { x: 18, y: 14 },
-          { x: 25, y: 14 },
+          { x: 12, y: midY },
+          { x: eastX, y: midY },
+          { x: 25, y: midY },
         ],
       }),
     ];
@@ -298,31 +324,24 @@ describe("planDistrictWall gates", () => {
 
 describe("planDistrictWall water skip", () => {
   it("skips wall segments whose tile is water", () => {
-    const d = mkDistrict({
-      bounds: { x: 0, y: 0, w: 6, h: 6 },
-    });
-    // Flood the entire north edge tiles with water.
-    const water = waterTileSet([
-      { gx: 0, gy: 0 },
-      { gx: 1, gy: 0 },
-      { gx: 2, gy: 0 },
-      { gx: 3, gy: 0 },
-      { gx: 4, gy: 0 },
-      { gx: 5, gy: 0 },
-    ]);
-    const plan = planDistrictWall(d, [], mkDistrictBuildings(12), {
-      waterTiles: water,
-      cityCenter: { x: 3, y: 100 }, // gate on south so north is free
+    // CHANGED (step2): water is tested on the built outline edge, not
+    // district.bounds. Compact cluster at (2,2); flood the outline's north edge.
+    const buildings = mkDistrictBuildings(12, "d1", 2, 2);
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const waterTiles: { gx: number; gy: number }[] = [];
+    for (let x = Math.floor(outline.x); x < Math.ceil(outline.x + outline.w); x++) {
+      waterTiles.push({ gx: x, gy: Math.floor(outline.y) });
+    }
+    const d = mkDistrict({ bounds: { x: 0, y: 0, w: 40, h: 40 } });
+    const plan = planDistrictWall(d, [], buildings, {
+      waterTiles: waterTileSet(waterTiles),
+      cityCenter: { x: outline.x + outline.w / 2, y: 100 }, // gate south
     });
     expect(plan).not.toBeNull();
-    // No segment should sit entirely on the waterlogged north edge (side 0).
-    // Sub-samples on water are dropped — north edge should have zero (or near-
-    // zero) length segments.
     const northLen = plan!.segments
       .filter((s) => s.side === 0)
       .reduce((acc, s) => acc + Math.hypot(s.bx - s.ax, s.by - s.ay), 0);
     expect(northLen).toBeLessThan(0.5);
-    // Other sides still have wall.
     const otherLen = plan!.segments
       .filter((s) => s.side !== 0)
       .reduce((acc, s) => acc + Math.hypot(s.bx - s.ax, s.by - s.ay), 0);
@@ -449,13 +468,142 @@ describe("mapRoadVisualKind", () => {
     ).toBe("cobble");
   });
 
-  it("maps ordinary minor import to minor", () => {
+  it("maps ordinary urban minor import to urban_street", () => {
     expect(
       mapRoadVisualKind(
         { type: "import", style: "lastricata", weight: 1, provenance: "regex" },
         false,
+        true,
       ),
-    ).toBe("minor");
+    ).toBe("urban_street");
+  });
+
+  it("maps rural trunk import to country_track (not bright cobble lattice)", () => {
+    expect(
+      mapRoadVisualKind(
+        { type: "import", style: "lastricata", weight: 5, provenance: "ast" },
+        true,
+        false,
+      ),
+    ).toBe("country_track");
+  });
+
+  it("maps rural non-trunk to country_track", () => {
+    expect(
+      mapRoadVisualKind(
+        { type: "import", style: "lastricata", weight: 1 },
+        false,
+        false,
+      ),
+    ).toBe("country_track");
+  });
+
+  it("defaults isUrban=true so legacy two-arg trunk calls stay cobble", () => {
+    expect(
+      mapRoadVisualKind(
+        { type: "import", style: "lastricata", weight: 5 },
+        true,
+      ),
+    ).toBe("cobble_edged");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Urban / rural segment classification (STEP 4)
+// ---------------------------------------------------------------------------
+
+describe("isSegmentUrban / collectBuiltOutlines", () => {
+  it("is deterministic for the same buildings", () => {
+    const buildings = mkDistrictBuildings(8, "d1", 10, 10);
+    const a = collectBuiltOutlines(buildings);
+    const b = collectBuiltOutlines(buildings);
+    expect(a).toEqual(b);
+    expect(a.length).toBe(1);
+  });
+
+  it("classifies a segment inside the built outline as urban", () => {
+    const buildings = mkDistrictBuildings(8, "d1", 10, 10);
+    const outlines = collectBuiltOutlines(buildings);
+    // buildings sit at (10..15, 10..11) roughly — center of outline is urban
+    expect(isSegmentUrban({ x: 12, y: 11 }, { x: 13, y: 11 }, outlines)).toBe(
+      true,
+    );
+  });
+
+  it("classifies a segment far from any building as rural", () => {
+    const buildings = mkDistrictBuildings(8, "d1", 10, 10);
+    const outlines = collectBuiltOutlines(buildings);
+    // Far away in empty meadow
+    expect(isSegmentUrban({ x: 200, y: 200 }, { x: 210, y: 200 }, outlines)).toBe(
+      false,
+    );
+  });
+
+  it("collectBuiltOutlines matches builtOutlineBounds when pad=0", () => {
+    const buildings = mkDistrictBuildings(6, "d1", 10, 10);
+    const base = builtOutlineBounds("d1", buildings)!;
+    const outlines = collectBuiltOutlines(buildings, 0);
+    expect(outlines).toHaveLength(1);
+    expect(outlines[0]).toEqual(base);
+    // Inside outline → urban; well outside → rural
+    const ix = base.x + base.w * 0.5;
+    const iy = base.y + base.h * 0.5;
+    expect(pointInBounds(ix, iy, outlines[0])).toBe(true);
+    expect(isSegmentUrban({ x: ix, y: iy }, { x: ix + 1, y: iy }, outlines)).toBe(
+      true,
+    );
+    const ox = base.x + base.w + 5;
+    const oy = base.y + base.h + 5;
+    expect(isSegmentUrban({ x: ox, y: oy }, { x: ox + 2, y: oy }, outlines)).toBe(
+      false,
+    );
+  });
+
+  it("explicit pad expands the urban zone", () => {
+    const buildings = mkDistrictBuildings(6, "d1", 10, 10);
+    const base = builtOutlineBounds("d1", buildings)!;
+    const pad = 2;
+    const outlines = collectBuiltOutlines(buildings, pad);
+    const x = base.x + base.w + pad * 0.5;
+    const y = base.y + base.h * 0.5;
+    expect(pointInBounds(x, y, outlines[0])).toBe(true);
+    expect(isSegmentUrban({ x, y }, { x: x + 1, y }, outlines)).toBe(true);
+  });
+
+  it("returns rural when there are no buildings / empty outlines", () => {
+    expect(isSegmentUrban({ x: 0, y: 0 }, { x: 1, y: 0 }, [])).toBe(false);
+    expect(collectBuiltOutlines([])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Urban hub / junction handling (STEP 4)
+// ---------------------------------------------------------------------------
+
+describe("drawUrbanHub junction floor", () => {
+  it("draws nothing for n < 2 (single kink not multi-route)", () => {
+    // Graphics is pixi — we only assert the pure early-return count.
+    const g = { circle: () => ({ fill: () => {} }) } as unknown as import("pixi.js").Graphics;
+    expect(drawUrbanHub(g, 0, 0, 0)).toBe(0);
+    expect(drawUrbanHub(g, 0, 0, 1)).toBe(0);
+  });
+
+  it("draws a disc for corners (n=2), T-junctions (n=3), and hubs (n≥4)", () => {
+    const g = { circle: () => ({ fill: () => {} }) } as unknown as import("pixi.js").Graphics;
+    expect(drawUrbanHub(g, 0, 0, 2)).toBe(1);
+    expect(drawUrbanHub(g, 0, 0, 3)).toBe(1);
+    expect(drawUrbanHub(g, 0, 0, 4)).toBe(1);
+    expect(drawUrbanHub(g, 0, 0, 8)).toBe(1);
+  });
+
+  it("exposes geometry constants used by the renderer", () => {
+    expect(ROAD_GEOMETRY.urbanStreetWidth).toBeGreaterThan(
+      ROAD_GEOMETRY.countryTrackWidth,
+    );
+    expect(ROAD_GEOMETRY.urbanCapRadius).toBeGreaterThan(0);
+    expect(ROAD_GEOMETRY.urbanHubRadius).toBeGreaterThanOrEqual(
+      ROAD_GEOMETRY.urbanCapRadius,
+    );
   });
 });
 
@@ -491,68 +639,281 @@ describe("planDistrictWall missing-endpoint roads", () => {
 });
 
 describe("planDistrictWall degenerate bounds", () => {
-  it("rejects zero / negative / non-finite bounds", () => {
+  it("still plans when reserved district.bounds are degenerate (uses built extents)", () => {
+    // CHANGED (step2): district.bounds no longer gate presence. A dense cluster
+    // with zero/negative reserved bounds still gets a wall from built extents.
+    // Old assertion (null on bad district.bounds) is intentionally replaced.
     const buildings = mkDistrictBuildings(12);
+    for (const bounds of [
+      { x: 0, y: 0, w: 0, h: 8 },
+      { x: 0, y: 0, w: 8, h: 0 },
+      { x: 0, y: 0, w: -2, h: 8 },
+      { x: 0, y: 0, w: 8, h: -1 },
+      { x: 0, y: 0, w: Number.NaN, h: 8 },
+    ]) {
+      const plan = planDistrictWall(mkDistrict({ bounds }), [], buildings, {
+        cityCenter: { x: 0, y: 0 },
+      });
+      expect(plan).not.toBeNull();
+      expect(plan!.variant).toBe("full");
+    }
+  });
+
+  it("returns null when there are no member buildings (no outline)", () => {
     expect(
-      planDistrictWall(
-        mkDistrict({ bounds: { x: 0, y: 0, w: 0, h: 8 } }),
-        [],
-        buildings,
-      ),
-    ).toBeNull();
-    expect(
-      planDistrictWall(
-        mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: 0 } }),
-        [],
-        buildings,
-      ),
-    ).toBeNull();
-    expect(
-      planDistrictWall(
-        mkDistrict({ bounds: { x: 0, y: 0, w: -2, h: 8 } }),
-        [],
-        buildings,
-      ),
-    ).toBeNull();
-    expect(
-      planDistrictWall(
-        mkDistrict({ bounds: { x: 0, y: 0, w: 8, h: -1 } }),
-        [],
-        buildings,
-      ),
-    ).toBeNull();
-    expect(
-      planDistrictWall(
-        mkDistrict({ bounds: { x: 0, y: 0, w: Number.NaN, h: 8 } }),
-        [],
-        buildings,
-      ),
+      planDistrictWall(mkDistrict(), [], [], { cityCenter: { x: 0, y: 0 } }),
     ).toBeNull();
   });
 });
 
 describe("planDistrictWall fallback gate water probe", () => {
   it("avoids water when non-water probe points are available", () => {
-    // District [0,0]..[10,10]. City centre east → fallback side = east (x=10).
-    // Midpoint (10, 5) is water; t=0.35 → y≈3.5 is dry.
-    const d = mkDistrict({
-      bounds: { x: 0, y: 0, w: 10, h: 10 },
-    });
+    // CHANGED (step2): probe runs on built outline east edge, not district.bounds.
+    const buildings = mkDistrictBuildings(12, "d1", 0, 0);
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const eastX = outline.x + outline.w;
+    const midY = outline.y + outline.h * 0.5;
+    const probeY = outline.y + outline.h * 0.35;
+    const d = mkDistrict({ bounds: { x: -50, y: -50, w: 100, h: 100 } });
     const water = waterTileSet([
-      { gx: 10, gy: 5 }, // midpoint of east edge
-      { gx: 9, gy: 5 },
+      { gx: Math.floor(eastX), gy: Math.floor(midY) },
+      { gx: Math.floor(eastX) - 1, gy: Math.floor(midY) },
     ]);
-    const plan = planDistrictWall(d, [], mkDistrictBuildings(12), {
+    const plan = planDistrictWall(d, [], buildings, {
       waterTiles: water,
-      cityCenter: { x: 100, y: 5 },
+      cityCenter: { x: 100, y: midY },
     });
     expect(plan).not.toBeNull();
     expect(plan!.gates).toHaveLength(1);
     const g = plan!.gates[0];
     expect(g.side).toBe(1);
-    // Gate must not sit on the water tile at y≈5.
-    expect(Math.floor(g.y)).not.toBe(5);
-    // First non-water probe after 0.5 is 0.35 → y = 0 + 10*0.35 = 3.5
-    expect(Math.abs(g.y - 3.5)).toBeLessThan(0.01);
+    // Gate must not sit on the water tile at midY.
+    expect(Math.floor(g.y)).not.toBe(Math.floor(midY));
+    // First non-water probe after 0.5 is 0.35.
+    expect(Math.abs(g.y - probeY)).toBeLessThan(0.01);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Step 2 regressions: built outline, emptiness, wall mass
+// ---------------------------------------------------------------------------
+
+describe("planDistrictWall built outline (not reserved bounds)", () => {
+  it("segments hug member building extents, not the reserved district box", () => {
+    // Huge reserved box; buildings only in a tight cluster around (20,20).
+    const d = mkDistrict({ bounds: { x: 0, y: 0, w: 80, h: 80 } });
+    const buildings: Building[] = [];
+    for (let i = 0; i < 12; i++) {
+      buildings.push(
+        mkBuilding("d1-b" + i, "d1", 20 + (i % 4), 20 + Math.floor(i / 4)),
+      );
+    }
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const plan = planDistrictWall(d, [], buildings, {
+      cityCenter: { x: 0, y: 0 },
+    });
+    expect(plan).not.toBeNull();
+    // Every segment endpoint must lie on the built outline (tolerance for
+    // float), never out on the reserved 80×80 rim.
+    for (const seg of plan!.segments) {
+      for (const [x, y] of [
+        [seg.ax, seg.ay],
+        [seg.bx, seg.by],
+      ] as const) {
+        const onOutline =
+          Math.abs(x - outline.x) < 1e-6 ||
+          Math.abs(x - (outline.x + outline.w)) < 1e-6 ||
+          Math.abs(y - outline.y) < 1e-6 ||
+          Math.abs(y - (outline.y + outline.h)) < 1e-6;
+        expect(onOutline).toBe(true);
+        // Far from reserved outer rim (0 or 80).
+        expect(x).toBeGreaterThan(10);
+        expect(x).toBeLessThan(40);
+        expect(y).toBeGreaterThan(10);
+        expect(y).toBeLessThan(40);
+      }
+    }
+    // Outline is far smaller than reserved bounds.
+    expect(outline.w * outline.h).toBeLessThan(d.bounds.w * d.bounds.h * 0.1);
+  });
+
+  it("outline expands by WALL_OUTLINE_MARGIN beyond footprints", () => {
+    const buildings = [
+      mkBuilding("a", "d1", 10, 10),
+      mkBuilding("b", "d1", 11, 10),
+      mkBuilding("c", "d1", 10, 11),
+      mkBuilding("d", "d1", 11, 11),
+      mkBuilding("e", "d1", 12, 10),
+      mkBuilding("f", "d1", 12, 11),
+      mkBuilding("g", "d1", 10, 12),
+      mkBuilding("h", "d1", 11, 12),
+      mkBuilding("i", "d1", 12, 12),
+      mkBuilding("j", "d1", 13, 10),
+      mkBuilding("k", "d1", 13, 11),
+      mkBuilding("l", "d1", 13, 12),
+    ];
+    // house/kalybe = 1×1 → raw AABB [10,10]–[14,13]
+    const outline = builtOutlineBounds("d1", buildings)!;
+    expect(outline.x).toBe(10 - WALL_OUTLINE_MARGIN);
+    expect(outline.y).toBe(10 - WALL_OUTLINE_MARGIN);
+    expect(outline.w).toBe(4 + 2 * WALL_OUTLINE_MARGIN);
+    expect(outline.h).toBe(3 + 2 * WALL_OUTLINE_MARGIN);
+  });
+});
+
+describe("planDistrictWall emptiness guard", () => {
+  it("returns null when buildings are sparse relative to their outline", () => {
+    // 10 buildings at the corners of a huge empty field → density << threshold.
+    const d = mkDistrict({ bounds: { x: 0, y: 0, w: 100, h: 100 } });
+    const spots = [
+      [0, 0],
+      [0, 1],
+      [1, 0],
+      [50, 0],
+      [50, 1],
+      [0, 50],
+      [1, 50],
+      [50, 50],
+      [49, 50],
+      [50, 49],
+    ];
+    const buildings = spots.map(([x, y], i) =>
+      mkBuilding("s" + i, "d1", x, y),
+    );
+    const ratio = builtToEnclosedRatio("d1", buildings);
+    expect(ratio).toBeLessThan(WALL_MIN_BUILT_RATIO);
+    expect(
+      planDistrictWall(d, [], buildings, { cityCenter: { x: 25, y: 25 } }),
+    ).toBeNull();
+  });
+
+  it("still walls a compact cluster above the density floor", () => {
+    const buildings = mkDistrictBuildings(12);
+    const ratio = builtToEnclosedRatio("d1", buildings);
+    expect(ratio).toBeGreaterThanOrEqual(WALL_MIN_BUILT_RATIO);
+    expect(
+      planDistrictWall(mkDistrict(), [], buildings, {
+        cityCenter: { x: 0, y: 0 },
+      }),
+    ).not.toBeNull();
+  });
+
+  it("natural layout density (~0.10–0.20) gets no wall; dense pack does", () => {
+    // Step 2b: walls are rare. GAP=3-ish packing sits ~0.10–0.20 on the real
+    // fixture — must NOT wall. Tight 1-tile packing stays above 0.25 and walls.
+    const natural: Building[] = [];
+    // 12 × 1×1 houses on a 4×3 grid with origin step 3 (GAP-like spacing).
+    // Span: x 0..10, y 0..7 → outline (margin 1) 12×9 = 108, ratio = 12/108 ≈ 0.111.
+    for (let i = 0; i < 12; i++) {
+      natural.push(
+        mkBuilding(`n${i}`, "d1", (i % 4) * 3, Math.floor(i / 4) * 3),
+      );
+    }
+    const naturalRatio = builtToEnclosedRatio("d1", natural);
+    expect(naturalRatio).toBeGreaterThanOrEqual(0.1);
+    expect(naturalRatio).toBeLessThan(0.2);
+    expect(naturalRatio).toBeLessThan(WALL_MIN_BUILT_RATIO);
+    expect(
+      planDistrictWall(mkDistrict(), [], natural, {
+        cityCenter: { x: 5, y: 5 },
+      }),
+    ).toBeNull();
+
+    const dense = mkDistrictBuildings(12);
+    const denseRatio = builtToEnclosedRatio("d1", dense);
+    expect(denseRatio).toBeGreaterThanOrEqual(WALL_MIN_BUILT_RATIO);
+    expect(
+      planDistrictWall(mkDistrict(), [], dense, {
+        cityCenter: { x: 0, y: 0 },
+      }),
+    ).not.toBeNull();
+  });
+
+  it("pins WALL_MIN_BUILT_RATIO at the step-2b density gate", () => {
+    // Raised from 0.1 so sparse GAP=3 fabric stays unwalled.
+    expect(WALL_MIN_BUILT_RATIO).toBe(0.25);
+  });
+});
+
+describe("boundary stelae (soft place markers)", () => {
+  it("plans four markers at built-outline corners when count ≥ 6", () => {
+    const buildings = mkDistrictBuildings(8);
+    const outline = builtOutlineBounds("d1", buildings)!;
+    const markers = planBoundaryMarkers("d1", buildings);
+    expect(markers).not.toBeNull();
+    expect(markers!).toHaveLength(4);
+    // NW, NE, SE, SW of the built outline.
+    expect(markers![0]).toMatchObject({ x: outline.x, y: outline.y, corner: 0 });
+    expect(markers![1]).toMatchObject({
+      x: outline.x + outline.w,
+      y: outline.y,
+      corner: 1,
+    });
+    expect(markers![2]).toMatchObject({
+      x: outline.x + outline.w,
+      y: outline.y + outline.h,
+      corner: 2,
+    });
+    expect(markers![3]).toMatchObject({
+      x: outline.x,
+      y: outline.y + outline.h,
+      corner: 3,
+    });
+  });
+
+  it("returns null below the low-wall count floor", () => {
+    const buildings = mkDistrictBuildings(5);
+    expect(planBoundaryMarkers("d1", buildings)).toBeNull();
+  });
+
+  it("stele mass stays readable at working zoom (not ticks)", () => {
+    expect(STELE_GEOMETRY.w).toBeGreaterThanOrEqual(4);
+    expect(STELE_GEOMETRY.h).toBeGreaterThanOrEqual(7);
+    // At scale 0.85: ~7.6px tall block; at 0.3 LOD floor: ~2.7px still a mark.
+    expect(STELE_GEOMETRY.h * 0.85).toBeGreaterThan(6);
+    expect(STELE_GEOMETRY.h * 0.3).toBeGreaterThan(2);
+  });
+});
+
+describe("wall mass geometry", () => {
+  it("full wall height and thickness stay above hairline constants", () => {
+    // Regression: a 4px wall reads as a fence. Keep mass.
+    expect(WALL_GEOMETRY.wallH).toBeGreaterThanOrEqual(12);
+    expect(WALL_GEOMETRY.bandW).toBeGreaterThanOrEqual(6);
+    expect(WALL_GEOMETRY.lowWallH).toBeGreaterThanOrEqual(5);
+    expect(WALL_GEOMETRY.lowBandW).toBeGreaterThanOrEqual(3);
+  });
+
+  it("on-screen size at viewport 0.85 and 0.3 matches constants × scale", () => {
+    // Pure arithmetic from constants — no live render required.
+    const scales = [0.85, 0.3] as const;
+    for (const s of scales) {
+      expect(WALL_GEOMETRY.wallH * s).toBeCloseTo(14 * s, 5);
+      expect(WALL_GEOMETRY.bandW * s).toBeCloseTo(7 * s, 5);
+    }
+    // At LOD floor (0.3) full wall is still > 3px tall (was 1.2px at WALL_H=4).
+    expect(WALL_GEOMETRY.wallH * 0.3).toBeGreaterThan(3);
+    // At working zoom (0.85) full wall is a solid ~12px band.
+    expect(WALL_GEOMETRY.wallH * 0.85).toBeGreaterThan(10);
+  });
+
+  it("buildingTileFootprint mirrors kit tiers for house/temple", () => {
+    expect(buildingTileFootprint("house", "kalybe")).toEqual({ w: 1, d: 1 });
+    expect(buildingTileFootprint("house", "synoikia")).toEqual({ w: 2, d: 2 });
+    expect(buildingTileFootprint("temple", "mnemeion")).toEqual({ w: 4, d: 6 });
+    expect(buildingTileFootprint("unknown-purpose", "kalybe")).toEqual({
+      w: 1,
+      d: 1,
+    });
+  });
+
+  it("builtFootprintArea sums tile footprints", () => {
+    const buildings = [
+      mkBuilding("a", "d1", 0, 0), // house kalybe 1×1
+      mkBuilding("b", "d1", 2, 0),
+    ];
+    buildings[0].purpose = "temple";
+    buildings[0].visualTier = "kalybe"; // 2×3 = 6
+    expect(builtFootprintArea("d1", buildings)).toBe(6 + 1);
   });
 });

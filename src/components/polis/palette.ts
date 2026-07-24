@@ -13,6 +13,8 @@
 // module is allowed to introduce a fresh hex literal.
 
 import { darken, lighten, blend, saturate } from "./iso";
+import { CONTACT_SHADOW } from "./contactShadow";
+export { CONTACT_SHADOW };
 
 // Reference targets used ONLY to bias a PALETTE entry toward a more believable
 // natural hue (the blend never adopts the target wholesale — it is a nudge of a
@@ -21,6 +23,13 @@ import { darken, lighten, blend, saturate } from "./iso";
 // A warm meadow green and a Mediterranean sea blue — same family, just alive.
 const HUE_MEADOW = 0x7a9a3e; // olive-meadow green bias target
 const HUE_SEA = 0x3f7fa6; // saturated sea-blue bias target
+// Mediterranean road surfaces (research anchors for blend — never painted raw).
+// Urban limestone must sit clearly lighter than MEADOW; country dirt only a
+// hair warmer so long inter-district tracks recede into the landscape.
+const HUE_LIMESTONE_LIGHT = 0xd9cdb8;
+const HUE_LIMESTONE_MID = 0xc4b49a;
+const HUE_LIMESTONE_KERB = 0x8a7a62;
+const HUE_DIRT_PATH = 0xa68b5b;
 // Bug-investigation P3 — a cool indigo/violet bias for the "under investigation"
 // smoke tint. Blend anchor only (the city has no native purple), same family as
 // the Scaleway livery but pushed bluer, so the investigative smoke reads as a
@@ -144,11 +153,11 @@ export const DERIVED = {
   crenellation: saturate(blend(PALETTE.stoneDark, PALETTE.terracotta, 0.12), 0.02),
 
   // District boundary walls — Caesar III sandstone: warm sand/stucco family
-  // blended ~12% toward terracotta (NOT cold grey Lego). Sit ON the bounds
-  // diamond, readable against meadow, but LIGHTER than building `outline`.
-  // All pure functions of existing PALETTE entries (COLOR CONTRACT).
-  // Base sand = blend(sandDark, cream) so we have a warm mid without a separate
-  // PALETTE.sand entry.
+  // blended ~12% toward terracotta (NOT cold grey Lego). Drawn on the built
+  // cluster outline (not the reserved district box), readable against meadow,
+  // but LIGHTER than building `outline`. All pure functions of existing
+  // PALETTE entries (COLOR CONTRACT). Base sand = blend(sandDark, cream) so
+  // we have a warm mid without a separate PALETTE.sand entry.
   wallStone: saturate(
     blend(
       blend(PALETTE.sandDark, PALETTE.stone, 0.4),
@@ -221,6 +230,32 @@ export const DERIVED = {
   bridgeStone: saturate(lighten(PALETTE.stone, 0.08), 0.06),
   bridgeStoneDark: saturate(darken(PALETTE.stoneDark, 0.12), 0.08),
   bridgeStoneLight: saturate(lighten(PALETTE.stone, 0.2), 0.05),
+
+  // ROAD SURFACES (STEP 4) — urban limestone vs country dirt. Always derived
+  // from PALETTE + research hue anchors (never raw hex on the wire).
+  // Urban paving: light warm limestone, clearly lighter than MEADOW ground.
+  roadUrbanPave: saturate(
+    blend(lighten(PALETTE.stone, 0.28), HUE_LIMESTONE_LIGHT, 0.55),
+    -0.08,
+  ),
+  roadUrbanPaveAlt: saturate(
+    blend(lighten(PALETTE.stone, 0.16), HUE_LIMESTONE_MID, 0.5),
+    -0.06,
+  ),
+  roadUrbanKerb: saturate(
+    blend(PALETTE.stoneDark, HUE_LIMESTONE_KERB, 0.45),
+    -0.05,
+  ),
+  // Country track: beaten earth — only slightly warmer than meadow so long
+  // inter-district lattice recedes; still traceable when you follow it.
+  roadCountryDirt: saturate(
+    blend(blend(MEADOW, PALETTE.sandDark, 0.42), HUE_DIRT_PATH, 0.35),
+    0.04,
+  ),
+  roadCountryDirtSoft: saturate(
+    blend(MEADOW, HUE_DIRT_PATH, 0.28),
+    0.02,
+  ),
 
   // Smoke / fire (square retro particles + flame shapes).
   smoke: lighten(PALETTE.stoneDark, 0.28),
@@ -328,9 +363,28 @@ export function modelLiveryTint(model?: string | null): number | undefined {
 
 /** Alpha constants reused across the renderer (semantic, not magic numbers). */
 export const ALPHA = {
-  shadow: 0.32, // drop-shadow under buildings (was 0.18 — buildings were floating)
-  districtFill: 0.1,
-  districtStroke: 0.5,
+  /** Drop-shadow under buildings — aliases CONTACT_SHADOW.alpha (single policy). */
+  shadow: CONTACT_SHADOW.alpha,
+  /**
+   * District place-tint peak (composited over MEADOW). 0.1 averaged ΔRGB≈8.6
+   * against groundMid on the real fixture — nearly invisible. 0.18 averages
+   * ΔRGB≈15 so unwalled districts still read as area, not a fence line.
+   */
+  districtFill: 0.18,
+  /**
+   * Retired continuous stroke (was 0.5). Hard edge reintroduces the fence look
+   * rejected for walls; soft concentric falloff + worn rim carry the place.
+   * Kept at 0 so any leftover stroke call is a no-op.
+   */
+  districtStroke: 0,
+  /**
+   * Soft outer falloff layers for district diamonds (multipliers of districtFill).
+   * Outermost first; expand is in cart tiles beyond reserved bounds.
+   */
+  districtSoftOuter: 0.4,
+  districtSoftMid: 0.7,
+  /** Worn-earth outer rim alpha (DERIVED.groundWorn over meadow). */
+  districtWornRim: 0.16,
   seam: 0.3,
   vignette: 0.22, // peak darkness at screen edges (was 0.42 — was drowning the scene)
   // Ground overlays — low enough that the continuous meadow base shows through

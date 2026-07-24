@@ -10,3 +10,16 @@ export const LOD_FIELDS = 0.22;
 /** District boundary walls: keep the phase-2 overview band (walls get noisy
  *  sooner than soft field tints). */
 export const LOD_WALLS = 0.3;
+
+/**
+ * On-map disaster overlays (legacy Disaster, crowd fires, hero fires, sin-smoke).
+ * Disasters matter so they read a touch sooner than fine facade detail — but
+ * stay hidden in the far overview so a zoomed-out city is not a field of tiny
+ * flames / grey noise.
+ */
+export const LOD_DISASTER = 0.35;
+
+/** Whether disaster-class effects (fires, sin-smoke) should render at this zoom. */
+export function disasterEffectsLodVisible(scale: number): boolean {
+  return scale >= LOD_DISASTER;
+}

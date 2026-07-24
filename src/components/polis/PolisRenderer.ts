@@ -53,14 +53,13 @@ import {
   depthKey,
   lerp,
   dist,
-  darken,
   lighten,
   saturate,
   blend,
   type IsoPoint,
 } from "./iso";
 import { hashString } from "./rng";
-import { PALETTE, ALPHA, getProfile, tierScale, tierRank } from "./palette";
+import { PALETTE, ALPHA, DERIVED, getProfile, tierScale, tierRank } from "./palette";
 import { AgentLayer } from "./AgentLayer";
 import { AmbientLayer, desiredAmbientCount } from "./AmbientLayer";
 import { PossessionController, type PossessionEnv } from "./possession";
@@ -98,7 +97,7 @@ import {
   drawShorelineDecor,
   type ShoreDecorItem,
 } from "./coast";
-import { LOD_FIELDS, LOD_WALLS } from "./lod";
+import { LOD_DISASTER, LOD_FIELDS, LOD_WALLS, disasterEffectsLodVisible } from "./lod";
 import {
   buildBuildingParts,
   buildPennant,
@@ -121,19 +120,27 @@ import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
 import {
   planDistrictWall,
   drawWallPlan,
+  planBoundaryMarkers,
+  drawBoundaryMarkers,
   waterTileSet,
   cityCenterFromBuildings,
   mapRoadVisualKind,
+  collectBuiltOutlines,
+  isSegmentUrban,
   drawDirtDashed,
   drawSemanticFaint,
   drawTrunkEdgeStones,
+  drawCountryTrack,
+  drawUrbanStreet,
+  drawUrbanHub,
+  ROAD_GEOMETRY,
   type WallPlan,
 } from "./walls";
 import { EffectsBudget, type BudgetRung } from "./effectsBudget";
 import {
   bakeFireAtlas, destroyFireAtlas, createCrowdFire, stepCrowdFire,
   createHeroFire, retargetHeroFire, stepHeroFire, parkHeroFire,
-  beginDemotionCrossfade, rankForPromotion,
+  beginDemotionCrossfade, rankForPromotion, crowdFireShowsFlame,
   type FireAtlas, type CrowdFire, type HeroFire, type FireSeverity,
   type PromotableBuilding,
 } from "./fire";
@@ -162,14 +169,8 @@ const CHUNK_SIZE = 8; // tiles per chunk side
 //
 // The DISASTER / EXTERNAL / LIVERY / ROAD-MINOR bands below are NOT profile-gated
 // (they gate cheap, allocation-free toggles), so they remain fixed module constants.
-// On-map DISASTER overlay (burning buildings with urban sins). Disasters MATTER,
-// so they read a touch sooner than fine facade detail — but they are still hidden
-// in the far overview (same band as agents/outposts) so a zoomed-out city isn't a
-// field of tiny flames and the per-step fire redraw is skipped when off. When
-// hidden, `Disaster.update` early-returns on `node.visible === false`.
-const LOD_DISASTER = 0.35;
-// LOD_FIELDS / LOD_WALLS live in ./lod so tests can pin the Phase-5 split
-// (fields extend further out; walls keep the tighter overview band).
+// LOD_DISASTER / LOD_FIELDS / LOD_WALLS live in ./lod so tests can pin them.
+// Disaster overlays (legacy, crowd fires, hero fires) share LOD_DISASTER.
 // External cloud outposts (harbour nodes) at the map margin: small procedural
 // structures, legible once the city itself is readable. Hidden in the far view
 // (same band as agents) so the margin doesn't speckle the zoomed-out overview.
@@ -178,53 +179,41 @@ const LOD_EXTERNAL = 0.35;
 // zoomed in past ~0.5, so they are hidden in the far view (avoids a confetti of
 // tiny flags over a dense city). Reuses the same threshold band as minor roads.
 const LOD_LIVERY = 0.5;
-// Below this zoom only the trunk network shows; minor lanes fade out so the
-// far view reads as a few avenues, not a mesh. Between this and full zoom the
-// minor lanes ramp from faint to their drawn alpha.
+// Below this zoom rural tracks / clone dashes / semantic faint fade out so the
+// far view is not a mesh of country lattice. URBAN streets live on the trunk
+// layer and stay visible (city fabric must remain bound while buildings are
+// still legible). Decision with numbers: at scale 0.45 urban street ≈ 3.2 screen
+// px (readable pave); country track ≈ 1.4 px (hairline) — hide rural early,
+// keep urban. See audit/step4.md.
 const LOD_ROAD_MINOR = 0.5;
 
 // Road hierarchy thresholds. A segment is a TRUNK when it carries real traffic:
 // either it is shared by several routed roads (>= ROAD_SHARED_TRUNK incident
-// roads) or the import itself is heavy (weight >= ROAD_WEIGHT_TRUNK). Everything
-// else is a faint MINOR lane. (Fixture: segment usage runs 1..13, weights 1..5;
-// these cut the 35% weight-1 / single-use noise from the cobbled trunks.)
+// roads) or the import itself is heavy (weight >= ROAD_WEIGHT_TRUNK). Urban
+// trunks get limestone cobble; rural segments of the same road become country
+// tracks (context beats weight — STEP 4).
 const ROAD_SHARED_TRUNK = 3;
 const ROAD_WEIGHT_TRUNK = 4;
-// A genuine junction disc is only worth drawing where this many routed roads
-// actually meet (raised from 3 so we stop dotting every minor kink).
-const ROAD_JUNCTION_MIN = 4;
+// Multi-route urban hub floor: corners (2) and T-junctions (3) get pavement
+// discs as well as true hubs (≥4). Rural kinks are not bumped.
+const ROAD_JUNCTION_MIN = 2;
 
 // ---------------------------------------------------------------------------
-// Road palette — muted, derived from PALETTE so the cobble stops reading red
-// against the green terrain. The OLD cobble used PALETTE.sandDark (0xc8b89a)
-// + a stoneDark kerb at alpha 0.85, which stacked into harsh brown blobs. The
-// new scheme is a calm two-tier stone/earth set:
-//   - TRUNKS get a desaturated stone cobble (two close tones) + faint kerb.
-//   - MINOR lanes get a single thin earth line at low alpha (a hint of a path).
-// All values are pure functions of PALETTE entries (palette discipline kept).
+// Road palette — STEP 4: urban limestone vs country dirt from DERIVED (palette
+// authority). Urban paving sits lighter than meadow; country tracks only
+// slightly warmer so the inter-district lattice recedes.
 const ROAD = {
-  // Trunk cobble: PALETTE.stone desaturated toward neutral so it sits BEHIND
-  // the buildings instead of competing. Two near tones for a subtle cobble
-  // weave without the old red/brown clash.
-  trunkStone: saturate(PALETTE.stone, -0.4),
-  trunkStoneAlt: saturate(darken(PALETTE.stone, 0.1), -0.4),
-  // Trunk side kerb — a soft, low-contrast edge (was full stoneDark @ .5).
-  trunkKerb: saturate(PALETTE.stoneDark, -0.35),
-  // Minor lane: a single faint earth line, desaturated so it whispers a path.
-  minorPath: saturate(lighten(PALETTE.stoneDark, 0.18), -0.45),
-  // Junction node: a subtle neutral disc, only on true trunk hubs.
-  junction: saturate(PALETTE.stoneDark, -0.3),
+  trunkStone: DERIVED.roadUrbanPave,
+  trunkStoneAlt: DERIVED.roadUrbanPaveAlt,
+  trunkKerb: DERIVED.roadUrbanKerb,
+  junction: DERIVED.roadUrbanPaveAlt,
 } as const;
 
 // Road alphas — flat per layer so OVERLAPS don't multiply into dark blobs.
-// Everything in a tier draws into ONE batched Graphics at a CONSISTENT alpha;
-// drawing many segments at the same alpha into the same Graphics fill does not
-// re-darken shared pixels, so crossings stay clean.
 const ROAD_ALPHA = {
-  trunkFill: 0.7, // cobbled trunk body (was 0.85, and stacking)
-  trunkKerb: 0.28, // faint trunk edge
-  minor: 0.3, // faint minor lane line at full zoom
-  junction: 0.35, // trunk-hub disc
+  trunkFill: 0.72, // limestone urban trunk body
+  trunkKerb: 0.32, // urban kerb
+  junction: 0.7, // urban hub disc (matches ROAD_SURFACE_ALPHA.urbanCap)
 } as const;
 
 // Clamp the per-step delta handed to the kit anims so a long stall (tab in the
@@ -2539,11 +2528,12 @@ export class PolisRenderer {
         if (hf.targetFileId !== null || hf.crossfading) {
           stepHeroFire(hf, dt);
         }
-        // F6 — gate hero fire container visibility via filter/LOD
+        // F6 — gate hero fire container visibility via filter + disaster LOD
         if (hf.targetFileId !== null) {
           const hnode = this.buildingNodes.get(hf.targetFileId);
           if (hnode) {
-            hf.container.visible = this.effectVisible(hnode, hf.targetFileId, true);
+            const showFx = disasterEffectsLodVisible(this.viewport.scale.x);
+            hf.container.visible = this.effectVisible(hnode, hf.targetFileId, showFx);
           }
         }
       }
@@ -2552,13 +2542,15 @@ export class PolisRenderer {
     // Sync crowd fires from current burning buildings (no alloc in steady state).
     if (this.fireAtlas) {
       this.syncCrowdFires();
+      const showFx = disasterEffectsLodVisible(this.viewport.scale.x);
       for (const [fileId, cf] of this.crowdFires) {
         stepCrowdFire(cf, this.fireAtlas, frame, halfRate || rung >= 3);
-        // F6 — gate crowd fire visibility via filter/LOD (no pool teardown)
+        // F6 — gate crowd fire visibility via filter + disaster LOD (no pool teardown)
         const vis = this.effectVisible(
-          this.buildingNodes.get(fileId)!, fileId, true,
+          this.buildingNodes.get(fileId)!, fileId, showFx,
         );
-        cf.fireSprite.visible = vis;
+        // Smoke-severity buildings never show a flame (taxonomy); only fire/inferno do.
+        cf.fireSprite.visible = vis && crowdFireShowsFlame(cf.severity);
         cf.smokeSprite.visible = vis;
       }
     }
@@ -2987,27 +2979,47 @@ export class PolisRenderer {
     buildings: Building[],
     terrain?: TerrainData,
   ): void {
-    // Tint diamonds + labels first (always visible).
+    // Soft place-tint + labels first (always visible). No continuous stroke —
+    // that reintroduces the fence look rejected for walls. Concentric soft
+    // falloff + worn-earth outer rim carry district identity for unwalled places.
     for (const d of districts) {
       const g = new Graphics();
       const { x, y, w, h } = d.bounds;
-      const c0 = cartToIso(x, y);
-      const c1 = cartToIso(x + w, y);
-      const c2 = cartToIso(x + w, y + h);
-      const c3 = cartToIso(x, y + h);
       let tint: number = PALETTE.sandDark;
       if (/^#?[0-9a-fA-F]{6}$/.test(d.colorAccent)) {
         tint = parseInt(d.colorAccent.replace("#", ""), 16);
       }
-      g.poly([c0.x, c0.y, c1.x, c1.y, c2.x, c2.y, c3.x, c3.y]).fill({
-        color: tint,
-        alpha: ALPHA.districtFill,
-      });
-      g.poly([c0.x, c0.y, c1.x, c1.y, c2.x, c2.y, c3.x, c3.y], true).stroke({
-        color: tint,
-        alpha: ALPHA.districtStroke,
-        width: 2,
-      });
+      // Soft layers: outermost first. Expand in cart tiles; alpha falls off.
+      // Outer worn-earth rim (neutral) then two accent falloff rings + peak fill.
+      const softLayers: { expand: number; color: number; alpha: number }[] = [
+        {
+          expand: 1.0,
+          color: DERIVED.groundWorn,
+          alpha: ALPHA.districtWornRim,
+        },
+        {
+          expand: 0.55,
+          color: tint,
+          alpha: ALPHA.districtFill * ALPHA.districtSoftOuter,
+        },
+        {
+          expand: 0.25,
+          color: tint,
+          alpha: ALPHA.districtFill * ALPHA.districtSoftMid,
+        },
+        { expand: 0, color: tint, alpha: ALPHA.districtFill },
+      ];
+      for (const layer of softLayers) {
+        const e = layer.expand;
+        const c0 = cartToIso(x - e, y - e);
+        const c1 = cartToIso(x + w + e, y - e);
+        const c2 = cartToIso(x + w + e, y + h + e);
+        const c3 = cartToIso(x - e, y + h + e);
+        g.poly([c0.x, c0.y, c1.x, c1.y, c2.x, c2.y, c3.x, c3.y]).fill({
+          color: layer.color,
+          alpha: layer.alpha,
+        });
+      }
 
       const label = new Text({
         text: d.name,
@@ -3019,7 +3031,8 @@ export class PolisRenderer {
         }),
       });
       label.anchor.set(0.5, 1);
-      label.position.set(c0.x, c0.y - 6);
+      const labelAnchor = cartToIso(x, y);
+      label.position.set(labelAnchor.x, labelAnchor.y - 6);
 
       const group = new Container();
       group.addChild(g);
@@ -3027,10 +3040,9 @@ export class PolisRenderer {
       this.layers.districts.addChild(group);
     }
 
-    // District walls — planned once, baked into chunked Graphics. Sit on the
-    // bounds diamond; LOD-hidden with LOD_WALLS so the far view stays clean.
-    // Water set + city centre + buildingsById computed once per draw (not per
-    // district). Caller already change-gates this whole rebuild.
+    // District walls + corner stelae — planned once, baked into chunked Graphics.
+    // LOD-hidden with LOD_WALLS so the far view stays clean. Water set + city
+    // centre + buildingsById computed once per draw (not per district).
     const water = waterTileSet(terrain?.water);
     const centre = cityCenterFromBuildings(buildings);
     const buildingsById = new Map<string, Building>();
@@ -3057,8 +3069,14 @@ export class PolisRenderer {
         cityCenter: centre,
         buildingsById,
       });
-      if (!plan) continue;
-      rotateWall(drawWallPlan(wallG, plan));
+      if (plan) {
+        rotateWall(drawWallPlan(wallG, plan));
+      } else {
+        // Unwalled place: corner stelae mark the built outline (LOD-gated with
+        // walls — same layer, same showWalls × LOD_WALLS visibility).
+        const markers = planBoundaryMarkers(d.districtId, buildings);
+        if (markers) rotateWall(drawBoundaryMarkers(wallG, markers));
+      }
     }
     this.layers.districts.addChild(wallsLayer);
     this.districtWallsLayer = wallsLayer;
@@ -3165,9 +3183,14 @@ export class PolisRenderer {
       }
     };
 
-    // Junction nodes: only TRUE trunk hubs (>= ROAD_JUNCTION_MIN routed roads
-    // through a waypoint). Drawn last on the trunk layer. Keyed by quantized
-    // iso so coincident waypoints across roads collapse to one count.
+    // Built-outline cache for urban/rural classification — once per plan, not
+    // per frame. Deterministic from buildings; road Graphics stays signature-gated.
+    const urbanOutlines = collectBuiltOutlines(
+      Array.from(byId.values()),
+    );
+
+    // Urban multi-route hubs (corners n=2, T n=3, true hubs n≥4). Keyed by
+    // quantized iso so coincident waypoints across urban roads collapse.
     const junctionCount = new Map<string, { x: number; y: number; n: number }>();
     const bumpJunction = (p: IsoPoint): void => {
       const key = `${Math.round(p.x)},${Math.round(p.y)}`;
@@ -3177,29 +3200,36 @@ export class PolisRenderer {
     };
 
     // Deterministic draw order: roads arrive stably ordered from the backend.
-    // Visual branch (walls.mapRoadVisualKind): clone/terra_battuta → dirt dash;
-    // semantic → faint dash; trunk import → cobble + edge stones; else hierarchy.
+    // Visual branch (walls.mapRoadVisualKind + isSegmentUrban):
+    //   clone/terra_battuta → dirt dash (minor LOD layer)
+    //   semantic → faint dash (minor LOD layer)
+    //   rural any weight → country track (minor LOD layer)
+    //   urban trunk → limestone cobble + kerb (trunk layer, always on)
+    //   urban minor → paved street + caps (trunk layer, always on)
     for (const road of roads) {
       const heavyImport = road.weight >= ROAD_WEIGHT_TRUNK;
       const am = roadAlphaMult(road.from, road.to);
       if (am === 0) continue;
 
       // Prefer the WORLD-GRID street polyline (>=2 points): draw segment by
-      // segment so each segment is classified by ITS OWN shared-ness — a road
-      // can run as a faint lane until it merges onto a busy avenue, then read
-      // as a trunk for the shared stretch (true street-network feel).
+      // segment so each segment is classified by ITS OWN shared-ness AND urban
+      // context — a heavy import can be limestone in the city and a dirt track
+      // across empty meadow (true city-builder read).
       if (road.path && road.path.length >= 2) {
         const raw = road.path;
         const pts = raw.map((p) => cartToIso(p.x, p.y));
-        let anyTrunk = false;
+        let anyUrbanPaved = false;
         for (let i = 0; i < pts.length - 1; i++) {
           const shared = segUsage.get(segKey(raw[i], raw[i + 1])) ?? 1;
           const isTrunk = heavyImport || shared >= ROAD_SHARED_TRUNK;
-          const kind = mapRoadVisualKind(road, isTrunk);
+          const urban = isSegmentUrban(raw[i], raw[i + 1], urbanOutlines);
+          const kind = mapRoadVisualKind(road, isTrunk, urban);
           if (kind === "dirt_dashed") {
             rotateMinor(drawDirtDashed(minorG, pts[i], pts[i + 1], am));
           } else if (kind === "semantic_faint") {
             rotateMinor(drawSemanticFaint(minorG, pts[i], pts[i + 1], am));
+          } else if (kind === "country_track") {
+            rotateMinor(drawCountryTrack(minorG, pts[i], pts[i + 1], am));
           } else if (kind === "cobble_edged" || kind === "cobble") {
             const edged = kind === "cobble_edged";
             rotateTrunk(
@@ -3213,14 +3243,15 @@ export class PolisRenderer {
                 edged,
               ),
             );
-            anyTrunk = true;
+            anyUrbanPaved = true;
           } else {
-            rotateMinor(this.drawMinorLane(minorG, pts[i], pts[i + 1], am));
+            // urban_street — paved city lane on the always-visible trunk layer
+            rotateTrunk(drawUrbanStreet(trunkG, pts[i], pts[i + 1], am));
+            anyUrbanPaved = true;
           }
         }
-        // Only count junctions for trunk-bearing routes — minor kinks are not
-        // intersections worth a disc.
-        if (anyTrunk) {
+        // Junction hubs only for urban-paved routes (city fabric joints).
+        if (anyUrbanPaved) {
           for (let i = 1; i < pts.length - 1; i++) bumpJunction(pts[i]);
           bumpJunction(pts[0]);
           bumpJunction(pts[pts.length - 1]);
@@ -3228,49 +3259,46 @@ export class PolisRenderer {
         continue;
       }
 
-      // Fallback: no routed path. These straight `from`->`to` lines cut
-      // corner-to-corner across the map and ARE the spiderweb — they don't
-      // follow streets and can't share segments. So a straight fallback is
-      // NEVER a cobbled trunk, regardless of weight. Clone/semantic still get
-      // their distinct dashed looks; everything else is a faint minor lane.
-      const from = byId.get(road.from);
-      const to = byId.get(road.to);
-      if (!from || !to) continue; // only draw roads whose endpoints exist
-      const a = cartToIso(from.coords.x, from.coords.y);
-      const b = cartToIso(to.coords.x, to.coords.y);
-      const kind = mapRoadVisualKind(road, false);
+      // Fallback: no routed path. Straight `from`->`to` lines cut across the
+      // map — never cobbled trunk. Context still applies when endpoints exist.
+      const fromB = byId.get(road.from);
+      const toB = byId.get(road.to);
+      if (!fromB || !toB) continue; // only draw roads whose endpoints exist
+      const a = cartToIso(fromB.coords.x, fromB.coords.y);
+      const b = cartToIso(toB.coords.x, toB.coords.y);
+      const urban = isSegmentUrban(fromB.coords, toB.coords, urbanOutlines);
+      const kind = mapRoadVisualKind(road, false, urban);
       if (kind === "dirt_dashed") {
         rotateMinor(drawDirtDashed(minorG, a, b, am));
       } else if (kind === "semantic_faint") {
         rotateMinor(drawSemanticFaint(minorG, a, b, am));
+      } else if (kind === "country_track") {
+        rotateMinor(drawCountryTrack(minorG, a, b, am));
       } else {
-        rotateMinor(this.drawMinorLane(minorG, a, b, am));
+        rotateTrunk(drawUrbanStreet(trunkG, a, b, am));
+        bumpJunction(a);
+        bumpJunction(b);
       }
     }
 
-    // True trunk-hub discs. A single neutral disc tidies the overlap where many
-    // avenues genuinely meet. Static (one pass, no per-frame work).
+    // Urban multi-route pavement discs (corners, T-junctions, hubs).
     for (const j of junctionCount.values()) {
       if (j.n >= ROAD_JUNCTION_MIN) {
-        trunkG
-          .circle(j.x, j.y, 4)
-          .fill({ color: ROAD.junction, alpha: ROAD_ALPHA.junction });
+        rotateTrunk(drawUrbanHub(trunkG, j.x, j.y, j.n));
       }
     }
 
     this.layers.roads.addChild(minorLayer);
     this.layers.roads.addChild(trunkLayer);
-    // Hand the minor layer to the LOD pass; set its initial visibility/alpha now
-    // (cull runs next tick, but this avoids a one-frame flash at the wrong LOD).
+    // Hand the minor (rural/clone/semantic) layer to the LOD pass; urban streets
+    // sit on trunkLayer and stay visible at every zoom.
     this.roadMinorLayer = minorLayer;
     this.applyRoadLod(this.viewport.scale.x);
   }
 
-  // TRUNK: cobbled lastricata — alternating muted stones + a soft kerb. Width
-  // and alpha scale with BOTH import weight AND shared-ness so the busiest
-  // avenues read widest/most solid. Drawn into the shared trunk Graphics at a
-  // flat alpha so crossings stay clean.
-  // T6a: returns fill+stroke count so drawRoads can rotate Graphics chunks.
+  // TRUNK: urban limestone cobble — alternating pave tones + kerb + end caps.
+  // Width scales with import weight AND shared-ness. Drawn into the trunk
+  // Graphics at a flat alpha so crossings stay clean. T6a: returns ops.
   private drawTrunk(
     g: Graphics,
     from: IsoPoint,
@@ -3325,7 +3353,7 @@ export class PolisRenderer {
               // texture per shape bounds; global keeps one continuous
               // pattern across all stone quads in this Graphics.
               textureSpace: "global" as const,
-              color: i % 2 === 0 ? 0xfff2dc : 0xeadfc4,
+              color: i % 2 === 0 ? ROAD.trunkStone : ROAD.trunkStoneAlt,
               alpha: ROAD_ALPHA.trunkFill * alphaMult,
             }
           : { color, alpha: ROAD_ALPHA.trunkFill * alphaMult },
@@ -3339,24 +3367,25 @@ export class PolisRenderer {
     if (edgeStones) {
       ops += drawTrunkEdgeStones(g, from, to, roadWidth, alphaMult);
     }
+    // End caps close miter gaps at corners within a polyline.
+    const capR = Math.min(ROAD_GEOMETRY.urbanCapRadius, roadWidth / 2);
+    g.circle(from.x, from.y, capR).fill({
+      color: ROAD.trunkStoneAlt,
+      alpha: ROAD_ALPHA.junction * alphaMult,
+    });
+    g.circle(to.x, to.y, capR).fill({
+      color: ROAD.trunkStoneAlt,
+      alpha: ROAD_ALPHA.junction * alphaMult,
+    });
+    ops += 2;
     return ops;
   }
 
-  // MINOR: a single faint desaturated earth line — a hint of a footpath, not a
-  // cobbled street. One stroke per segment into the shared minor Graphics at a
-  // flat low alpha; LOD fades/hides the whole layer when zoomed out.
-  // T6a: returns stroke count so drawRoads can rotate Graphics chunks.
-  private drawMinorLane(g: Graphics, from: IsoPoint, to: IsoPoint, alphaMult = 1): number {
-    g.moveTo(from.x, from.y).lineTo(to.x, to.y);
-    g.stroke({ color: ROAD.minorPath, alpha: ROAD_ALPHA.minor * alphaMult, width: 2 });
-    return 1; // 1 stroke
-  }
-
-  // LOD for roads: fade/hide the minor-lane layer by zoom. Allocation-free —
-  // only flips visibility + alpha on the prebuilt sub-container. Below
-  // LOD_ROAD_MINOR the far view shows trunks only; above it the minor lanes
-  // ramp from invisible to their drawn alpha so the network reveals as you
-  // zoom in.
+  // LOD for roads: fade/hide the rural/clone/semantic layer by zoom.
+  // Allocation-free — only flips visibility + alpha on the prebuilt
+  // sub-container. Urban streets live on the trunk layer and are unaffected.
+  // Below LOD_ROAD_MINOR the far view shows urban fabric only; above it the
+  // country tracks ramp in so the import graph reveals as you zoom in.
   private applyRoadLod(scale: number): void {
     const layer = this.roadMinorLayer;
     if (!layer) return;
@@ -4289,6 +4318,11 @@ export class PolisRenderer {
     const flickerFreeze = rung >= 2;
     const tileSize = 64;
     const scale = this.viewport.scale.x;
+    // Same disaster LOD as crowd/hero fires — far overview is not a field of glows.
+    if (!disasterEffectsLodVisible(scale)) {
+      for (const sprite of this.haloSprites.values()) sprite.visible = false;
+      return;
+    }
 
     for (const [fileId, sprite] of this.haloSprites) {
       const node = this.buildingNodes.get(fileId);
@@ -4298,11 +4332,16 @@ export class PolisRenderer {
         sprite.visible = false;
         continue;
       }
+      // Smoke-severity: no flame halo (soot column only). Fire/inferno keep glow.
+      const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
+      if (!crowdFireShowsFlame(sev)) {
+        sprite.visible = false;
+        continue;
+      }
       sprite.visible = true;
 
-      const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
-      const baseRadius = sev === "inferno" ? 6 : sev === "fire" ? 4 : 2.5;
-      const baseAlpha = sev === "inferno" ? 0.22 : sev === "fire" ? 0.16 : 0.10;
+      const baseRadius = sev === "inferno" ? 6 : 4;
+      const baseAlpha = sev === "inferno" ? 0.22 : 0.16;
 
       const cf = this.crowdFires.get(fileId);
       const phase = cf ? cf.phase : seededPhaseFromId(fileId);
@@ -4378,9 +4417,11 @@ export class PolisRenderer {
         const node = this.buildingNodes.get(fileId);
         if (!node) continue;
         const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
+        // Smoke originates at the roof (labelDepth = silhouette height above the
+        // iso foot — same quantity makeLabel uses). Flame stays near the body.
         const cf = createCrowdFire(
           this.fireAtlas, fileId, sev,
-          node.iso.x, node.iso.y - 20,
+          node.iso.x, node.iso.y, node.labelDepth,
         );
         cf.fireSprite.eventMode = "none";
         cf.smokeSprite.eventMode = "none";

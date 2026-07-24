@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { Container, Texture } from "pixi.js";
 import {
   seededPhase,
   rankForPromotion,
@@ -9,9 +10,35 @@ import {
   parkHeroFire,
   stepHeroFire,
   createHeroFire,
+  createCrowdFire,
+  retargetHeroFire,
+  crowdFireShowsFlame,
+  SIN_SMOKE,
+  SMOKE_PUFF,
+  bakeFireAtlas,
+  SMOKE_BAKE_SCALE,
+  SMOKE_SPRITE_SCALE,
+  SMOKE_TEX_WIDTH,
+  SMOKE_TEX_HEIGHT,
+  SMOKE_INK_ALPHA_FLOOR,
+  measureSmokeInkCoverage,
+  smokeBakeTimes,
+  enumerateSmokeLobes,
+  enumerateSmokePuffs,
+  smokePuffVerticalSpacing,
+  SMOKE_LOBES_PER_PUFF,
   type HeroFire,
+  type FireAtlas,
 } from "./fire";
 import type { PromotableBuilding } from "./fire";
+import {
+  CHIMNEY_SMOKE_TINT,
+  CHIMNEY_SMOKE_MAX_ALPHA,
+} from "./ambientLife";
+import {
+  LOD_DISASTER,
+  disasterEffectsLodVisible,
+} from "./lod";
 
 describe("seededPhase — determinism", () => {
   it("same fileId → same phase", () => {
@@ -186,5 +213,328 @@ describe("HeroFire crossfade state machine", () => {
     expect(SEVERITY_SCALE.smoke).toBe(0.7);
     expect(SEVERITY_SCALE.fire).toBe(1.0);
     expect(SEVERITY_SCALE.inferno).toBe(1.2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STEP 1 regressions — severity taxonomy, LOD gate, sin- vs activity-smoke
+// ---------------------------------------------------------------------------
+
+function makeStubAtlas(): FireAtlas {
+  const fakeRenderer = {
+    generateTexture: () => {
+      const t = { destroy: () => {} } as unknown as Texture;
+      return t;
+    },
+  };
+  return bakeFireAtlas(fakeRenderer);
+}
+
+describe("crowdFireShowsFlame — severity taxonomy", () => {
+  it("smoke → no flame; fire and inferno → flame", () => {
+    expect(crowdFireShowsFlame("smoke")).toBe(false);
+    expect(crowdFireShowsFlame("fire")).toBe(true);
+    expect(crowdFireShowsFlame("inferno")).toBe(true);
+  });
+
+  it("createCrowdFire: smoke-severity has no visible flame; fire/inferno do", () => {
+    const atlas = makeStubAtlas();
+    const smoke = createCrowdFire(atlas, "a.ts", "smoke", 0, 0);
+    const fire = createCrowdFire(atlas, "b.ts", "fire", 0, 0);
+    const inferno = createCrowdFire(atlas, "c.ts", "inferno", 0, 0);
+
+    expect(smoke.fireSprite.visible).toBe(false);
+    expect(smoke.smokeSprite.visible).toBe(true);
+    expect(fire.fireSprite.visible).toBe(true);
+    expect(fire.smokeSprite.visible).toBe(true);
+    expect(inferno.fireSprite.visible).toBe(true);
+    expect(inferno.smokeSprite.visible).toBe(true);
+  });
+
+  it("retargetHeroFire smoke → zero active flame/ember particles", () => {
+    const fakeRenderer = {
+      generateTexture: () => ({ destroy: () => {} } as any),
+    };
+    const hf = createHeroFire(fakeRenderer, "x.ts", 0, 0);
+    retargetHeroFire(hf, "x.ts", "smoke", 10, 20);
+
+    const nf = hf.flameParticles.length;
+    const ne = hf.emberParticles.length;
+    for (let i = 0; i < nf; i++) {
+      expect(hf.particleState[i].active).toBe(false);
+    }
+    for (let i = 0; i < ne; i++) {
+      expect(hf.particleState[nf + i].active).toBe(false);
+    }
+    // At least one smoke particle remains active for the soot column.
+    const smokeActive = hf.particleState
+      .slice(nf + ne)
+      .some((s) => s.active);
+    expect(smokeActive).toBe(true);
+  });
+});
+
+describe("disaster LOD gate — crowd/hero fires", () => {
+  it("pins LOD_DISASTER and hides effects below the gate", () => {
+    expect(LOD_DISASTER).toBe(0.35);
+    expect(disasterEffectsLodVisible(LOD_DISASTER - 0.01)).toBe(false);
+    expect(disasterEffectsLodVisible(LOD_DISASTER)).toBe(true);
+    expect(disasterEffectsLodVisible(LOD_DISASTER + 0.5)).toBe(true);
+    expect(disasterEffectsLodVisible(0.1)).toBe(false);
+  });
+});
+
+describe("sin-smoke vs activity-smoke — must not collapse", () => {
+  it("sooty SIN_SMOKE is darker and denser than cool chimney activity smoke", () => {
+    // Tint / colour families differ (activity = cool blue-gray; sin = warm soot).
+    expect(SIN_SMOKE.colorCore).not.toBe(CHIMNEY_SMOKE_TINT);
+    expect(SIN_SMOKE.colorMid).not.toBe(CHIMNEY_SMOKE_TINT);
+    // Peak opacity of sin-smoke base is far above the thin chimney wisp.
+    expect(SIN_SMOKE.baseAlpha).toBeGreaterThan(CHIMNEY_SMOKE_MAX_ALPHA * 2);
+    // Sin core is a mid warm-grey (sooty, not near-black fog-hole, not meadow).
+    const coreR = (SIN_SMOKE.colorCore >> 16) & 0xff;
+    const coreG = (SIN_SMOKE.colorCore >> 8) & 0xff;
+    const coreB = SIN_SMOKE.colorCore & 0xff;
+    const mean = (coreR + coreG + coreB) / 3;
+    expect(mean).toBeLessThan(100);
+    expect(mean).toBeGreaterThan(55);
+  });
+});
+
+describe("createCrowdFire — smoke origin above the body (STEP 1b)", () => {
+  it("smoke base tracks bodyHeightPx (roof), not a foot constant; flame stays at body", () => {
+    const atlas = makeStubAtlas();
+    // Same geometry as PolisRenderer: iso foot + labelDepth (= makeLabel depthPx).
+    const isoY = 500;
+    const tallDepth = 240; // temple-scale silhouette height above foot
+    const shortDepth = 48; // house-scale
+
+    const tall = createCrowdFire(atlas, "temple.ts", "smoke", 10, isoY, tallDepth);
+    const short = createCrowdFire(atlas, "hut.ts", "smoke", 10, isoY, shortDepth);
+
+    // Flame near the body (fixed lift above foot) — same for both buildings.
+    expect(tall.fireSprite.y).toBe(isoY - 20);
+    expect(short.fireSprite.y).toBe(isoY - 20);
+
+    // Smoke at roof: iso.y - bodyHeight + small ridge inset (must NOT be foot-level).
+    // Fails if smoke is ever placed back at the foot with a constant lift.
+    expect(tall.smokeSprite.y).toBe(isoY - tallDepth + 2);
+    expect(short.smokeSprite.y).toBe(isoY - shortDepth + 2);
+
+    // Smoke sits well above the flame for a tall body (clears the facade).
+    expect(tall.fireSprite.y - tall.smokeSprite.y).toBe(tallDepth - 20 - 2);
+    expect(tall.smokeSprite.y).toBeLessThan(tall.fireSprite.y);
+
+    // Offset is height-driven, not a constant — tall and short differ by depths.
+    expect(short.smokeSprite.y - tall.smokeSprite.y).toBe(tallDepth - shortDepth);
+    expect(tall.smokeSprite.y).not.toBe(short.smokeSprite.y);
+
+    // Guard against the old bug: smoke must not sit near the foot (y - ~6..26).
+    expect(isoY - tall.smokeSprite.y).toBeGreaterThan(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STEP 1c — smoke texture must not be a degenerate 2×N sliver
+// ---------------------------------------------------------------------------
+
+describe("bakeFireAtlas — smoke texture is non-degenerate (STEP 1c)", () => {
+  it("bakes smoke frames with usable width/height (not a 2px thread)", () => {
+    // Smoke frames pass a fixed `frame` to generateTexture (last 6 calls after
+    // 3×8 flame bands). That frame IS the baked texture size in real PIXI.
+    const smokeFrames: { w: number; h: number }[] = [];
+    const spy = {
+      generateTexture: (opts: {
+        target: Container;
+        frame?: { width: number; height: number };
+      }) => {
+        if (opts.frame) {
+          const w = opts.frame.width;
+          const h = opts.frame.height;
+          smokeFrames.push({ w, h });
+          return { width: w, height: h, destroy: () => {} } as unknown as Texture;
+        }
+        // Flame bands still use bounds-based capture.
+        const b = opts.target.getLocalBounds();
+        return {
+          width: Math.ceil(b.width) || 1,
+          height: Math.ceil(b.height) || 1,
+          destroy: () => {},
+        } as unknown as Texture;
+      },
+    };
+
+    const atlas = bakeFireAtlas(spy);
+    expect(atlas.smokes).toHaveLength(6);
+    expect(smokeFrames).toHaveLength(6);
+
+    // Regression pin: was 2×13 (or 2×8). Texture must be a real plume band.
+    expect(SMOKE_TEX_WIDTH).toBeGreaterThanOrEqual(40);
+    expect(SMOKE_TEX_HEIGHT).toBeGreaterThanOrEqual(48);
+    for (const tex of atlas.smokes) {
+      expect(tex.width).toBeGreaterThanOrEqual(40);
+      expect(tex.height).toBeGreaterThanOrEqual(48);
+      expect(tex.width).toBe(SMOKE_TEX_WIDTH);
+      expect(tex.height).toBe(SMOKE_TEX_HEIGHT);
+    }
+    for (const f of smokeFrames) {
+      expect(f.w).toBe(SMOKE_TEX_WIDTH);
+      expect(f.h).toBe(SMOKE_TEX_HEIGHT);
+    }
+
+    // Bake resolution ≠ on-screen size: sprite scale is the world-size lever.
+    expect(SMOKE_BAKE_SCALE).toBeGreaterThanOrEqual(0.8);
+    expect(SMOKE_SPRITE_SCALE).toBeGreaterThan(0);
+    expect(SMOKE_SPRITE_SCALE).toBeLessThanOrEqual(SMOKE_BAKE_SCALE);
+
+    // createCrowdFire applies the display scale (not bake scale).
+    const cf = createCrowdFire(atlas, "smoke-scale.ts", "smoke", 0, 0, 100);
+    expect(cf.smokeSprite.scale.x).toBeCloseTo(SMOKE_SPRITE_SCALE, 5);
+    expect(cf.smokeSprite.scale.y).toBeCloseTo(SMOKE_SPRITE_SCALE, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STEP 1d — ink must FILL the band (frame size alone is worthless)
+// ---------------------------------------------------------------------------
+
+describe("smoke ink fills the bake band (STEP 1d)", () => {
+  it("alpha-nonzero bbox covers ≥60% width and ≥70% height on every bake frame", () => {
+    const times = smokeBakeTimes();
+    expect(times).toHaveLength(6);
+
+    for (const t of times) {
+      const m = measureSmokeInkCoverage(t, SMOKE_BAKE_SCALE, SMOKE_INK_ALPHA_FLOOR);
+      // Predictor of on-screen visibility: ink bbox vs frame (not frame alone).
+      expect(m.widthRatio).toBeGreaterThanOrEqual(0.6);
+      expect(m.heightRatio).toBeGreaterThanOrEqual(0.7);
+      // Opaque enough: a meaningful fraction of the bbox is actual soot, not
+      // a one-pixel outline of a huge empty rectangle.
+      expect(m.fillRatio).toBeGreaterThanOrEqual(0.25);
+      // ~4–7 puffs in the column (overlap merges them visually).
+      expect(m.puffCount).toBeGreaterThanOrEqual(4);
+      expect(m.puffCount).toBeLessThanOrEqual(7);
+    }
+  });
+
+  it("STEP 3: consecutive puffs overlap (continuous column, not beads)", () => {
+    // Spacing must sit below mid-life diameter so envelopes intersect.
+    const spacing = smokePuffVerticalSpacing(1);
+    const rMid =
+      SMOKE_PUFF.r0Min +
+      0.5 * SMOKE_PUFF.r0Span +
+      0.5 * SMOKE_PUFF.growth;
+    const diameterMid = 2 * rMid;
+    // Overlap ratio: spacing / diameter < 1 (gap would be beads-on-a-string).
+    expect(spacing / diameterMid).toBeLessThan(0.75);
+    expect(spacing).toBeLessThan(diameterMid);
+
+    // Geometry pin: every consecutive pair on every bake frame intersects.
+    for (const t of smokeBakeTimes()) {
+      const puffs = enumerateSmokePuffs(t, 1);
+      expect(puffs.length).toBeGreaterThanOrEqual(4);
+      for (let i = 0; i < puffs.length - 1; i++) {
+        const a = puffs[i];
+        const b = puffs[i + 1];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        expect(dist).toBeLessThan(a.r + b.r);
+      }
+    }
+
+    // Cadence still yields ~4–6 alive (not a solid fog wall of 10+).
+    const lifetime = 1 / SMOKE_PUFF.rate;
+    const alive = lifetime / SMOKE_PUFF.interval;
+    expect(alive).toBeGreaterThanOrEqual(4);
+    expect(alive).toBeLessThanOrEqual(7);
+  });
+
+  it("STEP 3: neighbouring puff radii vary (not identical beads)", () => {
+    // Parameter pin: birth radius span is large relative to r0Min.
+    expect(SMOKE_PUFF.r0Span).toBeGreaterThanOrEqual(5.0);
+    expect(SMOKE_PUFF.r0Span / SMOKE_PUFF.r0Min).toBeGreaterThanOrEqual(0.7);
+
+    // Residual after stripping pure age-growth: |Δr − growth×Δage| ≈ |Δr0|.
+    // Identical beads (same r0) would leave residual ≈ 0.
+    const g = SMOKE_PUFF.growth;
+    let pairCount = 0;
+    let sumResidual = 0;
+    let maxResidual = 0;
+    for (const t of smokeBakeTimes()) {
+      const puffs = enumerateSmokePuffs(t, 1);
+      const ordered = [...puffs].sort((a, b) => a.age - b.age);
+      for (let i = 0; i < ordered.length - 1; i++) {
+        const younger = ordered[i];
+        const older = ordered[i + 1];
+        const dr = older.r - younger.r;
+        const pureGrowth = g * (older.age - younger.age);
+        const residual = Math.abs(dr - pureGrowth);
+        sumResidual += residual;
+        maxResidual = Math.max(maxResidual, residual);
+        pairCount++;
+      }
+    }
+    expect(pairCount).toBeGreaterThan(0);
+    const meanResidual = sumResidual / pairCount;
+    // Floor: mean |Δr0| must be clearly above noise (span/3 ≈ 2 for span 6).
+    expect(meanResidual).toBeGreaterThan(1.5);
+    expect(maxResidual).toBeGreaterThan(3.5);
+  });
+
+  it("STEP 3: multi-lobe puffs break the pure circle (offset satellites)", () => {
+    const puffs = enumerateSmokePuffs(smokeBakeTimes()[0], 1);
+    const lobes = enumerateSmokeLobes(smokeBakeTimes()[0], 1);
+    expect(SMOKE_LOBES_PER_PUFF).toBeGreaterThanOrEqual(4);
+    expect(lobes.length).toBe(puffs.length * SMOKE_LOBES_PER_PUFF);
+
+    // Within each puff's lobe group, centres are not all identical (not concentric).
+    for (let p = 0; p < puffs.length; p++) {
+      const group = lobes.slice(
+        p * SMOKE_LOBES_PER_PUFF,
+        (p + 1) * SMOKE_LOBES_PER_PUFF,
+      );
+      const radii = group.map((L) => L.r);
+      const minR = Math.min(...radii);
+      const maxR = Math.max(...radii);
+      // Different lobe radii (union silhouette is bumpy).
+      expect(maxR / minR).toBeGreaterThan(1.25);
+      // At least one satellite is offset from the main body centre.
+      const main = group[0];
+      const anyOffset = group
+        .slice(1)
+        .some((L) => Math.hypot(L.x - main.x, L.y - main.y) > main.r * 0.25);
+      expect(anyOffset).toBe(true);
+    }
+  });
+
+  it("on-screen plume size is honestly mid-building scale at zoom 1", () => {
+    // Arithmetic: onScreen ≈ inkBBox × SMOKE_SPRITE_SCALE (zoom 1).
+    // Target band: ~20–30 wide × ~50–70 tall for a mid building.
+    const times = smokeBakeTimes();
+    let minW = Infinity;
+    let maxW = -Infinity;
+    let minH = Infinity;
+    let maxH = -Infinity;
+    for (const t of times) {
+      const m = measureSmokeInkCoverage(t);
+      const screenW = m.inkW * SMOKE_SPRITE_SCALE;
+      const screenH = m.inkH * SMOKE_SPRITE_SCALE;
+      minW = Math.min(minW, screenW);
+      maxW = Math.max(maxW, screenW);
+      minH = Math.min(minH, screenH);
+      maxH = Math.max(maxH, screenH);
+    }
+    // All frames land in the readable plume band (not hairline, not facade veil).
+    expect(minW).toBeGreaterThanOrEqual(18);
+    expect(maxW).toBeLessThanOrEqual(38);
+    expect(minH).toBeGreaterThanOrEqual(45);
+    expect(maxH).toBeLessThanOrEqual(80);
+  });
+
+  it("enumerateSmokeLobes matches lobe count of a populated column", () => {
+    const lobes = enumerateSmokeLobes(smokeBakeTimes()[0], 1);
+    // SMOKE_LOBES_PER_PUFF × 4–7 puffs.
+    expect(lobes.length).toBeGreaterThanOrEqual(SMOKE_LOBES_PER_PUFF * 4);
+    expect(lobes.length).toBeLessThanOrEqual(SMOKE_LOBES_PER_PUFF * 7);
+    expect(lobes.every((L) => L.r > 0 && L.a > 0)).toBe(true);
   });
 });

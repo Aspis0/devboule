@@ -23,6 +23,7 @@
 import {
   Container,
   Graphics,
+  Rectangle,
   Sprite,
   Texture,
   ParticleContainer,
@@ -52,6 +53,111 @@ const SEVERITY_RANK: Record<FireSeverity, number> = {
   smoke: 1,
 };
 
+/**
+ * Whether this severity draws a flame (flip-book or hero particles).
+ * Smoke-severity buildings emit soot columns only — never orange fire.
+ */
+export function crowdFireShowsFlame(severity: FireSeverity): boolean {
+  return severity === "fire" || severity === "inferno";
+}
+
+/**
+ * Sin-smoke look (worst severity === "smoke"): sooty warm-grey column of
+ * irregular, overlapping puffs. Must stay visually distinct from ambient
+ * activity chimney smoke (cool blue-gray, thin wisp, CHIMNEY_SMOKE_*).
+ *
+ * Colours sit in a mid warm-grey band — sooty vs cool chimney smoke, but not
+ * near-black (a dark mass this size reads as a hole / fog glitch).
+ *
+ * STEP 3 — silhouette (not architecture): consecutive puffs overlap and merge,
+ * radii vary strongly and grow with age, each puff is multi-lobe (bumpy, not a
+ * bead), column densest at the roof and dissolving upward, tilted by wind.
+ * baseAlpha is the design peak; per-lobe alpha is a fraction of it so stacked
+ * overlap does not re-create an opaque dark smear (see lobeAlphaWeight).
+ *
+ * STEP 1d — ink must fill the band (not a hairline in a padded frame). Geometry
+ * is sized so the alpha-nonzero bbox covers ≥60% width / ≥70% height of the
+ * bake frame; on-screen size is frame × ink coverage × SMOKE_SPRITE_SCALE.
+ */
+export const SIN_SMOKE = {
+  /** Sooty warm-grey core (mid value — not near-black). */
+  colorCore: 0x524a42,
+  /** Mid body. */
+  colorMid: 0x6b6258,
+  /** Soft outer lobe (still warmer/darker than terrain). */
+  colorEdge: 0x82786c,
+  /**
+   * Design peak opacity (user-tuned for limestone + meadow visibility).
+   * Per-lobe fills use baseAlpha × lobeAlphaWeight × age-fade — not this raw.
+   */
+  baseAlpha: 0.8,
+  /** Rise (px) over a puff's life. */
+  rise: 96,
+  /** Horizontal wind lean amplitude over life (column tilt, not per-puff scatter). */
+  driftSpan: 34,
+  /**
+   * Multiplier on baseAlpha for the main body lobe at birth.
+   * Overlap composites; 0.42 → single ~0.34, two-puff stack ~0.56, not near-1 smear.
+   */
+  lobeAlphaWeight: 0.42,
+} as const;
+
+/**
+ * Shared puff cadence + radius growth for drawSmokeFrame and ink-coverage
+ * measurement. lifetime = 1/rate; alive ≈ lifetime/interval ≈ 5–6.
+ *
+ * STEP 3: vertical spacing = interval × rate × rise must sit *below* the
+ * mid-life diameter so consecutive puffs intersect (continuous column), while
+ * r0Span keeps neighbours differently sized (not a bead chain of clones).
+ */
+export const SMOKE_PUFF = {
+  interval: 0.34,
+  rate: 0.48,
+  /** Birth radius range: r0Min .. r0Min+r0Span (wide span → neighbour size pop). */
+  r0Min: 7.5,
+  r0Span: 6.0,
+  /** Radius growth over life: r = (r0 + age * growth) * scale (column widens). */
+  growth: 9.5,
+  /** Lateral spawn half-width (px at scale 1): x0 ∈ [-pxHalf, +pxHalf]. */
+  pxHalf: 3.5,
+} as const;
+
+/** Lobes drawn per puff (main body + offset satellites — bumpy silhouette). */
+export const SMOKE_LOBES_PER_PUFF = 5;
+
+/** Flame sits this many px above the building iso foot (body, not roof). */
+const CROWD_FLAME_FOOT_LIFT = 20;
+/** Smoke base sits this many px below the ridge peak (into the roof edge). */
+const CROWD_SMOKE_RIDGE_INSET = 2;
+
+/**
+ * Smoke flip-book bake scale — draw resolution only. On-screen size is
+ * SMOKE_SPRITE_SCALE. (Bake 0.3 + tight STEP-1b radii + bounds-based capture
+ * collapsed the band to a 2×13 sliver.)
+ */
+export const SMOKE_BAKE_SCALE = 1.0;
+/**
+ * Fixed generateTexture frame (px at SMOKE_BAKE_SCALE). Sized to hold a filled
+ * column of separated puffs (STEP 1d ink-fill), not a hairline with padding.
+ */
+export const SMOKE_TEX_WIDTH = 48;
+export const SMOKE_TEX_HEIGHT = 96;
+/**
+ * Crowd smoke sprite scale. Visible plume ≈ inkBBox × scale.
+ * With ~70–90%×48 / ~100%×96 ink fill → on-screen ≈ 23–31 × 66–67 at zoom 1
+ * (mid building plume: readable column, not a facade veil / not a thread).
+ */
+export const SMOKE_SPRITE_SCALE = 0.7;
+/** Phase base so every baked frame has a populated column (~5 alive puffs). */
+const SMOKE_BAKE_T0 = 2.0;
+/** Flip-book cycle length (must match bakeSmokeBand). */
+const SMOKE_CYCLE_PERIOD = 1.4;
+/** Minimum lobe alpha counted as visible soot for ink-coverage measurement. */
+export const SMOKE_INK_ALPHA_FLOOR = 0.08;
+
+const FIRE_FRAMES = 8;
+const SMOKE_FRAMES = 6;
+
 export { SEVERITY_SPAWN_MULTIPLIER, SEVERITY_SCALE, SEVERITY_RANK };
 
 // ---- Deterministic seeded helpers (NO Math.random) ----
@@ -80,6 +186,8 @@ export interface FireTextureSource {
     target: Container;
     resolution?: number;
     antialias?: boolean;
+    /** When set, bake this region instead of local bounds (smoke band pad). */
+    frame?: Rectangle;
   }): Texture;
 }
 
@@ -109,37 +217,299 @@ function drawFlameFrame(g: Graphics, t: number, scale: number, tint: number): vo
   g.circle(0, -11 * s, 30 * s).fill({ color: applyTint(0xf2922e, tint), alpha: 0.2 + 0.07 * Math.sin(t * 9) });
 }
 
-function drawSmokeFrame(g: Graphics, t: number, scale: number): void {
+/** One filled circle lobe in draw-space (matches drawSmokeFrame fills). */
+export interface SmokeLobe {
+  x: number;
+  y: number;
+  r: number;
+  a: number;
+}
+
+/** One puff envelope (center + design radius) — for spacing / variation tests. */
+export interface SmokePuffGeom {
+  x: number;
+  y: number;
+  /** Design radius (r0 + age × growth) × scale — lobe hull extends ~1.15× this. */
+  r: number;
+  /** Main-body lobe alpha at this age. */
+  a: number;
+  age: number;
+}
+
+/**
+ * Vertical spacing between consecutive puff centres (draw-space, scale 1).
+ * spacing = interval × rate × rise. Overlap when spacing < r_i + r_j.
+ */
+export function smokePuffVerticalSpacing(scale: number = 1): number {
+  return SMOKE_PUFF.interval * SMOKE_PUFF.rate * SIN_SMOKE.rise * scale;
+}
+
+/** Internal puff sample including the seeded lobe rotation angle. */
+interface SmokePuffSample extends SmokePuffGeom {
+  ang0: number;
+}
+
+/**
+ * Shared spawn loop for puff envelopes (and lobe expansion).
+ * Wind is shared per frame so the column leans as one; wobble is per-puff.
+ */
+function sampleSmokePuffs(t: number, scale: number): SmokePuffSample[] {
   const s = scale;
-  g.clear();
-  const puffInterval = 0.28;
-  const puffRate = 0.42;
-  // Walk backwards from t to find all puffs alive at this time.
-  for (let spawnT = t; spawnT >= 0; spawnT -= puffInterval) {
-    const age = (t - spawnT) * puffRate;
+  const puffs: SmokePuffSample[] = [];
+  const { interval, rate, r0Min, r0Span, growth, pxHalf } = SMOKE_PUFF;
+  // Shared wind phase for this frame — tilts the whole column as one lean.
+  const wind = Math.sin(t * 1.7) * SIN_SMOKE.driftSpan;
+
+  for (let spawnT = t; spawnT >= 0; spawnT -= interval) {
+    const age = (t - spawnT) * rate;
     if (age > 1) continue;
 
     const seed = Math.floor(spawnT * 1000);
     const rng = xmur3Fast(seed);
-    const px = (rng() * 4 - 2) * s;
-    const drift = (rng() * 17 - 7) * s;
-    const r0 = 3 + rng() * 2;
+    const px = (rng() * (pxHalf * 2) - pxHalf) * s;
+    // Small per-puff wobble on top of the shared wind lean (not full scatter).
+    const wobble = (rng() * 2 - 1) * SIN_SMOKE.driftSpan * 0.22 * s;
+    const r0 = r0Min + rng() * r0Span;
+    const ang0 = rng() * Math.PI * 2;
 
-    const y = -age * 52 * s;
-    const x = px + drift * age;
-    const r = (r0 + age * 13) * s;
-    const a = 0.5 * (1 - age);
+    const y = -age * SIN_SMOKE.rise * s;
+    const x = px + wind * age * s + wobble * age;
+    const r = (r0 + age * growth) * s;
+    // Fade the top, weight the base — still dissolves upward, stays above ink floor longer.
+    const fade = Math.pow(1 - age, 0.95);
+    const a = SIN_SMOKE.baseAlpha * SIN_SMOKE.lobeAlphaWeight * fade;
 
-    g.circle(x, y, r).fill({ color: 0x7e7868, alpha: a });
-    g.circle(x - r * 0.25, y - r * 0.22, r * 0.62).fill({ color: 0x9c968a, alpha: a * 0.8 });
-    g.circle(x - r * 0.4, y - r * 0.35, r * 0.34).fill({ color: 0xb6b0a2, alpha: a * 0.5 });
+    puffs.push({ x, y, r, a, age, ang0 });
+  }
+  return puffs;
+}
+
+/**
+ * Enumerate puff envelopes alive at time `t` (centers + design radii).
+ * Same spawn loop as drawSmokeFrame / enumerateSmokeLobes.
+ */
+export function enumerateSmokePuffs(t: number, scale: number): SmokePuffGeom[] {
+  return sampleSmokePuffs(t, scale).map(({ x, y, r, a, age }) => ({
+    x,
+    y,
+    r,
+    a,
+    age,
+  }));
+}
+
+/**
+ * Expand one puff into offset lobes of *different* radii (bumpy silhouette).
+ * Not concentric rings — satellites sit off-centre so the union is irregular.
+ */
+function lobesForPuff(
+  x: number,
+  y: number,
+  r: number,
+  a: number,
+  ang0: number,
+): SmokeLobe[] {
+  // Satellite defs: unit offsets × r, radius fraction, alpha fraction of main.
+  const sats: { ox: number; oy: number; rr: number; aa: number }[] = [
+    { ox: 0.52, oy: -0.38, rr: 0.68, aa: 0.82 },
+    { ox: -0.48, oy: 0.22, rr: 0.52, aa: 0.72 },
+    { ox: 0.18, oy: 0.55, rr: 0.58, aa: 0.68 },
+    { ox: -0.32, oy: -0.48, rr: 0.42, aa: 0.55 },
+  ];
+  const c = Math.cos(ang0);
+  const sn = Math.sin(ang0);
+  const out: SmokeLobe[] = [{ x, y, r: r * 0.7, a }];
+  for (const L of sats) {
+    const ox = (L.ox * c - L.oy * sn) * r;
+    const oy = (L.ox * sn + L.oy * c) * r;
+    out.push({
+      x: x + ox,
+      y: y + oy,
+      r: r * L.rr,
+      a: a * L.aa,
+    });
+  }
+  return out;
+}
+
+/**
+ * Enumerate every soot lobe alive at time `t` (same params as drawSmokeFrame).
+ * Analytical stand-in for GPU readback — used by ink-coverage tests.
+ */
+export function enumerateSmokeLobes(t: number, scale: number): SmokeLobe[] {
+  const lobes: SmokeLobe[] = [];
+  for (const p of sampleSmokePuffs(t, scale)) {
+    const puffLobes = lobesForPuff(p.x, p.y, p.r, p.a, p.ang0);
+    for (const L of puffLobes) lobes.push(L);
+  }
+  return lobes;
+}
+
+/** Bake-frame rectangle in draw-space at the given bake scale. */
+export function smokeBakeFrameRect(scale: number): {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+} {
+  const s = scale / SMOKE_BAKE_SCALE;
+  return {
+    x: (-SMOKE_TEX_WIDTH / 2) * s,
+    y: (-SMOKE_TEX_HEIGHT + 8) * s,
+    w: SMOKE_TEX_WIDTH * s,
+    h: SMOKE_TEX_HEIGHT * s,
+  };
+}
+
+export interface SmokeInkCoverage {
+  /** Alpha-nonzero bounding-box width / frame width. */
+  widthRatio: number;
+  /** Alpha-nonzero bounding-box height / frame height. */
+  heightRatio: number;
+  /** Fraction of bbox samples with any lobe alpha ≥ floor. */
+  fillRatio: number;
+  inkW: number;
+  inkH: number;
+  frameW: number;
+  frameH: number;
+  lobeCount: number;
+  puffCount: number;
+}
+
+/**
+ * Measure how much of the bake frame is filled by drawn soot (analytical).
+ * Samples the frame grid; a sample is ink if any lobe covers it with a ≥ floor.
+ * This is the number that predicts on-screen visibility — not frame size alone.
+ */
+export function measureSmokeInkCoverage(
+  t: number,
+  scale: number = SMOKE_BAKE_SCALE,
+  alphaFloor: number = SMOKE_INK_ALPHA_FLOOR,
+): SmokeInkCoverage {
+  const frame = smokeBakeFrameRect(scale);
+  const allLobes = enumerateSmokeLobes(t, scale);
+  // Lobe groups of SMOKE_LOBES_PER_PUFF; count before alpha floor culls faded tips.
+  const puffCount = Math.floor(allLobes.length / SMOKE_LOBES_PER_PUFF);
+  const lobes = allLobes.filter((L) => L.a >= alphaFloor && L.r > 0);
+
+  // 1px grid over the frame (integer sample centers).
+  const step = 1;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let inkSamples = 0;
+  const cols = Math.max(1, Math.ceil(frame.w / step));
+  const rows = Math.max(1, Math.ceil(frame.h / step));
+
+  for (let iy = 0; iy < rows; iy++) {
+    const py = frame.y + (iy + 0.5) * step;
+    for (let ix = 0; ix < cols; ix++) {
+      const px = frame.x + (ix + 0.5) * step;
+      let hit = false;
+      for (const L of lobes) {
+        const dx = px - L.x;
+        const dy = py - L.y;
+        if (dx * dx + dy * dy <= L.r * L.r) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        inkSamples++;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+      }
+    }
+  }
+
+  if (inkSamples === 0) {
+    return {
+      widthRatio: 0,
+      heightRatio: 0,
+      fillRatio: 0,
+      inkW: 0,
+      inkH: 0,
+      frameW: frame.w,
+      frameH: frame.h,
+      lobeCount: lobes.length,
+      puffCount,
+    };
+  }
+
+  // BBox of ink samples (sample centers → expand half-step to pixel extent).
+  const inkW = maxX - minX + step;
+  const inkH = maxY - minY + step;
+  // Re-count fill inside the ink bbox only.
+  let bboxSamples = 0;
+  let bboxInk = 0;
+  const bx0 = minX - step * 0.5;
+  const by0 = minY - step * 0.5;
+  const bCols = Math.max(1, Math.ceil(inkW / step));
+  const bRows = Math.max(1, Math.ceil(inkH / step));
+  for (let iy = 0; iy < bRows; iy++) {
+    const py = by0 + (iy + 0.5) * step;
+    for (let ix = 0; ix < bCols; ix++) {
+      const px = bx0 + (ix + 0.5) * step;
+      // Stay inside frame
+      if (px < frame.x || px >= frame.x + frame.w || py < frame.y || py >= frame.y + frame.h) {
+        continue;
+      }
+      bboxSamples++;
+      for (const L of lobes) {
+        const dx = px - L.x;
+        const dy = py - L.y;
+        if (dx * dx + dy * dy <= L.r * L.r) {
+          bboxInk++;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    widthRatio: inkW / frame.w,
+    heightRatio: inkH / frame.h,
+    fillRatio: bboxSamples > 0 ? bboxInk / bboxSamples : 0,
+    inkW,
+    inkH,
+    frameW: frame.w,
+    frameH: frame.h,
+    lobeCount: lobes.length,
+    puffCount,
+  };
+}
+
+/**
+ * Bake times used for the six smoke flip-book frames (matches bakeSmokeBand).
+ */
+export function smokeBakeTimes(): number[] {
+  const times: number[] = [];
+  for (let i = 0; i < SMOKE_FRAMES; i++) {
+    times.push(SMOKE_BAKE_T0 + (i / SMOKE_FRAMES) * SMOKE_CYCLE_PERIOD);
+  }
+  return times;
+}
+
+/**
+ * Sin-smoke flip-book frame: overlapping multi-lobe puffs that merge into a
+ * continuous, irregular column (STEP 3 — not beads on a string). ~5–6 alive.
+ * STEP 1d: puff radii fill the bake band (see measureSmokeInkCoverage).
+ */
+function drawSmokeFrame(g: Graphics, t: number, scale: number): void {
+  g.clear();
+  const lobes = enumerateSmokeLobes(t, scale);
+  // Cycle sooty core / mid / edge tints across irregular lobes.
+  const colors = [SIN_SMOKE.colorCore, SIN_SMOKE.colorMid, SIN_SMOKE.colorEdge];
+  for (let i = 0; i < lobes.length; i++) {
+    const L = lobes[i];
+    g.circle(L.x, L.y, L.r).fill({ color: colors[i % 3], alpha: L.a });
   }
 }
 
 // ---- Atlas bake ----
-
-const FIRE_FRAMES = 8;
-const SMOKE_FRAMES = 6;
 
 export interface FireAtlas {
   flames: Record<FireSeverity, Texture[]>;
@@ -195,7 +565,9 @@ export function bakeFireAtlas(
         fire: bakeFlameBand(renderer, 0.4, 0xffffff),
         inferno: bakeFlameBand(renderer, 0.6, 0xcc3322),
       };
-  const smokes = bakeSmokeBand(renderer, 0.28);
+  // Bake at SMOKE_BAKE_SCALE for texture resolution; sprites use
+  // SMOKE_SPRITE_SCALE for world size (see createCrowdFire).
+  const smokes = bakeSmokeBand(renderer, SMOKE_BAKE_SCALE);
   return { flames, smokes };
 }
 
@@ -259,15 +631,24 @@ function bakeFlameBand(renderer: FireTextureSource, scale: number, tint: number)
 
 function bakeSmokeBand(renderer: FireTextureSource, scale: number): Texture[] {
   const frames: Texture[] = [];
-  const cyclePeriod = 1.4;
   const g = new Graphics();
   const container = new Container();
   container.addChild(g);
+  // Fixed frame in draw-space (scale-relative): width/height match the exported
+  // SMOKE_TEX_* at scale === SMOKE_BAKE_SCALE. STEP 1d fills this band with
+  // soot (not a hairline padded into a large transparent frame).
+  const fr = smokeBakeFrameRect(scale);
+  const frame = new Rectangle(fr.x, fr.y, fr.w, fr.h);
 
-  for (let i = 0; i < SMOKE_FRAMES; i++) {
-    const t = (i / SMOKE_FRAMES) * cyclePeriod;
+  // smokeBakeTimes() already offsets past the empty birth window.
+  for (const t of smokeBakeTimes()) {
     drawSmokeFrame(g, t, scale);
-    const tex = renderer.generateTexture({ target: container, resolution: 1, antialias: false });
+    const tex = renderer.generateTexture({
+      target: container,
+      resolution: 1,
+      antialias: false,
+      frame,
+    });
     frames.push(tex);
   }
 
@@ -295,24 +676,45 @@ export interface CrowdFire {
   lastSmokeFrame: number;
 }
 
+/**
+ * @param x Building iso foot X (front-bottom anchor).
+ * @param y Building iso foot Y (front-bottom anchor).
+ * @param bodyHeightPx Silhouette height above the iso foot — same quantity as
+ *   `labelDepth` / `makeLabel`'s `depthPx`. Smoke anchors at the roof line;
+ *   flame stays near the body. When 0 (tests without height), smoke gets a
+ *   small lift above the flame only.
+ */
 export function createCrowdFire(
   atlas: FireAtlas,
   fileId: string,
   severity: FireSeverity,
   x: number,
   y: number,
+  bodyHeightPx = 0,
 ): CrowdFire {
   const phase = seededPhase(fileId);
   const fireIdx = Math.abs(Math.floor(phase)) % FIRE_FRAMES;
   const smokeIdx = Math.abs(Math.floor(phase / 7)) % SMOKE_FRAMES;
 
-  const fireSprite = new Sprite(atlas.flames[severity][fireIdx]);
+  // Fire band only used when severity shows flame; smoke-severity still picks a
+  // texture so a later severity upgrade can flip the sprite without rebuild.
+  const fireSprite = new Sprite(atlas.flames[severity === "smoke" ? "fire" : severity][fireIdx]);
   fireSprite.anchor.set(0.5, 1);
-  fireSprite.position.set(x, y);
+  // Flames belong on the body (near the foot), not on the roof.
+  fireSprite.position.set(x, y - CROWD_FLAME_FOOT_LIFT);
+  fireSprite.visible = crowdFireShowsFlame(severity);
 
   const smokeSprite = new Sprite(atlas.smokes[smokeIdx]);
   smokeSprite.anchor.set(0.5, 1);
-  smokeSprite.position.set(x, y - 10);
+  // World size is sprite scale, not bake scale — texture stays high-res.
+  smokeSprite.scale.set(SMOKE_SPRITE_SCALE);
+  // Roof origin: same height basis as the file label (`-depthPx`), inset a hair
+  // below the ridge so the column reads as lifting off the building.
+  const smokeY =
+    bodyHeightPx > 0
+      ? y - bodyHeightPx + CROWD_SMOKE_RIDGE_INSET
+      : y - CROWD_FLAME_FOOT_LIFT - (severity === "smoke" ? 6 : 10);
+  smokeSprite.position.set(x, smokeY);
 
   return { fireSprite, smokeSprite, phase, severity, lastFireFrame: fireIdx, lastSmokeFrame: smokeIdx };
 }
@@ -458,7 +860,7 @@ export function createHeroFire(
     const p = new Particle(texture);
     p.x = x; p.y = y;
     p.alpha = i < smokeCount ? 1 : 0; // Particle has no `visible`; alpha 0 = inert (state.life 0 keeps it dead)
-    p.tint = 0x7e7868;
+    p.tint = SIN_SMOKE.colorMid;
     p.scaleX = 0.6; p.scaleY = 0.6;
     container.addParticle(p);
     smokeParticles.push(p);
@@ -500,9 +902,19 @@ export function retargetHeroFire(
 
   const flameBase = Math.round(28 + rngSeq() * 12);
   const mult = SEVERITY_SPAWN_MULTIPLIER[severity];
-  const flameCount = Math.min(MAX_FLAMES, Math.round(flameBase * mult));
-  const emberCount = Math.min(MAX_EMBERS, Math.round((8 + rngSeq() * 4) * mult));
-  const smokeCount = Math.min(MAX_SMOKE, Math.round((6 + rngSeq() * 4) * mult));
+  // Smoke-severity heroes: soot only — no flame/ember particles.
+  const showsFlame = crowdFireShowsFlame(severity);
+  const flameCount = showsFlame
+    ? Math.min(MAX_FLAMES, Math.round(flameBase * mult))
+    : 0;
+  const emberCount = showsFlame
+    ? Math.min(MAX_EMBERS, Math.round((8 + rngSeq() * 4) * mult))
+    : 0;
+  // Smoke-severity gets a fuller soot column; fire/inferno keep the lighter cap.
+  const smokeCount = Math.min(
+    MAX_SMOKE,
+    Math.round((showsFlame ? 6 + rngSeq() * 4 : 8 + rngSeq() * 2) * mult),
+  );
   const scaleExtra = SEVERITY_SCALE[severity];
 
   const resetParticle = (

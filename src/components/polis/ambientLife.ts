@@ -63,8 +63,9 @@ export const BIRDS_SEED = 0xb1d5_c0de;
 /** Day-phase darkness threshold above which night windows read. */
 export const NIGHT_WINDOW_DARKNESS_THRESHOLD = 0.35;
 
-// Soft cool blue-gray smoke (distinct from warm disaster fire smoke).
-const CHIMNEY_SMOKE_TINT = darken(DERIVED.smokeCool, 0.06);
+// Soft cool blue-gray smoke (distinct from sooty sin-smoke in fire.SIN_SMOKE).
+// Exported so tests can pin the activity-vs-sin visual split.
+export const CHIMNEY_SMOKE_TINT = darken(DERIVED.smokeCool, 0.06);
 
 /** Max sprite alpha for idle chimney puffs — thin wisp, not a plume. */
 export const CHIMNEY_SMOKE_MAX_ALPHA = 0.18;

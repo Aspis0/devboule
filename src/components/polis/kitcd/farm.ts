@@ -10,6 +10,7 @@
 import { Graphics } from "pixi.js";
 import { MAT, shade as S, poly as isoPoly, outlinePoly, type Proj } from "./iso";
 import { olive } from "./detail";
+import { CONTACT_SHADOW } from "../contactShadow";
 
 /**
  * Optional real-art base fill (A4): when provided, the parcel's flat base
@@ -267,9 +268,14 @@ export function fallowField(
     const pt = proj.p(rx, ry, 0.01);
     const s = 2 + rnd(seed + i * 23) * 2.5;
     // Shadow.
-    g.ellipse(pt.x + 1.5, pt.y + s * 0.35, s * 0.9, s * 0.35).fill({
+    g.ellipse(
+      pt.x + CONTACT_SHADOW.offsetX,
+      pt.y + s * 0.35 + CONTACT_SHADOW.offsetY,
+      s * 0.9,
+      s * 0.35,
+    ).fill({
       color: S(MAT.shadow, 0.8),
-      alpha: 0.2,
+      alpha: CONTACT_SHADOW.alpha,
     });
     // Stone body.
     const rot = rnd(seed + i * 17) * Math.PI;
@@ -296,7 +302,12 @@ export function haystack(
 ): void {
   const p = proj.p(gx + 0.5, gy + 0.5, 0);
   // Shadow.
-  g.ellipse(p.x + 3, p.y + 2, 14, 6).fill({ color: S(MAT.shadow, 0.8), alpha: 0.22 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX,
+    p.y + CONTACT_SHADOW.offsetY,
+    14,
+    6,
+  ).fill({ color: S(MAT.shadow, 0.8), alpha: CONTACT_SHADOW.alpha });
   // Base layer.
   g.ellipse(p.x, p.y - 3, 12, 8).fill({ color: S(MAT.thatch, 0.92) });
   // Top layer (slightly smaller, lighter).
@@ -331,7 +342,12 @@ export function farmShed(
 
   const p = proj.p(gx + 0.5, gy + 0.5, 0);
   // Shadow.
-  g.ellipse(p.x + 4, p.y + 2, 16, 7).fill({ color: S(MAT.shadow, 0.8), alpha: 0.2 });
+  g.ellipse(
+    p.x + CONTACT_SHADOW.offsetX,
+    p.y + CONTACT_SHADOW.offsetY,
+    16,
+    7,
+  ).fill({ color: S(MAT.shadow, 0.8), alpha: CONTACT_SHADOW.alpha });
 
   // Walls — a low box (simpler than building kit).
   const wallW = 18;
