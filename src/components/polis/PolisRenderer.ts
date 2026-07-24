@@ -84,9 +84,17 @@ import {
   buildTerrainFrame,
   type TerrainChunk,
 } from "./terrain";
-import { occupiedTiles, drawProps, planForestPatches } from "./props";
+import { occupiedTiles, drawProps, planForestPatches, basePropCap } from "./props";
 import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
 import { planResourceSites, resourceSiteTiles, type ResourceCity, type ResourceSite } from "./resources";
+import {
+  planPiers,
+  drawPiers,
+  planShorelineDecor,
+  drawShorelineDecor,
+  type ShoreDecorItem,
+} from "./coast";
+import { LOD_FIELDS, LOD_WALLS } from "./lod";
 import {
   buildBuildingParts,
   buildPennant,
@@ -156,8 +164,8 @@ const CHUNK_SIZE = 8; // tiles per chunk side
 // field of tiny flames and the per-step fire redraw is skipped when off. When
 // hidden, `Disaster.update` early-returns on `node.visible === false`.
 const LOD_DISASTER = 0.35;
-// Farmland parcels: too fine at the far overview; hidden below this zoom.
-const LOD_FIELDS = 0.3;
+// LOD_FIELDS / LOD_WALLS live in ./lod so tests can pin the Phase-5 split
+// (fields extend further out; walls keep the tighter overview band).
 // External cloud outposts (harbour nodes) at the map margin: small procedural
 // structures, legible once the city itself is readable. Hidden in the far view
 // (same band as agents) so the margin doesn't speckle the zoomed-out overview.
@@ -561,8 +569,10 @@ export class PolisRenderer {
     bounds: Rectangle;
     visible: boolean;
   }[] = [];
-  // Fields (farmland parcels) — one Graphics, LOD-gated at zoom >= 0.3.
+  // Fields (farmland parcels) — one Graphics, LOD-gated at LOD_FIELDS.
   private fieldsGraphics: Graphics | null = null;
+  // Harbor–sea piers (Phase 5) — one Graphics, LOD-gated with terrain details.
+  private pierGraphics: Graphics | null = null;
   // T6a — terrain grid Graphics tracked separately for zoom gating (sub-pixel
   // below zoom 0.5; hidden there to save ~557 draw calls).
   private terrainGridGraphics: Graphics | null = null;
@@ -2602,6 +2612,7 @@ export class PolisRenderer {
       this.fieldsGraphics.destroy();
       this.fieldsGraphics = null;
     }
+    this.pierGraphics = null; // destroyed with terrain layer children above
     this.clearResourceSites();
     const ext = computeExtent(
       buildings.map((b) => b.coords),
@@ -2662,10 +2673,76 @@ export class PolisRenderer {
       resourceSiteTileSet = resourceSiteTiles(drawableSites);
     }
 
-    this.drawPropsLayer(ext, buildings, fieldTileSet, resourceSiteTileSet);
+    // Plan shoreline decor BEFORE props so shore tile keys can block prop
+    // scatter (no double rocks on the same sand tile). Pure + deterministic.
+    const shoreItems = terrain ? planShorelineDecor(terrain) : [];
+    const shoreBlocked = new Set<string>();
+    for (const item of shoreItems) shoreBlocked.add(`${item.gx},${item.gy}`);
+
+    this.drawPropsLayer(
+      ext,
+      buildings,
+      fieldTileSet,
+      resourceSiteTileSet,
+      districts,
+      shoreBlocked,
+    );
     // Water frame on top of the grass ground but BELOW everything else (it lives
     // in the terrain layer). Chunked so the cull pass can hide off-screen water.
     this.drawWaterFrame(terrain);
+    // Harbor–sea glue piers + shoreline props (on top of water/sand, still in
+    // the terrain layer). Pure decoration; never invents sea or buildings.
+    // Reuses the pre-planned shore items so props + coast share one plan.
+    this.drawCoastDecor(buildings, terrain, shoreItems);
+  }
+
+  /**
+   * Pier walkways from harbor/lighthouse buildings toward real water, plus
+   * sparse shoreline rocks/reeds/foam. LOD-gated with terrain details so the
+   * far overview stays clean; shore chunks share terrain-frame culling.
+   */
+  private drawCoastDecor(
+    buildings: Building[],
+    terrain?: TerrainData,
+    // Pre-planned by buildTerrainLayer so prop scatter can block the same keys.
+    shoreItems: readonly ShoreDecorItem[] = [],
+  ): void {
+    if (!terrain) return;
+
+    // Piers: max 8, nearest harbors with water in reach.
+    const pierPlans = planPiers(buildings, terrain);
+    if (pierPlans.length > 0) {
+      const pierG = drawPiers(pierPlans);
+      // Same band as fine terrain detail — piers are small at far zoom.
+      pierG.visible = this.viewport.scale.x >= this.lodDetails;
+      this.pierGraphics = pierG;
+      this.layers.terrain.addChild(pierG);
+    }
+
+    // Shoreline scatter: sand tiles adjacent to water, cap ~180.
+    // Items are planned once in buildTerrainLayer (before props) and passed in.
+    if (shoreItems.length === 0) return;
+    const shoreChunks = drawShorelineDecor(shoreItems, CHUNK_SIZE);
+    const showShore = this.viewport.scale.x >= this.lodDetails;
+    for (const sc of shoreChunks) {
+      sc.container.visible = showShore;
+      this.layers.terrain.addChild(sc.container);
+      // Approximate iso bounds from chunk key for the cull pass.
+      const [csx, csy] = sc.key.split(",").map(Number);
+      const a = cartToIso(csx * CHUNK_SIZE, csy * CHUNK_SIZE);
+      const b = cartToIso((csx + 1) * CHUNK_SIZE, (csy + 1) * CHUNK_SIZE);
+      const c = cartToIso((csx + 1) * CHUNK_SIZE, csy * CHUNK_SIZE);
+      const d = cartToIso(csx * CHUNK_SIZE, (csy + 1) * CHUNK_SIZE);
+      const minX = Math.min(a.x, b.x, c.x, d.x) - 48;
+      const maxX = Math.max(a.x, b.x, c.x, d.x) + 48;
+      const minY = Math.min(a.y, b.y, c.y, d.y) - 48;
+      const maxY = Math.max(a.y, b.y, c.y, d.y) + 48;
+      this.terrainChunks.push({
+        chunk: { key: `shore:${sc.key}`, container: sc.container, anim: null },
+        bounds: new Rectangle(minX, minY, maxX - minX, maxY - minY),
+        visible: true,
+      });
+    }
   }
 
   /** Build the sparse sea/river/sand/bridge frame into CHUNK-keyed containers and
@@ -2720,6 +2797,10 @@ export class PolisRenderer {
     buildings: Building[],
     fieldTiles?: Set<string> | null,
     resourceSiteTiles?: Set<string> | null,
+    districts?: District[],
+    // Shore decor tiles (from planShorelineDecor) — block prop scatter so
+    // rocks/reeds/foam and countryside props never double-place on one tile.
+    shoreBlocked?: Set<string> | null,
   ): void {
     const occupied = occupiedTiles(buildings.map((b) => b.coords));
     // Buildings-only snapshot: tall tree sprites only need clearance from
@@ -2733,15 +2814,23 @@ export class PolisRenderer {
     if (resourceSiteTiles) {
       for (const key of resourceSiteTiles) occupied.add(key);
     }
-    // Plan forest patches: 3-5 dense tree clusters in the countryside.
+    // Union shore decor keys so drawProps never stacks on planShorelineDecor tiles.
+    if (shoreBlocked) {
+      for (const key of shoreBlocked) occupied.add(key);
+    }
+    // Plan forest patches: 5–8 dense clusters + outer countryside ring.
     // Guard: only plan patches when the bank has tree sprites (no bank or
-    // missing keys → no patches, base cap).
+    // missing keys → no patches, base cap for this profile tier).
+    const tier = this.profile?.tier ?? "rich";
     const hasTreeSprites = this.spriteBank != null &&
       (this.spriteBank.pickVariant("prop:tree", "probe") != null ||
        this.spriteBank.pickVariant("prop:cypress", "probe") != null);
     const { patches: forestPatches, cap: forestCap } = hasTreeSprites
-      ? planForestPatches(ext, occupied)
-      : { patches: [], cap: 2800 };
+      ? planForestPatches(ext, occupied, {
+          tier,
+          districts: districts?.map((d) => ({ bounds: d.bounds })),
+        })
+      : { patches: [], cap: basePropCap(tier) };
     const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers, forestPatches, forestCap);
     for (const g of graphics) this.layers.terrain.addChild(g);
   }
@@ -2887,7 +2976,7 @@ export class PolisRenderer {
     }
 
     // District walls — planned once, baked into chunked Graphics. Sit on the
-    // bounds diamond; LOD-hidden with LOD_FIELDS so the far view stays clean.
+    // bounds diamond; LOD-hidden with LOD_WALLS so the far view stays clean.
     // Water set + city centre + buildingsById computed once per draw (not per
     // district). Caller already change-gates this whole rebuild.
     const water = waterTileSet(terrain?.water);
@@ -2925,7 +3014,7 @@ export class PolisRenderer {
     // alpha; redraw must not restore opaque cages around ghosted buildings).
     wallsLayer.alpha = this.filterSets ? 0.25 : 1;
     // Seed LOD from current zoom (cull runs next tick).
-    wallsLayer.visible = this.viewport.scale.x >= LOD_FIELDS;
+    wallsLayer.visible = this.viewport.scale.x >= LOD_WALLS;
   }
 
   // ---------------------------------------------------------------------------
@@ -3912,8 +4001,11 @@ export class PolisRenderer {
 
     // Terrain water chunks: same cull, so off-screen sea/river geometry is hidden
     // AND its shimmer is skipped per frame (the update loop gates on `visible`).
+    // Shore decoration chunks (key prefix `shore:`) also require terrain-detail LOD.
+    const showShoreLod = this.viewport.scale.x >= this.lodDetails;
     for (const tc of this.terrainChunks) {
-      const vis = view.intersects(tc.bounds);
+      let vis = view.intersects(tc.bounds);
+      if (tc.chunk.key.startsWith("shore:")) vis = vis && showShoreLod;
       tc.chunk.container.visible = vis;
       tc.visible = vis;
     }
@@ -3931,6 +4023,7 @@ export class PolisRenderer {
       const showDetails = scale >= this.lodDetails;
       const showLivery = scale >= LOD_LIVERY;
       const showDisaster = scale >= LOD_DISASTER;
+      if (this.pierGraphics) this.pierGraphics.visible = showDetails;
       for (const node of this.buildingNodes.values()) {
         // LABEL — ATTACH-ON-DEMAND with hysteresis. At/above LOD_LABELS_IN: create
         // the Text + parent it (topmost child) if absent. Below LOD_LABELS_OUT:
@@ -3990,12 +4083,12 @@ export class PolisRenderer {
       // External cloud outposts: hidden in the far view (same band as agents) so
       // the seaward margin doesn't speckle the zoomed-out overview.
       this.externalLayer.setLodVisible(scale >= LOD_EXTERNAL);
-      // Fields (farmland): hidden below LOD_FIELDS so the far view is clean.
+      // Fields (farmland): soft LOD so parcels stay readable a bit further out.
       if (this.fieldsGraphics) this.fieldsGraphics.visible = scale >= LOD_FIELDS;
-      // District walls: same band as fields/labels detail — far overview keeps
-      // only the tint diamond, walls appear once the city is readable.
+      // District walls: tighter band than fields (Phase 5 split) — walls get
+      // noisy sooner than soft field tints at far overview.
       if (this.districtWallsLayer) {
-        this.districtWallsLayer.visible = scale >= LOD_FIELDS;
+        this.districtWallsLayer.visible = scale >= LOD_WALLS;
       }
       // T6a — terrain grid: sub-pixel below zoom 0.5, hide to save ~557 draw calls.
       if (this.terrainGridGraphics) this.terrainGridGraphics.visible = scale >= 0.5;
@@ -4490,6 +4583,7 @@ export class PolisRenderer {
       .forEach((c) => c.destroy({ children: true }));
     this.terrainChunks = [];
     this.fieldsGraphics = null;
+    this.pierGraphics = null;
     this.terrainGridGraphics = null;
     this.clearResourceSites();
     this.layers.districts

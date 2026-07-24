@@ -21,8 +21,8 @@ import {
 import { SpriteBank } from "./spriteAssets";
 import { isoToCart } from "./iso";
 
-// An extent where the base cap (2800) binds: ~120×120 = 14400 tiles × 0.24
-// density ≈ 3456 expected props, exceeding 2800.
+// An extent where the rich base cap (3400) binds: ~120×120 = 14400 tiles × 0.24
+// density ≈ 3456 expected props, exceeding 3400 once stalls/rocks/olives fill.
 const EXT_BUST = { minX: 0, maxX: 119, minY: 0, maxY: 119 };
 
 // A small extent where the base cap does NOT bind (for determinism tests).
@@ -38,11 +38,11 @@ function treeBank(): SpriteBank {
 }
 
 describe("planForestPatches", () => {
-  it("returns 3-5 patches (or fewer if extent is tiny)", () => {
+  it("returns 5-8 patches (or fewer if extent is tiny)", () => {
     const occupied = new Set<string>();
     const { patches } = planForestPatches(EXT_SMALL, occupied);
     expect(patches.length).toBeGreaterThanOrEqual(0);
-    expect(patches.length).toBeLessThanOrEqual(5);
+    expect(patches.length).toBeLessThanOrEqual(8);
   });
 
   it("is deterministic: same input → same output", () => {
@@ -63,9 +63,17 @@ describe("planForestPatches", () => {
     }
   });
 
-  it("cap is raised proportionally to patch count", () => {
+  it("cap is raised proportionally to patch count (rich base 3400)", () => {
     const occupied = new Set<string>();
     const { patches, cap } = planForestPatches(EXT_SMALL, occupied);
+    expect(cap).toBe(3400 + patches.length * 120);
+  });
+
+  it("lean tier keeps the historical 2800 base", () => {
+    const occupied = new Set<string>();
+    const { patches, cap } = planForestPatches(EXT_SMALL, occupied, {
+      tier: "lean",
+    });
     expect(cap).toBe(2800 + patches.length * 120);
   });
 });
@@ -78,8 +86,8 @@ describe("drawProps forest cap behavior", () => {
 
     // With the raised cap, the forest path has more room.
     const withForest = drawProps(EXT_BUST, occupied, bank, occupied, patches, forestCap);
-    // With the base cap, the non-forest path is limited.
-    const withoutForest = drawProps(EXT_BUST, occupied, bank, occupied, [], 2800);
+    // With the rich base cap, the non-forest path is limited.
+    const withoutForest = drawProps(EXT_BUST, occupied, bank, occupied, [], 3400);
 
     // The raised cap should allow at least as many props (likely more).
     expect(withForest.propCount).toBeGreaterThanOrEqual(withoutForest.propCount);
@@ -123,7 +131,7 @@ describe("drawProps forest cap behavior", () => {
     const occupied = new Set<string>();
     const { patches } = planForestPatches(EXT_BUST, occupied);
     // Use the SAME cap for both — rng draws are unconditional.
-    const sameCap = 2800;
+    const sameCap = 3400;
     const { propCount: withForest } = drawProps(EXT_BUST, occupied, bank, occupied, patches, sameCap);
     const { propCount: withoutForest } = drawProps(EXT_BUST, occupied, bank, occupied, [], sameCap);
     expect(withForest).toBe(withoutForest);
@@ -132,7 +140,7 @@ describe("drawProps forest cap behavior", () => {
   it("stream parity holds even without a bank (procedural path)", () => {
     const occupied = new Set<string>();
     const { patches } = planForestPatches(EXT_BUST, occupied);
-    const sameCap = 2800;
+    const sameCap = 3400;
     const withForest = drawProps(EXT_BUST, occupied, null, occupied, patches, sameCap);
     const withoutForest = drawProps(EXT_BUST, occupied, null, occupied, [], sameCap);
     expect(withForest.propCount).toBe(withoutForest.propCount);

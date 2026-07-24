@@ -23,8 +23,24 @@ import { DERIVED } from "./palette";
 import { rngFromCoords, hashCoords, type Rng } from "./rng";
 import type { SpriteBank } from "./spriteAssets";
 import type { TerrainExtent } from "./terrain";
+import type { Bounds } from "../../types/city";
+import type { RenderTier } from "./renderProfile";
 
-const MAX_PROPS = 2800;
+/** Rich-tier base prop cap (Phase 5 countryside density). */
+export const MAX_PROPS_RICH = 3400;
+/** Lean keeps the historical base; minimal is untouched (same floor). */
+export const MAX_PROPS_LEAN = 2800;
+export const MAX_PROPS_MINIMAL = 2800;
+
+/** Base prop cap for a render tier. Rich raises density; lean/minimal stay put. */
+export function basePropCap(tier: RenderTier = "rich"): number {
+  if (tier === "rich") return MAX_PROPS_RICH;
+  if (tier === "lean") return MAX_PROPS_LEAN;
+  return MAX_PROPS_MINIMAL;
+}
+
+// Default (rich) base — used when drawProps has no capOverride.
+const MAX_PROPS = MAX_PROPS_RICH;
 // Raised cap for forest patches: forests add concentrated tree density that
 // can push total props beyond the base cap. The cap is raised proportionally
 // when forest patches exist (see planForestPatches).
@@ -50,12 +66,20 @@ const P_STALL = 0.02;
 // outside (~0.14). The rng draw stays unconditional so stream parity holds.
 const P_OLIVE_FOREST = 0.65;
 
-// Forest patch constants.
-const FOREST_PATCH_COUNT_MIN = 3;
-const FOREST_PATCH_COUNT_MAX = 5;
-const FOREST_RADIUS_MIN = 3;
-const FOREST_RADIUS_MAX = 6;
+// Forest patch constants (Phase 5: denser countryside — was 3–5 / r 3–6).
+const FOREST_PATCH_COUNT_MIN = 5;
+const FOREST_PATCH_COUNT_MAX = 8;
+const FOREST_RADIUS_MIN = 4;
+const FOREST_RADIUS_MAX = 7;
 const FOREST_LATTICE_STEP = 18; // spacing between candidate patch centres
+
+// Outer countryside ring: sparse patches just outside district bounds.
+const OUTER_RING_MARGIN_MIN = 3;
+const OUTER_RING_MARGIN_MAX = 6;
+const OUTER_RING_RADIUS_MIN = 2;
+const OUTER_RING_RADIUS_MAX = 3;
+const OUTER_RING_PER_DISTRICT_MAX = 2;
+const OUTER_RING_GLOBAL_MAX = 12;
 
 // A4 — real tree sprites (UH maples/tupelos). Trees are TALL (≈2 tiles
 // up-screen) and props live BELOW the buildings layer, so a tree drawn too
@@ -205,17 +229,98 @@ function drawStall(g: Graphics, cx: number, cy: number, rng: Rng): void {
   ]).fill({ color: flip ? DERIVED.awningDark : DERIVED.awning, alpha: 0.9 });
 }
 
+/** Options for {@link planForestPatches}. */
+export interface PlanForestOpts {
+  /** Render tier — clamps the base prop cap (rich 3400 / lean+minimal 2800). */
+  tier?: RenderTier;
+  /** District bounds for the outer sparse countryside ring. Absent → no outer ring. */
+  districts?: readonly { bounds: Bounds }[];
+}
+
+/** True when (tx, ty) lies strictly outside every district rectangle. */
+function outsideAllDistricts(
+  tx: number,
+  ty: number,
+  districts: readonly { bounds: Bounds }[],
+): boolean {
+  for (const d of districts) {
+    const b = d.bounds;
+    if (tx >= b.x && tx < b.x + b.w && ty >= b.y && ty < b.y + b.h) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
- * Plan 3-5 forest patches on the countryside. Pure function of extent + blockers.
+ * Sparse outer-ring patches just outside district bounds (countryside only).
+ * Deterministic: 4 side midpoints × margin hash, capped globally.
+ */
+function planOuterRingPatches(
+  districts: readonly { bounds: Bounds }[],
+  occupied: Set<string>,
+): ForestPatch[] {
+  if (districts.length === 0) return [];
+  type Cand = ForestPatch & { h: number };
+  const cands: Cand[] = [];
+
+  for (let di = 0; di < districts.length; di++) {
+    const b = districts[di].bounds;
+    // Four compass midpoints outside the district bbox.
+    const sides: { cx: number; cy: number; salt: number }[] = [
+      { cx: b.x + b.w / 2, cy: b.y - 1, salt: 1 }, // north
+      { cx: b.x + b.w / 2, cy: b.y + b.h, salt: 2 }, // south
+      { cx: b.x - 1, cy: b.y + b.h / 2, salt: 3 }, // west
+      { cx: b.x + b.w, cy: b.y + b.h / 2, salt: 4 }, // east
+    ];
+    for (const side of sides) {
+      const h = hashCoords(side.cx + side.salt * 17, side.cy + di * 31);
+      const margin =
+        OUTER_RING_MARGIN_MIN +
+        (h % (OUTER_RING_MARGIN_MAX - OUTER_RING_MARGIN_MIN + 1));
+      // Push further outward from the bbox edge along the side normal.
+      let cx = Math.round(side.cx);
+      let cy = Math.round(side.cy);
+      if (side.salt === 1) cy = Math.round(b.y) - margin;
+      else if (side.salt === 2) cy = Math.round(b.y + b.h) + margin - 1;
+      else if (side.salt === 3) cx = Math.round(b.x) - margin;
+      else cx = Math.round(b.x + b.w) + margin - 1;
+
+      if (occupied.has(`${cx},${cy}`)) continue;
+      if (!outsideAllDistricts(cx, cy, districts)) continue;
+      const radius =
+        OUTER_RING_RADIUS_MIN +
+        (h % (OUTER_RING_RADIUS_MAX - OUTER_RING_RADIUS_MIN + 1));
+      cands.push({ cx, cy, radius, h });
+    }
+  }
+
+  // Deterministic pick: sort by hash, then at most OUTER_RING_PER_DISTRICT_MAX
+  // worth of global density (capped by OUTER_RING_GLOBAL_MAX).
+  cands.sort((a, b) => a.h - b.h);
+  const want = Math.min(
+    OUTER_RING_GLOBAL_MAX,
+    districts.length * OUTER_RING_PER_DISTRICT_MAX,
+  );
+  return cands.slice(0, want).map(({ cx, cy, radius }) => ({ cx, cy, radius }));
+}
+
+/**
+ * Plan 5–8 forest patches on the countryside (+ optional outer district ring).
+ * Pure function of extent + blockers (+ optional districts/tier).
  * Deterministic: hash-based seeds from the lattice scan, no Math.random.
  *
- * Returns the list of patches and a raised MAX_PROPS that accommodates the
- * concentrated tree density without truncating the global prop cap.
+ * Returns the list of patches and a raised prop cap that accommodates the
+ * concentrated tree density. Base cap is profile-aware (rich 3400 / lean 2800).
  */
 export function planForestPatches(
   ext: TerrainExtent,
   occupied: Set<string>,
+  opts?: PlanForestOpts,
 ): { patches: ForestPatch[]; cap: number } {
+  const tier = opts?.tier ?? "rich";
+  const base = basePropCap(tier);
+
   // Candidate lattice: step 18 tiles gives ~4–6 candidates per map side.
   const cols = Math.max(1, Math.ceil((ext.maxX - ext.minX + 1) / FOREST_LATTICE_STEP));
   const rows = Math.max(1, Math.ceil((ext.maxY - ext.minY + 1) / FOREST_LATTICE_STEP));
@@ -239,16 +344,42 @@ export function planForestPatches(
     const hb = hashCoords(b.cx, b.cy);
     return ha - hb;
   });
-  const count = Math.min(candidates.length, FOREST_PATCH_COUNT_MIN + ((hashCoords(ext.minX, ext.minY) % (FOREST_PATCH_COUNT_MAX - FOREST_PATCH_COUNT_MIN + 1))));
+  const count = Math.min(
+    candidates.length,
+    FOREST_PATCH_COUNT_MIN +
+      (hashCoords(ext.minX, ext.minY) %
+        (FOREST_PATCH_COUNT_MAX - FOREST_PATCH_COUNT_MIN + 1)),
+  );
   const patches = candidates.slice(0, count);
 
+  // Phase 5: second sparse scatter ring outside district bounds.
+  if (opts?.districts && opts.districts.length > 0) {
+    const outer = planOuterRingPatches(opts.districts, occupied);
+    // Dedup centres that already sit inside a main patch, and skip outer-ring
+    // centres that collide with a previously-pushed outer ring patch (adjacent
+    // districts can land on the same tile).
+    const outerCentres = new Set<string>();
+    for (const o of outer) {
+      if (inForestPatch(patches, o.cx, o.cy)) continue;
+      const key = `${o.cx},${o.cy}`;
+      if (occupied.has(key)) continue;
+      if (outerCentres.has(key)) continue;
+      outerCentres.add(key);
+      patches.push(o);
+    }
+  }
+
   // Raised cap: each patch adds concentrated tree density.
-  const cap = MAX_PROPS + patches.length * FOREST_EXTRA_PROPS_PER_PATCH;
+  const cap = base + patches.length * FOREST_EXTRA_PROPS_PER_PATCH;
   return { patches, cap };
 }
 
 /** True when (tx, ty) is inside any forest patch (Chebyshev distance). */
-function inForestPatch(patches: ForestPatch[], tx: number, ty: number): boolean {
+export function inForestPatch(
+  patches: readonly ForestPatch[],
+  tx: number,
+  ty: number,
+): boolean {
   for (const p of patches) {
     const dx = Math.abs(tx - p.cx);
     const dy = Math.abs(ty - p.cy);
