@@ -27,8 +27,10 @@ const HUE_SEA = 0x3f7fa6; // saturated sea-blue bias target
 // DISTINCT color from the orange/red disaster fire (the HONESTY invariant: a
 // suspect is Oracle's GUESS, never a confirmed disaster).
 const HUE_INVESTIGATE = 0x5a6fd8; // indigo-violet bias target
-const HUE_JADE = 0x4a9a7a; // jade green bias target for MiMo livery
+const HUE_JADE = 0x4a9a7a; // jade green bias target for Qwen / legacy MiMo livery
 const HUE_INDIGO = 0x4a5a9e; // indigo blue bias target for DeepSeek livery
+const HUE_TEAL = 0x2a8a8a; // teal bias target for OpenAI livery
+const HUE_STEEL = 0x6a7a8e; // slate/steel bias target for Grok livery
 
 export const PALETTE = {
   cream: 0xf4f0e6,
@@ -148,12 +150,85 @@ export const DERIVED = {
   investigateMark: lighten(saturate(blend(PALETTE.water, HUE_INVESTIGATE, 0.7), 0.12), 0.22),
 
   // Provider livery tints — applied to an agent's tunic to hint at the driving
-  // model family. Pure derivations: jade for MiMo, indigo for DeepSeek, terracotta
-  // for Claude family. No raw hex outside this file.
-  liveryMimo: saturate(blend(PALETTE.grass, HUE_JADE, 0.55), 0.2),
-  liveryDeepseek: saturate(blend(PALETTE.water, HUE_INDIGO, 0.6), 0.15),
+  // model family. Pure derivations from palette hues. No raw hex outside this
+  // file. Matched via MODEL_LIVERIES (ordered family → substrings → tint).
   liveryClaude: PALETTE.terracotta,
+  liveryOpenai: saturate(blend(PALETTE.water, HUE_TEAL, 0.55), 0.2),
+  liveryDeepseek: saturate(blend(PALETTE.water, HUE_INDIGO, 0.6), 0.15),
+  // Jade for Qwen; "mimo" remains a match alias only (see MODEL_LIVERIES).
+  liveryJade: saturate(blend(PALETTE.grass, HUE_JADE, 0.55), 0.2),
+  liveryGrok: saturate(blend(PALETTE.stone, HUE_STEEL, 0.55), 0.08),
 } as const;
+
+/**
+ * Single source of truth for model-family tunic liveries. Ordered list: first
+ * match wins. Matching is case-insensitive against the whole model id
+ * (handles OpenRouter-style "provider/model" ids). Unknown → no entry matches
+ * → callers keep the default per-seed tunic.
+ *
+ * Tokens are deliberately specific (e.g. "gpt-4" not "gpt", "mimo-" not "mimo")
+ * so unrelated architectures/aliases do not false-match. Exact-id aliases go
+ * in `matchExact` (e.g. bare legacy "mimo").
+ *
+ * Display copy (Legend/Guide) and AgentLayer.liveryTint both consume this table.
+ */
+export interface ModelLivery {
+  /** Human family name shown in legend/guide. */
+  family: string;
+  /** Case-insensitive substrings; any hit selects this family. */
+  match: readonly string[];
+  /** Case-insensitive full-id equality matches (after lowercasing). */
+  matchExact?: readonly string[];
+  /** Palette-derived tunic tint (number 0xRRGGBB). */
+  tint: number;
+}
+
+export const MODEL_LIVERIES: readonly ModelLivery[] = [
+  {
+    family: "Claude",
+    match: ["anthropic", "claude", "opus", "fable"],
+    tint: DERIVED.liveryClaude,
+  },
+  {
+    family: "OpenAI",
+    match: ["openai/", "gpt-4", "gpt-3", "gpt-5", "o1-", "o3-", "o4-"],
+    tint: DERIVED.liveryOpenai,
+  },
+  {
+    family: "DeepSeek",
+    match: ["deepseek"],
+    tint: DERIVED.liveryDeepseek,
+  },
+  {
+    // "mimo-" / exact "mimo" kept as legacy aliases for the jade family.
+    family: "Qwen",
+    match: ["qwen", "mimo-"],
+    matchExact: ["mimo"],
+    tint: DERIVED.liveryJade,
+  },
+  {
+    family: "Grok",
+    match: ["x-ai", "grok-", "/grok"],
+    tint: DERIVED.liveryGrok,
+  },
+];
+
+/**
+ * Resolve a model id to a livery tint, or `undefined` when unknown / empty.
+ * Case-insensitive; ordered first-match. Exact tokens win per-entry before
+ * substrings; OpenRouter prefixes ok.
+ */
+export function modelLiveryTint(model?: string | null): number | undefined {
+  if (!model) return undefined;
+  const m = model.toLowerCase();
+  for (const entry of MODEL_LIVERIES) {
+    if (entry.matchExact?.some((ex) => m === ex)) return entry.tint;
+    for (const sub of entry.match) {
+      if (m.includes(sub)) return entry.tint;
+    }
+  }
+  return undefined;
+}
 
 /** Alpha constants reused across the renderer (semantic, not magic numbers). */
 export const ALPHA = {
@@ -280,12 +355,15 @@ export function tierRank(tier: string): number {
 
 // Agent type → omino + glow color. Mirrors the design doc; augur has no omino
 // (invisible agent) but we keep a gold color for its glow if it ever lands on
-// a building.
+// a building. `mini` uses a water/aqua hue fitting the watercarrier figure.
+// Keep these hex values in lockstep with `agent_color_for_type` in
+// src-tauri/src/polis/scanner.rs (frontend wins for glow when type is known).
 export const AGENT_COLORS: Record<string, number> = {
   orchestrator: 0x4a9eff, // blue
   coder: 0xffb347, // orange
   verifier: 0x7fd47f, // green
   augur: 0xd4a843, // gold
+  mini: 0x5ab8c0, // aqua (watercarrier)
 };
 
 // ---------------------------------------------------------------------------
@@ -334,5 +412,6 @@ export function agentColor(type: string, fallback?: string): number {
   if (fallback && /^#?[0-9a-fA-F]{6}$/.test(fallback)) {
     return parseInt(fallback.replace("#", ""), 16);
   }
-  return 0x9a8f80;
+  // Keep in lockstep with Rust AGENT_COLOR_DEFAULT (#B0A99F) in scanner.rs.
+  return 0xb0a99f;
 }

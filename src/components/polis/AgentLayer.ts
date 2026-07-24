@@ -38,7 +38,7 @@
 import { Container, Graphics, Rectangle } from "pixi.js";
 import type { Agent, AgentStatus, AgentType } from "../../types/city";
 import { type IsoPoint, isoToCart } from "./iso";
-import { agentColor, DERIVED } from "./palette";
+import { agentColor, modelLiveryTint } from "./palette";
 import { steppedPulse } from "./effects";
 import { hashString } from "./rng";
 import { SlotAllocator, buildSafeSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint, type SafeSplineLeg } from "./locomotion";
@@ -78,10 +78,11 @@ export function subagentFigureScale(): number {
 
 // Map a Polis agent `type` slug -> a kitcd citizen figure (kitcd/people.ts):
 //   coder        -> builder  (Tekton, swings a hammer)   [1:1 Greek label]
+//   mini         -> watercarrier (mini-coder figure; also selected via parentAgentId)
 //   orchestrator -> noble    (Eupatrides, himation cloak + staff; the authority)
 //   verifier     -> citizen  (Polites) + a magnifier overlay (drawn below)
 //   augur        -> never drawn (skipped off-map in setAgents)
-//   anything else-> citizen  (plain Polites)
+//   anything else-> foreigner (hooded external / unknown)
 //
 // ROLE UNTANGLE (2026-07): "orchestrator" is a FIRST-CLASS stored role again and
 // the `type` slug is a pass-through of it (polis/scanner.rs `derived_agent_type`
@@ -95,6 +96,8 @@ function figureForType(type: AgentType): CitizenType {
   switch (type) {
     case "coder":
       return "builder";
+    case "mini":
+      return "watercarrier";
     case "orchestrator":
       return "noble";
     case "verifier":
@@ -114,7 +117,7 @@ function figureForType(type: AgentType): CitizenType {
  *     coder). This takes PRECEDENCE over `type`, regardless of the underlying
  *     type slug.
  *   - otherwise fall back to the type map ({@link figureForType}): coder→builder,
- *     orchestrator→noble, verifier→citizen, augur→priest,
+ *     mini→watercarrier, orchestrator→noble, verifier→citizen, augur→priest,
  *     anything else→foreigner.
  *
  * Agent rendering routes through here; {@link figureForType} stays for any
@@ -130,14 +133,19 @@ export function figureForAgent(
 /**
  * Polis-P2 — pick the kit figure for a SUBAGENT by its role slug (used by P4 to
  * render each subagent as the scaled-down figure of its OWN role):
- * coder→builder, verifier→citizen, augur→priest, anything else→foreigner. A subagent of a coder
- * is itself doing coder work, so it draws as a builder; the SCALE
- * ({@link subagentFigureScale}) is what marks it as a subordinate, not the figure.
+ * coder→builder, mini→watercarrier, orchestrator→noble, verifier→citizen,
+ * augur→priest, anything else→foreigner. A subagent of a coder is itself doing
+ * coder work, so it draws as a builder; the SCALE ({@link subagentFigureScale})
+ * is what marks it as a subordinate, not the figure.
  */
 export function figureForRole(role: string): CitizenType {
   switch (role) {
     case "coder":
       return "builder";
+    case "mini":
+      return "watercarrier";
+    case "orchestrator":
+      return "noble";
     case "verifier":
       return "citizen";
     case "augur":
@@ -149,28 +157,12 @@ export function figureForRole(role: string): CitizenType {
 
 /**
  * Provider livery tint: returns a PALETTE-derived tunic override colour when
- * the model string matches a known provider family, or `undefined` to use the
- * figure's default tunic. Case-insensitive substring match.
- *
- *   - contains "mimo"  ⇒ jade green
- *   - contains "deepseek" ⇒ indigo
- *   - contains "claude" / "sonnet" / "opus" / "fable" ⇒ terracotta
- *   - otherwise (including undefined / null / empty) ⇒ undefined
+ * the model string matches a known family in {@link modelLiveryTint} /
+ * MODEL_LIVERIES, or `undefined` to use the figure's default tunic.
+ * Case-insensitive substring match on the whole model id (OpenRouter prefixes ok).
  */
 export function liveryTint(model?: string | null): number | undefined {
-  if (!model) return undefined;
-  const m = model.toLowerCase();
-  if (m.includes("mimo")) return DERIVED.liveryMimo;
-  if (m.includes("deepseek")) return DERIVED.liveryDeepseek;
-  if (
-    m.includes("claude") ||
-    m.includes("sonnet") ||
-    m.includes("opus") ||
-    m.includes("fable")
-  ) {
-    return DERIVED.liveryClaude;
-  }
-  return undefined;
+  return modelLiveryTint(model);
 }
 
 // A subtly-varied per-citizen tunic so a crowd of the same role isn't uniform.

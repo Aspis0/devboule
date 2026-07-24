@@ -81,6 +81,7 @@ pub fn agent_type_label(slug: &str) -> String {
     match slug {
         "orchestrator" => "Orchestrator (Strategos)",
         "coder" => "Coder (Tekton)",
+        "mini" => "Mini coder",
         "verifier" => "Verifier (Episkopos)",
         "augur" => "Augur (Mantis)",
         other => return title_case_slug(other),
@@ -505,7 +506,7 @@ pub mod road_style {
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub agent_id: String,
-    /// "orchestrator" | "coder" | "verifier" | "augur" (stable English slug).
+    /// "orchestrator" | "coder" | "mini" | "verifier" | "augur" (stable English slug).
     /// Display label via `agent_type_label`.
     #[serde(rename = "type")]
     pub agent_type: String,
@@ -518,11 +519,11 @@ pub struct Agent {
     /// ISO timestamp of the last augur action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_intervention: Option<String>,
-    /// The driving model string (e.g. "MiMo-V2.5", "deepseek-r1", "claude-sonnet").
-    /// Copied straight from `AgentSession.model` — the Polis walker layer uses it
-    /// to tint the agent tunic by provider family (see `liveryTint`). Additive +
-    /// skip-if-none so older payloads (and agents without a model) round-trip
-    /// byte-identical.
+    /// The driving model string (e.g. "anthropic/claude-sonnet-4", "deepseek-chat",
+    /// "qwen3-coder"). Copied straight from `AgentSession.model` — the Polis walker
+    /// layer uses it to tint the agent tunic by model family (see `liveryTint`).
+    /// Additive + skip-if-none so older payloads (and agents without a model)
+    /// round-trip byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Set when this session is a MINI-CODER spawned by a parent coder
@@ -562,6 +563,7 @@ pub struct AgentSubagentBrief {
 pub mod agent_type {
     pub const ORCHESTRATOR: &str = "orchestrator";
     pub const CODER: &str = "coder";
+    pub const MINI: &str = "mini";
     pub const VERIFIER: &str = "verifier";
     pub const AUGUR: &str = "augur";
 }
@@ -886,6 +888,7 @@ mod tests {
             "Orchestrator (Strategos)"
         );
         assert_eq!(agent_type_label(agent_type::CODER), "Coder (Tekton)");
+        assert_eq!(agent_type_label(agent_type::MINI), "Mini coder");
         assert_eq!(
             agent_type_label(agent_type::VERIFIER),
             "Verifier (Episkopos)"

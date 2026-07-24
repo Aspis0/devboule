@@ -75,6 +75,7 @@ export const PURPOSE_LABELS: Record<string, string> = {
 export const AGENT_TYPE_LABELS: Record<string, string> = {
   orchestrator: "Orchestrator (Strategos)",
   coder: "Coder (Tekton)",
+  mini: "Mini coder",
   verifier: "Verifier (Episkopos)",
   augur: "Augur (Mantis)",
 };
@@ -186,6 +187,7 @@ export type RoadStyle = "terra_battuta" | "lastricata" | "acquedotto";
 export type AgentType =
   | "orchestrator"
   | "coder"
+  | "mini"
   | "verifier"
   | "augur"
   | string;
@@ -357,9 +359,9 @@ export interface Agent {
   color: string;
   lastIntervention?: string;
   /**
-   * The driving model string (e.g. "MiMo-V2.5", "deepseek-r1", "claude-sonnet").
-   * Used by the Polis walker layer to tint the agent tunic by provider family.
-   * Absent (omitted) for agents without a model — no-churn serde.
+   * The driving model string (e.g. "anthropic/claude-sonnet-4", "deepseek-chat",
+   * "qwen3-coder"). Used by the Polis walker layer to tint the agent tunic by
+   * model family. Absent (omitted) for agents without a model — no-churn serde.
    */
   model?: string | null;
   /**

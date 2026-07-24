@@ -51,6 +51,10 @@ describe("figureForAgent — agent type/parent → kit figure", () => {
     expect(figureForAgent(mkAgent({ type: "augur" }))).toBe("priest");
   });
 
+  it("maps mini → watercarrier", () => {
+    expect(figureForAgent(mkAgent({ type: "mini" }))).toBe("watercarrier");
+  });
+
   it("maps an unknown type → foreigner (graceful default)", () => {
     expect(figureForAgent(mkAgent({ type: "sherpa" }))).toBe("foreigner");
     expect(figureForAgent(mkAgent({ type: "whatever" }))).toBe("foreigner");
@@ -77,6 +81,14 @@ describe("figureForRole — subagent role → kit figure", () => {
     expect(figureForRole("coder")).toBe("builder");
   });
 
+  it("maps mini → watercarrier", () => {
+    expect(figureForRole("mini")).toBe("watercarrier");
+  });
+
+  it("maps orchestrator → noble", () => {
+    expect(figureForRole("orchestrator")).toBe("noble");
+  });
+
   it("maps verifier → citizen", () => {
     expect(figureForRole("verifier")).toBe("citizen");
   });
@@ -91,9 +103,8 @@ describe("figureForRole — subagent role → kit figure", () => {
     expect(figureForRole("")).toBe("foreigner");
   });
 
-  it("non-subagent roles fall to the foreigner default", () => {
-    // Subagent roles are coder/verifier/augur; everything else lands on
-    // the foreigner default (unknown/external).
+  it("figure names fall to the foreigner default", () => {
+    // Role slugs map; kit figure names themselves are not roles.
     expect(figureForRole("noble")).toBe("foreigner");
     expect(figureForRole("watercarrier")).toBe("foreigner");
   });
@@ -123,26 +134,99 @@ describe("subagent figure scale (for P4 scaled-down omini)", () => {
   });
 });
 
-describe("liveryTint — provider model → tunic colour", () => {
-  it("returns jade for MiMo (case-insensitive)", () => {
-    const t = liveryTint("MiMo-V2.5");
-    expect(t).toBeDefined();
-    expect(typeof t).toBe("number");
+describe("liveryTint — model family → tunic colour", () => {
+  it("returns jade for Qwen and legacy MiMo alias (case-insensitive)", () => {
+    const qwen = liveryTint("qwen3-coder");
+    expect(qwen).toBeDefined();
+    expect(typeof qwen).toBe("number");
+    // MiMo is a legacy match alias for the same jade family.
+    expect(liveryTint("MiMo-V2.5")).toBe(qwen);
+    expect(liveryTint("MIMO")).toBe(qwen);
+    expect(liveryTint("mimo")).toBe(qwen);
   });
 
-  it("returns indigo for DeepSeek", () => {
-    expect(liveryTint("deepseek-r1")).toBeDefined();
+  it("returns indigo for DeepSeek (same-family equality)", () => {
+    const a = liveryTint("deepseek-chat");
+    const b = liveryTint("deepseek-r1");
+    expect(a).toBeDefined();
+    expect(b).toBe(a);
   });
 
-  it("returns terracotta for Claude family (claude/sonnet/opus/fable)", () => {
-    expect(liveryTint("claude-sonnet-4")).toBeDefined();
-    expect(liveryTint("opus-4")).toBeDefined();
-    expect(liveryTint("fable-turbo")).toBeDefined();
+  it("returns terracotta for Claude family (same-family equality)", () => {
+    const base = liveryTint("anthropic/claude-opus-4");
+    expect(base).toBeDefined();
+    expect(liveryTint("claude-sonnet-4")).toBe(base);
+    expect(liveryTint("opus-4")).toBe(base);
+    expect(liveryTint("fable-turbo")).toBe(base);
+    expect(liveryTint("anthropic/claude-sonnet-4")).toBe(base);
   });
 
-  it("returns undefined for unrelated strings", () => {
-    expect(liveryTint("gpt-4o")).toBeUndefined();
-    expect(liveryTint("qwen-72b")).toBeUndefined();
+  it("returns teal for OpenAI / gpt family (same-family equality)", () => {
+    const openai = liveryTint("openai/gpt-4o-mini");
+    expect(openai).toBeDefined();
+    expect(liveryTint("gpt-4o")).toBe(openai);
+    expect(liveryTint("gpt-3.5-turbo")).toBe(openai);
+    expect(liveryTint("o1-preview")).toBe(openai);
+    expect(liveryTint("o3-mini")).toBe(openai);
+    expect(liveryTint("o4-mini")).toBe(openai);
+    expect(liveryTint("gpt-5-preview")).toBe(openai);
+  });
+
+  it("returns slate for Grok / x-ai family (same-family equality)", () => {
+    const grok = liveryTint("x-ai/grok-2");
+    expect(grok).toBeDefined();
+    expect(liveryTint("grok-beta")).toBe(grok);
+  });
+
+  it("cross-family tints are distinct", () => {
+    const claude = liveryTint("claude-sonnet-4");
+    const openai = liveryTint("openai/gpt-4o");
+    const qwen = liveryTint("qwen3-coder");
+    const deepseek = liveryTint("deepseek-chat");
+    const grok = liveryTint("grok-2");
+    expect(claude).toBeDefined();
+    expect(openai).toBeDefined();
+    expect(qwen).toBeDefined();
+    expect(deepseek).toBeDefined();
+    expect(grok).toBeDefined();
+    expect(claude).not.toBe(openai);
+    expect(claude).not.toBe(qwen);
+    expect(openai).not.toBe(qwen);
+    expect(claude).not.toBe(deepseek);
+    expect(claude).not.toBe(grok);
+    expect(openai).not.toBe(deepseek);
+    expect(openai).not.toBe(grok);
+    expect(qwen).not.toBe(deepseek);
+    expect(qwen).not.toBe(grok);
+    expect(deepseek).not.toBe(grok);
+  });
+
+  it("handles OpenRouter-prefixed ids via whole-string substring match", () => {
+    expect(liveryTint("anthropic/claude-sonnet-4")).toBe(
+      liveryTint("claude-sonnet-4"),
+    );
+    expect(liveryTint("openai/gpt-4o-mini")).toBe(liveryTint("gpt-4o"));
+    expect(liveryTint("deepseek/deepseek-chat")).toBe(
+      liveryTint("deepseek-chat"),
+    );
+    expect(liveryTint("qwen/qwen3-coder")).toBe(liveryTint("qwen3-coder"));
+  });
+
+  it("returns undefined for unknown models", () => {
+    expect(liveryTint("llama-3.1-70b")).toBeUndefined();
+    expect(liveryTint("mistral-large")).toBeUndefined();
+    expect(liveryTint("some-local-model")).toBeUndefined();
+  });
+
+  it("does not false-match substring conflicts", () => {
+    // "gpt" alone is not enough — EleutherAI-style / non-OpenAI architectures.
+    expect(liveryTint("gpt-neox-20b")).toBeUndefined();
+    // "mimo" substring without hyphen / exact token must not hit Qwen.
+    expect(liveryTint("mimosa-7b")).toBeUndefined();
+    // "grok" without hyphen / path boundary must not hit Grok.
+    expect(liveryTint("grokfast")).toBeUndefined();
+    // OpenRouter auto router is not a model family.
+    expect(liveryTint("openrouter/auto")).toBeUndefined();
   });
 
   it("returns undefined for undefined input", () => {
@@ -155,11 +239,6 @@ describe("liveryTint — provider model → tunic colour", () => {
 
   it("returns undefined for empty string", () => {
     expect(liveryTint("")).toBeUndefined();
-  });
-
-  it("matches mixed-case input (e.g. MiMo-V2.5)", () => {
-    expect(liveryTint("MiMo-V2.5")).toBeDefined();
-    expect(liveryTint("MIMO")).toBeDefined();
   });
 });
 

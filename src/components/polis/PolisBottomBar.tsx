@@ -49,7 +49,7 @@ import {
 } from "lucide-react";
 import { OracleAskPanel } from "./OracleAskPanel";
 import { purposeLabel } from "../../types/city";
-import { getProfile, PALETTE, PROVIDER_LIVERY } from "./palette";
+import { getProfile, PALETTE, PROVIDER_LIVERY, MODEL_LIVERIES } from "./palette";
 import { hashString } from "./rng";
 import { useCityStore } from "../../store/cityStore";
 import {
@@ -823,6 +823,57 @@ function FileTypesPanel({ onClose }: { onClose: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared model-livery legend block (Legend list + Help inline)
+// ---------------------------------------------------------------------------
+
+/** 24-bit RGB hex for a palette tint (masks overflow / sign bits). */
+function tintHex(tint: number): string {
+  return `#${(tint & 0xffffff).toString(16).padStart(6, "0")}`;
+}
+
+/**
+ * Data-driven model-family swatches. Renders nothing when MODEL_LIVERIES is
+ * empty so Legend and Help stay in lockstep (no orphan header/parenthetical).
+ */
+function LiveryLegend({ mode }: { mode: "list" | "inline" }) {
+  if (MODEL_LIVERIES.length === 0) return null;
+  if (mode === "list") {
+    return (
+      <ul className="mt-1 flex flex-wrap gap-x-2.5 gap-y-1">
+        {MODEL_LIVERIES.map((l) => (
+          <li key={l.family} className="flex items-center gap-1">
+            <span
+              className="inline-block h-2 w-2 shrink-0 rounded-full ring-1 ring-cream-200"
+              style={{ backgroundColor: tintHex(l.tint) }}
+              aria-hidden
+            />
+            <span className="text-[9px] text-cream-500">{l.family}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return (
+    <>
+      {" "}
+      (
+      {MODEL_LIVERIES.map((l, i) => (
+        <span key={l.family}>
+          {i > 0 ? ", " : null}
+          <span
+            className="mx-0.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full align-middle"
+            style={{ backgroundColor: tintHex(l.tint) }}
+            aria-hidden
+          />
+          {l.family}
+        </span>
+      ))}
+      )
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Legend overlay
 // ---------------------------------------------------------------------------
 
@@ -884,7 +935,7 @@ function LegendOverlay({ onClose }: { onClose: () => void }) {
           {[
             { fig: "Noble", desc: "Orchestrator" },
             { fig: "Builder", desc: "Coder" },
-            { fig: "Water carrier", desc: "Mini-coder" },
+            { fig: "Water carrier", desc: "Mini coder" },
             { fig: "Citizen", desc: "Verifier" },
             { fig: "Priest", desc: "Augur" },
             { fig: "Hooded foreigner", desc: "External / unknown" },
@@ -896,10 +947,10 @@ function LegendOverlay({ onClose }: { onClose: () => void }) {
             </li>
           ))}
         </ul>
-        <p className="mt-1 text-[9px] leading-3 text-cream-400">
-          Tunic tint hints at the model: jade = MiMo, indigo = DeepSeek,
-          terracotta = Claude family.
+        <p className="mt-1.5 text-[9px] leading-3 text-cream-400">
+          Tunic tint follows the model family when known:
         </p>
+        <LiveryLegend mode="list" />
       </div>
 
       <p className="mt-2 border-t border-cream-100 pt-2 text-[10px] leading-4 text-cream-400">
@@ -1027,13 +1078,14 @@ function HelpPanel({
             head and a glow on the building they are editing. Each figure
             reflects the agent’s role: <strong>noble</strong> = orchestrator,
             <strong>builder</strong> = coder, <strong>water carrier</strong> =
-            mini-coder, <strong>citizen</strong> = verifier, <strong>priest</strong> =
+            mini coder, <strong>citizen</strong> = verifier, <strong>priest</strong> =
             augur, and a <strong>hooded foreigner</strong> = external or unknown
-            roles. A tunic tint hints at the driving model: jade = MiMo, indigo =
-            DeepSeek, terracotta = Claude family. The other figures wandering the
-            streets are <strong className="text-cream-700">decorative
-            townsfolk</strong>: scenery to make the city feel alive. They have no
-            arrow, are not clickable, and never represent a real agent.
+            roles. Tunic tint follows the model family when known
+            <LiveryLegend mode="inline" />
+            . The other figures wandering the streets are{" "}
+            <strong className="text-cream-700">decorative townsfolk</strong>:
+            scenery to make the city feel alive. They have no arrow, are not
+            clickable, and never represent a real agent.
           </HelpSection>
 
           <HelpSection icon={Bot} title="A living city">

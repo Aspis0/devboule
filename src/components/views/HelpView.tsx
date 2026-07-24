@@ -175,7 +175,7 @@ export const HELP_SECTIONS: HelpSection[] = [
 		title: "Polis — the city of your code",
 		body: [
 			"Polis is an isometric living map of your codebase. Files are buildings, dependencies are roads and trade routes, agents are walking figures, and the Censor's findings show up as fires.",
-			"Click a building to inspect the file it represents, or a trade route to trace a dependency edge. Use the bottom bar to ask Oracle a question about the code directly from the map, and to filter agents and anomalies.",
+			"Click a building to inspect the file it represents, or a trade route to trace a dependency edge. Use the bottom bar to ask Oracle a question about the code directly from the map, and to filter buildings, anomalies, quarters, and paths.",
 		],
 		link: { label: "Open Polis", view: "polis" },
 	},

@@ -5005,11 +5005,14 @@ mod apply_sins_filtered_tests {
 // now we resolve to a stable, representative building for the agent's project
 // subtree — see `pick_representative_building`.
 
-/// Color palette for the three visible agent kinds (omino + glow). Augur is the
-/// off-map surveyor and reuses the orchestrator hue if it ever appears.
-const AGENT_COLOR_ORCHESTRATOR: &str = "#C9A227";
-const AGENT_COLOR_CODER: &str = "#FFB347";
-const AGENT_COLOR_VERIFIER: &str = "#6FB3D6";
+/// Glow/omino colors for agent kinds — must stay in lockstep with frontend
+/// `AGENT_COLORS` in `src/components/polis/palette.ts` (0xRRGGBB → "#RRGGBB").
+/// Frontend wins for glow when the type is known; these seed `Agent.color`.
+const AGENT_COLOR_ORCHESTRATOR: &str = "#4a9eff";
+const AGENT_COLOR_CODER: &str = "#ffb347";
+const AGENT_COLOR_VERIFIER: &str = "#7fd47f";
+const AGENT_COLOR_AUGUR: &str = "#d4a843";
+const AGENT_COLOR_MINI: &str = "#5ab8c0";
 const AGENT_COLOR_DEFAULT: &str = "#B0A99F";
 
 /// Map a real MCP session `role` to the stable Polis agent `type` slug. Unknown
@@ -5022,6 +5025,7 @@ pub fn agent_type_for_role(role: &str) -> String {
         "coder" => agent_type::CODER.to_string(),
         "verifier" => agent_type::VERIFIER.to_string(),
         "augur" => agent_type::AUGUR.to_string(),
+        "mini" => agent_type::MINI.to_string(),
         other => other.to_string(),
     }
 }
@@ -5040,9 +5044,11 @@ pub fn derived_agent_type(role: &str) -> String {
 /// Glow/omino color for a Polis agent `type` slug.
 fn agent_color_for_type(agent_type: &str) -> &'static str {
     match agent_type {
-        "orchestrator" | "augur" => AGENT_COLOR_ORCHESTRATOR,
+        "orchestrator" => AGENT_COLOR_ORCHESTRATOR,
         "coder" => AGENT_COLOR_CODER,
         "verifier" => AGENT_COLOR_VERIFIER,
+        "augur" => AGENT_COLOR_AUGUR,
+        "mini" => AGENT_COLOR_MINI,
         _ => AGENT_COLOR_DEFAULT,
     }
 }

@@ -53,6 +53,19 @@ function polisDebug(line: string): void {
   }
 }
 
+/** Roster secondary label: strip OpenRouter-style provider prefix, truncate. */
+function shortModelLabel(model: string, max = 18): string {
+  const trimmed = model.trim();
+  if (!trimmed) return "";
+  const bare = (
+    trimmed.includes("/") ? (trimmed.split("/").pop() ?? trimmed) : trimmed
+  ).trim();
+  if (!bare) return "";
+  if (bare.length <= max) return bare;
+  if (max <= 1) return "…";
+  return `${bare.slice(0, max - 1)}…`;
+}
+
 export function PolisView() {
   const hostRef = useRef<HTMLDivElement>(null);
   const polisFocusedRef = useRef(false);
@@ -818,6 +831,7 @@ export function PolisView() {
                 const off = offMapAgentIds.has(a.agentId);
                 const isSel =
                   selected?.kind === "agent" && selected.agent.agentId === a.agentId;
+                const modelLabel = a.model ? shortModelLabel(a.model) : "";
                 return (
                   <li key={a.agentId}>
                     <button
@@ -840,6 +854,11 @@ export function PolisView() {
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-[12px] font-medium text-cream-700">
                           {agentTypeLabel(a.type)}
+                          {modelLabel ? (
+                            <span className="ml-1 font-normal text-cream-400">
+                              {modelLabel}
+                            </span>
+                          ) : null}
                         </p>
                         {a.currentTask && (
                           <p className="truncate text-[11px] text-cream-400">
