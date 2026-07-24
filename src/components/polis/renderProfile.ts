@@ -70,6 +70,13 @@ export interface RenderProfile {
   /** Cap for the building-atlas texture resolution (combined with the device
    *  pixel ratio: the atlas uses min(dpr, this)). 1 = no HiDPI super-sampling. */
   atlasResolutionCap: number;
+  /**
+   * Max procedural salt variants per (purpose, level) the atlas may mint.
+   * Rich allows the full high-frequency N=4; lean clamps to 2; minimal to 1.
+   * Keeps texture count growth modest on weak hardware (~2–3× on rich for
+   * common purposes, flat on minimal). See buildingAtlas.variantCountFor.
+   */
+  buildingVariantSaltMax: number;
   /** Hard cap on the DECORATIVE ambient walker count (fed alongside the city-size
    *  derivation so a weak box renders a smaller crowd). */
   maxAmbientWalkers: number;
@@ -95,6 +102,7 @@ const RICH: RenderProfile = {
   lodAgents: 0.35,
   preloadRing: 2,
   atlasResolutionCap: 2,
+  buildingVariantSaltMax: 4,
   maxAmbientWalkers: 40,
   antialias: true,
   maxHeroFires: 6,
@@ -112,6 +120,7 @@ const LEAN: RenderProfile = {
   lodAgents: 0.45,
   preloadRing: 1,
   atlasResolutionCap: 1,
+  buildingVariantSaltMax: 2,
   maxAmbientWalkers: 18,
   antialias: false,
   maxHeroFires: 3,
@@ -128,6 +137,7 @@ const MINIMAL: RenderProfile = {
   lodAgents: 0.6,
   preloadRing: 0,
   atlasResolutionCap: 1,
+  buildingVariantSaltMax: 1,
   maxAmbientWalkers: 6,
   antialias: false,
   maxHeroFires: 0,

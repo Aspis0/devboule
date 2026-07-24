@@ -10,6 +10,7 @@ const RICH_PROFILE: RenderProfile = {
   lodAgents: 0.35,
   preloadRing: 2,
   atlasResolutionCap: 2,
+  buildingVariantSaltMax: 4,
   maxAmbientWalkers: 40,
   antialias: true,
   maxHeroFires: 6,

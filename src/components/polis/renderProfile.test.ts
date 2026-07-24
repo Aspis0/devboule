@@ -34,6 +34,7 @@ describe("profileFor — tier truth table", () => {
     expect(p.tier).toBe("rich");
     expect(p.preloadRing).toBe(2);
     expect(p.atlasResolutionCap).toBe(2);
+    expect(p.buildingVariantSaltMax).toBe(4);
     expect(p.antialias).toBe(true);
   });
 
@@ -44,6 +45,7 @@ describe("profileFor — tier truth table", () => {
     expect(p.tier).toBe("lean");
     expect(p.preloadRing).toBe(1);
     expect(p.atlasResolutionCap).toBe(1);
+    expect(p.buildingVariantSaltMax).toBe(2);
     expect(p.antialias).toBe(false);
   });
 
@@ -63,6 +65,7 @@ describe("profileFor — tier truth table", () => {
     const p = profileFor(hw({ cpuCores: 4 }));
     expect(p.tier).toBe("minimal");
     expect(p.preloadRing).toBe(0);
+    expect(p.buildingVariantSaltMax).toBe(1);
     expect(p.maxAmbientWalkers).toBeLessThanOrEqual(RENDER_PROFILES.lean.maxAmbientWalkers);
   });
 

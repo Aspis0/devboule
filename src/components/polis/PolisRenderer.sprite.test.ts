@@ -76,6 +76,8 @@ function makeFakeRenderer() {
   set("lodAgents", 0.35);
   set("app", { renderer: { generateTexture: () => new Texture() } });
   set("buildingAtlas", new BuildingTextureAtlas(1));
+  // Salt path reads profile.buildingVariantSaltMax (rich = 4).
+  set("profile", { buildingVariantSaltMax: 4, tier: "rich" });
   set("buildingNodes", new Map());
   set("fileIdByPath", new Map());
   set("animatedNodes", []);

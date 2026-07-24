@@ -24,9 +24,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Mock buildBuildingParts to return a minimal BuiltParts with real PIXI objects.
 // The actual geometry is irrelevant for this test; we only care about the shadow
 // sprite's parent lifecycle. We import Graphics/Container AFTER the mock below.
-vi.mock("./buildings", () => ({
-  buildBuildingParts: vi.fn(),
-}));
+vi.mock("./buildings", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./buildings")>();
+  return {
+    ...actual,
+    buildBuildingParts: vi.fn(),
+  };
+});
 
 // Mock worstSinSeverity to throw on demand; controlled per-test via
 // worstSinSeveritySpy.mockImplementation().
@@ -119,6 +123,12 @@ function makeFakeRenderer() {
   // the fake renderer above. dpr 1 for a stable resolution.
   (fake as unknown as Record<string, unknown>)["buildingAtlas"] =
     new BuildingTextureAtlas(1);
+
+  // Salt path reads profile.buildingVariantSaltMax (rich = 4).
+  (fake as unknown as Record<string, unknown>)["profile"] = {
+    buildingVariantSaltMax: 4,
+    tier: "rich",
+  };
 
   // callbacks — empty, no-op.
   (fake as unknown as Record<string, unknown>)["callbacks"] = {};

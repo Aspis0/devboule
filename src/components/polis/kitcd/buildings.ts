@@ -35,9 +35,69 @@ export interface BuiltResult {
 
 export interface BuilderOpt {
   outline?: boolean;
+  /**
+   * Procedural salt 0..N-1 for cosmetic variants (roof/wall tint, chimney,
+   * window arrangement, small accents). Footprint and silhouette stay fixed.
+   * Default 0 (canonical look).
+   */
+  salt?: number;
 }
 
 export type Builder = (L: number, opt: BuilderOpt) => BuiltResult;
+
+/**
+ * Bounded, tasteful per-salt look derived only from existing kit materials
+ * (shade/mix — no new raw hex). Deterministic for a given salt.
+ */
+export interface SaltLook {
+  /** Roof colour (terracotta ± small palette blend). */
+  roof: number;
+  /** Multiplier applied via ISO.shade to wall materials (~0.96–1.04). */
+  wallF: number;
+  /** Door / wood panel shade factor. */
+  door: number;
+  /** Whether to emit chimney smoke (and any chimney stack geometry). */
+  hasChimney: boolean;
+  /**
+   * Shared lateral bias in grid units (−|0|+) applied to chimney stack/smoke
+   * and to workshop door placement (same wall-face drift).
+   */
+  lateralDx: number;
+  /** Window layout mode: 0 default, 1 wider spacing, 2 fewer windows. */
+  winMode: number;
+  /** Small awning / pergola accent strip. */
+  hasAwning: boolean;
+  /** Awning / accent cloth colour from the kit palette. */
+  accent: number;
+}
+
+/** Resolve cosmetic picks for a salt. PURE + deterministic. */
+export function saltLook(salt = 0): SaltLook {
+  const s = ((salt % 4) + 4) % 4;
+  const roofBlends = [
+    M.terracotta,
+    ISO.mix(M.terracotta, M.ochre, 0.22),
+    ISO.mix(M.terracotta, M.red, 0.16),
+    ISO.mix(M.terracotta, M.plinth, 0.14),
+  ];
+  const roofF = [1.0, 0.94, 1.05, 0.97][s];
+  const accents = [M.blue, M.red, M.ochre, M.blueDeep];
+  return {
+    roof: ISO.shade(roofBlends[s], roofF),
+    wallF: [1.0, 1.035, 0.965, 1.02][s],
+    door: ISO.shade(M.wood, [0.6, 0.52, 0.68, 0.55][s]),
+    hasChimney: s !== 1,
+    lateralDx: [-0.08, 0, 0.1, -0.04][s],
+    winMode: s % 3,
+    hasAwning: s === 2 || s === 3,
+    accent: accents[s],
+  };
+}
+
+/** Shade a wall material by the salt wall factor. */
+function wallCol(base: number, look: SaltLook): number {
+  return ISO.shade(base, look.wallF);
+}
 
 // shared registry (display + accent) --------------------------------------
 export const BUILD_META = {
@@ -304,9 +364,11 @@ const house: Builder = function (L, opt) {
   const { W, D } = cfg;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
 
   function smokeAt(gx: number, gy: number, z: number, sc?: number): void {
-    const p = proj.p(gx, gy, z);
+    if (!look.hasChimney) return;
+    const p = proj.p(gx + look.lateralDx, gy, z);
     const sm = new Smoke(p.x, p.y, sc || 1);
     c.addChild(sm.node);
     anims.push(sm);
@@ -314,48 +376,62 @@ const house: Builder = function (L, opt) {
 
   if (L === 0) {
     // kalybe: round-ish mud hut + thatch hip roof
-    bx(0.15, 0.15, 0, 0.7, 0.7, 0.55, M.mud);
-    ISO.panelLeft(g, proj, 0.38, 0.85, 0, 0.24, 0.4, ISO.shade(M.wood, 0.65));
-    ISO.hipRoof(g, proj, 0.05, 0.05, 0.55, 0.9, 0.9, 0.5, M.thatch, {
+    bx(0.15, 0.15, 0, 0.7, 0.7, 0.55, wallCol(M.mud, look));
+    ISO.panelLeft(g, proj, 0.38, 0.85, 0, 0.24, 0.4, look.door);
+    ISO.hipRoof(g, proj, 0.05, 0.05, 0.55, 0.9, 0.9, 0.5, ISO.shade(M.thatch, look.wallF), {
       overhang: 0.12,
       outline: out,
     });
     smokeAt(0.5, 0.5, 1.05, 0.7);
   } else if (L === 1) {
     // casa piccola: mudbrick box + tile gable
-    bx(0.12, 0.12, 0, 0.76, 0.76, 0.7, M.mud);
-    ISO.panelLeft(g, proj, 0.4, 0.88, 0, 0.22, 0.46, ISO.shade(M.wood, 0.6));
-    ISO.panelLeft(g, proj, 0.18, 0.88, 0.42, 0.16, 0.16, M.blue);
-    ISO.hipRoof(g, proj, 0.08, 0.08, 0.7, 0.8, 0.8, 0.46, M.terracotta, {
+    bx(0.12, 0.12, 0, 0.76, 0.76, 0.7, wallCol(M.mud, look));
+    ISO.panelLeft(g, proj, 0.4, 0.88, 0, 0.22, 0.46, look.door);
+    ISO.panelLeft(g, proj, 0.18, 0.88, 0.42, 0.16, 0.16, look.accent);
+    ISO.hipRoof(g, proj, 0.08, 0.08, 0.7, 0.8, 0.8, 0.46, look.roof, {
       overhang: 0.14,
       outline: out,
     });
     smokeAt(0.3, 0.3, 1.16, 0.8);
   } else if (L === 2) {
     // casa: plastered 2x2, tile roof, windows
-    bx(0.1, 0.1, 0, 1.8, 1.8, 0.95, M.marbleWarm);
-    ISO.panelLeft(g, proj, 0.75, 1.9, 0, 0.4, 0.62, ISO.shade(M.wood, 0.6));
-    ISO.panelLeft(g, proj, 0.28, 1.9, 0.5, 0.3, 0.3, M.blue);
-    ISO.panelLeft(g, proj, 1.28, 1.9, 0.5, 0.3, 0.3, M.blue);
-    ISO.hipRoof(g, proj, 0.05, 0.05, 0.95, 1.9, 1.9, 0.66, M.terracotta, {
+    bx(0.1, 0.1, 0, 1.8, 1.8, 0.95, wallCol(M.marbleWarm, look));
+    ISO.panelLeft(g, proj, 0.75, 1.9, 0, 0.4, 0.62, look.door);
+    // Window arrangement variants (same wall, different count/spacing)
+    if (look.winMode === 0) {
+      ISO.panelLeft(g, proj, 0.28, 1.9, 0.5, 0.3, 0.3, look.accent);
+      ISO.panelLeft(g, proj, 1.28, 1.9, 0.5, 0.3, 0.3, look.accent);
+    } else if (look.winMode === 1) {
+      ISO.panelLeft(g, proj, 0.22, 1.9, 0.5, 0.28, 0.3, look.accent);
+      ISO.panelLeft(g, proj, 0.78, 1.9, 0.5, 0.28, 0.3, look.accent);
+      ISO.panelLeft(g, proj, 1.34, 1.9, 0.5, 0.28, 0.3, look.accent);
+    } else {
+      ISO.panelLeft(g, proj, 0.7, 1.9, 0.48, 0.4, 0.34, look.accent);
+    }
+    ISO.hipRoof(g, proj, 0.05, 0.05, 0.95, 1.9, 1.9, 0.66, look.roof, {
       overhang: 0.18,
       outline: out,
     });
+    // Optional fabric awning strip under the eaves
+    if (look.hasAwning) {
+      ISO.panelLeft(g, proj, 0.2, 1.92, 0.88, 1.4, 0.08, ISO.shade(look.accent, 0.9));
+    }
     smokeAt(0.4, 0.4, 1.6, 0.95);
   } else if (L === 3) {
     // megaron: two storeys
-    bx(0.1, 0.1, 0, 1.8, 1.8, 1.0, M.marbleWarm);
-    bx(0.22, 0.22, 1.0, 1.56, 1.56, 0.9, M.marble);
+    bx(0.1, 0.1, 0, 1.8, 1.8, 1.0, wallCol(M.marbleWarm, look));
+    bx(0.22, 0.22, 1.0, 1.56, 1.56, 0.9, wallCol(M.marble, look));
     // balcony band
-    ISO.panelLeft(g, proj, 0.1, 1.9, 0.98, 1.8, 0.12, M.red);
-    ISO.panelLeft(g, proj, 0.4, 1.9, 0.1, 0.4, 0.62, ISO.shade(M.wood, 0.6));
-    [0.45, 1.05].forEach((x) =>
-      ISO.panelLeft(g, proj, x, 1.9, 0.4, 0.3, 0.34, M.blue),
+    ISO.panelLeft(g, proj, 0.1, 1.9, 0.98, 1.8, 0.12, look.accent);
+    ISO.panelLeft(g, proj, 0.4, 1.9, 0.1, 0.4, 0.62, look.door);
+    const winXs =
+      look.winMode === 1 ? [0.35, 0.85, 1.35] : look.winMode === 2 ? [0.75] : [0.45, 1.05];
+    winXs.forEach((x) => ISO.panelLeft(g, proj, x, 1.9, 0.4, 0.3, 0.34, look.accent));
+    const upXs = look.winMode === 2 ? [0.75] : [0.5, 1.05];
+    upXs.forEach((x) =>
+      ISO.panelLeft(g, proj, x, 1.78, 1.32, 0.28, 0.34, ISO.shade(look.accent, 0.85)),
     );
-    [0.5, 1.05].forEach((x) =>
-      ISO.panelLeft(g, proj, x, 1.78, 1.32, 0.28, 0.34, M.blueDeep),
-    );
-    ISO.gableRoof(g, proj, 0.18, 0.18, 1.9, 1.64, 1.64, 0.5, M.terracotta, {
+    ISO.gableRoof(g, proj, 0.18, 0.18, 1.9, 1.64, 1.64, 0.5, look.roof, {
       ridge: "y",
       overhang: 0.14,
       outline: out,
@@ -376,14 +452,14 @@ const house: Builder = function (L, opt) {
     // small inner colonnade
     ISO.colonnade(g, proj, 0.95, 2.05, 2.05, 2.05, 0.04, 0.7, 0.07, 4, M.marble, {});
     wings.forEach((w) => {
-      bx(w[0], w[1], 0, w[2], w[3], 1.05, M.marble);
-      ISO.gableRoof(g, proj, w[0], w[1], 1.05, w[2], w[3], 0.38, M.terracotta, {
+      bx(w[0], w[1], 0, w[2], w[3], 1.05, wallCol(M.marble, look));
+      ISO.gableRoof(g, proj, w[0], w[1], 1.05, w[2], w[3], 0.38, look.roof, {
         ridge: w[2] > w[3] ? "x" : "y",
         overhang: 0.12,
         outline: out,
       });
     });
-    ISO.panelLeft(g, proj, 1.2, 3.0, 0, 0.6, 0.66, ISO.shade(M.wood, 0.55));
+    ISO.panelLeft(g, proj, 1.2, 3.0, 0, 0.6, 0.66, look.door);
     smokeAt(0.45, 0.45, 1.7, 0.9);
   }
   // dooryard greenery (Caesar-style lived-in plots)
@@ -592,11 +668,12 @@ const market: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
   // paved plot
   ISO.box(g, proj, 0, 0, 0, W, D, 0.05, ISO.shade(M.stone, 1.05), { outline: out });
   // back stoa: colonnade + roof along the back edge
   const stoaD = 0.7;
-  bx(0, 0, 0.05, W, stoaD, 0.1, M.marble);
+  bx(0, 0, 0.05, W, stoaD, 0.1, wallCol(M.marble, look));
   ISO.colonnade(
     g,
     proj,
@@ -611,8 +688,8 @@ const market: Builder = function (L, opt) {
     M.marble,
     {},
   );
-  bx(0, 0, 0.05 + 1.1, W, stoaD, 0.16, M.marble);
-  ISO.gableRoof(g, proj, 0, 0, 0.05 + 1.26, W, stoaD, 0.34, M.terracotta, {
+  bx(0, 0, 0.05 + 1.1, W, stoaD, 0.16, wallCol(M.marble, look));
+  ISO.gableRoof(g, proj, 0, 0, 0.05 + 1.26, W, stoaD, 0.34, look.roof, {
     ridge: "x",
     overhang: 0.14,
     outline: out,
@@ -630,9 +707,10 @@ const market: Builder = function (L, opt) {
   ]
     .filter((p) => p[0] < W - 0.3 && p[1] < D - 0.2)
     .slice(0, [2, 3, 4, 6, 8][L]);
-  const acc = [M.red, M.blue];
+  // Salt rotates the awning stripe pair so two market variants don't match.
+  const acc = [look.accent, ISO.shade(look.accent === M.red ? M.blue : M.red, 1)];
   stalls.forEach((p, i) => {
-    bx(p[0], p[1], 0.05, 0.5, 0.5, 0.45, M.wood);
+    bx(p[0], p[1], 0.05, 0.5, 0.5, 0.45, look.door);
     // awning: striped quad on top, slightly larger
     const a = proj.p(p[0] - 0.1, p[1] - 0.1, 0.62);
     const b = proj.p(p[0] + 0.65, p[1] - 0.1, 0.62);
@@ -651,12 +729,12 @@ const market: Builder = function (L, opt) {
     );
     // amphorae
     const ap = proj.p(p[0] + 0.6, p[1] + 0.55, 0.05);
-    g.ellipse(ap.x, ap.y - 5, 4, 7).fill({ color: ISO.shade(M.terracotta, 0.9) });
+    g.ellipse(ap.x, ap.y - 5, 4, 7).fill({ color: ISO.shade(look.roof, 0.9) });
   });
   PROP.cypress(g, proj, -0.25, D - 0.3, 0, 0.85);
   PROP.cypress(g, proj, W + 0.25, D - 0.3, 0, 0.85);
   PROP.amphora(g, proj, 0.2, D - 0.1, 0.05, 1, M.ochre);
-  PROP.amphora(g, proj, 0.45, D - 0.15, 0.05, 0.9, M.terracotta);
+  PROP.amphora(g, proj, 0.45, D - 0.15, 0.05, 0.9, look.roof);
   return { container: c, body: g, anims, foot: [W, D] };
 };
 
@@ -672,12 +750,13 @@ const warehouse: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
   ISO.box(g, proj, 0, 0, 0, W, D, 0.08, M.plinth, { outline: out });
   // central roofed depot
   const dw = W - 0.4;
   const dd = Math.min(D - 0.4, 1.6);
-  bx(0.2, 0.2, 0.08, dw, dd, 0.9, M.marbleWarm);
-  ISO.gableRoof(g, proj, 0.15, 0.15, 0.98, dw + 0.1, dd + 0.1, 0.5, M.terracotta, {
+  bx(0.2, 0.2, 0.08, dw, dd, 0.9, wallCol(M.marbleWarm, look));
+  ISO.gableRoof(g, proj, 0.15, 0.15, 0.98, dw + 0.1, dd + 0.1, 0.5, look.roof, {
     ridge: "x",
     overhang: 0.16,
     outline: out,
@@ -688,19 +767,23 @@ const warehouse: Builder = function (L, opt) {
   for (let i = 0; i < cols; i++) {
     const x = 0.25 + (i * (W - 0.5)) / Math.max(1, cols - 1 || 1);
     // wooden frame
-    bx(x, slotsY, 0.08, 0.12, 0.5, 0.6, M.wood);
+    bx(x, slotsY, 0.08, 0.12, 0.5, 0.6, look.door);
     // goods
     const gp = proj.p(x + 0.32, slotsY + 0.4, 0.08);
     for (let k = 0; k < 3; k++) {
       g.ellipse(gp.x + (k - 1) * 6, gp.y - 6 - k * 2, 4.5, 7).fill({
-        color: ISO.shade(k % 2 ? M.terracotta : M.ochre, 0.95 - k * 0.08),
+        color: ISO.shade(k % 2 ? look.roof : M.ochre, 0.95 - k * 0.08),
       });
+    }
+    // optional awning strip over every other bay
+    if (look.hasAwning && i % 2 === 0) {
+      ISO.panelLeft(g, proj, x - 0.05, slotsY + 0.55, 0.62, 0.55, 0.06, look.accent);
     }
   }
   // depot flag
   if (L >= 2) {
     const fp = proj.p(0.4, 0.4, 0.98 + 0.5 + 0.3);
-    const fg = new Flag(fp.x, fp.y, 0.8, M.ochre);
+    const fg = new Flag(fp.x, fp.y, 0.8, look.accent);
     c.addChild(fg.node);
     anims.push(fg);
   }
@@ -719,31 +802,53 @@ const workshop: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
   ISO.box(g, proj, 0, 0, 0, W, D, 0.07, M.plinth, { outline: out });
   // shed
   const sw = W - 0.3;
   const sd = D - 0.5;
-  bx(0.15, 0.15, 0.07, sw, sd, 0.85, M.mud);
-  ISO.gableRoof(g, proj, 0.1, 0.1, 0.92, sw + 0.1, sd + 0.1, 0.42, M.terracotta, {
+  bx(0.15, 0.15, 0.07, sw, sd, 0.85, wallCol(M.mud, look));
+  ISO.gableRoof(g, proj, 0.1, 0.1, 0.92, sw + 0.1, sd + 0.1, 0.42, look.roof, {
     ridge: "x",
     overhang: 0.14,
     outline: out,
   });
+  // Door / shutter accent on the shed front
+  ISO.panelLeft(g, proj, 0.3 + look.lateralDx, 0.15 + sd, 0.07, 0.28, 0.5, look.door);
   // kiln / furnace (stone, glowing mouth) in front-right, with chimney
   const nKiln = [1, 1, 2, 2, 3][L];
   for (let i = 0; i < nKiln; i++) {
     const kx = 0.25 + i * 0.85;
     const ky = D - 0.55;
     if (kx > W - 0.4) break;
-    bx(kx, ky, 0.07, 0.5, 0.45, 0.7, M.stone);
-    // glowing mouth
-    ISO.panelLeft(g, proj, kx + 0.12, ky + 0.45, 0.12, 0.26, 0.22, 0xe2761f);
-    // chimney + smoke
-    bx(kx + 0.16, ky + 0.1, 0.77, 0.2, 0.2, 0.4, ISO.shade(M.stone, 0.9));
-    const sp = proj.p(kx + 0.26, ky + 0.2, 1.17);
-    const sm = new Smoke(sp.x, sp.y, 0.85);
-    c.addChild(sm.node);
-    anims.push(sm);
+    bx(kx, ky, 0.07, 0.5, 0.45, 0.7, wallCol(M.stone, look));
+    // glowing mouth — kit bronze/ochre blend (no new raw hex)
+    ISO.panelLeft(
+      g,
+      proj,
+      kx + 0.12,
+      ky + 0.45,
+      0.12,
+      0.26,
+      0.22,
+      ISO.mix(M.bronze, M.ochre, 0.55),
+    );
+    // chimney + smoke (salt may drop the stack)
+    if (look.hasChimney) {
+      bx(
+        kx + 0.16 + look.lateralDx,
+        ky + 0.1,
+        0.77,
+        0.2,
+        0.2,
+        0.4,
+        ISO.shade(M.stone, 0.9),
+      );
+      const sp = proj.p(kx + 0.26 + look.lateralDx, ky + 0.2, 1.17);
+      const sm = new Smoke(sp.x, sp.y, 0.85);
+      c.addChild(sm.node);
+      anims.push(sm);
+    }
     // small flame at mouth
     const fp = proj.p(kx + 0.25, ky + 0.46, 0.16);
     const fl = new Flame(fp.x, fp.y, 0.55);
@@ -754,7 +859,7 @@ const workshop: Builder = function (L, opt) {
   const wp = proj.p(0.3, D - 0.3, 0.07);
   for (let k = 0; k < 3; k++) {
     g.ellipse(wp.x - 6 + k * 5, wp.y - 3 - k * 3, 7, 3).fill({
-      color: ISO.shade(M.wood, 1 - k * 0.06),
+      color: ISO.shade(look.door, 1 - k * 0.06),
     });
   }
   return { container: c, body: g, anims, foot: [W, D] };
@@ -816,14 +921,15 @@ const baths: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
-  ISO.box(g, proj, 0, 0, 0, W, D, 0.1, M.stone, { outline: out });
+  const look = saltLook(opt?.salt ?? 0);
+  ISO.box(g, proj, 0, 0, 0, W, D, 0.1, wallCol(M.stone, look), { outline: out });
   // enclosed hall at back
   const hd = Math.min(1.4, D * 0.5);
-  bx(0.1, 0.0, 0.1, W - 0.2, hd, 1.0, M.marbleWarm);
-  ISO.gableRoof(g, proj, 0.05, -0.05, 1.1, W - 0.1, hd + 0.05, 0.5, M.terracotta, {
+  bx(0.1, 0.0, 0.1, W - 0.2, hd, 1.0, wallCol(M.marbleWarm, look));
+  ISO.gableRoof(g, proj, 0.05, -0.05, 1.1, W - 0.1, hd + 0.05, 0.5, look.roof, {
     ridge: "x",
     overhang: 0.16,
-    tympanum: M.blue,
+    tympanum: look.accent,
     outline: out,
   });
   // colonnade framing the pool (front)
@@ -902,6 +1008,7 @@ const theater: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out } = s;
+  const look = saltLook(opt?.salt ?? 0);
   const cx = W / 2;
   const cy = 0.2; // centre of the arcs (near back)
   const tiers = [3, 4, 5, 6, 7][L];
@@ -932,12 +1039,12 @@ const theater: Builder = function (L, opt) {
     const top = inner.concat(outer.slice().reverse());
     const topFlat: number[] = [];
     top.forEach((p) => topFlat.push(p.x, p.y));
-    g.poly(topFlat).fill({ color: ISO.shade(M.stone, 1.08) });
+    g.poly(topFlat).fill({ color: ISO.shade(M.stone, 1.08 * look.wallF) });
     // riser face
     const rf = outer.concat(riser.slice().reverse());
     const rfFlat: number[] = [];
     rf.forEach((p) => rfFlat.push(p.x, p.y));
-    g.poly(rfFlat).fill({ color: ISO.shade(M.stone, 0.74) });
+    g.poly(rfFlat).fill({ color: ISO.shade(M.stone, 0.74 * look.wallF) });
     if (out) {
       g.poly(topFlat).stroke({ width: 1, color: M.ink, alpha: 0.2 });
     }
@@ -950,9 +1057,11 @@ const theater: Builder = function (L, opt) {
   }
   const opF: number[] = [];
   op.forEach((p) => opF.push(p.x, p.y));
-  g.poly(opF).fill({ color: ISO.shade(M.stone, 1.14) });
+  g.poly(opF).fill({ color: ISO.shade(M.stone, 1.14 * look.wallF) });
   // skene (stage building) at the very front
-  ISO.box(g, proj, 0.4, D - 0.55, 0, W - 0.8, 0.4, 0.95, M.marbleWarm, { outline: out });
+  ISO.box(g, proj, 0.4, D - 0.55, 0, W - 0.8, 0.4, 0.95, wallCol(M.marbleWarm, look), {
+    outline: out,
+  });
   ISO.colonnade(
     g,
     proj,
@@ -1049,10 +1158,11 @@ const library: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
   const z0 = ISO.steps(g, proj, 0, 0, 0, W, D, 2, 0.12, 0.1, M.stone);
   const ins = 0.2;
   // main block
-  bx(ins, ins, z0, W - 2 * ins, D - 2 * ins, 1.7, M.marble);
+  bx(ins, ins, z0, W - 2 * ins, D - 2 * ins, 1.7, wallCol(M.marble, look));
   // niches (scroll shelves) on front
   for (let i = 0; i < Math.round(W); i++) {
     const x =
@@ -1085,7 +1195,7 @@ const library: Builder = function (L, opt) {
     z0 + 1.74,
     W - 2 * ins + 0.1,
     0.1,
-    ISO.shade(M.blue, ISO.faceFactor("left")),
+    ISO.shade(look.accent, ISO.faceFactor("left")),
   );
   ISO.gableRoof(
     g,
@@ -1096,8 +1206,8 @@ const library: Builder = function (L, opt) {
     W - 2 * ins + 0.1,
     D - 2 * ins + 0.1,
     0.5,
-    M.terracotta,
-    { ridge: "y", overhang: 0.18, tympanum: M.red, outline: out },
+    look.roof,
+    { ridge: "y", overhang: 0.18, tympanum: look.accent, outline: out },
   );
   PROP.statue(g, proj, 0.4, D - 0.05, z0, 0.8);
   PROP.statue(g, proj, W - 0.4, D - 0.05, z0, 0.8);
@@ -1118,11 +1228,12 @@ const townhall: Builder = function (L, opt) {
   const [W, D] = sizes;
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx, anims } = s;
+  const look = saltLook(opt?.salt ?? 0);
   const z0 = ISO.steps(g, proj, 0, 0, 0, W, D, 2, 0.13, 0.1, M.stone);
   const ins = 0.25;
   const bodyH = 1.2 + L * 0.12;
   // main hall
-  bx(ins, ins, z0, W - 2 * ins, D - 2 * ins - 0.4, bodyH, M.marbleWarm);
+  bx(ins, ins, z0, W - 2 * ins, D - 2 * ins - 0.4, bodyH, wallCol(M.marbleWarm, look));
   // hipped roof
   ISO.hipRoof(
     g,
@@ -1133,7 +1244,7 @@ const townhall: Builder = function (L, opt) {
     W - 2 * ins + 0.1,
     D - 2 * ins - 0.4 + 0.1,
     0.7 + 0.1 * L,
-    M.terracotta,
+    look.roof,
     { overhang: 0.18, outline: out },
   );
   // front porch colonnade + small pediment
@@ -1162,7 +1273,7 @@ const townhall: Builder = function (L, opt) {
     W - 2 * ins - 0.1,
     0.42,
     0.34,
-    M.terracotta,
+    look.roof,
     { ridge: "x", overhang: 0.12, pediment: M.marble, tympanum: M.gold, outline: out },
   );
   // door
@@ -1193,8 +1304,11 @@ const unknown: Builder = function (L, opt) {
   const [W, D] = [1, 1];
   const s = setup(W, D, opt);
   const { proj, g, c, out, bx } = s;
+  const look = saltLook(opt?.salt ?? 0);
   // striped placeholder plinth
-  ISO.box(g, proj, 0, 0, 0, 1, 1, 0.1, ISO.shade(M.stone, 0.96), { outline: true });
+  ISO.box(g, proj, 0, 0, 0, 1, 1, 0.1, ISO.shade(M.stone, 0.96 * look.wallF), {
+    outline: true,
+  });
   // hatched top
   for (let i = -2; i < 6; i++) {
     const a = proj.p(i * 0.18, 0, 0.1);
@@ -1203,8 +1317,8 @@ const unknown: Builder = function (L, opt) {
       .lineTo(b.x, b.y)
       .stroke({ width: 3, color: ISO.shade(M.groundEdge, 1.0), alpha: 0.5 });
   }
-  // crate
-  bx(0.18, 0.18, 0.1, 0.64, 0.64, 0.7, M.wood, { outline: true });
+  // crate — wood tone shifts with salt
+  bx(0.18, 0.18, 0.1, 0.64, 0.64, 0.7, look.door, { outline: true });
   // big "?" mark
   const qp = proj.p(0.5, 0.5, 0.82);
   const t = new Text({

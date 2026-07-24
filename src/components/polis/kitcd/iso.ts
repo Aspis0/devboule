@@ -149,7 +149,7 @@ export const MAT = {
 // only change is the BASE FILL of faces/roofs/ground: a light SBS texture
 // multiplied by the exact same shaded color the flat fill used. Bank absent
 // (or a key missing) ⇒ the flat fill below runs unchanged. Buildings are
-// baked ONCE per purpose:level (BuildingTextureAtlas), so texture fills cost
+// baked ONCE per purpose:level:salt (BuildingTextureAtlas), so texture fills cost
 // nothing per frame; the bank must be set BEFORE the first bake (the renderer
 // constructor does it).
 let kitBank: SpriteBank | null = null;

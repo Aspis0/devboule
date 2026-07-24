@@ -87,8 +87,18 @@ import {
 import { occupiedTiles, drawProps, planForestPatches } from "./props";
 import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
 import { planResourceSites, resourceSiteTiles, type ResourceCity, type ResourceSite } from "./resources";
-import { buildBuildingParts, type BuiltParts } from "./buildings";
-import { BuildingTextureAtlas } from "./buildingAtlas";
+import {
+  buildBuildingParts,
+  buildPennant,
+  metricsFromBounds,
+  peekBuildingParts,
+  type BuiltParts,
+} from "./buildings";
+import {
+  BuildingTextureAtlas,
+  buildingSalt,
+  landmarkPresenceScale,
+} from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
 import { setKitSpriteBank } from "./kitcd/iso";
 import { buildingChanged, worstSinSeverity } from "./diffCity";
@@ -3113,6 +3123,10 @@ export class PolisRenderer {
     const profile = getProfile(b.purpose);
     const scale = tierScale(b.visualTier);
     const level = tierRank(b.visualTier); // atlas variant axis (0..4)
+    // Procedural salt: stable hash of fileId → 0..N-1 cosmetic variant. N is
+    // purpose-classed and clamped by the render profile (rich 4 / lean 2 / min 1).
+    const saltMax = this.profile?.buildingVariantSaltMax ?? 4;
+    const salt = buildingSalt(b.fileId, b.purpose, saltMax);
 
     // Build the kit split into STATIC body (textured + cached) vs the cheap live
     // parts (anims + pennant) we keep per building. The kit build is unavoidable
@@ -3125,18 +3139,23 @@ export class PolisRenderer {
     // constructor and this lazily-triggered bake. Without this, later-baked
     // variants silently lose their textures for the rest of the session.
     setKitSpriteBank(this.spriteBank);
-    const built = buildBuildingParts(b, profile, scale);
+    const built = buildBuildingParts(b, profile, scale, salt);
 
-    // Was the (purpose, level) variant already cached? If so the atlas will NOT
-    // consume our freshly-built static body/shadow — we own their disposal.
-    const wasCached = this.buildingAtlas.has(b.purpose, level);
+    // Was the (purpose, level, salt) variant already cached? If so the atlas will
+    // NOT consume our freshly-built static body/shadow — we own their disposal.
+    const wasCached = this.buildingAtlas.has(b.purpose, level, salt);
     let variant: import("./buildingAtlas").BuildingVariant;
     try {
       variant = this.buildingAtlas.get(
         this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
         b.purpose,
         level,
-        () => ({ body: built.staticBody, shadow: built.shadow }),
+        () => ({
+          body: built.staticBody,
+          shadow: built.shadow,
+          foot: built.foot,
+        }),
+        salt,
       );
     } catch (err) {
       // generateTexture (or any atlas step) threw on a MISS: the atlas ran our
@@ -3153,10 +3172,16 @@ export class PolisRenderer {
       built.shadow.destroy();
     }
 
+    // Landmark presence: modest scale-up for civic/rare purposes at PLACEMENT
+    // (not baked into the atlas). Body + shadow + hit radius share the same
+    // factor so the skyline emphasis stays clickable and grounded.
+    const presence = landmarkPresenceScale(b.purpose);
+
     // Drop-shadow SPRITE (shared texture). Anchored so the shadow ORIGIN sits at
     // iso (where the per-building shadow Graphics was drawn from local (0,0)).
     const shadowSprite = this.makeShadowSprite(variant);
     shadowSprite.position.set(iso.x, iso.y);
+    if (presence !== 1) shadowSprite.scale.set(presence);
     shadowSprite.zIndex = depthKey(b.coords.x, b.coords.y);
     shadowSprite.eventMode = "none"; // shadows never intercept clicks
     this.layers.shadows.addChild(shadowSprite);
@@ -3175,6 +3200,7 @@ export class PolisRenderer {
     // label/anims/pennant/overlays attach to it with their identical local coords.
     const container = new Container();
     container.position.set(iso.x, iso.y);
+    if (presence !== 1) container.scale.set(presence);
     container.zIndex = depthKey(b.coords.x, b.coords.y);
     container.eventMode = "static";
     container.cursor = "pointer";
@@ -3209,7 +3235,7 @@ export class PolisRenderer {
       pennant: dyn.pennant,
       disaster: dyn.disaster,
       investigation: dyn.investigation,
-      hitRadius: built.hw,
+      hitRadius: built.hw * presence,
       chunkKey,
     };
 
@@ -3321,7 +3347,7 @@ export class PolisRenderer {
   private attachBuildingDynamics(
     container: Container,
     b: Building,
-    built: BuiltParts,
+    built: Pick<BuiltParts, "anims" | "pennant" | "hw" | "depth">,
   ): {
     anims: AnimInstance[];
     label: Text | null;
@@ -3444,40 +3470,141 @@ export class PolisRenderer {
     const profile = getProfile(b.purpose);
     const scale = tierScale(b.visualTier);
     const level = tierRank(b.visualTier);
+    const saltMax = this.profile?.buildingVariantSaltMax ?? 4;
+    const salt = buildingSalt(b.fileId, b.purpose, saltMax);
+    const prevLevel = tierRank(prev.visualTier);
+    const prevSalt = buildingSalt(prev.fileId, prev.purpose, saltMax);
+    // Same atlas key as before → kit body/anims geometry is unchanged; only
+    // overlays (sin/status/provider/agent/label) may differ. Skip the full kit
+    // rebuild and pull metrics from the warm atlas frame.
+    const sameVariant =
+      prev.purpose === b.purpose && prevLevel === level && prevSalt === salt;
+    const wasCached = this.buildingAtlas.has(b.purpose, level, salt);
 
-    // Build the new kit parts (for fresh anims/pennant/metrics) + the new variant
-    // texture. Same atlas hit/miss disposal contract as createBuildingNode.
     // Re-assert this renderer's bank first (see createBuildingNode: kitBank is
     // module-level and an overlapping instance may have clobbered it).
     setKitSpriteBank(this.spriteBank);
-    const built = buildBuildingParts(b, profile, scale);
-    const wasCached = this.buildingAtlas.has(b.purpose, level);
+
     let variant: import("./buildingAtlas").BuildingVariant;
-    try {
+    let live: Pick<BuiltParts, "anims" | "pennant" | "hw" | "depth">;
+
+    if (wasCached && sameVariant) {
+      // FAST PATH (atlas HIT + unchanged variant): no static body/shadow Graphics.
+      // Metrics come from the cached frame (same formulas as buildBuildingParts);
+      // base kit anims are reused; only overlays are rebuilt below.
       variant = this.buildingAtlas.get(
         this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
         b.purpose,
         level,
-        () => ({ body: built.staticBody, shadow: built.shadow }),
+        () => {
+          throw new Error(
+            "updateBuildingNodeInPlace: atlas HIT expected (build must not run)",
+          );
+        },
+        salt,
       );
-    } catch (err) {
-      // Atlas threw on a MISS: destroy our freshly-built parts (the atlas never
-      // reached its own destroy) so they don't leak. The EXISTING node is left
-      // untouched — its old dynamics/textures are still valid — and we re-throw so
-      // the caller's per-node handler logs+skips this diff entry. Restore the OLD
-      // building snapshot we re-pointed at the top: the visuals are still the OLD
-      // building, so node.building must match (else the inspector shows NEW data).
-      node.building = prev;
-      this.disposeBuiltParts(built);
-      throw err;
+      const { hw, depth } = metricsFromBounds(variant.frame);
+      // Preserve base kit anims (Flame/Smoke/…); strip Scaffold/Disaster/Investigation
+      // which attachBuildingDynamics re-derives from the new Building snapshot.
+      const baseAnims: AnimInstance[] = [];
+      for (const a of node.kitAnims) {
+        const isOverlay =
+          a === node.disaster ||
+          a === node.investigation ||
+          a instanceof Scaffold;
+        if (isOverlay) {
+          a.node.removeFromParent();
+          a.node.destroy({ children: true });
+        } else {
+          baseAnims.push(a);
+        }
+      }
+      node.kitAnims = baseAnims;
+      node.disaster = null;
+      node.investigation = null;
+      if (node.label) {
+        node.label.removeFromParent();
+        node.label.destroy();
+        node.label = null;
+      }
+      if (node.pennant) {
+        node.pennant.removeFromParent();
+        node.pennant.destroy();
+        node.pennant = null;
+      }
+      removeFromArrayByIdentity(this.animatedNodes, node);
+      const pennant = buildPennant(b.provider, variant.frame.y);
+      live = { anims: baseAnims, pennant, hw, depth };
+    } else if (wasCached) {
+      // Atlas HIT but variant key changed (tier/purpose swap onto a warm texture):
+      // peek for fresh kit anims + metrics WITHOUT retaining static body/shadow.
+      const peeked = peekBuildingParts(b, profile, scale, salt);
+      try {
+        variant = this.buildingAtlas.get(
+          this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
+          b.purpose,
+          level,
+          () => {
+            throw new Error(
+              "updateBuildingNodeInPlace: atlas HIT expected (build must not run)",
+            );
+          },
+          salt,
+        );
+      } catch (err) {
+        node.building = prev;
+        for (const a of peeked.anims) {
+          a.node.removeFromParent();
+          a.node.destroy({ children: true });
+        }
+        if (peeked.pennant && !peeked.pennant.destroyed) peeked.pennant.destroy();
+        throw err;
+      }
+      // Prefer atlas-frame metrics (byte-identical to the bake that produced the
+      // texture); foot is on the variant for callers that need it.
+      const m = metricsFromBounds(variant.frame);
+      live = {
+        anims: peeked.anims,
+        pennant: peeked.pennant,
+        hw: m.hw,
+        depth: m.depth,
+      };
+      this.detachBuildingDynamics(node);
+    } else {
+      // Atlas MISS: full geometry build so the atlas can bake body + shadow.
+      const built = buildBuildingParts(b, profile, scale, salt);
+      try {
+        variant = this.buildingAtlas.get(
+          this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
+          b.purpose,
+          level,
+          () => ({
+            body: built.staticBody,
+            shadow: built.shadow,
+            foot: built.foot,
+          }),
+          salt,
+        );
+      } catch (err) {
+        // Atlas threw on a MISS: destroy our freshly-built parts (the atlas never
+        // reached its own destroy) so they don't leak. The EXISTING node is left
+        // untouched — its old dynamics/textures are still valid — and we re-throw so
+        // the caller's per-node handler logs+skips this diff entry. Restore the OLD
+        // building snapshot we re-pointed at the top: the visuals are still the OLD
+        // building, so node.building must match (else the inspector shows NEW data).
+        node.building = prev;
+        this.disposeBuiltParts(built);
+        throw err;
+      }
+      // On MISS the atlas consumes + destroys staticBody/shadow. Live bits remain.
+      live = {
+        anims: built.anims,
+        pennant: built.pennant,
+        hw: built.hw,
+        depth: built.depth,
+      };
+      this.detachBuildingDynamics(node);
     }
-    if (wasCached) {
-      built.staticBody.destroy({ children: true });
-      built.shadow.destroy();
-    }
-
-    // Tear down the OLD dynamics first (so re-attach lands a clean child set).
-    this.detachBuildingDynamics(node);
 
     // Swap the BODY sprite texture + re-anchor (the node Container origin stays at
     // iso, so overlay local coords are unchanged). The OLD shared texture is
@@ -3497,21 +3624,26 @@ export class PolisRenderer {
       sf.height > 0 ? -sf.y / sf.height : 0,
     );
 
+    // Landmark presence scale (placement-only; keep body + shadow + hit aligned).
+    const presence = landmarkPresenceScale(b.purpose);
+    node.container.scale.set(presence);
+    node.shadow.scale.set(presence);
+
     // Re-attach fresh dynamics on the SAME Sprite.
-    const dyn = this.attachBuildingDynamics(node.container, b, built);
+    const dyn = this.attachBuildingDynamics(node.container, b, live);
 
     // Update the node record in place (identity preserved). `node.building` was
     // already re-pointed at the top of this method (handlers read it at fire time).
     node.kitAnims = dyn.anims;
     node.label = dyn.label;
-    node.labelDepth = built.depth;
+    node.labelDepth = live.depth;
     node.pennant = dyn.pennant;
     node.disaster = dyn.disaster;
     node.investigation = dyn.investigation;
     // Sin/disaster state may have changed → re-evaluate hero promotions.
     this.heroPromoDirty = true;
     this.crowdBurningDirty = true; // sin STATE may have changed in-place
-    node.hitRadius = built.hw;
+    node.hitRadius = live.hw * presence;
 
     // Keep the path→fileId index correct (filePath could change with a rename,
     // though coords-unchanged usually means same path). Re-point to this fileId.

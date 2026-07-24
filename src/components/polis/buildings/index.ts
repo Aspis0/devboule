@@ -103,24 +103,42 @@ export function buildPennant(provider: string | undefined, topY: number): Graphi
 }
 
 /**
+ * Hit-radius / label metrics from a local-bounds frame (atlas capture or kit
+ * container). Same formulas as {@link buildBuildingParts} — pure, allocation-free.
+ *
+ *   hw    = max(|x|, |x+width|, 1)  — half-width of the silhouette
+ *   depth = max(-y, 1)              — height above the front-bottom anchor
+ */
+export function metricsFromBounds(bounds: {
+  x: number;
+  y: number;
+  width: number;
+}): { hw: number; depth: number } {
+  const hw = Math.max(Math.abs(bounds.x), Math.abs(bounds.x + bounds.width), 1);
+  const depth = Math.max(-bounds.y, 1); // bounds.y is the top (most negative) px
+  return { hw, depth };
+}
+
+/**
  * Build a building's geometry for the renderer. Resolves the kit builder from
  * the purpose slug, maps the visual tier to a kit level, draws, and adapts the
  * result into a BuiltBuilding. `_profile` is accepted for API symmetry.
+ * `salt` selects a cosmetic atlas variant (0..N-1); default 0 is the canonical look.
  */
 export function buildBuilding(
   b: Building,
   _profile: BuildingProfile,
   _scale: { w: number; depth: number },
+  salt = 0,
 ): BuiltBuilding {
   const level = tierRank(b.visualTier); // 0..4 — same map the kit levels use
-  const built = getBuilder(b.purpose)(level, { outline: false });
+  const built = getBuilder(b.purpose)(level, { outline: false, salt });
   const [W, D] = built.foot;
 
   // hw / depth for label placement + hit radius. The kit anchors front-bottom
   // at local (0,0) and rises in -y; getLocalBounds gives the silhouette extent.
   const bounds = built.container.getLocalBounds();
-  const hw = Math.max(Math.abs(bounds.x), Math.abs(bounds.x + bounds.width), 1);
-  const depth = Math.max(-bounds.y, 1); // bounds.y is the top (most negative) px
+  const { hw, depth } = metricsFromBounds(bounds);
 
   // TECH LIVERY pennant — parented into the kit container so it positions with
   // the building and is destroyed with it. `null` for plain local files.
@@ -161,9 +179,11 @@ export function buildBuilding(
  *   - `hw`/`depth`/`foot` : same metrics as buildBuilding (hit radius / label
  *                     placement / footprint).
  *
- * IMPORTANT: the geometry of `staticBody` is a pure function of (purpose, level)
- * — NOTHING about the specific building `b` (provider, sins, agent, status,
- * coords) changes it — which is exactly what makes the texture cacheable.
+ * IMPORTANT: the geometry of `staticBody` is a pure function of
+ * (purpose, level, salt) — NOTHING about the specific building `b` (provider,
+ * sins, agent, status, coords) changes it beyond the salt the caller derived
+ * from fileId — which is exactly what makes the texture cacheable under
+ * `${purpose}:${level}:s${salt}`.
  */
 export interface BuiltParts {
   staticBody: Container;
@@ -175,13 +195,29 @@ export interface BuiltParts {
   foot: [number, number];
 }
 
+/**
+ * Live-only parts for an atlas HIT: kit anims + pennant + metrics, WITHOUT a
+ * retained static body or shadow Graphics. Runs the kit builder (needed for
+ * anim placement), measures bounds, then destroys the static container before
+ * return. Prefer {@link metricsFromBounds} on a cached atlas frame + anim reuse
+ * when the (purpose, level, salt) variant is unchanged on an in-place update.
+ */
+export interface LiveParts {
+  anims: BuiltBuilding["anims"];
+  pennant: Graphics | null;
+  hw: number;
+  depth: number;
+  foot: [number, number];
+}
+
 export function buildBuildingParts(
   b: Building,
   _profile: BuildingProfile,
   _scale: { w: number; depth: number },
+  salt = 0,
 ): BuiltParts {
   const level = tierRank(b.visualTier); // 0..4 — same map the kit levels use
-  const built = getBuilder(b.purpose)(level, { outline: false });
+  const built = getBuilder(b.purpose)(level, { outline: false, salt });
   const [W, D] = built.foot;
   const container = built.container;
 
@@ -194,8 +230,7 @@ export function buildBuildingParts(
   // hw / depth measured on the FULL silhouette (anims removed don't change the
   // static extent — flames/smoke are above the body and were empty here anyway).
   const bounds = container.getLocalBounds();
-  const hw = Math.max(Math.abs(bounds.x), Math.abs(bounds.x + bounds.width), 1);
-  const depth = Math.max(-bounds.y, 1); // bounds.y is the top (most negative) px
+  const { hw, depth } = metricsFromBounds(bounds);
 
   // Provider pennant — built but NOT added to the static body (it varies by
   // provider, so it stays an overlay, not part of the cached texture). `null` for
@@ -205,6 +240,45 @@ export function buildBuildingParts(
   return {
     staticBody: container,
     shadow: buildShadow(W, D),
+    anims: built.anims,
+    pennant,
+    hw,
+    depth,
+    foot: [W, D],
+  };
+}
+
+/**
+ * Metrics + live anims/pennant without retaining static body/shadow Graphics.
+ *
+ * Constructs the kit body briefly (anim positions are derived from the same
+ * geometry tables as the full path), measures hw/depth/foot with the same
+ * formulas as {@link buildBuildingParts}, then destroys the static container.
+ * Shadow is never built. Callers on an atlas HIT that need fresh kit anims
+ * (variant key changed but texture already warm) use this instead of the full
+ * path; when the variant is unchanged, prefer atlas frame metrics + anim reuse.
+ */
+export function peekBuildingParts(
+  b: Building,
+  _profile: BuildingProfile,
+  _scale: { w: number; depth: number },
+  salt = 0,
+): LiveParts {
+  const level = tierRank(b.visualTier);
+  const built = getBuilder(b.purpose)(level, { outline: false, salt });
+  const [W, D] = built.foot;
+
+  // Detach anims BEFORE destroying the container so their nodes survive.
+  for (const a of built.anims) a.node.removeFromParent();
+
+  const bounds = built.container.getLocalBounds();
+  const { hw, depth } = metricsFromBounds(bounds);
+  const pennant = buildPennant(b.provider, bounds.y);
+
+  // Drop the heavy static Graphics tree — peek never retains it.
+  built.container.destroy({ children: true });
+
+  return {
     anims: built.anims,
     pennant,
     hw,

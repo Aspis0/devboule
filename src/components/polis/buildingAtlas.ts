@@ -10,16 +10,13 @@
 // right after it is captured; only the (tiny) animated parts + overlays stay live.
 //
 // VARIANT KEY — the full static visual identity of a building. The procedural
-// kit builders (kitcd/buildings.ts) take ONLY `(level, opt)`: their geometry,
-// props, colors and silhouette are a pure function of the PURPOSE slug (which
-// builder) and the LEVEL 0..4 (= tierRank(visualTier)). There is NO per-building
-// seed, NO district accent, NO status/sin tint in the STATIC body — every such
-// thing (selection ring, hover, status/censor/unknown-bug overlays, agent glow,
-// the provider pennant, the animated flame/smoke/flag/water) is an OVERLAY the
-// renderer attaches on demand, NOT baked here. So the key is exactly
-// `${purpose}:${level}` — two buildings with the same (purpose, level) are
-// pixel-identical and share ONE Texture object; a different level (or purpose)
-// is a different texture.
+// kit builders take `(level, opt)` where `opt.salt` is a small integer 0..N-1
+// that picks tasteful cosmetic deltas (roof/wall tint, chimney, window layout,
+// small accents). Geometry silhouette and footprint stay fixed per (purpose,
+// level). The key is therefore `${purpose}:${level}:s${salt}` — two buildings
+// with the same (purpose, level, salt) are pixel-identical and share ONE Texture
+// object. Salt is a stable hash of the building's fileId modulo N (see
+// {@link buildingSalt}); N is purpose-classed and profile-clamped.
 //
 // SHADOW: the contact shadow is also a pure function of the footprint [W, D],
 // which is fixed per (purpose, level). So it is baked into a SECOND per-variant
@@ -32,6 +29,7 @@
 // renders up front.
 
 import { Container, Graphics, Texture, Rectangle } from "pixi.js";
+import { hashString } from "./rng";
 
 /**
  * The minimal renderer surface the atlas needs. PIXI's `Renderer.generateTexture`
@@ -64,6 +62,12 @@ export interface BuildingVariant {
   frame: { x: number; y: number; width: number; height: number };
   /** Local bounds of the shadow at capture (the shadow is centred under foot). */
   shadowFrame: { x: number; y: number; width: number; height: number };
+  /**
+   * Kit footprint [W, D] in grid units — pure function of (purpose, level).
+   * Cached at bake so atlas-HIT update paths can skip rebuildBuildingParts
+   * entirely when only overlays (sin/status/provider) change.
+   */
+  foot: [number, number];
 }
 
 /**
@@ -82,9 +86,101 @@ export function atlasResolution(dpr: number): number {
   return Math.min(Math.max(dpr, 1), ATLAS_RESOLUTION_CAP);
 }
 
-/** Canonical variant key: the FULL static visual identity (purpose × level). */
-export function variantKey(purpose: string, level: number): string {
-  return `${purpose}:${level}`;
+// ---------------------------------------------------------------------------
+// Procedural salt — variety without exploding the atlas.
+// ---------------------------------------------------------------------------
+
+/** High-frequency purposes: N=4 salt variants (houses dominate a real city). */
+const SALT_HIGH = new Set(["house", "workshop", "warehouse", "unknown"]);
+/** Medium-frequency civic: N=2. */
+const SALT_MED = new Set(["market", "library", "baths", "theater", "townhall"]);
+/** Landmarks / rare: N=1 (no variants — one texture per purpose×level). */
+const SALT_LANDMARK = new Set([
+  "temple",
+  "lighthouse",
+  "fortress",
+  "harbor",
+  "conduit",
+  "tower",
+]);
+
+/**
+ * Base variant count N for a purpose BEFORE profile clamping.
+ *   - high-frequency (house/workshop/warehouse/unknown): 4
+ *   - medium civic (market/library/baths/theater/townhall): 2
+ *   - landmarks (temple/lighthouse/fortress/harbor/conduit/tower): 1
+ *   - any other / fallback purpose slug: 4 (treat as high-frequency default)
+ */
+export function baseVariantCount(purpose: string): number {
+  if (SALT_LANDMARK.has(purpose)) return 1;
+  if (SALT_MED.has(purpose)) return 2;
+  if (SALT_HIGH.has(purpose)) return 4;
+  return 4; // default/fallback for unknown slugs
+}
+
+/**
+ * Effective variant count N for a purpose, clamped by a profile salt cap
+ * (`RenderProfile.buildingVariantSaltMax`: rich 4 / lean 2 / minimal 1).
+ * PURE. Used by the atlas key path and by tests for distribution checks.
+ */
+export function variantCountFor(purpose: string, saltMax = 4): number {
+  const cap =
+    Number.isFinite(saltMax) && saltMax >= 1 ? Math.floor(saltMax) : 1;
+  return Math.min(baseVariantCount(purpose), cap);
+}
+
+/**
+ * Stable salt in `0 .. N-1` from a building's fileId.
+ * Same fileId → same salt; different ids spread across the N slots.
+ * When N ≤ 1 the salt is always 0 (single shared texture).
+ *
+ * @param saltMax profile clamp (rich 4 / lean 2 / minimal 1)
+ */
+export function buildingSalt(
+  fileId: string,
+  purpose: string,
+  saltMax = 4,
+): number {
+  const n = variantCountFor(purpose, saltMax);
+  if (n <= 1) return 0;
+  return hashString(fileId) % n;
+}
+
+/**
+ * Canonical variant key: purpose × level × salt.
+ * Format: `${purpose}:${level}:s${salt}` (salt always present, even when 0).
+ */
+export function variantKey(
+  purpose: string,
+  level: number,
+  salt = 0,
+): string {
+  return `${purpose}:${level}:s${salt}`;
+}
+
+/**
+ * Civic/rare landmark presence scale applied at PLACEMENT (not baked into the
+ * atlas). Modest skyline emphasis only — monuments / externalServices are
+ * intentionally excluded. PURE.
+ *
+ * Values sit in ~1.06–1.1 so hit areas / shadows scaled by the same factor stay
+ * consistent with the body.
+ */
+export function landmarkPresenceScale(purpose: string): number {
+  switch (purpose) {
+    case "temple":
+      return 1.1;
+    case "theater":
+      return 1.08;
+    case "library":
+      return 1.07;
+    case "baths":
+      return 1.06;
+    case "lighthouse":
+      return 1.09;
+    default:
+      return 1;
+  }
 }
 
 export class BuildingTextureAtlas {
@@ -104,14 +200,14 @@ export class BuildingTextureAtlas {
     return this.cache.size;
   }
 
-  /** True iff the (purpose, level) variant texture has already been generated. */
-  has(purpose: string, level: number): boolean {
-    return this.cache.has(variantKey(purpose, level));
+  /** True iff the (purpose, level, salt) variant texture has already been generated. */
+  has(purpose: string, level: number, salt = 0): boolean {
+    return this.cache.has(variantKey(purpose, level, salt));
   }
 
   /**
-   * Lazily resolve (and cache) the texture variant for a (purpose, level). On a
-   * cache MISS the caller-provided `build` closure constructs the STATIC body
+   * Lazily resolve (and cache) the texture variant for a (purpose, level, salt).
+   * On a cache MISS the caller-provided `build` closure constructs the STATIC body
    * Container + shadow Graphics ONCE off-stage; we generateTexture both, destroy
    * the source display objects, and cache the textures. On a HIT nothing is built
    * — the shared textures are returned. The `build` closure is invoked at most
@@ -126,13 +222,14 @@ export class BuildingTextureAtlas {
     renderer: TextureSource,
     purpose: string,
     level: number,
-    build: () => { body: Container; shadow: Graphics },
+    build: () => { body: Container; shadow: Graphics; foot: [number, number] },
+    salt = 0,
   ): BuildingVariant {
-    const key = variantKey(purpose, level);
+    const key = variantKey(purpose, level, salt);
     const hit = this.cache.get(key);
     if (hit) return hit;
 
-    const { body, shadow } = build();
+    const { body, shadow, foot } = build();
 
     // Capture local bounds BEFORE generateTexture (some fake renderers in tests
     // don't mutate the target; real PIXI reads bounds internally anyway).
@@ -163,6 +260,7 @@ export class BuildingTextureAtlas {
       shadowTexture,
       frame,
       shadowFrame,
+      foot: [foot[0], foot[1]],
     };
     this.cache.set(key, variant);
     return variant;
