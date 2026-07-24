@@ -21,10 +21,9 @@
 //     this ordering so a future edit can't accidentally make `minimal` reveal more
 //     than `rich`.
 //
-// The `rich` tier reproduces the renderer's historical hard-coded defaults exactly
-// (LOD_LABELS_IN 0.62 / OUT 0.58, LOD_DETAILS 0.4, LOD_AGENTS 0.35, atlas cap 2,
-// antialias on, MAX_AMBIENT 40), so a discrete-GPU box renders byte-for-byte what
-// it did before B2c — the profile only ever RELAXES detail on weaker hardware.
+// The `rich` tier keeps the historical LOD defaults (LOD_LABELS_IN 0.62 / OUT
+// 0.58, LOD_DETAILS 0.4, LOD_AGENTS 0.35, atlas cap 2, antialias on) and raises
+// the ambient-walker cap to 64 (Phase 4). Weaker tiers only ever RELAX detail.
 
 /** The host hardware capability snapshot. Mirrors the Rust `HardwareInfo` wire
  *  shape (serde camelCase) returned by the `detect_hardware` Tauri command. Every
@@ -85,6 +84,24 @@ export interface RenderProfile {
   /** P5.1 — max number of hero fires (Tier F2 ParticleContainers). Capped at init;
    *  pooled once, re-targeted between buildings. RICH 6 / LEAN 3 / MINIMAL 0. */
   maxHeroFires: number;
+  /** Phase 4 ambient life — max concurrent chimney-smoke emitters. RICH 24 /
+   *  LEAN 10 / MINIMAL 0. Shared particle pool; budget-rung demotes to zero. */
+  maxChimneySmoke: number;
+  /** Phase 4 — max civic Flag anims with deterministic wind phase. RICH 20 /
+   *  LEAN 8 / MINIMAL 0. */
+  maxCivicFlags: number;
+  /** Phase 4 — max concurrent bird silhouettes (bezier flyers). RICH 3 /
+   *  LEAN/MINIMAL 0. */
+  maxBirds: number;
+  /** Phase 4 — max night-window glow sprites (mid+ tier buildings). RICH 120 /
+   *  LEAN 40 / MINIMAL 0. Layer alpha only per tick. */
+  maxNightWindows: number;
+  /** Phase 4 — max traffic-dust motes on trunk roads at far zoom. RICH 12 /
+   *  LEAN/MINIMAL 0. */
+  maxTrafficDust: number;
+  /** Phase 4 — max static forum crowd clusters near civic buildings. RICH 8 /
+   *  LEAN 3 / MINIMAL 0. */
+  maxForumClusters: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,9 +120,15 @@ const RICH: RenderProfile = {
   preloadRing: 2,
   atlasResolutionCap: 2,
   buildingVariantSaltMax: 4,
-  maxAmbientWalkers: 40,
+  maxAmbientWalkers: 64,
   antialias: true,
   maxHeroFires: 6,
+  maxChimneySmoke: 24,
+  maxCivicFlags: 20,
+  maxBirds: 3,
+  maxNightWindows: 120,
+  maxTrafficDust: 12,
+  maxForumClusters: 8,
 };
 
 /** LEAN — integrated / unknown GPU, low VRAM, or a modest CPU. Also the SAFE
@@ -124,6 +147,12 @@ const LEAN: RenderProfile = {
   maxAmbientWalkers: 18,
   antialias: false,
   maxHeroFires: 3,
+  maxChimneySmoke: 10,
+  maxCivicFlags: 8,
+  maxBirds: 0,
+  maxNightWindows: 40,
+  maxTrafficDust: 0,
+  maxForumClusters: 3,
 };
 
 /** MINIMAL — the lowest floor (tiny VRAM or a 1-4 core box). Labels/detail only
@@ -141,6 +170,12 @@ const MINIMAL: RenderProfile = {
   maxAmbientWalkers: 6,
   antialias: false,
   maxHeroFires: 0,
+  maxChimneySmoke: 0,
+  maxCivicFlags: 0,
+  maxBirds: 0,
+  maxNightWindows: 0,
+  maxTrafficDust: 0,
+  maxForumClusters: 0,
 };
 
 // ---------------------------------------------------------------------------

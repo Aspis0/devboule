@@ -148,6 +148,10 @@ export const DERIVED = {
 
   // Smoke / fire (square retro particles + flame shapes).
   smoke: lighten(PALETTE.stoneDark, 0.28),
+  // Idle chimney smoke: cool blue-gray so it reads distinct from warm disaster
+  // fire smoke (DERIVED.smoke / fire orange family). Blend warm smoke ~18% toward
+  // water — still on-palette, no raw hex.
+  smokeCool: blend(lighten(PALETTE.stoneDark, 0.28), PALETTE.water, 0.18),
   fireCore: lighten(PALETTE.terracotta, 0.1),
   fireHot: lighten(PALETTE.goldAccent, 0.18),
   ember: PALETTE.terracottaDark,

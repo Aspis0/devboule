@@ -125,6 +125,7 @@ import {
   type FireAtlas, type CrowdFire, type HeroFire, type FireSeverity,
   type PromotableBuilding,
 } from "./fire";
+import { AmbientLifeManager } from "./ambientLife";
 import { sliceBatches, DEFAULT_BUILD_BATCH } from "./chunk";
 import {
   orderBuildQueue,
@@ -496,6 +497,10 @@ export class PolisRenderer {
   // growthEffects.ts. Fired from the live diff on real agentPresent/tier/add/
   // remove deltas — never for the ambient crowd.
   private growthFx: GrowthFx;
+  // Phase 4 ambient life — chimney smoke, civic flags, birds, night windows,
+  // traffic dust, forum clusters. Profile-capped + budget-gated; pure planners
+  // in ambientLife.ts. Decoration only (honesty rules).
+  private ambientLife: AmbientLifeManager;
   private clock = new StepClock();
   // Running animation time (seconds) handed to the kit anim instances'
   // update(t, dt). Advanced once per step in update(); only visible-chunk anims
@@ -844,6 +849,18 @@ export class PolisRenderer {
     this.layers.effects.eventMode = "none";
     this.growthFx = new GrowthFx(this.layers.effects);
 
+    // Phase 4 ambient life: shared systems on the effects layer (above buildings,
+    // non-interactive). Textures baked once; planners re-run on city rebuild.
+    this.ambientLife = new AmbientLifeManager(this.profile);
+    this.layers.effects.addChild(this.ambientLife.root);
+    try {
+      this.ambientLife.bake(
+        this.app.renderer as unknown as import("./ambientLife").AmbientTextureSource,
+      );
+    } catch {
+      this.debugLog("Phase 4 ambient-life bake failed — systems disabled");
+    }
+
     // P5.1 — halos layer: z-grouped additive sprites (two blend switches per frame).
     this.layers.halos.eventMode = "none";
     // P5.1 — effects budget (pure, injectable clock).
@@ -1138,6 +1155,9 @@ export class PolisRenderer {
         this.externalLayer.setLodVisible(this.viewport.scale.x >= LOD_EXTERNAL);
         this.clock.reset();
         this.recenter();
+        // Phase 4 ambient life — after buildings + camera settle so nearest-
+        // center selection uses the fitted view. Pure planners + pooled rebuild.
+        this.syncAmbientLife(city.roads);
         // Force a cull/LOD pass on the next tick for the freshly built scene.
         this.cullDirty = true;
         // P3.2 — apply any active filter to the freshly built scene
@@ -1506,6 +1526,8 @@ export class PolisRenderer {
     for (const b of next.buildings) nextById.set(b.fileId, b);
 
     let addedOrRemoved = false;
+    // Phase 4: any visual building change can retarget smoke/flags/windows/forums.
+    let buildingsTouched = false;
 
     // 1) ADDED / CHANGED. Walk the next buildings; compare to the current node.
     //    L2 growth visuals are keyed on deltas computed HERE (old vs new) and
@@ -1523,6 +1545,7 @@ export class PolisRenderer {
       }
       // CHANGED? Update only if a visual input differs.
       if (buildingChanged(node.building, b)) {
+        buildingsTouched = true;
         const old = node.building;
         // Capture the growth deltas from the OLD node BEFORE it mutates.
         const oldTier = tierRank(old.visualTier);
@@ -1657,6 +1680,13 @@ export class PolisRenderer {
     // now the terrain-driven walkability guard, so re-sync on either). Run BEFORE
     // the agent reconcile so a newly-active agent claims from the up-to-date crowd.
     if (graphRebuilt) this.syncAmbient();
+
+    // Phase 4 ambient life: feed city data on building/road diffs. Per-subsystem
+    // input signatures inside AmbientLifeManager.rebuild skip work when that
+    // system's inputs are unchanged (F7). Birds only update bounds (F12).
+    if (addedOrRemoved || graphRebuilt || buildingsTouched) {
+      this.syncAmbientLife(next.roads);
+    }
 
     // 6) Agents — reconcile through the PURE possession layer: a newly-active agent
     //    claims an idle crowd omino (or spawns fresh), an agent whose currentFileId
@@ -2030,6 +2060,103 @@ export class PolisRenderer {
     this.ambientLayer.setCount(
       desiredAmbientCount(nodeIds.length, this.profile.maxAmbientWalkers),
     );
+  }
+
+  /**
+   * Phase 4 ambient life rebuild: pure planners select chimney emitters, civic
+   * flags, night windows, traffic dust paths, and forum clusters; PIXI systems
+   * reassign pooled sprites. Call after buildings are placed (finalize / live
+   * diff). Uses city geometric center for nearest-cap ranking (deterministic).
+   */
+  private syncAmbientLife(roads: Road[]): void {
+    if (this.destroyed) return;
+    // Headless build-order tests stub buildingNodes as `{ size }` without a
+    // real Map — skip ambient life there (no PIXI texture bake either).
+    if (typeof this.buildingNodes.values !== "function") return;
+    const saltMax = this.profile.buildingVariantSaltMax;
+    const views = [];
+    let cx = 0;
+    let cy = 0;
+    let n = 0;
+    for (const node of this.buildingNodes.values()) {
+      const b = node.building;
+      const salt = buildingSalt(b.fileId, b.purpose, saltMax);
+      const level = tierRank(b.visualTier);
+      views.push({
+        building: b,
+        iso: node.iso,
+        salt,
+        level,
+        depth: node.labelDepth,
+        hw: node.hitRadius,
+        kitAnims: node.kitAnims,
+        container: node.container,
+      });
+      cx += node.iso.x;
+      cy += node.iso.y;
+      n++;
+    }
+    if (n > 0) {
+      cx /= n;
+      cy /= n;
+    }
+
+    // Trunk segments for traffic dust (top-weight import roads with path).
+    const trunks: Array<{
+      id: string;
+      x0: number;
+      y0: number;
+      x1: number;
+      y1: number;
+      weight: number;
+    }> = [];
+    for (const road of roads) {
+      if (road.weight < 3) continue;
+      if (road.path && road.path.length >= 2) {
+        for (let i = 0; i < road.path.length - 1; i++) {
+          const a = cartToIso(road.path[i].x, road.path[i].y);
+          const b = cartToIso(road.path[i + 1].x, road.path[i + 1].y);
+          trunks.push({
+            id: `${road.roadId}#${i}`,
+            x0: a.x,
+            y0: a.y,
+            x1: b.x,
+            y1: b.y,
+            weight: road.weight,
+          });
+        }
+      } else {
+        const from = this.buildingNodes.get(road.from);
+        const to = this.buildingNodes.get(road.to);
+        if (!from || !to) continue;
+        trunks.push({
+          id: road.roadId,
+          x0: from.iso.x,
+          y0: from.iso.y,
+          x1: to.iso.x,
+          y1: to.iso.y,
+          weight: road.weight,
+        });
+      }
+    }
+
+    this.ambientLife.rebuild({
+      buildings: views,
+      trunks,
+      centerX: cx,
+      centerY: cy,
+      nowMs: Date.now(),
+    });
+
+    // Civic flags may have been ADDED to buildings that previously had no kit
+    // anims (temple/theater/library). Ensure those nodes are on the step list.
+    const animatedSet = new Set(this.animatedNodes);
+    for (const node of this.buildingNodes.values()) {
+      if (node.kitAnims.length > 0 && !animatedSet.has(node)) {
+        this.animatedNodes.push(node);
+        animatedSet.add(node);
+      }
+    }
   }
 
   /** Center + fit the viewport on the current content. */
@@ -2426,6 +2553,16 @@ export class PolisRenderer {
     // stepped status-lamp pulse for "spawning" nodes (steady states are set once
     // at build). LOD-gated inside the layer.
     this.externalLayer.step(frame, t, dt);
+
+    // Phase 4 ambient life: chimney smoke / birds / night windows / traffic dust
+    // / forum bob. Budget-rung gated inside the manager; only transform/alpha.
+    this.ambientLife.step({
+      frame,
+      rung,
+      dayPhase: this.dayPhase,
+      zoomScale: this.viewport.scale.x,
+      lodAgents: this.lodAgents,
+    });
 
     // P5.1 — effects budget: record elapsed ms.
     const effectsElapsed = performance.now() - effectsStart;
@@ -4317,6 +4454,9 @@ export class PolisRenderer {
     this.haloSprites.clear();
 
     this.growthFx.clear();
+    // Phase 4 ambient life — park particles / clear clusters (textures kept for
+    // the next rebuild; dispose in destroy()).
+    this.ambientLife.clear();
     this.roadGraph = null;
     // FIX: reset the live-diff baselines. Leaving these set would let the next
     // setCityState diff against a destroyed/stale city (lastCity) or wrongly skip
@@ -4432,6 +4572,8 @@ export class PolisRenderer {
       this.debugOverlay = null;
     }
     this.growthFx.dispose();
+    // Phase 4 ambient life — destroy pooled sprites + baked textures.
+    this.ambientLife.destroy();
     // Both overlays live directly on app.stage. PIXI v8 `destroy()` does NOT
     // detach a child from its parent, and PolisRenderer.destroy() does NOT stop
     // the PIXI Application — so the ticker keeps rendering and would dereference

@@ -118,8 +118,10 @@ const BOB_OFFSETS = [0, -1, -2, -1] as const;
 const AMBIENT_ALPHA = 0.88;
 
 // Crowd size relative to the road-connected building count, capped for perf.
+// Phase 4: raised to 64 so the rich profile's maxAmbientWalkers (64) is the
+// effective ceiling; weaker tiers still clamp via desiredAmbientCount's cap arg.
 const AMBIENT_PER_NODE = 0.4;
-const MAX_AMBIENT = 40;
+const MAX_AMBIENT = 64;
 const MIN_AMBIENT = 4;
 
 // Figure vocabulary for the DECORATIVE ambient crowd. Polis-P2 broadens this to

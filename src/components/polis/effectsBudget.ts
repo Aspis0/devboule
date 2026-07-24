@@ -57,6 +57,75 @@ const PROMO_INTERVAL_S = 2.0;
 const DEMO_INTERVAL_S = 1.0;
 
 /**
+ * Phase 4 ambient-life effect gates driven by the budget ladder. Pure.
+ *
+ *   rung 0–2: full ambient life (profile caps still apply)
+ *   rung 3:   half-rate smoke / dust / birds still on; forum bob half-rate
+ *   rung 4:   chimney smoke, birds, traffic dust OFF; windows + forum bob stay
+ *   rung 5:   everything ambient-life OFF
+ *
+ * Civic flags are kit Flag anims already gated by chunk visibility in the
+ * renderer — they ride the ambient half-rate (rung 4+) via kit anim skip.
+ */
+export interface AmbientLifeGates {
+  chimneySmoke: boolean;
+  birds: boolean;
+  nightWindows: boolean;
+  trafficDust: boolean;
+  forumBob: boolean;
+  /** When false, civic Flag kit anims should not step (rung >= 4). */
+  civicFlags: boolean;
+  /** True when stepped systems should advance only every other StepClock frame. */
+  halfRate: boolean;
+}
+
+/** Pure mapping of budget rung → which Phase 4 ambient-life systems may run. */
+export function ambientLifeGates(rung: BudgetRung): AmbientLifeGates {
+  if (rung >= 5) {
+    return {
+      chimneySmoke: false,
+      birds: false,
+      nightWindows: false,
+      trafficDust: false,
+      forumBob: false,
+      civicFlags: false,
+      halfRate: true,
+    };
+  }
+  if (rung >= 4) {
+    return {
+      chimneySmoke: false,
+      birds: false,
+      nightWindows: true,
+      trafficDust: false,
+      forumBob: true,
+      civicFlags: false,
+      halfRate: true,
+    };
+  }
+  if (rung >= 3) {
+    return {
+      chimneySmoke: true,
+      birds: true,
+      nightWindows: true,
+      trafficDust: true,
+      forumBob: true,
+      civicFlags: true,
+      halfRate: true,
+    };
+  }
+  return {
+    chimneySmoke: true,
+    birds: true,
+    nightWindows: true,
+    trafficDust: true,
+    forumBob: true,
+    civicFlags: true,
+    halfRate: false,
+  };
+}
+
+/**
  * Pure effects-budget accumulator. The renderer owns ONE instance, brackets its
  * effects pass, and reads `.rung` (0–5) to gate expensive effects.
  *

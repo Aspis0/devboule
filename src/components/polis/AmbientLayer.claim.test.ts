@@ -191,11 +191,11 @@ describe("AmbientLayer.adopt — return a claimed omino to the crowd", () => {
   });
 
   it("does NOT exceed MAX_AMBIENT on adopt (built walker destroyed, no leak)", () => {
-    // Drive the crowd to the perf cap (request well above MAX_AMBIENT=40).
+    // Drive the crowd to the perf cap (request well above MAX_AMBIENT=64).
     const { root, layer } = makeLayer(200);
-    expect(layer.count).toBe(40); // clamped to MAX_AMBIENT
+    expect(layer.count).toBe(64); // clamped to MAX_AMBIENT
     const childrenAtCap = root.children.length;
-    expect(childrenAtCap).toBe(40);
+    expect(childrenAtCap).toBe(64);
 
     // Simulate the claim-window race: a slot was claimed (claimedCount++ via
     // release) AND setCount re-filled the crowd back to the cap. A subsequent
@@ -203,14 +203,14 @@ describe("AmbientLayer.adopt — return a claimed omino to the crowd", () => {
     layer.release("builder", isoOf("a"));
     expect(layer.claimed).toBe(1);
     layer.setCount(200); // re-fills the released slot up to the cap
-    expect(layer.count).toBe(40);
+    expect(layer.count).toBe(64);
 
     layer.adopt("builder", isoOf("e"));
     // The cap holds: the built walker was destroyed, not pushed over the cap.
-    expect(layer.count).toBe(40);
+    expect(layer.count).toBe(64);
     expect(layer.claimed).toBe(0);
     // No PIXI leak: root never holds more than the capped number of containers.
-    expect(root.children.length).toBe(40);
+    expect(root.children.length).toBe(64);
   });
 });
 

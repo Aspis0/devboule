@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { EffectsBudget, budgetAllowanceMs } from "./effectsBudget";
+import {
+  EffectsBudget,
+  budgetAllowanceMs,
+  ambientLifeGates,
+} from "./effectsBudget";
 import type { RenderProfile } from "./renderProfile";
 
 const RICH_PROFILE: RenderProfile = {
@@ -11,12 +15,38 @@ const RICH_PROFILE: RenderProfile = {
   preloadRing: 2,
   atlasResolutionCap: 2,
   buildingVariantSaltMax: 4,
-  maxAmbientWalkers: 40,
+  maxAmbientWalkers: 64,
   antialias: true,
   maxHeroFires: 6,
+  maxChimneySmoke: 24,
+  maxCivicFlags: 20,
+  maxBirds: 3,
+  maxNightWindows: 120,
+  maxTrafficDust: 12,
+  maxForumClusters: 8,
 };
-const LEAN_PROFILE: RenderProfile = { ...RICH_PROFILE, tier: "lean", maxHeroFires: 3 };
-const MINIMAL_PROFILE: RenderProfile = { ...RICH_PROFILE, tier: "minimal", maxHeroFires: 0 };
+const LEAN_PROFILE: RenderProfile = {
+  ...RICH_PROFILE,
+  tier: "lean",
+  maxHeroFires: 3,
+  maxChimneySmoke: 10,
+  maxCivicFlags: 8,
+  maxBirds: 0,
+  maxNightWindows: 40,
+  maxTrafficDust: 0,
+  maxForumClusters: 3,
+};
+const MINIMAL_PROFILE: RenderProfile = {
+  ...RICH_PROFILE,
+  tier: "minimal",
+  maxHeroFires: 0,
+  maxChimneySmoke: 0,
+  maxCivicFlags: 0,
+  maxBirds: 0,
+  maxNightWindows: 0,
+  maxTrafficDust: 0,
+  maxForumClusters: 0,
+};
 
 describe("budgetAllowanceMs", () => {
   it("RICH → 3.0ms", () => expect(budgetAllowanceMs(RICH_PROFILE)).toBe(3.0));
@@ -207,5 +237,40 @@ describe("EffectsBudget — ladder order pinned", () => {
     b.reset();
     expect(b.rung).toBe(0);
     expect(b.smoothedCostMs).toBe(0);
+  });
+});
+
+describe("ambientLifeGates — Phase 4 demotion path", () => {
+  it("rung 0 keeps every ambient-life system on", () => {
+    const g = ambientLifeGates(0);
+    expect(g).toEqual({
+      chimneySmoke: true,
+      birds: true,
+      nightWindows: true,
+      trafficDust: true,
+      forumBob: true,
+      civicFlags: true,
+      halfRate: false,
+    });
+  });
+
+  it("rung 4 demotes chimney smoke / birds / dust to zero", () => {
+    const g = ambientLifeGates(4);
+    expect(g.chimneySmoke).toBe(false);
+    expect(g.birds).toBe(false);
+    expect(g.trafficDust).toBe(false);
+    expect(g.nightWindows).toBe(true);
+    expect(g.forumBob).toBe(true);
+  });
+
+  it("rung 5 pauses all ambient life", () => {
+    const g = ambientLifeGates(5);
+    expect(g.chimneySmoke).toBe(false);
+    expect(g.birds).toBe(false);
+    expect(g.nightWindows).toBe(false);
+    expect(g.trafficDust).toBe(false);
+    expect(g.forumBob).toBe(false);
+    expect(g.civicFlags).toBe(false);
+    expect(g.halfRate).toBe(true);
   });
 });
