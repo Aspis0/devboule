@@ -7,6 +7,7 @@ use clap::ValueEnum;
 use fastembed::Qwen3TextEmbedding;
 use serde::Serialize;
 
+use crate::embed::{CancelFlag, CandleEmbedder, Embedder};
 use crate::onnx_embedder::{EpArg, OnnxEmbedder, ONNX_MODEL_ID};
 use crate::BackendArg;
 use std::time::Instant;
@@ -65,7 +66,14 @@ fn metal_device() -> Result<Device> {
     anyhow::bail!("metal not compiled in (build with --features metal on macOS)")
 }
 
-/// A loaded model plus how long the load took.
+/// A loaded raw model plus how long the load took.
+///
+/// # Caller contract
+///
+/// The `model` field is a bare [`Qwen3TextEmbedding`] with **no** windowing and
+/// **no** attention-budget enforcement. Prefer [`CandleEmbedder`] /
+/// [`Embedder`] for any untrusted-length input; do not call `model.embed`
+/// directly on arbitrary texts (attention memory scales as `batch × seq_len²`).
 pub struct Loaded {
     pub model: Qwen3TextEmbedding,
     pub load_ms: u128,
@@ -74,8 +82,14 @@ pub struct Loaded {
 /// Load the Qwen3 embedding model from the local HF cache.
 ///
 /// Max sequence length is [`crate::embed::resolve_embed_max_seq_tokens`]
-/// (one window). Callers must window long texts (see `crate::embed`) so the
-/// model never needs to drop tokens.
+/// (one window).
+///
+/// # Caller contract
+///
+/// Returns a **raw** model. Callers that embed untrusted-length text must use
+/// [`CandleEmbedder`] / the [`Embedder`] trait (windowing + mean-pooling +
+/// `pack_windows_for_attention`). Direct `model.embed` skips the runtime
+/// attention budget and has frozen hosts on long inputs.
 pub fn load_model(device: &Device, dtype: DType) -> Result<Loaded> {
     let start = std::time::Instant::now();
     let max_len = crate::embed::resolve_embed_max_seq_tokens();
@@ -87,33 +101,11 @@ pub fn load_model(device: &Device, dtype: DType) -> Result<Loaded> {
     })
 }
 
-/// Result of an embed call plus the elapsed wall time.
-pub struct EmbedResult {
-    pub vectors: Vec<Vec<f32>>,
-    pub embed_ms: u128,
-}
-
-/// Embed `texts` (L2-normalized) and time the call.
-///
-/// Texts are processed in chunks of `batch_size` to bound per-call memory and
-/// avoid the quadratic blowup of padding the whole input to the longest item.
-pub fn embed_texts(
-    model: &Qwen3TextEmbedding,
-    texts: &[String],
-    batch_size: usize,
-) -> Result<EmbedResult> {
-    let start = std::time::Instant::now();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(batch_size.max(1)) {
-        let mut v = model
-            .embed(chunk)
-            .with_context(|| "embedding texts failed")?;
-        vectors.append(&mut v);
-    }
-    Ok(EmbedResult {
-        vectors,
-        embed_ms: start.elapsed().as_millis(),
-    })
+/// Map CLI device/dtype flags to [`CandleEmbedder::load`] args.
+fn candle_load_flags(device_arg: DeviceArg, dtype_arg: DtypeArg) -> (bool, bool) {
+    let metal = matches!(device_arg, DeviceArg::Metal);
+    let f16 = matches!(dtype_arg, DtypeArg::F16);
+    (metal, f16)
 }
 
 /// Output shape for the `embed` subcommand.
@@ -184,29 +176,28 @@ pub async fn cmd_embed(
         return Ok(());
     }
 
-    let device = resolve_device(device_arg)?;
-    let dtype = dtype_arg.to_dtype();
+    let (metal, f16) = candle_load_flags(device_arg, dtype_arg);
+    let load_start = Instant::now();
+    let mut embedder = CandleEmbedder::load(metal, f16).context("loading candle embedder")?;
+    let load_ms = load_start.elapsed().as_millis();
+    eprintln!("model load: {} ms", load_ms);
 
-    let loaded = load_model(&device, dtype)?;
-    eprintln!("model load: {} ms", loaded.load_ms);
-
-    let res = embed_texts(&loaded.model, &texts, batch_size)?;
+    let start = Instant::now();
+    let vectors = embedder.embed(&texts, batch_size, &CancelFlag::new())?;
+    let embed_ms = start.elapsed().as_millis();
     let n = texts.len();
-    let tps = if res.embed_ms > 0 {
-        n as f64 / (res.embed_ms as f64 / 1000.0)
+    let tps = if embed_ms > 0 {
+        n as f64 / (embed_ms as f64 / 1000.0)
     } else {
         0.0
     };
-    eprintln!(
-        "embed: {} ms ({} texts, {:.1} texts/sec)",
-        res.embed_ms, n, tps
-    );
+    eprintln!("embed: {} ms ({} texts, {:.1} texts/sec)", embed_ms, n, tps);
 
-    let dims = res.vectors.first().map(|v| v.len()).unwrap_or(0);
+    let dims = vectors.first().map(|v| v.len()).unwrap_or(0);
     let out_obj = EmbedOut {
         model: MODEL_ID.to_string(),
         dims,
-        vectors: res.vectors,
+        vectors,
     };
     let json = serde_json::to_string_pretty(&out_obj)?;
     std::fs::write(&out, json).with_context(|| format!("writing output {}", out.display()))?;
@@ -292,14 +283,14 @@ pub async fn cmd_bench(
             total_words,
         )
     } else {
-        let device = resolve_device(device_arg)?;
-        let dtype = dtype_arg.to_dtype();
-        let loaded = load_model(&device, dtype)?;
+        let (metal, f16) = candle_load_flags(device_arg, dtype_arg);
+        let mut embedder = CandleEmbedder::load(metal, f16).context("loading candle embedder")?;
 
         let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
         for _ in 0..iters {
-            let res = embed_texts(&loaded.model, &texts, batch_size)?;
-            per_iter_ms.push(res.embed_ms);
+            let start = Instant::now();
+            let _ = embedder.embed(&texts, batch_size, &CancelFlag::new())?;
+            per_iter_ms.push(start.elapsed().as_millis());
         }
         bench_summary(
             MODEL_ID.to_string(),
@@ -314,4 +305,42 @@ pub async fn cmd_bench(
 
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::embed::{
+        expand_texts_to_windows, pool_window_vectors, resolve_embed_window_bytes,
+        resolve_embed_window_overlap_bytes,
+    };
+
+    /// Pure stand-in for the CLI candle path (`CandleEmbedder::embed`):
+    /// window → (fake per-window vectors) → mean-pool. No model load.
+    fn protected_cli_path_vectors(texts: &[String]) -> Vec<Vec<f32>> {
+        let window_bytes = resolve_embed_window_bytes();
+        let overlap = resolve_embed_window_overlap_bytes();
+        let (windows, counts) = expand_texts_to_windows(texts, window_bytes, overlap);
+        let fake: Vec<Vec<f32>> = windows.iter().map(|_| vec![1.0f32, 0.0]).collect();
+        pool_window_vectors(&fake, &counts)
+    }
+
+    #[test]
+    fn cli_protected_path_is_one_vector_per_text() {
+        let texts = vec![
+            "short".to_string(),
+            "x".repeat(20_000),
+            String::new(),
+            "mid".to_string(),
+            "y".repeat(5_000),
+        ];
+        let vectors = protected_cli_path_vectors(&texts);
+        assert_eq!(
+            vectors.len(),
+            texts.len(),
+            "CLI protected path must yield exactly one vector per input text"
+        );
+        for (i, v) in vectors.iter().enumerate() {
+            assert_eq!(v.len(), 2, "vector {i} must keep fake dim");
+        }
+    }
 }
