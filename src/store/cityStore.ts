@@ -84,6 +84,30 @@ export function folderBasename(path: string | null): string | null {
   return base && base.length > 0 ? base : path;
 }
 
+/**
+ * Preserve the backend's reason when `generate_city_state` rejects.
+ * Tauri delivers `Err(String)` as a plain string (not `Error`); using only
+ * `e instanceof Error ? e.message : generic` hid the real text from the UI.
+ * Exported for unit tests that pin string rejections must surface unchanged.
+ */
+export function folderMapErrorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * How Polis should surface a folder-load error without wiping a good city.
+ * - blocking: full-map overlay (no city yet)
+ * - banner: non-destructive toast over an existing map
+ * - null: nothing to show
+ */
+export function folderLoadErrorSurface(
+  error: string | null | undefined,
+  hasCity: boolean,
+): "blocking" | "banner" | null {
+  if (!error) return null;
+  return hasCity ? "banner" : "blocking";
+}
+
 interface CityStoreState {
   cityState: CityState | null;
   /**
@@ -755,10 +779,12 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       }
     } catch (e) {
       if (seq !== requestSeq) return;
+      // Tauri rejects with a plain string (not Error). Preserve that text so the
+      // UI can show the real reason ("not a registered project root", "locked", …)
+      // instead of a generic fallback. Same pattern as sin-action catches below.
       set({
         loading: false,
-        error:
-          e instanceof Error ? e.message : "Failed to map the selected folder.",
+        error: folderMapErrorMessage(e),
       });
     }
   },

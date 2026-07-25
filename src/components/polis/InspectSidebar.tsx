@@ -89,7 +89,20 @@ const AnomalySection = React.lazy(() => import("./AnomalySection"));
 const KinSection = React.lazy(() => import("./KinSection"));
 import type { OracleAnswer } from "../../types/backend";
 import { purposeLabel, agentTypeLabel } from "../../types/city";
-import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
+import {
+  invokeBackendCommand,
+  isTauriRuntime,
+  useAppContext,
+} from "../../context/AppContext";
+import {
+  browserOracleMessage,
+  emptyOracleResultMessage,
+  indexingUnavailableMessage,
+  oracleFailureMessage,
+  shouldDeferOracleAsk,
+} from "./oraclePanelMessages";
+import { buildDossierEvidence } from "./dossierEvidence";
+import { DossierEvidenceSection } from "./dossierEvidenceView";
 import { isAppleHost } from "../../lib/platform";
 import { getProfile } from "./palette";
 import { MONUMENT_META } from "./kitcd/monuments";
@@ -253,7 +266,9 @@ const CONNECTIONS_PREVIEW = 6;
 type OracleState =
   | { kind: "loading" }
   | { kind: "ok"; text: string }
-  | { kind: "unavailable" };
+  // `message` is the honest reason (indexing, typed OracleError, empty, browser…).
+  // Never cache pure "indexing" rows so a finished job can re-ask on next open.
+  | { kind: "unavailable"; message: string; transient?: boolean };
 
 const oracleCache = new Map<string, OracleState>();
 
@@ -295,8 +310,8 @@ type DossierState =
   | { kind: "generating"; cached: string | null }
   // Have text (possibly being refreshed if `refreshing`).
   | { kind: "ok"; text: string }
-  // No text + generation failed/unavailable (fail-closed).
-  | { kind: "unavailable" };
+  // No text + generation failed/unavailable (fail-closed). Honest `message`.
+  | { kind: "unavailable"; message: string; transient?: boolean };
 
 const dossierCache = new Map<string, DossierState>();
 
@@ -319,17 +334,24 @@ export function decideDossierOpen(status: DossierStatus): {
 // PURE decision: given the generate result + the cached text shown meanwhile, what
 // final state should we land in? Fail-closed: an unavailable result keeps any
 // cached text ("ok" with cached) rather than discarding it; only a genuinely empty
-// result with no cache becomes "unavailable". Exported for unit tests.
+// result with no cache becomes "unavailable". `failureMessage` is the honest
+// reason when there is nothing to show. Exported for unit tests.
 export function decideDossierResult(
   res: DossierResult | null,
   cached: string | null,
+  failureMessage?: string,
 ): DossierState {
   const text = (res?.text ?? "").trim();
   if (res?.available && text.length > 0) return { kind: "ok", text };
   if (text.length > 0) return { kind: "ok", text };
   const keep = (cached ?? "").trim();
   if (keep.length > 0) return { kind: "ok", text: keep };
-  return { kind: "unavailable" };
+  return {
+    kind: "unavailable",
+    message:
+      failureMessage?.trim() ||
+      emptyOracleResultMessage("dossier", false),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -751,8 +773,8 @@ function BuildingPopup({
         </section>
       )}
 
-      {/* MORE DETAILS — the persisted narrative dossier (lazy, fail-closed). */}
-      <MoreDetails building={building} />
+      {/* MORE DETAILS — narrative dossier (Oracle) + client-side evidence. */}
+      <MoreDetails building={building} city={city} />
     </PopupFrame>
   );
 }
@@ -770,6 +792,14 @@ function BuildingPopup({
 
 function OracleBlurb({ building }: { building: Building }) {
   const fileId = building.fileId;
+  // Index status is already polled app-wide — use it to say "indexing" and to
+  // skip a doomed ask_oracle while the embedder is contended.
+  const { oracleIndexStatus } = useAppContext();
+  const indexStatusRef = useRef(oracleIndexStatus);
+  indexStatusRef.current = oracleIndexStatus;
+  // Boolean only in the effect deps so progress-tick object identity does not
+  // cancel an in-flight ask; transitioning true→false re-runs to fetch.
+  const isIndexing = shouldDeferOracleAsk(oracleIndexStatus);
   const [state, setState] = useState<OracleState>(
     () => oracleCache.get(fileId) ?? { kind: "loading" },
   );
@@ -784,15 +814,36 @@ function OracleBlurb({ building }: { building: Building }) {
     setExpanded(false);
 
     const cached = oracleCache.get(fileId);
-    if (cached && cached.kind !== "loading") {
+    // Skip transient "indexing" cache hits so a finished job can re-ask.
+    if (
+      cached &&
+      cached.kind !== "loading" &&
+      !(cached.kind === "unavailable" && cached.transient)
+    ) {
       setState(cached);
       return;
     }
 
     // Browser harness (or no Tauri): skip the call, show muted message.
     if (!isTauriRuntime()) {
-      const next: OracleState = { kind: "unavailable" };
+      const next: OracleState = {
+        kind: "unavailable",
+        message: browserOracleMessage("blurb"),
+      };
       oracleCache.set(fileId, next);
+      setState(next);
+      return;
+    }
+
+    const statusNow = indexStatusRef.current;
+    // While an index job is queued/running, say so instead of waiting ~90s for
+    // a ServerUnavailable timeout. Do not cache: status will change.
+    if (shouldDeferOracleAsk(statusNow)) {
+      const next: OracleState = {
+        kind: "unavailable",
+        message: indexingUnavailableMessage(statusNow, "blurb"),
+        transient: true,
+      };
       setState(next);
       return;
     }
@@ -811,13 +862,27 @@ function OracleBlurb({ building }: { building: Building }) {
         const next: OracleState =
           text.length > 0 && !ans?.notFound
             ? { kind: "ok", text }
-            : { kind: "unavailable" };
+            : {
+                kind: "unavailable",
+                message: emptyOracleResultMessage("blurb", !!ans?.notFound),
+              };
         oracleCache.set(fileId, next);
         setState(next);
-      } catch {
+      } catch (e) {
         if (cancelled || epoch !== epochRef.current) return;
-        const next: OracleState = { kind: "unavailable" };
-        oracleCache.set(fileId, next);
+        // Re-check indexing on failure: a job may have started mid-flight, or
+        // the timeout was embedder contention we already know about.
+        const status = indexStatusRef.current;
+        const indexing = shouldDeferOracleAsk(status);
+        const next: OracleState = {
+          kind: "unavailable",
+          message: oracleFailureMessage(e, "blurb", {
+            indexing,
+            indexStatus: status,
+          }),
+          transient: indexing,
+        };
+        if (!indexing) oracleCache.set(fileId, next);
         setState(next);
       }
     })();
@@ -827,7 +892,7 @@ function OracleBlurb({ building }: { building: Building }) {
       // Bump the epoch so any still-pending promise is ignored on resolve.
       epochRef.current++;
     };
-  }, [fileId, building.filePath]);
+  }, [fileId, building.filePath, isIndexing]);
 
   const CLAMP = 220;
 
@@ -843,9 +908,7 @@ function OracleBlurb({ building }: { building: Building }) {
         </div>
       )}
       {state.kind === "unavailable" && (
-        <p className="text-[12px] italic text-cream-400">
-          Description unavailable (Oracle not ready).
-        </p>
+        <p className="text-[12px] italic text-cream-400">{state.message}</p>
       )}
       {state.kind === "ok" && (
         <div>
@@ -869,28 +932,36 @@ function OracleBlurb({ building }: { building: Building }) {
 }
 
 // ---------------------------------------------------------------------------
-// MORE DETAILS — the persisted narrative DOSSIER (4b).
+// MORE DETAILS — the dossier is TWO genuinely different halves:
 //
-// A deeper, product-level Oracle explanation than the one-line blurb above.
-// Flow on the explicit "More details" click:
-//   1. polis_get_dossier(filePath) — instant disk read. If cached `text` is
-//      present it shows immediately (in a scrollable reading section). If
-//      `stale` (file changed) OR there is no text, we kick off a background
-//      generate (showing cached text + an "updating…" hint, or a spinner if
-//      none) and replace with the fresh text when it lands.
-//   2. polis_generate_dossier(filePath) — the gated, retrieval-backed Oracle
-//      call. Fail-closed: on `available=false` we keep any cached text and show
-//      an honest muted line; nothing is invented.
-// Session-cached per fileId; epoch-guarded so a slow generate for a previously
-// selected building never lands in this pergamena. Tauri-only (degrades muted
-// in the browser harness). NEVER auto-runs — only on the button click.
+//   1. NARRATIVE — persisted Oracle prose (4b), lazy on explicit click. Same
+//      get/generate/fail-closed/session-cache/epoch path as before. Prompt and
+//      secret-redaction behaviour are unchanged.
+//   2. EVIDENCE — pure client extraction from the loaded city (roads, sins,
+//      purpose/tier/district). Needs no Oracle call, so it still paints when
+//      the narrative is unavailable/indexing — the panel is never empty prose
+//      with no facts underneath.
 // ---------------------------------------------------------------------------
 
-function MoreDetails({ building }: { building: Building }) {
+function MoreDetails({
+  building,
+  city,
+}: {
+  building: Building;
+  city: CityState | null;
+}) {
   const fileId = building.fileId;
   const filePath = building.filePath;
+  const { oracleIndexStatus } = useAppContext();
+  const indexStatusRef = useRef(oracleIndexStatus);
+  indexStatusRef.current = oracleIndexStatus;
   const [state, setState] = useState<DossierState>(
     () => dossierCache.get(fileId) ?? { kind: "idle" },
+  );
+  // Evidence is free: recompute from city + building whenever either changes.
+  const evidence = useMemo(
+    () => buildDossierEvidence(building, city),
+    [building, city],
   );
   // Monotonic epoch: only the latest interaction may write state. Bumped on
   // every building switch and on unmount so a slow in-flight generate can never
@@ -905,14 +976,16 @@ function MoreDetails({ building }: { building: Building }) {
   // Persist a state transition, guarded by the captured epoch so a stale async
   // resolution is dropped. Only TERMINAL states (ok / unavailable / idle) are
   // written to the session cache — never the transient `checking`/`generating`
-  // states. Otherwise switching away mid-generate and back would restore a
-  // spinner with no in-flight promise behind it (stuck forever): the original
-  // request was epoch-invalidated on the switch and never resolves into the new
-  // mount. Restoring `idle` instead lets the user re-open and re-fetch cleanly.
+  // states (or indexing-unavailable). Otherwise switching away mid-generate and
+  // back would restore a spinner with no in-flight promise behind it.
   const commit = useCallback(
     (epoch: number, next: DossierState) => {
       if (epoch !== epochRef.current) return;
-      if (next.kind === "ok" || next.kind === "unavailable" || next.kind === "idle") {
+      if (
+        next.kind === "ok" ||
+        next.kind === "idle" ||
+        (next.kind === "unavailable" && !next.transient)
+      ) {
         dossierCache.set(fileId, next);
       }
       setState(next);
@@ -924,6 +997,24 @@ function MoreDetails({ building }: { building: Building }) {
   // it runs. Fail-closed: keep cached text on `available=false`.
   const runGenerate = useCallback(
     async (epoch: number, cached: string | null) => {
+      const statusNow = indexStatusRef.current;
+      // Prefer truth over a doomed generate while the embedder is contended.
+      if (shouldDeferOracleAsk(statusNow)) {
+        if (cached && cached.trim().length > 0) {
+          // Keep any cached prose; surface indexing as a soft note via generating
+          // is wrong — show ok + user can re-open later. Prefer unavailable only
+          // when there is nothing else to read.
+          commit(epoch, { kind: "ok", text: cached });
+          return;
+        }
+        commit(epoch, {
+          kind: "unavailable",
+          message: indexingUnavailableMessage(statusNow, "dossier"),
+          transient: true,
+        });
+        return;
+      }
+
       commit(epoch, { kind: "generating", cached });
       try {
         const res = await invokeBackendCommand<DossierResult>(
@@ -931,9 +1022,20 @@ function MoreDetails({ building }: { building: Building }) {
           { filePath },
         );
         commit(epoch, decideDossierResult(res, cached));
-      } catch {
-        // Fail-closed: keep any cached text, else honest unavailable.
-        commit(epoch, decideDossierResult(null, cached));
+      } catch (e) {
+        // Fail-closed: keep any cached text, else honest typed reason.
+        const status = indexStatusRef.current;
+        const indexing = shouldDeferOracleAsk(status);
+        const msg = oracleFailureMessage(e, "dossier", {
+          indexing,
+          indexStatus: status,
+        });
+        const decided = decideDossierResult(null, cached, msg);
+        if (decided.kind === "unavailable" && indexing) {
+          commit(epoch, { ...decided, transient: true });
+        } else {
+          commit(epoch, decided);
+        }
       }
     },
     [commit, filePath],
@@ -957,7 +1059,12 @@ function MoreDetails({ building }: { building: Building }) {
       // Browser harness: no backend — honest muted message (explicit open only;
       // a background re-check simply leaves the cached text untouched).
       if (!isTauriRuntime()) {
-        if (showCheckingSpinner) commit(epoch, { kind: "unavailable" });
+        if (showCheckingSpinner) {
+          commit(epoch, {
+            kind: "unavailable",
+            message: browserOracleMessage("dossier"),
+          });
+        }
         return;
       }
 
@@ -977,10 +1084,15 @@ function MoreDetails({ building }: { building: Building }) {
         }
         // Stale or absent -> generate (showing cached text + "Updating…" hint).
         void runGenerate(epoch, decision.cached);
-      } catch {
+      } catch (e) {
         // A failed status read on an explicit open is honest-unavailable; on a
         // silent background re-check we keep whatever text is already shown.
-        if (showCheckingSpinner) commit(epoch, { kind: "unavailable" });
+        if (showCheckingSpinner) {
+          commit(epoch, {
+            kind: "unavailable",
+            message: oracleFailureMessage(e, "dossier"),
+          });
+        }
       }
     },
     [commit, filePath, runGenerate],
@@ -1020,6 +1132,10 @@ function MoreDetails({ building }: { building: Building }) {
     };
   }, [fileId, checkAndServe]);
 
+  // Evidence rides with every open state (checking / generating / ok /
+  // unavailable) so an indexing Oracle never leaves the dossier body empty.
+  const showEvidence = state.kind !== "idle";
+
   return (
     <section className="mt-4">
       <SectionTitle icon={<BookOpen className="h-3.5 w-3.5" />}>
@@ -1037,9 +1153,12 @@ function MoreDetails({ building }: { building: Building }) {
       )}
 
       {state.kind === "checking" && (
-        <div className="flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-3 py-2.5 text-[12px] text-cream-400">
-          <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-cream-300 border-t-terracotta" />
-          Loading…
+        <div className="rounded-xl border border-cream-200 bg-white px-3 py-2.5">
+          <div className="flex items-center gap-2 text-[12px] text-cream-400">
+            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-cream-300 border-t-terracotta" />
+            Loading…
+          </div>
+          {showEvidence && <DossierEvidenceSection evidence={evidence} />}
         </div>
       )}
 
@@ -1059,26 +1178,27 @@ function MoreDetails({ building }: { building: Building }) {
               Consulting the Oracle…
             </div>
           )}
+          {showEvidence && <DossierEvidenceSection evidence={evidence} />}
         </div>
       )}
 
       {state.kind === "ok" && (
         <div className="rounded-xl border border-terracotta-200 bg-cream-50 px-3 py-2.5">
           <DossierProse text={state.text} />
+          {showEvidence && <DossierEvidenceSection evidence={evidence} />}
         </div>
       )}
 
       {state.kind === "unavailable" && (
         <div className="rounded-xl border border-cream-200 bg-white px-3 py-2.5">
-          <p className="text-[12px] italic text-cream-400">
-            Detailed dossier unavailable (Oracle not ready).
-          </p>
+          <p className="text-[12px] italic text-cream-400">{state.message}</p>
           <button
             onClick={() => void onOpen()}
             className="mt-1.5 text-[11px] font-semibold text-terracotta-500 hover:text-terracotta-600"
           >
             Try again
           </button>
+          {showEvidence && <DossierEvidenceSection evidence={evidence} />}
         </div>
       )}
     </section>

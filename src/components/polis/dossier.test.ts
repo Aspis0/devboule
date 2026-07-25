@@ -56,7 +56,19 @@ describe("decideDossierResult (fail-closed)", () => {
 
   it("becomes unavailable only when there is nothing to show", () => {
     const s = decideDossierResult({ text: null, available: false }, null);
-    expect(s).toEqual({ kind: "unavailable" });
+    expect(s.kind).toBe("unavailable");
+    if (s.kind === "unavailable") {
+      // Honest default (no longer a bare kind with discarded reason).
+      expect(s.message.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("preserves an explicit failure message when nothing to show", () => {
+    const s = decideDossierResult(null, null, "Index is empty. Run Index now.");
+    expect(s).toEqual({
+      kind: "unavailable",
+      message: "Index is empty. Run Index now.",
+    });
   });
 
   it("falls back to a non-empty cached result text even if available=false", () => {

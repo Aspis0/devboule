@@ -22,7 +22,11 @@ import {
 } from "lucide-react";
 import type { Building, Agent, CityState } from "../../types/city";
 import { agentTypeLabel } from "../../types/city";
-import { useCityStore, folderBasename } from "../../store/cityStore";
+import {
+  useCityStore,
+  folderBasename,
+  folderLoadErrorSurface,
+} from "../../store/cityStore";
 import {
   isTauriRuntime,
   useAppContext,
@@ -715,8 +719,8 @@ export function PolisView() {
 
         {/* Empty state — no folder mapped yet (desktop only). Workspace-aware:
             if the app has a workspace folder, the primary action MAPS it; the
-            "Open folder" override is always available. If no workspace is set,
-            guide the user to pick one in Oracle ▸ Indexing (or open one here). */}
+            "Open folder" override is always available. Mapping requires a
+            registered project root (or the management root) — not Oracle indexing. */}
         {showEmptyState && (
           <Overlay>
             <div className="max-w-[420px] rounded-2xl border border-cream-200 bg-white px-6 py-6 text-center shadow-soft">
@@ -733,7 +737,8 @@ export function PolisView() {
                     {folderBasename(workspaceRoot)
                       ? ` (${folderBasename(workspaceRoot)})`
                       : ""}{" "}
-                    into a city, or you can open a different folder here.
+                    into a city from the files on disk, or you can open a
+                    different project folder here. Oracle indexing is not required.
                   </p>
                   <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
                     <button
@@ -758,8 +763,9 @@ export function PolisView() {
                     Choose a folder to map its city
                   </p>
                   <p className="mt-1 text-[12px] text-cream-500">
-                    No workspace folder chosen yet — pick it in Oracle ▸
-                    Indexing, or open a folder here.
+                    Open a folder that belongs to one of your projects. Polis
+                    builds the city from the files on disk — no indexing step
+                    needed.
                   </p>
                   <button
                     onClick={() => void handleOpenFolder()}
@@ -790,8 +796,10 @@ export function PolisView() {
           </Overlay>
         )}
 
-        {/* Error overlay */}
-        {error && !cityState && (
+        {/* Error: blocking overlay only when there is no city yet. When a city is
+            already on screen, a failed re-map/switch must not wipe the map —
+            surface a non-destructive banner so the real reason is still visible. */}
+        {folderLoadErrorSurface(error, !!cityState) === "blocking" && (
           <Overlay>
             <div className="max-w-[440px] rounded-2xl border border-coral/20 bg-white px-5 py-4 text-center shadow-sm">
               <p className="text-[13px] font-semibold text-coral-dark">
@@ -806,6 +814,22 @@ export function PolisView() {
               </button>
             </div>
           </Overlay>
+        )}
+        {folderLoadErrorSurface(error, !!cityState) === "banner" && (
+          <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2">
+            <div className="pointer-events-auto flex max-w-[min(480px,92vw)] items-start gap-2 rounded-xl border border-coral/30 bg-white/95 px-3 py-2 text-[12px] text-cream-700 shadow-soft-md backdrop-blur">
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-coral-dark">Could not map folder</p>
+                <p className="mt-0.5 text-cream-500">{error}</p>
+              </div>
+              <button
+                onClick={handleRefresh}
+                className="shrink-0 rounded-lg bg-terracotta px-2.5 py-1 text-[11px] font-medium text-white hover:bg-terracotta-500"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
         )}
 
         {/* Empty overlay (loaded, but no buildings) */}
