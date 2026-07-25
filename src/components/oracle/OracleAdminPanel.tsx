@@ -18,6 +18,11 @@ import {
 import { invokeBackendCommand, useAppContext } from "../../context/AppContext";
 import { toOracleError } from "../../utils/oracleError";
 import { oracleIndexPhaseHint } from "../../utils/oracleIndexPhase";
+import {
+  estimateOracleIndexEta,
+  normalizeIndexPhase,
+  type OracleIndexProgressSample,
+} from "../../utils/oracleIndexEta";
 import { classifyRuntimeStage } from "../../utils/oracleRuntimeState";
 import { OracleDoctorPanel } from "../views/OracleDoctorPanel";
 import { OracleAnswerSettingsCard } from "../settings/OracleAnswerSettingsCard";
@@ -129,6 +134,15 @@ export function OracleAdminPanel() {
     count: -1,
     at: 0,
   });
+  // Progress samples for the pure ETA estimator (phase-scoped rate). Cleared
+  // when the job leaves active; never drives the stall detector.
+  const indexEtaSamplesRef = useRef<OracleIndexProgressSample[]>([]);
+  // Last remaining-ms shown, so the pure function can smooth; reset on phase
+  // change / pause so a prior phase cannot poison the next.
+  const indexEtaPrevMsRef = useRef<number | null>(null);
+  const indexEtaPhaseRef = useRef<string | null>(null);
+  // Display label next to "Indexing… n / N" — null when no ETA surface.
+  const [indexEtaLabel, setIndexEtaLabel] = useState<string | null>(null);
   // Synchronous re-entrancy guard for the "Index now" click. The disabled gate
   // is intentionally relaxed when the poll goes stale (so a genuinely stuck job
   // can be retried), but a slow-but-alive single large file can also trip the
@@ -355,6 +369,77 @@ export function OracleAdminPanel() {
       window.clearInterval(intervalId);
     };
   }, [jobActive, refreshOracleIndexStatus]);
+
+  // Feed the pure ETA estimator: sample count/phase while the job is active,
+  // recompute the label, and clear everything when the job ends. The component
+  // only samples + renders; rate math lives in oracleIndexEta.ts.
+  useEffect(() => {
+    if (!jobActive) {
+      indexEtaSamplesRef.current = [];
+      indexEtaPrevMsRef.current = null;
+      indexEtaPhaseRef.current = null;
+      setIndexEtaLabel(null);
+      return;
+    }
+    const now = Date.now();
+    const count = index?.indexedFiles ?? 0;
+    const expected = index?.expectedFiles ?? 0;
+    const phaseKey = normalizeIndexPhase(oracleIndexStatus?.job?.phase);
+
+    // Phase change: drop the smoothed prior so file-scan speed cannot leak
+    // into the embedding estimate (and vice versa).
+    if (
+      indexEtaPhaseRef.current != null &&
+      indexEtaPhaseRef.current !== phaseKey
+    ) {
+      indexEtaPrevMsRef.current = null;
+    }
+    indexEtaPhaseRef.current = phaseKey;
+
+    const samples = indexEtaSamplesRef.current;
+    const last = samples[samples.length - 1];
+    // Record a sample when count or phase moved, or on the first tick.
+    // Identical consecutive snapshots are skipped so a re-render storm does
+    // not flood the window with zero-delta clones of the same instant.
+    if (
+      !last ||
+      last.count !== count ||
+      last.phase !== phaseKey ||
+      now - last.at >= INDEX_POLL_MS
+    ) {
+      samples.push({ count, at: now, phase: phaseKey });
+      // Hard cap: keep a few minutes of history at poll cadence.
+      if (samples.length > 80) samples.splice(0, samples.length - 80);
+    }
+
+    const result = estimateOracleIndexEta({
+      samples,
+      expectedFiles: expected,
+      currentCount: count,
+      phase: phaseKey,
+      now,
+      prevRemainingMs: indexEtaPrevMsRef.current,
+      stalled: indexPollStale,
+    });
+
+    if (result.kind === "eta") {
+      indexEtaPrevMsRef.current = result.remainingMs;
+      setIndexEtaLabel(result.label);
+    } else if (result.kind === "paused" || result.kind === "estimating") {
+      // Pause: clear smoothed prior so resume re-learns the rate.
+      if (result.kind === "paused") indexEtaPrevMsRef.current = null;
+      setIndexEtaLabel(result.label);
+    } else {
+      indexEtaPrevMsRef.current = null;
+      setIndexEtaLabel(null);
+    }
+  }, [
+    jobActive,
+    index?.indexedFiles,
+    index?.expectedFiles,
+    oracleIndexStatus?.job?.phase,
+    indexPollStale,
+  ]);
 
   // "Run doctor" just mounts OracleDoctorPanel, which runs the heavy doctor
   // exactly once on its own mount and reports back via handleDoctorReport. We do
@@ -672,12 +757,18 @@ export function OracleAdminPanel() {
 
             {jobActive && (
               <div className="mt-3">
-                <div className="flex items-center justify-between text-[11px] text-cream-500">
-                  <span>
+                <div className="flex items-center justify-between gap-2 text-[11px] text-cream-500">
+                  <span className="min-w-0 truncate">
                     Indexing… {(index?.indexedFiles ?? 0).toLocaleString()} /{" "}
                     {(index?.expectedFiles ?? 0).toLocaleString()}
+                    {indexEtaLabel ? (
+                      <span className="text-cream-400">
+                        {" "}
+                        · {indexEtaLabel}
+                      </span>
+                    ) : null}
                   </span>
-                  <span className="font-mono">
+                  <span className="shrink-0 font-mono">
                     {index && index.expectedFiles > 0
                       ? `${Math.min(
                           100,
