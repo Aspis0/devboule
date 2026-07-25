@@ -40,10 +40,18 @@ pub const MAX_BOUNDED_LIMIT: usize = 100;
 // Byte-identical to `oracle/ingestion/retrieval_text.py`.
 
 /// Raw (non-semantic-prefix) chunk-profile version string.
-pub const RAW_CHUNK_PROFILE_VERSION: &str = "adaptive-qwen3-2026-05-28";
+///
+/// Bumped 2026-07-25 (`w2556`) to invalidate indexes built with the
+/// pre-windowing (truncating) embedder and the pre-hard-split chunker.
+/// `w2556` encodes [`crate::embed::EMBED_WINDOW_BYTES`].
+pub const RAW_CHUNK_PROFILE_VERSION: &str = "adaptive-qwen3-2026-07-25-w2556";
 
 /// Semantic-prefix chunk-profile version string (the default).
-pub const SEMANTIC_PREFIX_PROFILE_VERSION: &str = "semantic-prefix-qwen3-2026-06-02-c2500";
+///
+/// Bumped 2026-07-25 (`w2556`) to invalidate indexes built with the
+/// pre-windowing (truncating) embedder and the pre-hard-split chunker.
+/// `w2556` encodes [`crate::embed::EMBED_WINDOW_BYTES`].
+pub const SEMANTIC_PREFIX_PROFILE_VERSION: &str = "semantic-prefix-qwen3-2026-07-25-c2500-w2556";
 
 /// Profile names that normalize to the semantic-prefix profile.
 /// Mirrors `SEMANTIC_PROFILE_NAMES` in `oracle/ingestion/retrieval_text.py`.
@@ -72,7 +80,7 @@ fn active_embed_profile() -> String {
 /// Mirrors `oracle/ingestion/retrieval_text.py::active_chunk_profile_version`.
 /// With no `profile` override and the default `ORACLE_EMBED_PROFILE`
 /// (`"semantic-prefix-v2"`) this returns exactly
-/// `"semantic-prefix-qwen3-2026-06-02-c2500"`.
+/// `"semantic-prefix-qwen3-2026-07-25-c2500-w2556"`.
 pub fn active_chunk_profile_version(profile: Option<&str>) -> String {
     let effective = match profile {
         Some(p) => normalize_profile(p),

@@ -322,6 +322,32 @@ fn manifest_needs_index_decisions() {
         .unwrap();
     assert!(!file_needs_index(&file, root, &fs, &store).unwrap());
     assert!(text_chunks_up_to_date(&file, root, &fs, &store).unwrap());
+
+    // (h) previous chunk-profile versions (pre-windowing / pre-hard-split)
+    // must force re-index even when size/mtime match and SQLite has chunks;
+    // the active profile must not.
+    for previous in [
+        "adaptive-qwen3-2026-05-28",
+        "semantic-prefix-qwen3-2026-06-02-c2500",
+    ] {
+        let mut f = matching.clone();
+        f.chunk_profile = Some(previous.to_string());
+        let mut fs = HashMap::new();
+        fs.insert(file_id.to_string(), f);
+        assert!(
+            file_needs_index(&file, root, &fs, &store).unwrap(),
+            "previous profile {previous} must need re-index"
+        );
+        assert!(
+            !text_chunks_up_to_date(&file, root, &fs, &store).unwrap(),
+            "previous profile {previous} must not be up-to-date"
+        );
+    }
+    // Current active profile + matching signature + present chunks → skip.
+    let mut fs = HashMap::new();
+    fs.insert(file_id.to_string(), matching);
+    assert!(!file_needs_index(&file, root, &fs, &store).unwrap());
+    assert!(text_chunks_up_to_date(&file, root, &fs, &store).unwrap());
 }
 
 #[test]
