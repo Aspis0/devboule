@@ -7216,6 +7216,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "lancedb",
+ "libc",
  "ndarray 0.16.1",
  "notify 7.0.0",
  "ort",

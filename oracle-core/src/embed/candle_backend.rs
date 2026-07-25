@@ -7,8 +7,12 @@
 use anyhow::{Context, Result};
 use candle_core::DType;
 
-use super::{CancelFlag, Embedder};
-use crate::embedder::{load_model, resolve_device, DeviceArg, MAX_LENGTH, MODEL_ID};
+use super::{
+    attention_cost, attention_sub_batch_sizes, expand_texts_to_windows, pack_windows_for_attention,
+    pool_window_vectors, resolve_attention_budget, resolve_embed_window_bytes,
+    resolve_embed_window_overlap_bytes, CancelFlag, Embedder,
+};
+use crate::embedder::{load_model, resolve_device, DeviceArg, MODEL_ID};
 
 pub struct CandleEmbedder {
     model: fastembed::Qwen3TextEmbedding,
@@ -42,24 +46,65 @@ impl Embedder for CandleEmbedder {
         batch_size: usize,
         cancel: &CancelFlag,
     ) -> Result<Vec<Vec<f32>>> {
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(batch_size.max(1)) {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let window_bytes = resolve_embed_window_bytes();
+        let overlap = resolve_embed_window_overlap_bytes();
+        let budget = resolve_attention_budget();
+
+        // Window every text (no truncation). Public API stays 1:1 via pooling.
+        let (windows, counts) = expand_texts_to_windows(texts, window_bytes, overlap);
+        let window_lens: Vec<usize> = windows.iter().map(|w| w.len()).collect();
+        let groups = pack_windows_for_attention(&window_lens, budget);
+
+        let mut window_vectors: Vec<Vec<f32>> = Vec::with_capacity(windows.len());
+        let outer = batch_size.max(1);
+
+        // Walk groups; also respect caller's outer batch_size as a soft cap on
+        // how many windows we hand to the model at once (groups already encode
+        // the attention budget).
+        for group in groups {
             if cancel.is_cancelled() {
-                anyhow::bail!("embedding cancelled after {} texts", vectors.len());
+                anyhow::bail!(
+                    "embedding cancelled after {} windows",
+                    window_vectors.len()
+                );
             }
-            // Truncation is silent inside the model (MAX_LENGTH tokens); warn
-            // on inputs that are certainly over the cap (≈4 chars/token).
-            for t in chunk {
-                if t.chars().count() > MAX_LENGTH * 8 {
-                    eprintln!(
-                        "warning: text of {} chars will be truncated to {MAX_LENGTH} tokens",
-                        t.chars().count()
+            let group_windows = &windows[group.clone()];
+            for sub in group_windows.chunks(outer) {
+                if cancel.is_cancelled() {
+                    anyhow::bail!(
+                        "embedding cancelled after {} windows",
+                        window_vectors.len()
                     );
                 }
+                // Release-safe attention gate: subdivide rather than assert.
+                // `batch == 1` is irreducible (single sequence still runs;
+                // bounded by the window size).
+                let est_seq = sub.iter().map(|w| w.len().max(1)).max().unwrap_or(1);
+                let sizes = if attention_cost(sub.len(), est_seq) > budget && sub.len() > 1 {
+                    attention_sub_batch_sizes(sub.len(), est_seq, budget)
+                } else {
+                    vec![sub.len()]
+                };
+                let mut off = 0usize;
+                for size in sizes {
+                    if cancel.is_cancelled() {
+                        anyhow::bail!(
+                            "embedding cancelled after {} windows",
+                            window_vectors.len()
+                        );
+                    }
+                    let piece = &sub[off..off + size];
+                    let mut v = self.model.embed(piece).context("candle embed failed")?;
+                    window_vectors.append(&mut v);
+                    off += size;
+                }
             }
-            let mut v = self.model.embed(chunk).context("candle embed failed")?;
-            vectors.append(&mut v);
         }
-        Ok(vectors)
+
+        Ok(pool_window_vectors(&window_vectors, &counts))
     }
 }

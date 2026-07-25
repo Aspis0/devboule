@@ -149,6 +149,11 @@ impl TestWorld {
         IndexerConfig {
             min_free_gb: 0.0,     // disable RAM guard in tests
             max_gpu_temp_c: None, // disable GPU guard in tests
+            // FakeEmbedder loads no model: keep file-batch → one embed call so
+            // cancel/max_batches tests stay deterministic (production defaults
+            // intentionally split by attention cost).
+            attention_budget: usize::MAX / 4,
+            batch_chars: 10_000_000,
             ..Default::default()
         }
     }

@@ -93,6 +93,9 @@ impl Embedder for OrtEmbedder {
         batch_size: usize,
         cancel: &CancelFlag,
     ) -> Result<Vec<Vec<f32>>> {
+        // Attention-budget enforcement (post-tokenization split) lives inside
+        // OnnxEmbedder::embed_batched — the authoritative gate after true seq_len
+        // is known. This loop only bounds outer call size + cancel checks.
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(batch_size.max(1)) {
             if cancel.is_cancelled() {
@@ -100,7 +103,7 @@ impl Embedder for OrtEmbedder {
             }
             let mut v = self
                 .inner
-                .embed_batched(chunk, chunk.len())
+                .embed_batched(chunk, chunk.len(), cancel)
                 .context("ort embed failed")?;
             vectors.append(&mut v);
         }

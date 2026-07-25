@@ -35,7 +35,7 @@ pub async fn cmd_query(
         let (mut embedder, load_ms) = OnnxEmbedder::load(model_dir.as_path(), ep)?;
         eprintln!("model load: {} ms", load_ms);
         let vectors = embedder
-            .embed_batched(&[query.clone()], 1)
+            .embed_batched(&[query.clone()], 1, &crate::embed::CancelFlag::new())
             .context("embedding query failed")?;
         vectors
             .into_iter()

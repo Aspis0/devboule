@@ -16,11 +16,15 @@
 //!
 //! ## RAM / GPU guards
 //!
-//! - **Low-RAM guard**: reads free system RAM via `sysinfo`; when below
-//!   `min_free_gb` the pipeline sleeps-and-retries for a bounded number of
-//!   cycles, then returns `paused_low_memory` if RAM does not recover.
-//! - **GPU thermal guard**: polls `nvidia-smi`; when absent (macOS / CPU-only)
-//!   the guard is a no-op (matching Python's `try/except` fallback).
+//! - **Low-RAM guard** (binding constraint on Apple Silicon): reads free system
+//!   RAM via `sysinfo`; when below `min_free_gb` the pipeline sleeps-and-retries
+//!   for a bounded number of cycles, then returns `paused_low_memory` if RAM
+//!   does not recover. The floor **fails closed**: unusable/near-zero readings
+//!   pause indexing rather than silently proceeding (Metal buffers are wired
+//!   and not swappable — low free RAM freezes the machine).
+//! - **GPU thermal guard**: polls `nvidia-smi` only. On macOS / Apple Silicon
+//!   there is **no thermal guard** (`nvidia-smi` is absent; we do not probe
+//!   powermetrics). Memory, not temperature, is the binding constraint there.
 //!
 //! ## Known divergences from Python
 //!
@@ -38,7 +42,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::config::{active_chunk_profile_version, EMBED_DIMS};
-use crate::embed::CancelFlag;
+use crate::embed::{self, CancelFlag};
 use crate::ingest::chunking;
 use crate::ingest::collect;
 use crate::ingest::retrieval_text::{self, ChunkMeta};
@@ -60,7 +64,14 @@ use crate::store::sqlite::{FileChunk, SqliteStore};
 pub const DEFAULT_BATCH_FILES: usize = 4;
 pub const DEFAULT_BATCH_CHUNKS: usize = 8;
 pub const DEFAULT_BATCH_CHARS: usize = 50_000;
-pub const DEFAULT_MIN_FREE_GB: f64 = 5.0;
+/// Max attention cost per embed batch: `batch_len × (max_est_tokens)²`.
+/// See [`embed::DEFAULT_ATTENTION_BUDGET`]. Override: `ORACLE_CHUNK_ATTENTION_BUDGET`.
+pub const DEFAULT_ATTENTION_BUDGET: usize = embed::DEFAULT_ATTENTION_BUDGET;
+/// Minimum free RAM (GB) before the indexer hard-pauses. Raised from 5.0 because
+/// Metal F16 buffers are wired — 5 GB is not real headroom on a 64 GB host.
+pub const DEFAULT_MIN_FREE_GB: f64 = 10.0;
+/// Default GPU temp ceiling (°C). Only enforced when `nvidia-smi` is available;
+/// on macOS / Apple Silicon this never applies (no thermal probe).
 pub const DEFAULT_MAX_GPU_TEMP_C: i32 = 85;
 const GPU_COOLDOWN_SECONDS: u64 = 45;
 const GPU_COOLDOWN_MAX_CYCLES: usize = 20;
@@ -110,9 +121,12 @@ pub struct IndexerConfig {
     pub batch_chunks: Option<usize>,
     /// Max aggregate chars per embed call.
     pub batch_chars: usize,
+    /// Max attention cost per embed batch (`batch_len × max_est_tokens²`).
+    pub attention_budget: usize,
     /// Minimum free RAM in GB before pausing (0 = disabled).
     pub min_free_gb: f64,
-    /// GPU temperature ceiling in °C (None = disabled).
+    /// GPU temperature ceiling in °C (None = disabled). On macOS this is
+    /// effectively unused — there is no thermal probe (see module docs).
     pub max_gpu_temp_c: Option<i32>,
     /// Max file-batches (in base units) per run (None = unbounded).
     pub max_batches: Option<usize>,
@@ -126,6 +140,10 @@ impl Default for IndexerConfig {
             batch_files: env_or_usize(&["ORACLE_CHUNK_BATCH_FILES"], DEFAULT_BATCH_FILES),
             batch_chunks: env_opt_usize("ORACLE_CHUNK_BATCH_CHUNKS"),
             batch_chars: env_or_usize(&["ORACLE_CHUNK_BATCH_CHARS"], DEFAULT_BATCH_CHARS),
+            attention_budget: env_or_usize(
+                &["ORACLE_CHUNK_ATTENTION_BUDGET"],
+                DEFAULT_ATTENTION_BUDGET,
+            ),
             min_free_gb: env_or_f64(
                 &["ORACLE_CHUNK_MIN_FREE_RAM_GB", "ORACLE_CHUNK_MIN_FREE_GB"],
                 DEFAULT_MIN_FREE_GB,
@@ -347,28 +365,60 @@ fn enrich_chunks(chunks: &mut [serde_json::Value], mtime: &str, file_id: &str) {
     }
 }
 
-/// Yield sub-batches of chunks bounded by `max_chunks` and `max_chars` of
-/// embedding text (mirrors Python's `chunk_batches`).
+/// Conservative token estimate for attention budgeting: `ceil(chars / 3)`.
+/// Over-estimating is safe; under-estimating (e.g. chars/4) is what OOM'd Macs.
+fn est_tokens_from_chars(chars: usize) -> usize {
+    chars.div_ceil(3)
+}
+
+/// Attention cost of a candidate batch: `batch_len × (max_est_tokens)²`.
+fn batch_attention_cost(batch_len: usize, max_est_tokens: usize) -> usize {
+    embed::attention_cost(batch_len, max_est_tokens)
+}
+
+/// Yield sub-batches of chunks bounded by `max_chunks`, `max_chars` of embedding
+/// text, **and** an attention-cost budget
+/// `batch_len × (max_est_tokens_in_batch)² ≤ attention_budget`.
+///
+/// A linear char budget cannot bound quadratic attention: one long chunk right-pads
+/// every sequence in the batch to its length. When a single chunk exceeds the
+/// budget alone it still forms its own batch (backends also hard-cap seq len).
 fn chunk_batches(
     chunks: &[serde_json::Value],
     max_chunks: usize,
     max_chars: usize,
+    attention_budget: usize,
 ) -> Vec<Vec<&serde_json::Value>> {
     let max_chunks = max_chunks.max(1);
     let max_chars = max_chars.max(1);
+    let attention_budget = attention_budget.max(1);
     let mut batches = Vec::new();
     let mut batch: Vec<&serde_json::Value> = Vec::new();
     let mut batch_chars: usize = 0;
+    let mut batch_max_tokens: usize = 0;
 
     for chunk in chunks {
         let meta = chunk_value_to_meta(chunk);
         let text_chars = retrieval_text::chunk_embedding_text(&meta, None).len();
-        if !batch.is_empty() && (batch.len() >= max_chunks || batch_chars + text_chars > max_chars)
-        {
-            batches.push(std::mem::take(&mut batch));
-            batch_chars = 0;
+        let cand_tokens = est_tokens_from_chars(text_chars);
+
+        if !batch.is_empty() {
+            let new_max_tokens = batch_max_tokens.max(cand_tokens);
+            // Recompute cost over the whole batch with the new max — adding a
+            // long chunk raises max for every sequence, not just itself.
+            let new_cost = batch_attention_cost(batch.len() + 1, new_max_tokens);
+            let over_chunks = batch.len() >= max_chunks;
+            let over_chars = batch_chars.saturating_add(text_chars) > max_chars;
+            let over_attention = new_cost > attention_budget;
+            if over_chunks || over_chars || over_attention {
+                batches.push(std::mem::take(&mut batch));
+                batch_chars = 0;
+                batch_max_tokens = 0;
+            }
         }
-        batch_chars += text_chars;
+
+        batch_chars = batch_chars.saturating_add(text_chars);
+        batch_max_tokens = batch_max_tokens.max(cand_tokens);
         batch.push(chunk);
     }
     if !batch.is_empty() {
@@ -465,47 +515,181 @@ pub fn free_memory_gb() -> f64 {
     (gb * 100.0).round() / 100.0
 }
 
-/// Total installed RAM in GB (2 decimal places). 0.0 if unknown.
-fn total_memory_gb() -> f64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let gb = (sys.total_memory() as f64) / (1024.0_f64.powi(3));
-    (gb * 100.0).round() / 100.0
-}
-
-/// Whether `free_gb` is a plausible free-RAM reading for this host.
+/// True when the memory floor should hard-pause indexing.
 ///
-/// macOS/sysinfo sometimes under-reports free (or returns near-zero) while the
-/// machine still has tens of GB total. Treating that as "low memory" aborts
-/// dense indexing with 0 vectors. Reject readings under 2% of total (capped at
-/// 1 GB) on hosts with ≥8 GB — those are treated as unreliable metrics.
-fn free_memory_reading_is_plausible(free_gb: f64) -> bool {
-    if !free_gb.is_finite() || free_gb < 0.0 {
+/// **Fail closed**: a low or unusable reading raises the guard, never lowers it.
+/// NaN / negative / non-finite free RAM means "cannot prove it is safe" → pause.
+/// (Incident 2026-07-25: the old plausible-reading escape hatch disabled the
+/// floor exactly when free fell below ~1 GB on a 64 GB Mac, then indexing resumed
+/// into a Jetsam freeze.)
+fn should_enforce_memory_floor(free_gb: f64, min_free_gb: f64) -> bool {
+    if min_free_gb <= 0.0 {
         return false;
     }
-    let total = total_memory_gb();
-    if total >= 8.0 {
-        let floor = (total * 0.02).min(1.0);
-        if free_gb < floor {
-            return false;
+    if !free_gb.is_finite() || free_gb < 0.0 {
+        return true;
+    }
+    free_gb < min_free_gb
+}
+
+/// Default minimum `kern.memorystatus_level` (kernel available-memory %) on macOS.
+/// Below this → pause. Conservative starting point (idle machines sit near 90+).
+const DEFAULT_MACOS_MIN_MEMORYSTATUS_LEVEL: u32 = 25;
+
+/// Pure decision: should macOS memory-pressure signals force a pause?
+///
+/// - `pressure`: `kern.memorystatus_vm_pressure_level` (1=normal, 2=warn, 4=critical)
+/// - `level`: `kern.memorystatus_level` (kernel available-memory percentage)
+/// - `min_level`: threshold for `level` (pause when `level < min_level`)
+///
+/// `None` inputs mean "probe unavailable" — they do **not** force a pause
+/// (the GB floor covers that path separately). Failed probes must never *unlock*
+/// indexing; they also must not invent a pause on their own.
+pub fn macos_pressure_says_pause(
+    pressure: Option<u32>,
+    level: Option<u32>,
+    min_level: u32,
+) -> bool {
+    if let Some(p) = pressure {
+        // 1 = normal; anything above is warn/critical (or unknown elevated).
+        if p > 1 {
+            return true;
         }
     }
-    true
+    if let Some(l) = level {
+        if l < min_level {
+            return true;
+        }
+    }
+    false
 }
 
-/// True when the memory floor should hard-pause indexing.
-/// Unreliable free-RAM readings never trip the floor (log+proceed instead).
-fn should_enforce_memory_floor(free_gb: f64, min_free_gb: f64) -> bool {
-    min_free_gb > 0.0
-        && free_gb < min_free_gb
-        && free_memory_reading_is_plausible(free_gb)
+/// Why the combined memory guard wants a pause (for diagnosable logs).
+#[derive(Debug, Clone, PartialEq)]
+enum MemoryPauseReason {
+    FreeGbFloor { free_gb: f64, min_free_gb: f64 },
+    MacosVmPressure { pressure: u32 },
+    MacosMemorystatusLevel { level: u32, min_level: u32 },
 }
 
-/// GPU temperature in °C via `nvidia-smi` (macOS/CPU-only → `None`).
+impl MemoryPauseReason {
+    fn log_label(&self) -> String {
+        match self {
+            Self::FreeGbFloor {
+                free_gb,
+                min_free_gb,
+            } => format!("signal=free_gb_floor free_gb={free_gb} min_free_gb={min_free_gb}"),
+            Self::MacosVmPressure { pressure } => {
+                format!("signal=macos_vm_pressure pressure_level={pressure}")
+            }
+            Self::MacosMemorystatusLevel { level, min_level } => {
+                format!(
+                    "signal=macos_memorystatus_level memorystatus_level={level} min_level={min_level}"
+                )
+            }
+        }
+    }
+}
+
+/// Resolve `ORACLE_MACOS_MIN_MEMORYSTATUS_LEVEL` (default 25).
+fn resolve_macos_min_memorystatus_level() -> u32 {
+    std::env::var("ORACLE_MACOS_MIN_MEMORYSTATUS_LEVEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MACOS_MIN_MEMORYSTATUS_LEVEL)
+}
+
+/// `ORACLE_DISABLE_MACOS_MEMORY_PRESSURE=1` (or true/yes) skips the sysctl probe
+/// for debugging. Default: probe enabled on macOS.
+fn macos_memory_pressure_probe_enabled() -> bool {
+    match std::env::var("ORACLE_DISABLE_MACOS_MEMORY_PRESSURE") {
+        Ok(v) => {
+            let t = v.trim();
+            !(t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Read macOS kernel memory-pressure sysctls. Fail-closed on errors → `None`.
 ///
-/// Mirrors Python's `gpu_temperature_c`: when `nvidia-smi` is absent or
-/// returns an error, this returns `None` — the thermal guard becomes a no-op.
+/// Uses `kern.memorystatus_vm_pressure_level` and `kern.memorystatus_level` —
+/// the same signals jetsam uses, so Metal wired buffers cannot fool them the
+/// way they fool `sysinfo::available_memory()`.
+#[cfg(target_os = "macos")]
+fn read_macos_memory_pressure() -> Option<(u32, u32)> {
+    fn sysctl_u32(name: &str) -> Option<u32> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let mut val: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                cname.as_ptr(),
+                &mut val as *mut u32 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && len == std::mem::size_of::<u32>() {
+            Some(val)
+        } else {
+            None
+        }
+    }
+    let pressure = sysctl_u32("kern.memorystatus_vm_pressure_level")?;
+    let level = sysctl_u32("kern.memorystatus_level")?;
+    Some((pressure, level))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_macos_memory_pressure() -> Option<(u32, u32)> {
+    None
+}
+
+/// Combined memory guard: GB floor **and** (on macOS) kernel pressure.
+/// Always takes the more conservative outcome. A failed macOS probe returns
+/// no pressure-based pause (GB floor still applies) — never unlocks indexing.
+///
+/// `min_free_gb <= 0` disables the entire memory guard (GB + pressure), matching
+/// the existing master switch for the free-RAM floor.
+fn memory_pause_reason(free_gb: f64, min_free_gb: f64) -> Option<MemoryPauseReason> {
+    if min_free_gb <= 0.0 {
+        return None;
+    }
+    if should_enforce_memory_floor(free_gb, min_free_gb) {
+        return Some(MemoryPauseReason::FreeGbFloor {
+            free_gb,
+            min_free_gb,
+        });
+    }
+    if !macos_memory_pressure_probe_enabled() {
+        return None;
+    }
+    match read_macos_memory_pressure() {
+        Some((pressure, level)) => {
+            let min_level = resolve_macos_min_memorystatus_level();
+            if !macos_pressure_says_pause(Some(pressure), Some(level), min_level) {
+                return None;
+            }
+            // Prefer naming the pressure signal when elevated; otherwise level.
+            if pressure > 1 {
+                Some(MemoryPauseReason::MacosVmPressure { pressure })
+            } else {
+                Some(MemoryPauseReason::MacosMemorystatusLevel { level, min_level })
+            }
+        }
+        // Probe failed: do not invent a pause; GB floor already checked above.
+        None => None,
+    }
+}
+
+/// GPU temperature in °C via `nvidia-smi`.
+///
+/// Returns `None` when `nvidia-smi` is absent or errors. On macOS / Apple Silicon
+/// this is **always** `None` — there is no thermal guard on those hosts (we do
+/// not call powermetrics; it needs sudo). Memory pressure is the binding limit.
 pub fn gpu_temperature_c() -> Option<i32> {
     use std::process::Command;
     let output = Command::new("nvidia-smi")
@@ -524,45 +708,61 @@ pub fn gpu_temperature_c() -> Option<i32> {
 }
 
 /// Sleep-and-retry while free RAM is below `min_free_gb`.
-/// Returns the final observed free-RAM reading.
+/// Returns the final observed free-RAM reading (never faked above the floor).
 ///
-/// If the free-RAM reading is implausible (host metric garbage), returns a
-/// value ≥ `min_free_gb` so callers proceed instead of hard-pausing.
+/// Exits only when free RAM genuinely recovers above `min_free_gb`, or when the
+/// bounded retry count is exhausted. Callers must re-check
+/// [`memory_pause_reason`] after return (GB floor **and** macOS pressure) and
+/// treat a still-blocking result as [`IndexStatus::PausedLowMemory`].
 fn wait_for_memory_recovery(min_free_gb: f64, progress: Option<&dyn Fn(&str)>) -> f64 {
-    let mut free_gb = free_memory_gb();
-    if !free_memory_reading_is_plausible(free_gb) {
-        log_progress(
-            progress,
-            &format!(
-                "chunk-index low-memory metric-unreliable free_gb={free_gb} \
-                 total_gb={} — not enforcing floor",
-                total_memory_gb(),
-            ),
-        );
-        return min_free_gb.max(free_gb);
-    }
-    if LOW_MEMORY_RETRY_SECONDS == 0 {
+    wait_for_memory_recovery_with(
+        min_free_gb,
+        progress,
+        free_memory_gb,
+        LOW_MEMORY_RETRY_SECONDS,
+        LOW_MEMORY_RETRY_CYCLES,
+    )
+}
+
+/// Testable core of [`wait_for_memory_recovery`]: inject free-RAM reader and
+/// retry timing (use `retry_seconds = 0` in unit tests to avoid sleeping).
+///
+/// This loop only clears the **GB floor**. Callers always re-check the combined
+/// guard ([`memory_pause_reason`]) after return so macOS pressure still pauses
+/// even when free-GB looks healthy.
+fn wait_for_memory_recovery_with<F>(
+    min_free_gb: f64,
+    progress: Option<&dyn Fn(&str)>,
+    mut free_reader: F,
+    retry_seconds: u64,
+    retry_cycles: usize,
+) -> f64
+where
+    F: FnMut() -> f64,
+{
+    let mut free_gb = free_reader();
+    if free_gb.is_finite() && free_gb >= min_free_gb {
         return free_gb;
     }
-    for cycle in 0..LOW_MEMORY_RETRY_CYCLES {
-        if free_gb >= min_free_gb || !should_enforce_memory_floor(free_gb, min_free_gb) {
-            return free_gb.max(min_free_gb);
-        }
+    for cycle in 0..retry_cycles {
         log_progress(
             progress,
             &format!(
                 "chunk-index low-memory retry free_gb={free_gb} min_free_gb={min_free_gb} \
-                 sleep_seconds={LOW_MEMORY_RETRY_SECONDS} cycle={}/{}",
+                 sleep_seconds={retry_seconds} cycle={}/{}",
                 cycle + 1,
-                LOW_MEMORY_RETRY_CYCLES,
+                retry_cycles,
             ),
         );
-        std::thread::sleep(Duration::from_secs(LOW_MEMORY_RETRY_SECONDS));
-        free_gb = free_memory_gb();
-        if !free_memory_reading_is_plausible(free_gb) {
-            return min_free_gb.max(free_gb);
+        if retry_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(retry_seconds));
+        }
+        free_gb = free_reader();
+        if free_gb.is_finite() && free_gb >= min_free_gb {
+            return free_gb;
         }
     }
+    // Exhausted: return the last real reading. Caller pauses with PausedLowMemory.
     free_gb
 }
 
@@ -891,35 +1091,39 @@ pub async fn index_file_chunks(
     let vector_path = chunk_vectors.path().to_path_buf();
     let sqlite_path = sqlite.path().to_path_buf();
 
-    // ── Pre-scan RAM guard (soft) ───────────────────────────────────────
-    // Wait once for recovery; if still below the floor, proceed into
-    // collect/embed rather than aborting with processed=0 (which used to
-    // finish the job as "success" and trigger CKG with no Lance writes).
-    // Between-batch guards still hard-pause under real pressure.
+    // ── Pre-scan RAM guard (fail-closed) ────────────────────────────────
+    // Wait once for recovery; if still blocked (GB floor or macOS pressure),
+    // hard-pause. Starting under jetsam pressure is what froze the host.
     if config.min_free_gb > 0.0 {
         let free_gb = free_memory_gb();
-        if should_enforce_memory_floor(free_gb, config.min_free_gb) {
+        if memory_pause_reason(free_gb, config.min_free_gb).is_some() {
             let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
-            if should_enforce_memory_floor(recovered, config.min_free_gb) {
+            if let Some(reason) = memory_pause_reason(recovered, config.min_free_gb) {
                 log_progress(
                     progress,
                     &format!(
-                        "chunk-index low-memory proceeding free_gb={recovered} \
-                         min_free_gb={} (pre-scan floor soft; between-batch guards still apply)",
-                        config.min_free_gb,
+                        "chunk-index paused_low_memory free_gb={recovered} {}",
+                        reason.log_label()
                     ),
                 );
+                return Ok(make_index_result(
+                    IndexStatus::PausedLowMemory,
+                    &root,
+                    &sqlite_path,
+                    &vector_path,
+                    &manifest_path,
+                    0,
+                    None,
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    recovered,
+                    None,
+                    None,
+                ));
             }
-        } else if free_gb < config.min_free_gb {
-            // Metric unusable — do not hard-pause.
-            log_progress(
-                progress,
-                &format!(
-                    "chunk-index low-memory metric-unreliable free_gb={free_gb} \
-                     total_gb={} — pre-scan floor skipped",
-                    total_memory_gb(),
-                ),
-            );
         }
     }
 
@@ -1012,8 +1216,8 @@ pub async fn index_file_chunks(
         }
 
         // ── Pre-batch RAM guard (wait-and-resume) ───────────────────────
-        // Hard-pause only when free-RAM reading is plausible AND below floor.
-        if should_enforce_memory_floor(free_gb, config.min_free_gb) {
+        // Fail-closed: low free-RAM or elevated macOS kernel pressure → pause.
+        if memory_pause_reason(free_gb, config.min_free_gb).is_some() {
             {
                 let mf = manifest_files_for_root(&mut manifest, &root, true).unwrap();
                 // Touch to ensure legacy mirror is up to date before save
@@ -1022,10 +1226,13 @@ pub async fn index_file_chunks(
             sync_legacy_manifest_root(&mut manifest, &root);
             save_manifest(&manifest_path, &manifest)?;
             let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
-            if should_enforce_memory_floor(recovered, config.min_free_gb) {
+            if let Some(reason) = memory_pause_reason(recovered, config.min_free_gb) {
                 log_progress(
                     progress,
-                    &format!("chunk-index paused_low_memory free_gb={recovered}"),
+                    &format!(
+                        "chunk-index paused_low_memory free_gb={recovered} {}",
+                        reason.log_label()
+                    ),
                 );
                 return Ok(make_index_result(
                     IndexStatus::PausedLowMemory,
@@ -1078,7 +1285,12 @@ pub async fn index_file_chunks(
 
         // ── Embed + build vector records ────────────────────────────────
         let mut vector_records: Vec<LanceRow> = Vec::new();
-        let sub_batches = chunk_batches(&batch_chunks_all, chunk_batch_size, chunk_char_budget);
+        let sub_batches = chunk_batches(
+            &batch_chunks_all,
+            chunk_batch_size,
+            chunk_char_budget,
+            config.attention_budget.max(1),
+        );
         let mut batch_embedded = 0usize;
 
         for sub_batch in &sub_batches {
@@ -1131,18 +1343,19 @@ pub async fn index_file_chunks(
                 }
             }
 
-            // In-sub-batch RAM guard (hard pause only on plausible free-RAM)
+            // In-sub-batch RAM guard (fail-closed hard pause)
             let free_gb = free_memory_gb();
-            if should_enforce_memory_floor(free_gb, config.min_free_gb) {
+            if memory_pause_reason(free_gb, config.min_free_gb).is_some() {
                 sync_legacy_manifest_root(&mut manifest, &root);
                 save_manifest(&manifest_path, &manifest)?;
                 let recovered = wait_for_memory_recovery(config.min_free_gb, progress);
-                if should_enforce_memory_floor(recovered, config.min_free_gb) {
+                if let Some(reason) = memory_pause_reason(recovered, config.min_free_gb) {
                     log_progress(
                         progress,
                         &format!(
-                            "chunk-index paused_low_memory before_embed batch_files={} free_gb={recovered}",
-                            batch_paths.len()
+                            "chunk-index paused_low_memory before_embed batch_files={} free_gb={recovered} {}",
+                            batch_paths.len(),
+                            reason.log_label()
                         ),
                     );
                     return Ok(make_index_result(
@@ -1450,4 +1663,231 @@ fn env_opt_i32(key: &str) -> Option<i32> {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<i32>().ok())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Unit tests — pure, no model / GPU / real index
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_chunk(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "file_id": "t.rs",
+            "file_sorgente": "t.rs",
+            "text": text,
+            "kind": "text_slice",
+            "symbol_name": "",
+            "language": "rs",
+            "line_start": 0,
+            "line_end": 0,
+            "symbols_used": "",
+            "chunk_index": 0,
+            "label": "",
+            "area": "",
+            "cluster_semantic": "",
+            "start_char": 0,
+            "end_char": text.len(),
+            "ultima_modifica": "",
+            "embedding_dims": 1024,
+        })
+    }
+
+    fn emb_chars(chunk: &serde_json::Value) -> usize {
+        let meta = chunk_value_to_meta(chunk);
+        retrieval_text::chunk_embedding_text(&meta, None).len()
+    }
+
+    fn batch_cost(batch: &[&serde_json::Value]) -> usize {
+        let max_tokens = batch
+            .iter()
+            .map(|c| est_tokens_from_chars(emb_chars(c)))
+            .max()
+            .unwrap_or(1);
+        batch_attention_cost(batch.len(), max_tokens)
+    }
+
+    #[test]
+    fn chunk_batches_long_chunk_alone_under_attention_budget() {
+        // Many short chunks + ONE very long chunk must never produce a batch
+        // whose len × max_tokens² exceeds the budget; the long one ends alone.
+        let budget = DEFAULT_ATTENTION_BUDGET;
+        let short = "fn short() {}".to_string();
+        let long = "x".repeat(40_000);
+        let mut owned: Vec<serde_json::Value> = (0..16)
+            .map(|i| make_chunk(&format!("s{i}"), &short))
+            .collect();
+        owned.push(make_chunk("LONG", &long));
+        for i in 16..24 {
+            owned.push(make_chunk(&format!("s{i}"), &short));
+        }
+
+        let batches = chunk_batches(&owned, 32, 50_000, budget);
+
+        for b in &batches {
+            let cost = batch_cost(b);
+            // A lone over-budget chunk is allowed (backends window + run alone);
+            // multi-item batches must stay within budget.
+            if b.len() > 1 {
+                assert!(
+                    cost <= budget,
+                    "multi-item batch cost {cost} > budget {budget} (len={})",
+                    b.len()
+                );
+            }
+        }
+
+        let long_batches: Vec<_> = batches
+            .iter()
+            .filter(|b| b.iter().any(|c| c.get("id").and_then(|v| v.as_str()) == Some("LONG")))
+            .collect();
+        assert_eq!(long_batches.len(), 1, "long chunk should appear in exactly one batch");
+        assert_eq!(
+            long_batches[0].len(),
+            1,
+            "long chunk must be alone (would pad every peer to its length)"
+        );
+    }
+
+    #[test]
+    fn chunk_batches_respects_max_chunks() {
+        let owned: Vec<_> = (0..10)
+            .map(|i| make_chunk(&format!("c{i}"), "hello"))
+            .collect();
+        // Huge char + attention budgets so only max_chunks binds.
+        let batches = chunk_batches(&owned, 3, usize::MAX / 4, usize::MAX / 4);
+        assert!(batches.iter().all(|b| b.len() <= 3));
+        assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), 10);
+        assert_eq!(batches.len(), 4); // 3+3+3+1
+    }
+
+    #[test]
+    fn chunk_batches_respects_max_chars() {
+        // Two medium texts that fit alone but not together under a tight char budget.
+        let a = make_chunk("a", &"a".repeat(500));
+        let b = make_chunk("b", &"b".repeat(500));
+        let owned = vec![a, b];
+        let chars_a = emb_chars(&owned[0]);
+        let chars_b = emb_chars(&owned[1]);
+        // Allow each alone, not both together.
+        let max_chars = chars_a.max(chars_b) + 10;
+        assert!(chars_a + chars_b > max_chars);
+
+        let batches = chunk_batches(&owned, 32, max_chars, usize::MAX / 4);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    #[test]
+    fn should_enforce_memory_floor_fail_closed_on_jetsam_levels() {
+        // Regression: incident 2026-07-25. JetsamEvent reported ~0.08 GB free on a
+        // 64 GB Mac. The old free_memory_reading_is_plausible hatch treated that as
+        // "unreliable" and disabled the floor — indexing resumed and froze the host.
+        // A reading this low MUST enforce (fail closed).
+        let min_free = 10.0;
+        let free = 0.08;
+        assert!(
+            should_enforce_memory_floor(free, min_free),
+            "free={free} GB on 64 GB host must enforce min_free={min_free} (2026-07-25)"
+        );
+        // Unusable readings also enforce.
+        assert!(should_enforce_memory_floor(f64::NAN, min_free));
+        assert!(should_enforce_memory_floor(-1.0, min_free));
+        // Disabled floor.
+        assert!(!should_enforce_memory_floor(0.08, 0.0));
+        // Healthy free.
+        assert!(!should_enforce_memory_floor(20.0, min_free));
+    }
+
+    #[test]
+    fn wait_for_memory_recovery_does_not_release_when_readings_fall() {
+        // Inject a free-RAM series that keeps dropping. The wait must not exit
+        // early by treating the reading as "implausible" — only recovery or
+        // exhausted retries release.
+        let readings = std::cell::RefCell::new(vec![0.5, 0.3, 0.1, 0.05]);
+        let last = wait_for_memory_recovery_with(
+            10.0,
+            None,
+            || {
+                let mut v = readings.borrow_mut();
+                if v.is_empty() {
+                    0.01
+                } else {
+                    v.remove(0)
+                }
+            },
+            0, // no sleep
+            3, // three retry cycles after the initial reading
+        );
+        assert!(
+            last < 10.0,
+            "must return a still-low reading, not a faked value above the floor; got {last}"
+        );
+        assert!(
+            should_enforce_memory_floor(last, 10.0),
+            "caller must still pause after exhausted retries"
+        );
+    }
+
+    #[test]
+    fn wait_for_memory_recovery_returns_when_free_recovers() {
+        let readings = std::cell::RefCell::new(vec![1.0, 2.0, 12.0]);
+        let last = wait_for_memory_recovery_with(
+            10.0,
+            None,
+            || {
+                let mut v = readings.borrow_mut();
+                v.remove(0)
+            },
+            0,
+            5,
+        );
+        assert!(last >= 10.0, "expected recovery above floor, got {last}");
+    }
+
+    #[test]
+    fn macos_pressure_says_pause_exhaustive() {
+        let min_level = 25u32;
+        // normal + high level → no pause
+        assert!(!macos_pressure_says_pause(Some(1), Some(96), min_level));
+        // warn → pause
+        assert!(macos_pressure_says_pause(Some(2), Some(96), min_level));
+        // critical → pause
+        assert!(macos_pressure_says_pause(Some(4), Some(96), min_level));
+        // probe unavailable → no pressure pause (GB floor covers separately)
+        assert!(!macos_pressure_says_pause(None, None, min_level));
+        // level just above threshold
+        assert!(!macos_pressure_says_pause(Some(1), Some(25), min_level));
+        assert!(!macos_pressure_says_pause(Some(1), Some(26), min_level));
+        // level just below threshold
+        assert!(macos_pressure_says_pause(Some(1), Some(24), min_level));
+        assert!(macos_pressure_says_pause(Some(1), Some(0), min_level));
+        // level None, pressure normal → no pause
+        assert!(!macos_pressure_says_pause(Some(1), None, min_level));
+        // pressure None, level low → pause
+        assert!(macos_pressure_says_pause(None, Some(10), min_level));
+    }
+
+    #[test]
+    fn macos_pressure_incident_2026_07_25_must_pause() {
+        // JetsamEvent: free = 5601 pages (~87 MB) but inactive ≈ 8.1 GB —
+        // sysinfo available_memory would report ~8 GB "free" while the machine
+        // was freezing. Kernel pressure was critical; that signal alone must pause.
+        let naive_free_gb = 8.0;
+        let min_free_gb = 5.0;
+        // Naive free-RAM floor would NOT fire:
+        assert!(
+            !should_enforce_memory_floor(naive_free_gb, min_free_gb),
+            "regression setup: naive free_gb must look healthy"
+        );
+        // Kernel critical pressure must still pause:
+        assert!(
+            macos_pressure_says_pause(Some(4), Some(1), 25),
+            "critical pressure while naive free≈8GB must pause (2026-07-25)"
+        );
+    }
 }

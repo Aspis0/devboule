@@ -426,8 +426,10 @@ pub fn split_semantic(text: &str, language: &str, max_chars: usize) -> Vec<Seman
 
         let chunk_text: String = lines[tl.line_idx..end_line].join("\n");
 
-        // If too large, sub-split
-        if chunk_text.chars().count() > max_chars * 2 {
+        // If too large, sub-split. Threshold is max_chars (not 2×): the declared
+        // limit must be honoured; long single lines are hard-split inside
+        // subsplit_large.
+        if chunk_text.chars().count() > max_chars {
             let sub_chunks = subsplit_large(
                 &chunk_text,
                 &lines[tl.line_idx..end_line],
@@ -485,6 +487,37 @@ pub fn split_semantic(text: &str, language: &str, max_chars: usize) -> Vec<Seman
     chunks
 }
 
+fn push_sub_chunk(
+    sub_chunks: &mut Vec<SemanticChunk>,
+    text: String,
+    start_char: usize,
+    end_char: usize,
+    kind: &str,
+    name: &str,
+    language: &str,
+    line_start: usize,
+    line_end: usize,
+) {
+    let symbol_name = if !name.is_empty() {
+        format!("{}#part{}", name, sub_chunks.len() + 1)
+    } else {
+        String::new()
+    };
+    let symbols_used = extract_symbols_used(&text, language);
+    sub_chunks.push(SemanticChunk {
+        start_char,
+        end_char,
+        kind: kind.to_string(),
+        symbol_name,
+        signature: String::new(),
+        line_start,
+        line_end,
+        language: language.to_string(),
+        symbols_used,
+        text,
+    });
+}
+
 fn subsplit_large(
     chunk_text: &str,
     chunk_lines: &[String],
@@ -498,48 +531,94 @@ fn subsplit_large(
         return vec![];
     }
 
+    let max_chars = max_chars.max(1);
+    let overlap = super::chunking::hard_split_overlap(max_chars);
     let char_offsets = compute_line_char_positions(chunk_lines);
     let mut sub_chunks: Vec<SemanticChunk> = Vec::new();
     let mut current_start: usize = 0;
     let mut current_group: Vec<String> = Vec::new();
     let mut current_chars: usize = 0;
 
+    let flush_group = |sub_chunks: &mut Vec<SemanticChunk>,
+                       current_group: &mut Vec<String>,
+                       current_start: usize,
+                       end_line_idx: usize,
+                       end_char_abs: usize| {
+        if current_group.is_empty() {
+            return;
+        }
+        let sub_text = current_group.join("\n");
+        let start_char = base_offset + char_offsets[current_start];
+        push_sub_chunk(
+            sub_chunks,
+            sub_text,
+            start_char,
+            end_char_abs,
+            kind,
+            name,
+            language,
+            current_start + 1,
+            end_line_idx,
+        );
+        current_group.clear();
+    };
+
     for (i, line) in chunk_lines.iter().enumerate() {
-        let line_chars = line.chars().count() + 1;
+        let line_body_chars = line.chars().count();
+        // +1 for the newline that join would insert, except we only count it
+        // when the line is part of a multi-line group.
+        let line_chars_with_nl = line_body_chars + 1;
+
+        // Single line longer than the limit: hard-split on char boundaries.
+        if line_body_chars > max_chars {
+            flush_group(
+                &mut sub_chunks,
+                &mut current_group,
+                current_start,
+                i,
+                base_offset + char_offsets[i],
+            );
+
+            let pieces = super::chunking::hard_split_chars(line, max_chars, overlap);
+            for (ps, pe, piece) in pieces {
+                let start_char = base_offset + char_offsets[i] + ps;
+                let end_char = base_offset + char_offsets[i] + pe;
+                push_sub_chunk(
+                    &mut sub_chunks,
+                    piece,
+                    start_char,
+                    end_char,
+                    kind,
+                    name,
+                    language,
+                    i + 1,
+                    i + 1,
+                );
+            }
+            // Next group starts at the following line.
+            current_start = i + 1;
+            current_group.clear();
+            current_chars = 0;
+            continue;
+        }
 
         let should_break = (line.trim().is_empty() && current_chars > max_chars / 2)
-            || (current_chars + line_chars > max_chars && !current_group.is_empty());
+            || (current_chars + line_chars_with_nl > max_chars && !current_group.is_empty());
 
         if should_break {
-            let sub_text = current_group.join("\n");
-            let start_char = base_offset + char_offsets[current_start];
-            let end_char = base_offset + char_offsets[i];
-
-            let symbol_name = if !name.is_empty() {
-                format!("{}#part{}", name, sub_chunks.len() + 1)
-            } else {
-                String::new()
-            };
-
-            sub_chunks.push(SemanticChunk {
-                start_char,
-                end_char,
-                kind: kind.to_string(),
-                symbol_name,
-                signature: String::new(),
-                line_start: current_start + 1,
-                line_end: i,
-                language: language.to_string(),
-                symbols_used: extract_symbols_used(&sub_text, language),
-                text: sub_text,
-            });
+            flush_group(
+                &mut sub_chunks,
+                &mut current_group,
+                current_start,
+                i,
+                base_offset + char_offsets[i],
+            );
             current_start = i;
-            current_group = Vec::new();
             current_chars = 0;
         }
 
         current_group.push(line.clone());
-        current_chars += line_chars;
+        current_chars += line_chars_with_nl;
     }
 
     // Final group
@@ -547,31 +626,24 @@ fn subsplit_large(
         let sub_text = current_group.join("\n");
         let start_char = base_offset + char_offsets[current_start];
         let end_char = base_offset + chunk_text.chars().count();
-
-        let symbol_name = if !name.is_empty() {
-            format!("{}#part{}", name, sub_chunks.len() + 1)
-        } else {
-            String::new()
-        };
-
-        sub_chunks.push(SemanticChunk {
+        push_sub_chunk(
+            &mut sub_chunks,
+            sub_text,
             start_char,
             end_char,
-            kind: kind.to_string(),
-            symbol_name,
-            signature: String::new(),
-            line_start: current_start + 1,
-            line_end: chunk_lines.len(),
-            language: language.to_string(),
-            symbols_used: extract_symbols_used(&sub_text, language),
-            text: sub_text,
-        });
+            kind,
+            name,
+            language,
+            current_start + 1,
+            chunk_lines.len(),
+        );
     }
 
     sub_chunks
 }
 
 fn fallback_chunks(text: &str, language: &str, max_chars: usize) -> Vec<SemanticChunk> {
+    let max_chars = max_chars.max(1);
     let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
     let mut chunks: Vec<SemanticChunk> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -641,7 +713,169 @@ fn fallback_chunks(text: &str, language: &str, max_chars: usize) -> Vec<Semantic
         });
     }
 
-    chunks
+    // Hard-split any chunk that still exceeds max_chars (single oversize line).
+    // If the whole file collapsed to one oversize chunk, leave it alone so
+    // `chunk_file_semantically` returns None and `split_text` owns labeling
+    // (golden: text_slice / FileChunk for single-line code without defs).
+    if chunks.len() == 1 && chunks[0].text.chars().count() > max_chars {
+        return chunks;
+    }
+    hard_split_oversize_chunks(chunks, max_chars, language)
+}
+
+/// Expand any chunk whose text exceeds `max_chars` into char-boundary pieces
+/// with overlap. Chunks already within the limit are kept as-is.
+fn hard_split_oversize_chunks(
+    chunks: Vec<SemanticChunk>,
+    max_chars: usize,
+    language: &str,
+) -> Vec<SemanticChunk> {
+    let max_chars = max_chars.max(1);
+    let overlap = super::chunking::hard_split_overlap(max_chars);
+    let mut out = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        if c.text.chars().count() <= max_chars {
+            out.push(c);
+            continue;
+        }
+        let pieces = super::chunking::hard_split_chars(&c.text, max_chars, overlap);
+        for (ps, pe, piece) in pieces {
+            out.push(SemanticChunk {
+                start_char: c.start_char + ps,
+                end_char: c.start_char + pe,
+                kind: c.kind.clone(),
+                symbol_name: if c.symbol_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}#part{}", c.symbol_name, out.len() + 1)
+                },
+                signature: String::new(),
+                line_start: c.line_start,
+                line_end: c.line_end,
+                language: language.to_string(),
+                symbols_used: extract_symbols_used(&piece, language),
+                text: piece,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod chunk_limit_tests {
+    use super::*;
+    use crate::ingest::chunking::CHUNK_CODE_MAX_CHARS;
+
+    fn reconstruct_chunks(original: &str, chunks: &[SemanticChunk]) -> String {
+        let orig_chars: Vec<char> = original.chars().collect();
+        let mut rebuilt = String::new();
+        let mut cursor = 0usize;
+        for c in chunks {
+            if c.end_char <= cursor {
+                continue;
+            }
+            let from = cursor.saturating_sub(c.start_char);
+            let span: String = orig_chars[c.start_char..c.end_char]
+                .iter()
+                .skip(from)
+                .collect();
+            rebuilt.push_str(&span);
+            cursor = c.end_char;
+        }
+        rebuilt
+    }
+
+    #[test]
+    fn single_line_40k_defers_to_one_chunk_for_split_text_path() {
+        // A lone oversize line with no defs must stay as one chunk so
+        // chunk_file_semantically returns None and split_text labels it
+        // text_slice (golden: sliding_window_code.py). Limits are enforced
+        // by split_text / hard_split_chars, not here.
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let original: String = (0..40_000)
+            .map(|i| char::from(b'A' + (i % 26) as u8))
+            .collect();
+        let chunks = fallback_chunks(&original, "text", max_chars);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.chars().count() > max_chars);
+    }
+
+    #[test]
+    fn oversize_lone_line_coupling_fallback_semantic_and_build() {
+        // Pins BOTH halves of the intentional coupling:
+        //   fallback_chunks L720-722: lone oversize chunk returned unsplit
+        //   chunk_file_semantically L872: `chunks.len() < 2` → None
+        // so build_chunks_for_file falls through to split_text (hard-split),
+        // which is what labels golden sliding_window_code.py as text_slice.
+        // If either side is "fixed" in isolation, this test fails loudly.
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let original: String = (0..40_000)
+            .map(|i| char::from(b'A' + (i % 26) as u8))
+            .collect();
+
+        // Half 1: fallback returns exactly one oversize chunk.
+        let fb = fallback_chunks(&original, "python", max_chars);
+        assert_eq!(fb.len(), 1, "fallback_chunks must defer lone oversize");
+        assert!(fb[0].text.chars().count() > max_chars);
+
+        // Half 2: semantic path on the same input returns None (len < 2).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sliding_window_code.py");
+        std::fs::write(&path, &original).expect("write fixture");
+        let semantic = chunk_file_semantically(&path, dir.path(), Some(&original), max_chars);
+        assert!(
+            semantic.is_none(),
+            "chunk_file_semantically must return None so split_text owns labeling"
+        );
+
+        // Half 3: build_chunks_for_file finally emits pieces all ≤ max_chars.
+        let built = crate::ingest::chunking::build_chunks_for_file(&path, dir.path());
+        assert!(!built.is_empty(), "build_chunks_for_file must emit chunks");
+        for c in &built {
+            let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                text.chars().count() <= max_chars,
+                "final chunk has {} chars > max_chars={max_chars}",
+                text.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_multi_line_with_oversize_line_respects_max_chars() {
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let long = "x".repeat(40_000);
+        let text = format!("short preamble line\n{long}\ntrailer");
+        let chunks = fallback_chunks(&text, "text", max_chars);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(
+                c.text.chars().count() <= max_chars,
+                "chunk has {} chars > max_chars={max_chars}",
+                c.text.chars().count()
+            );
+        }
+        // Long line pieces reconstruct with overlap removed.
+        let long_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.text.chars().all(|ch| ch == 'x') || c.text.contains('x'))
+            .cloned()
+            .collect();
+        assert!(!long_chunks.is_empty());
+    }
+
+    #[test]
+    fn subsplit_large_hard_splits_oversize_line() {
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let long = "x".repeat(40_000);
+        let lines = vec![long.clone()];
+        let chunks = subsplit_large(&long, &lines, 0, "function", "big", "rust", max_chars);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.text.chars().count() <= max_chars);
+        }
+        assert_eq!(reconstruct_chunks(&long, &chunks), long);
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────

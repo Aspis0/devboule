@@ -129,26 +129,71 @@ pub fn chunk_limits_for_file(path: &Path) -> (usize, usize) {
 
 // ── Split text (sliding window) ──────────────────────────────────────────────
 
+/// Overlap used when hard-splitting a single oversize line/run, matching the
+/// non-semantic path in [`build_chunks_for_file`].
+pub fn hard_split_overlap(max_chars: usize) -> usize {
+    let max_chars = max_chars.max(1);
+    (max_chars / 8).max(200).min(max_chars.saturating_sub(1))
+}
+
+/// Hard-split `text` on char boundaries into pieces of at most `max_chars`
+/// characters with `overlap` character overlap. Never emits a piece longer
+/// than `max_chars`. Returns `(start_char, end_char, piece)` relative to `text`.
+///
+/// Used when a single line exceeds the file-type limit (line-oriented splitters
+/// cannot break it) and as the core of [`split_text`] for runs without newlines.
+pub fn hard_split_chars(
+    text: &str,
+    max_chars: usize,
+    overlap: usize,
+) -> Vec<(usize, usize, String)> {
+    let max_chars = max_chars.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![];
+    }
+    if chars.len() <= max_chars {
+        return vec![(0, chars.len(), text.to_string())];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start: usize = 0;
+    while start < chars.len() {
+        let end = (start + max_chars).min(chars.len());
+        let piece: String = chars[start..end].iter().collect();
+        chunks.push((start, end, piece));
+        if end >= chars.len() {
+            break;
+        }
+        let mut next = end.saturating_sub(overlap);
+        if next <= start {
+            // Ensure progress even with extreme overlap.
+            next = start + 1;
+        }
+        start = next;
+    }
+    chunks
+}
+
 pub fn split_text(text: &str, max_chars: usize, overlap: usize) -> Vec<(usize, usize, String)> {
     let clean = text.replace("\r\n", "\n");
     if clean.trim().is_empty() {
         return vec![];
     }
 
+    let max_chars = max_chars.max(1);
     // Work with chars for correct Unicode handling
     let chars: Vec<char> = clean.chars().collect();
     let length = chars.len();
     let mut chunks = Vec::new();
     let mut start: usize = 0;
-    let step = max_chars.saturating_sub(overlap).max(1);
 
     while start < length {
         let mut end = (start + max_chars).min(length);
 
-        // Newline snap in the back half
+        // Newline snap in the back half (prefer soft boundaries when present).
         if end < length {
             let search_start = (start + max_chars / 2).min(end);
-            // Find the last newline in [search_start, end)
             let mut newline_pos = None;
             for i in (search_start..end).rev() {
                 if chars[i] == '\n' {
@@ -163,28 +208,93 @@ pub fn split_text(text: &str, max_chars: usize, overlap: usize) -> Vec<(usize, u
             }
         }
 
+        // Guarantee: never emit a piece longer than max_chars (hard-split if
+        // the chosen span still exceeds — should not happen after the min above,
+        // but keep the invariant explicit for a single long line).
+        if end - start > max_chars {
+            end = start + max_chars;
+        }
+
         let piece: String = chars[start..end]
             .iter()
             .collect::<String>()
             .trim()
             .to_string();
         if !piece.is_empty() {
+            // piece may be shorter than [start,end) after trim; still record
+            // the char span used for overlap advance.
             chunks.push((start, end, piece));
         }
 
         if end >= length {
             break;
         }
-        start = end.saturating_sub(overlap);
-        if start >= length {
-            break;
+        let mut next = end.saturating_sub(overlap);
+        if next <= start {
+            next = start + 1;
         }
-        if start < end.saturating_sub(step) {
-            start = end.saturating_sub(overlap);
-        }
+        start = next;
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod split_text_tests {
+    use super::*;
+
+    #[test]
+    fn hard_split_single_line_40k_respects_max_chars() {
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let overlap = hard_split_overlap(max_chars);
+        let original: String = (0..40_000)
+            .map(|i| char::from(b'A' + (i % 26) as u8))
+            .collect();
+        let pieces = hard_split_chars(&original, max_chars, overlap);
+        assert!(pieces.len() > 1);
+        for (_, _, p) in &pieces {
+            assert!(
+                p.chars().count() <= max_chars,
+                "piece has {} chars > max_chars={max_chars}",
+                p.chars().count()
+            );
+        }
+        // Reconstruct with overlap removed via char offsets.
+        let mut rebuilt = String::new();
+        let mut cursor = 0usize;
+        for (s, e, _) in &pieces {
+            if *e <= cursor {
+                continue;
+            }
+            let from = cursor.saturating_sub(*s);
+            let piece_chars: Vec<char> = original.chars().skip(*s).take(e - s).collect();
+            let take: String = piece_chars.into_iter().skip(from).collect();
+            rebuilt.push_str(&take);
+            cursor = *e;
+        }
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn split_text_single_line_40k_respects_max_chars() {
+        let max_chars = CHUNK_CODE_MAX_CHARS;
+        let overlap = CHUNK_CODE_OVERLAP_CHARS;
+        let original: String = (0..40_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let pieces = split_text(&original, max_chars, overlap);
+        assert!(pieces.len() > 1);
+        for (_, _, p) in &pieces {
+            assert!(
+                p.chars().count() <= max_chars,
+                "split_text piece has {} chars",
+                p.chars().count()
+            );
+        }
+        // Offsets must cover the full range with only overlap gaps.
+        assert_eq!(pieces[0].0, 0);
+        assert_eq!(pieces.last().unwrap().1, original.chars().count());
+    }
 }
 
 // ── Read text file ───────────────────────────────────────────────────────────

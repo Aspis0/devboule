@@ -212,7 +212,6 @@ impl CkgStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn unique_temp_db(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ckg-store-test-{tag}-{}", std::process::id()));

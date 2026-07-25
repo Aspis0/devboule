@@ -48,6 +48,8 @@ rmcp = { version = "0.7", features = ["server", "transport-io", "macros"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # Metal/CoreML are macOS-only — other targets must never see them.
 ort = { version = "2.0.0-rc.10", features = ["coreml"] }
+# sysctlbyname for kern.memorystatus_* pressure probes (no root required).
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # DirectML runs on any DX12 GPU (AMD/Intel/NVIDIA) with no CUDA toolkit, so it is

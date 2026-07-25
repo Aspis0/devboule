@@ -12,7 +12,13 @@ use crate::BackendArg;
 use std::time::Instant;
 
 pub const MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
-pub const MAX_LENGTH: usize = 8192;
+
+/// Default max tokens per forward-pass sequence (one embed window).
+///
+/// Prefer [`crate::embed::EMBED_MAX_SEQ_TOKENS`] / `resolve_embed_max_seq_tokens()`.
+/// Kept as an alias so older call sites compile. Long texts are windowed +
+/// mean-pooled rather than truncated — see `crate::embed::window_text`.
+pub const MAX_LENGTH: usize = crate::embed::EMBED_MAX_SEQ_TOKENS;
 
 /// CLI-facing device selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -66,9 +72,14 @@ pub struct Loaded {
 }
 
 /// Load the Qwen3 embedding model from the local HF cache.
+///
+/// Max sequence length is [`crate::embed::resolve_embed_max_seq_tokens`]
+/// (one window). Callers must window long texts (see `crate::embed`) so the
+/// model never needs to drop tokens.
 pub fn load_model(device: &Device, dtype: DType) -> Result<Loaded> {
     let start = std::time::Instant::now();
-    let model = Qwen3TextEmbedding::from_hf(MODEL_ID, device, dtype, MAX_LENGTH)
+    let max_len = crate::embed::resolve_embed_max_seq_tokens();
+    let model = Qwen3TextEmbedding::from_hf(MODEL_ID, device, dtype, max_len)
         .with_context(|| format!("failed to load embedding model {MODEL_ID} from HF cache"))?;
     Ok(Loaded {
         model,
@@ -151,7 +162,8 @@ pub async fn cmd_embed(
         let (mut embedder, load_ms) = OnnxEmbedder::load(model_dir.as_path(), ep)?;
         eprintln!("model load: {} ms", load_ms);
         let start = Instant::now();
-        let vectors = embedder.embed_batched(&texts, batch_size)?;
+        let vectors =
+            embedder.embed_batched(&texts, batch_size, &crate::embed::CancelFlag::new())?;
         let embed_ms = start.elapsed().as_millis();
         let n = texts.len();
         let tps = if embed_ms > 0 {
@@ -267,7 +279,7 @@ pub async fn cmd_bench(
         let mut per_iter_ms: Vec<u128> = Vec::with_capacity(iters);
         for _ in 0..iters {
             let start = Instant::now();
-            let _ = embedder.embed_batched(&texts, batch_size)?;
+            let _ = embedder.embed_batched(&texts, batch_size, &crate::embed::CancelFlag::new())?;
             per_iter_ms.push(start.elapsed().as_millis());
         }
         bench_summary(
