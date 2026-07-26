@@ -27,8 +27,7 @@ inventory and attributions are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES
 
 - **macOS** — primary target, actively developed and tested.
 - **Windows** — supported; being tested shortly.
-- **Linux** — should build on the desktop WebView, but is not tested yet (no near-term plans).
-
+  
 ## Develop
 
 ```bash
