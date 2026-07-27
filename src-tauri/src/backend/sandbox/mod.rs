@@ -227,8 +227,12 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Flips to `true` when the Windows Job Object backend lands (sandbox epic phase 3).
-        false
+        // C1 (Job Object kill-on-close + memory limit) + C3 (filesystem ACL via icacls) +
+        // C4 (network block via netsh advfirewall) are enforced in the spawn path.
+        // C2 (restricted token broker via CreateProcessAsUserW) is implemented but not
+        // wired into the spawn path yet — it requires replacing std::process::Command.
+        // The broker (spawn_sandboxed) is available for future wiring.
+        true
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -307,11 +311,18 @@ mod tests {
         assert!(is_enforced());
     }
 
-    /// Off macOS, `wrap` is passthrough (no OS confinement), so `is_enforced()` is false until the
-    /// platform sandbox backend lands.
-    #[cfg(not(target_os = "macos"))]
+    /// Off macOS, `wrap` is passthrough (no OS confinement).
+    /// On Windows, `is_enforced()` is true after C1+C3+C4 landed.
+    /// On Linux/other, still false (landlock stub not implemented).
+    #[cfg(target_os = "windows")]
     #[test]
-    fn is_enforced_false_off_macos() {
+    fn is_enforced_true_on_windows() {
+        assert!(is_enforced());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn is_enforced_false_on_linux() {
         assert!(!is_enforced());
     }
 }

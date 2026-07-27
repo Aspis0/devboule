@@ -420,6 +420,38 @@ impl SandboxedChild {
     /// Returns the stderr pipe read handle.
     pub fn stderr_handle(&self) -> HANDLE { self.stderr_read }
 
+    /// Take ownership of the stdout pipe handle (for conversion to `File`).
+    /// After this call, Drop will NOT close the stdout handle — caller owns it.
+    pub fn take_stdout_handle(&mut self) -> HANDLE {
+        std::mem::take(&mut self.stdout_read)
+    }
+    /// Take ownership of the stderr pipe handle (for conversion to `File`).
+    pub fn take_stderr_handle(&mut self) -> HANDLE {
+        std::mem::take(&mut self.stderr_read)
+    }
+
+    /// Non-blocking wait. Returns Some(exit_code) if child exited, None if still running.
+    pub fn try_wait(&self) -> Result<Option<i32>, String> {
+        use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess};
+        let result = unsafe { WaitForSingleObject(self.process_handle, 0) };
+        if result.0 == 0 { // WAIT_OBJECT_0 = 0
+            let mut code: u32 = 0;
+            unsafe { GetExitCodeProcess(self.process_handle, &mut code)
+                .map_err(|e| format!("GetExitCodeProcess failed: {e}"))?; }
+            Ok(Some(code as i32))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Kill the child process.
+    pub fn kill(&self) -> Result<(), String> {
+        unsafe {
+            windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1)
+                .map_err(|e| format!("TerminateProcess failed: {e}"))
+        }
+    }
+
     /// Wait for the child to exit, then restore the filesystem ACLs (C3).
     /// Handles are closed by `Drop` when the struct goes out of scope.
     pub fn wait_and_restore(mut self) -> Result<i32, String> {

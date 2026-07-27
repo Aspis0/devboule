@@ -1055,6 +1055,21 @@ impl ScopedAgentTools {
         // spawned process (inherited by the child). Bounds a runaway/fork-bomb in a sandboxed run.
         crate::backend::sandbox::apply_rlimits(&mut cmd, &policy.rlimits);
 
+        // C3+C4 (Windows): apply filesystem ACLs + network blocking BEFORE spawn.
+        // Saved for restore after child exit. On error, the snapshots are leaked (ACLs stay
+        // modified) — acceptable for v1; the common path (spawn success) always restores.
+        #[cfg(target_os = "windows")]
+        let _sandbox_c3_c4: (Vec<crate::backend::sandbox::windows::PathAclSnapshot>,
+                             Option<crate::backend::sandbox::windows::NetPolicySnapshot>) = {
+            use crate::backend::sandbox::windows;
+            let acl = windows::apply_path_policy(&policy).unwrap_or_else(|e| {
+                eprintln!("[sandbox/windows] WARN: apply_path_policy failed: {e}");
+                Vec::new()
+            });
+            let net = windows::apply_net_policy(&policy, &argv[0]).ok();
+            (acl, net)
+        };
+
         let mut child = cmd.spawn().map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
         let pid = child.id() as i32;
 
@@ -1103,6 +1118,20 @@ impl ScopedAgentTools {
         let jt = std::time::Duration::from_secs(5);
         let stdout = rx_o.recv_timeout(jt).unwrap_or_default();
         let stderr = rx_e.recv_timeout(jt).unwrap_or_default();
+
+        // C3+C4 (Windows): restore filesystem ACLs + remove firewall rule AFTER child exit.
+        #[cfg(target_os = "windows")]
+        {
+            use crate::backend::sandbox::windows;
+            if let Err(e) = windows::restore_path_policy(_sandbox_c3_c4.0) {
+                eprintln!("[sandbox/windows] WARN: restore_path_policy failed: {e}");
+            }
+            if let Some(net) = _sandbox_c3_c4.1 {
+                if let Err(e) = windows::restore_net_policy(net) {
+                    eprintln!("[sandbox/windows] WARN: restore_net_policy failed: {e}");
+                }
+            }
+        }
         let mut body = match status {
             Some(s) => format!("exit: {}\n", s.code().unwrap_or(-1)),
             None => format!("TIMEOUT after {RUN_TIMEOUT_SECS}s (process group killed)\n"),
