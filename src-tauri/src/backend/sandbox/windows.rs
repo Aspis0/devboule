@@ -148,4 +148,26 @@ mod tests {
         attach_to_child(child.id()).expect("attach child to job");
         // Closing the job handle (or parent exit) would terminate the child via KILL_ON_JOB_CLOSE.
     }
+
+    /// Reviewer N6: CI-safe integration test of the full create -> stash -> spawn -> attach -> exit
+    /// path, without depending on kill-on-close cross-process behavior. Spawns `cmd /c exit 0`,
+    /// attaches it to the Job Object, and waits for the child to exit normally. This exercises
+    /// every public function in this module end-to-end.
+    #[test]
+    fn spawn_attach_and_exit_cleanly() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/c", "exit", "0"])
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
+        let limits = ResourceLimits {
+            cpu_secs: 60,
+            addr_space_bytes: None,
+            max_procs: 16,
+        };
+        apply_rlimits(&mut cmd, &limits);
+        let mut child = cmd.spawn().expect("spawn exit-0 child");
+        attach_to_child(child.id()).expect("attach child to job");
+        let status = child.wait().expect("wait for child");
+        assert!(status.success(), "cmd /c exit 0 should report success; got {:?}", status);
+    }
 }

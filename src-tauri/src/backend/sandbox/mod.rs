@@ -19,6 +19,11 @@ pub enum NetPolicy {
 /// OS resource limits applied to the sandboxed child (rlimit on macOS/Linux, Job Object on Windows).
 /// Enforced at the process level to prevent runaway tasks from starving the host or other agents.
 /// `addr_space_bytes == None` means "do not cap address space".
+///
+/// **Platform-specific semantics** (reviewer N2, post-C1):
+/// - `cpu_secs`: enforced via `RLIMIT_CPU` on unix; Windows has no CPU-time limit and **silently ignores** this field (relies on AgentScope/orchestrator timeouts instead).
+/// - `addr_space_bytes`: on unix maps to `RLIMIT_AS` (virtual address space); on Windows maps to `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit` which is "private commit charge" (committed, non-shareable virtual memory), NOT total virtual address space. Both are sufficient for a runaway-task guard (an infinite allocator loop hits either), but `top`/`tasklist` will report different numbers.
+/// - `max_procs`: enforced via `RLIMIT_NPROC` on unix-macOS (intentionally NOT set on macOS — see `apply_rlimits`); on Windows **silently ignored** today (would require `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`). Per-process fork-bounding belongs to the Windows Job Object's process-count, which we may set in C4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub cpu_secs: u64,
