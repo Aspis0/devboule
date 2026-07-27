@@ -377,7 +377,13 @@ pub fn cleanup_orphaned_firewall_rules() {
         let Some(pid_str) = name.strip_prefix("devboule_firewall_journal_").and_then(|s| s.strip_suffix(".txt")) else { continue; };
         let Ok(pid) = pid_str.parse::<u32>() else { continue; };
         // Skip journals of still-running processes.
-        let alive = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).is_ok() };
+        // MEDIUM fix: close the OpenProcess handle — previously .is_ok() leaked it.
+        let alive = unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) => { let _ = CloseHandle(h); true }
+                Err(_) => false,
+            }
+        };
         if alive { continue; }
         // Orphan: read + delete each rule, then remove the journal file.
         let journal = entry.path();
@@ -694,7 +700,12 @@ fn open_null_handle() -> Result<HANDLE, String> {
             None,
         ).map_err(|e| format!("CreateFileW(NUL) failed: {e}"))?;
         // Make inheritable so the child can use it as stdin.
-        let _ = windows::Win32::Foundation::SetHandleInformation(h, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1));
+        // LOW fix: propagate SetHandleInformation failure instead of silently ignoring.
+        windows::Win32::Foundation::SetHandleInformation(h, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1))
+            .map_err(|e| {
+                let _ = CloseHandle(h);
+                format!("SetHandleInformation(NUL) failed: {e}")
+            })?;
         Ok(h)
     }
 }
@@ -719,14 +730,18 @@ fn create_restricted_token() -> Result<HANDLE, String> {
         // H-8 fix: DISABLE_MAX_PRIVILEGE (0x1) strips privileges; LUA_TOKEN (0x4)
         // produces a filtered token (like UAC does), removing admin group SIDs from
         // being effective. This is stronger than DISABLE_MAX_PRIVILEGE alone.
-        CreateRestrictedToken(
+        if let Err(e) = CreateRestrictedToken(
             primary_token,
             CREATE_RESTRICTED_TOKEN_FLAGS(0x1 | 0x4), // DISABLE_MAX_PRIVILEGE | LUA_TOKEN
             None,
             None,
             None,
             &mut restricted_token,
-        ).map_err(|e| format!("CreateRestrictedToken failed: {e}"))?;
+        ) {
+            // LOW fix: close primary_token before returning the error.
+            let _ = CloseHandle(primary_token);
+            return Err(format!("CreateRestrictedToken failed: {e}"));
+        }
     }
 
     unsafe { let _ = CloseHandle(primary_token); }
@@ -869,7 +884,7 @@ pub fn spawn_sandboxed(
               | PROCESS_CREATION_FLAGS(0x00080000);
 
     unsafe {
-        CreateProcessAsUserW(
+        if let Err(e) = CreateProcessAsUserW(
             restricted_token,
             PCWSTR::null(),
             PWSTR(cmdline_wide.as_mut_ptr()),
@@ -880,7 +895,19 @@ pub fn spawn_sandboxed(
             PCWSTR(cwd_wide.as_ptr()),
             &si as *const _ as *const _,
             &mut pi,
-        ).map_err(|e| format!("CreateProcessAsUserW failed: {e}"))?;
+        ) {
+            // LOW fix: clean up ALL intermediate handles + attr list before returning.
+            // SandboxGuard (Drop) restores ACLs/net.
+            unsafe { DeleteProcThreadAttributeList(attr_list); }
+            let _ = CloseHandle(stdout_write);
+            let _ = CloseHandle(stderr_write);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            let _ = CloseHandle(null_stdin);
+            let _ = CloseHandle(restricted_token);
+            let _ = CloseHandle(job);
+            return Err(format!("CreateProcessAsUserW failed: {e}"));
+        }
     }
 
     // H-9: the attribute list can be freed now (loader copied what it needed).
@@ -906,6 +933,9 @@ pub fn spawn_sandboxed(
             let _ = CloseHandle(pi.hProcess);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(job);
+            // LOW fix: close the pipe READ ends too (not yet moved into SandboxedChild).
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
             return Err(format!("AssignProcessToJobObject failed: {e}"));
         }
     }
