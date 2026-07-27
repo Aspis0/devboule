@@ -1008,12 +1008,16 @@ impl ScopedAgentTools {
         use std::os::windows::io::FromRawHandle;
         use crate::backend::sandbox::windows;
 
-        // Build env vars (same list as the Unix path).
+        // M-5 fix: Windows-specific env vars required by build tools.
         let env_vars: Vec<(String, String)> = [
+            // Unix-compatible
             "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "CARGO_HOME",
             "RUSTUP_HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "NODE_PATH", "JAVA_HOME",
             "ANDROID_HOME", "PYENV_ROOT", "VIRTUAL_ENV",
             "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+            // Windows-required
+            "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC", "PATHEXT",
+            "APPDATA", "LOCALAPPDATA", "ProgramData", "WINDIR",
         ].iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();

@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
 
@@ -66,6 +66,10 @@ pub fn apply_rlimits(_cmd: &mut Command, limits: &ResourceLimits) {
         let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
         let mut basic = std::mem::zeroed::<JOBOBJECT_BASIC_LIMIT_INFORMATION>();
         basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // H-2 fix: enable PROCESS_MEMORY only when a finite limit is set.
+        if limits.addr_space_bytes.is_some() {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
         info.BasicLimitInformation = basic;
         info.ProcessMemoryLimit = memory_limit;
         if let Err(e) = SetInformationJobObject(
@@ -174,9 +178,15 @@ fn canonicalize_path(path: &Path) -> std::path::PathBuf {
 /// passed as a literal string (Git Bash's `/save` → `C:/Program Files/Git/save`
 /// path translation does NOT apply).
 fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
+    // C-2 fix: use a unique counter to prevent backup file collision when the same
+    // path appears as both readonly_root and a writable_path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let backup = std::env::temp_dir().join(format!(
-        "devboule_acl_{}_{}",
+        "devboule_acl_{}_{}_{}",
         std::process::id(),
+        id,
         path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("root".into())
     ));
     let out = std::process::Command::new("icacls")
@@ -261,20 +271,27 @@ fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
 /// this before spawn. `is_enforced()` stays `false` on Windows.
 pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>, String> {
     let mut snapshots = Vec::new();
+    let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
+    // C-2 fix: deduplicate paths to prevent deny+allow collision on the same path.
+    // If readonly_root also appears in writable_paths, only the deny-write is applied.
     if policy.readonly_root.is_absolute() {
         let canon = canonicalize_path(&policy.readonly_root);
-        let backup = save_acl(&canon)?;
-        deny_write_everyone(&canon)?;
-        snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+        if processed.insert(canon.clone()) {
+            let backup = save_acl(&canon)?;
+            deny_write_everyone(&canon)?;
+            snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+        }
     }
 
     for wp in &policy.writable_paths {
         if wp.is_absolute() {
             let canon = canonicalize_path(wp);
-            let backup = save_acl(&canon)?;
-            allow_write_everyone(&canon)?;
-            snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+            if processed.insert(canon.clone()) {
+                let backup = save_acl(&canon)?;
+                allow_write_everyone(&canon)?;
+                snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+            }
         }
     }
 
@@ -283,11 +300,19 @@ pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>,
 
 /// Restore the original ACLs saved by [`apply_path_policy`].
 pub fn restore_path_policy(snapshots: Vec<PathAclSnapshot>) -> Result<(), String> {
+    let mut errors = Vec::new();
     for snap in snapshots {
-        restore_acl(&snap.path, &snap.backup_file)?;
-        let _ = std::fs::remove_file(&snap.backup_file);
+        if let Err(e) = restore_acl(&snap.path, &snap.backup_file) {
+            errors.push(format!("{}: {e}", snap.path.display()));
+        } else {
+            let _ = std::fs::remove_file(&snap.backup_file);
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("restore failed for {} paths: {}", errors.len(), errors.join("; ")))
+    }
 }
 
 // ─── C4: Network egress layer ──────────────────────────────────────────────────
@@ -465,14 +490,17 @@ impl SandboxedChild {
             code as i32
         };
 
-        // C3+C4: restore ACLs + net policy. Take both BEFORE restoring so Drop sees
-        // empty snapshots even if one restore fails (reviewer C4 note #2 fix).
+        // C3+C4: restore ACLs + net policy. H-5 fix: set restored=true only AFTER both succeed.
         let snapshots = std::mem::take(&mut self.acl_snapshots);
         let net = std::mem::take(&mut self.net_snapshot);
-        self.restored = true;
 
         let acl_err = restore_path_policy(snapshots).err();
         let net_err = restore_net_policy(net).err();
+
+        if acl_err.is_none() && net_err.is_none() {
+            self.restored = true;
+        }
+
         if let Some(e) = net_err.or(acl_err) {
             return Err(e);
         }
@@ -485,10 +513,23 @@ impl SandboxedChild {
 impl Drop for SandboxedChild {
     fn drop(&mut self) {
         unsafe {
-            // If wait_and_restore was NOT called, kill the child + restore ACLs.
+            // If wait_and_restore was NOT called, kill the child.
             if !self.restored {
                 let _ = windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1);
                 let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
+            }
+
+            // H-4 fix: close Job FIRST (KILL_ON_JOB_CLOSE kills remaining descendants).
+            // This must happen BEFORE restoring ACLs/net so descendants can't write/network
+            // under restored host policy.
+            if !self.job.0.is_null() {
+                let _ = CloseHandle(self.job);
+            }
+            // Wait briefly for descendants to die after job close.
+            let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
+
+            // NOW restore ACLs + net (descendants are dead).
+            if !self.restored {
                 let snapshots = std::mem::take(&mut self.acl_snapshots);
                 if !snapshots.is_empty() {
                     let _ = restore_path_policy(snapshots);
@@ -496,12 +537,13 @@ impl Drop for SandboxedChild {
                 let net = std::mem::take(&mut self.net_snapshot);
                 let _ = restore_net_policy(net);
             }
-            // Close ALL handles (including job — child is dead, KILL_ON_JOB_CLOSE is safe).
-            let _ = CloseHandle(self.process_handle);
-            let _ = CloseHandle(self.thread_handle);
-            let _ = CloseHandle(self.stdout_read);
-            let _ = CloseHandle(self.stderr_read);
-            let _ = CloseHandle(self.job);
+
+            // M-2 fix: check for null before CloseHandle (take_*_handle sets to default).
+            if !self.process_handle.0.is_null() { let _ = CloseHandle(self.process_handle); }
+            if !self.thread_handle.0.is_null() { let _ = CloseHandle(self.thread_handle); }
+            if !self.stdout_read.0.is_null() { let _ = CloseHandle(self.stdout_read); }
+            if !self.stderr_read.0.is_null() { let _ = CloseHandle(self.stderr_read); }
+            // job already closed above.
         }
     }
 }
@@ -515,12 +557,17 @@ fn make_env_block(env_vars: &[(String, String)]) -> Vec<u16> {
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
     let mut w: Vec<u16> = Vec::new();
+    let is_empty = items.is_empty();
     for (_, k, v) in items {
         let entry = format!("{k}={v}");
         w.extend(entry.encode_utf16());
         w.push(0);
     }
-    w.push(0);
+    w.push(0); // block terminator
+    // M-5 fix: empty block needs two NULs per Windows spec.
+    if is_empty {
+        w.push(0);
+    }
     w
 }
 
@@ -581,6 +628,10 @@ fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
         let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
         let mut basic = std::mem::zeroed::<JOBOBJECT_BASIC_LIMIT_INFORMATION>();
         basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // H-2 fix: enable PROCESS_MEMORY only when a finite limit is set.
+        if rlimits.addr_space_bytes.is_some() {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
         info.BasicLimitInformation = basic;
         info.ProcessMemoryLimit = memory_limit;
         SetInformationJobObject(
@@ -609,6 +660,7 @@ pub fn spawn_sandboxed(
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, STARTUPINFOW, PROCESS_INFORMATION,
         STARTF_USESTDHANDLES, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        CREATE_SUSPENDED, ResumeThread,
     };
     use windows::core::{PWSTR, PCWSTR};
     use windows::Win32::Foundation::BOOL;
@@ -658,7 +710,7 @@ pub fn spawn_sandboxed(
     si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    let flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
 
     unsafe {
         CreateProcessAsUserW(
@@ -683,10 +735,23 @@ pub fn spawn_sandboxed(
         let _ = CloseHandle(restricted_token);
     }
 
-    // C1: assign child to Job Object.
+    // C1: assign the SUSPENDED child to the Job Object BEFORE it starts running (C-4 fix).
+    // This prevents descendants from escaping before assignment.
     unsafe {
-        AssignProcessToJobObject(job, pi.hProcess)
-            .map_err(|e| format!("AssignProcessToJobObject failed: {e}"))?;
+        if let Err(e) = AssignProcessToJobObject(job, pi.hProcess) {
+            // H-3 fix: kill the suspended child + close ALL handles + let guard restore ACLs/net.
+            let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+            let _ = windows::Win32::System::Threading::WaitForSingleObject(pi.hProcess, 5000);
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(job);
+            return Err(format!("AssignProcessToJobObject failed: {e}"));
+        }
+    }
+
+    // Resume the child's main thread — it starts executing now, safely inside the Job Object.
+    unsafe {
+        ResumeThread(pi.hThread);
     }
 
     // Disarm the guard: on success, snapshots move into SandboxedChild.
