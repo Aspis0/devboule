@@ -433,13 +433,17 @@ impl SandboxedChild {
             code as i32
         };
 
-        // C3: restore the original ACLs.
+        // C3+C4: restore ACLs + net policy. Take both BEFORE restoring so Drop sees
+        // empty snapshots even if one restore fails (reviewer C4 note #2 fix).
         let snapshots = std::mem::take(&mut self.acl_snapshots);
-        restore_path_policy(snapshots)?;
-        // C4: restore the firewall rule.
         let net = std::mem::take(&mut self.net_snapshot);
-        restore_net_policy(net)?;
         self.restored = true;
+
+        let acl_err = restore_path_policy(snapshots).err();
+        let net_err = restore_net_policy(net).err();
+        if let Some(e) = net_err.or(acl_err) {
+            return Err(e);
+        }
 
         Ok(exit_code)
         // Drop closes ALL handles (child is dead, safe to close job too).
