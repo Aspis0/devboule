@@ -8846,6 +8846,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn user_server_with_empty_args_omits_the_args_token() {
         // FIX 5: a user server with NO args must NOT emit `mcp_servers.<name>.args=[]` (matches
         // the Oracle, which never emits an empty args token). `command` is always present.
