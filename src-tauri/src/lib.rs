@@ -409,6 +409,11 @@ pub fn run() {
         // app's webviews; the app CSP grants it via `frame-src` in tauri.conf.json.
         .register_uri_scheme_protocol("artifact", backend::artifact_protocol::handle_artifact_request)
         .setup(|app| {
+            // M-10: on Windows, clean up firewall rules left by crashed sandbox runs.
+            #[cfg(target_os = "windows")]
+            {
+                backend::sandbox::windows::cleanup_orphaned_firewall_rules();
+            }
             // Record the bundled, read-only `oracle/` location so release builds
             // run Oracle Python only from there, never from a user "drop" dir.
             if let Ok(dir) = app.path().resource_dir() {

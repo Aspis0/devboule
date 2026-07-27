@@ -335,8 +335,70 @@ pub struct NetPolicySnapshot {
     rule_name: String,
 }
 
+/// Path to this process's firewall-rule journal (one rule name per line).
+/// Used by [`cleanup_orphaned_firewall_rules`] to recover from crashes.
+fn firewall_journal_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("devboule_firewall_journal_{}.txt", std::process::id()))
+}
+
+/// Append a rule name to this process's journal.
+fn journal_add(rule: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open(firewall_journal_path())
+    {
+        let _ = writeln!(f, "{rule}");
+    }
+}
+
+/// Remove a rule name from this process's journal (rewrite without it).
+fn journal_remove(rule: &str) {
+    let path = firewall_journal_path();
+    if let Ok(lines) = std::fs::read_to_string(&path) {
+        let kept: Vec<&str> = lines.lines().filter(|l| *l != rule).collect();
+        if kept.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, kept.join("\n") + "\n");
+        }
+    }
+}
+
+/// M-10: remove firewall rules left behind by crashed devboule instances.
+/// Scan temp dir for `devboule_firewall_journal_*.txt`, and for each whose
+/// owning PID is no longer alive, delete the listed rules and the journal.
+/// Safe to call at app startup.
+pub fn cleanup_orphaned_firewall_rules() {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let tmp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&tmp) else { return; };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(pid_str) = name.strip_prefix("devboule_firewall_journal_").and_then(|s| s.strip_suffix(".txt")) else { continue; };
+        let Ok(pid) = pid_str.parse::<u32>() else { continue; };
+        // Skip journals of still-running processes.
+        let alive = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).is_ok() };
+        if alive { continue; }
+        // Orphan: read + delete each rule, then remove the journal file.
+        let journal = entry.path();
+        if let Ok(lines) = std::fs::read_to_string(&journal) {
+            for rule in lines.lines() {
+                let _ = std::process::Command::new("netsh")
+                    .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
+                    .output();
+            }
+        }
+        let _ = std::fs::remove_file(&journal);
+    }
+}
+
 /// Add a firewall rule blocking outbound network for `program` (C4).
 /// Only applies when `policy.net == NetPolicy::None`.
+///
+/// H-1: `netsh advfirewall` requires administrator privileges. If the calling
+/// process is not elevated, this returns an error directing the user to run as
+/// admin. A v2 alternative (WFP filter via a broker service) would remove the
+/// elevation requirement but is out of scope for v1.
 pub fn apply_net_policy(policy: &SandboxPolicy, program: &str) -> Result<NetPolicySnapshot, String> {
     use super::NetPolicy;
     match policy.net {
@@ -352,11 +414,24 @@ pub fn apply_net_policy(policy: &SandboxPolicy, program: &str) -> Result<NetPoli
                 .output()
                 .map_err(|e| format!("netsh add rule spawn failed: {e}"))?;
             if !out.status.success() {
-                return Err(format!(
-                    "netsh add rule failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let combined = format!("{stderr} {stdout}");
+                // H-1: detect access-denied (admin required) and give a clear message.
+                if combined.to_ascii_lowercase().contains("administrator")
+                    || combined.to_ascii_lowercase().contains("access is denied")
+                    || combined.to_ascii_lowercase().contains("elevation")
+                {
+                    return Err(
+                        "network blocking requires administrator privileges \
+                         (netsh advfirewall). Run devboule as administrator. \
+                         See H-1 in specs/PORT_MACOS_TO_WINDOWS_FINAL.md.".into()
+                    );
+                }
+                return Err(format!("netsh add rule failed: {combined}"));
             }
+            // M-10: record the rule so a crash can be recovered.
+            journal_add(&rule_name);
             Ok(NetPolicySnapshot { rule_name })
         }
         NetPolicy::Loopback | NetPolicy::Enabled => {
@@ -371,10 +446,11 @@ pub fn restore_net_policy(snapshot: NetPolicySnapshot) -> Result<(), String> {
     if snapshot.rule_name.is_empty() {
         return Ok(());
     }
+    let rule = snapshot.rule_name.clone();
     let out = std::process::Command::new("netsh")
         .args([
             "advfirewall", "firewall", "delete", "rule",
-            &format!("name={}", snapshot.rule_name),
+            &format!("name={rule}"),
         ])
         .output()
         .map_err(|e| format!("netsh delete rule spawn failed: {e}"))?;
@@ -384,8 +460,11 @@ pub fn restore_net_policy(snapshot: NetPolicySnapshot) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
+    // M-10: drop the rule from the journal (recovered). Ignore errors.
+    journal_remove(&rule);
     Ok(())
 }
+
 
 // ─── C2 broker: restricted token + sandboxed spawn ─────────────────────────────
 //
@@ -595,6 +674,31 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), String> {
     Ok((read, write))
 }
 
+/// Open a handle to the NUL device for use as a child's stdin.
+/// The child can read from this without blocking (always returns EOF/0 bytes).
+/// The handle is inheritable so the child receives it.
+fn open_null_handle() -> Result<HANDLE, String> {
+    use windows::Win32::Storage::FileSystem::CreateFileW;
+    // Use numeric constants to avoid windows 0.58 import drift:
+    // GENERIC_READ=0x80000000, FILE_SHARE_READ|WRITE=0x3,
+    // OPEN_EXISTING=3, FILE_ATTRIBUTE_NORMAL=0x80.
+    let null_name: Vec<u16> = "NUL\0".encode_utf16().collect();
+    unsafe {
+        let h = CreateFileW(
+            windows::core::PCWSTR(null_name.as_ptr()),
+            0x80000000u32,                // GENERIC_READ
+            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0x3), // READ|WRITE
+            None,
+            windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION(3), // OPEN_EXISTING
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x80), // FILE_ATTRIBUTE_NORMAL
+            None,
+        ).map_err(|e| format!("CreateFileW(NUL) failed: {e}"))?;
+        // Make inheritable so the child can use it as stdin.
+        let _ = windows::Win32::Foundation::SetHandleInformation(h, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1));
+        Ok(h)
+    }
+}
+
 /// Open the current process token and create a restricted version
 /// with DISABLE_MAX_PRIVILEGE (strips all privileges from the token).
 fn create_restricted_token() -> Result<HANDLE, String> {
@@ -612,9 +716,12 @@ fn create_restricted_token() -> Result<HANDLE, String> {
 
     let mut restricted_token = HANDLE::default();
     unsafe {
+        // H-8 fix: DISABLE_MAX_PRIVILEGE (0x1) strips privileges; LUA_TOKEN (0x4)
+        // produces a filtered token (like UAC does), removing admin group SIDs from
+        // being effective. This is stronger than DISABLE_MAX_PRIVILEGE alone.
         CreateRestrictedToken(
             primary_token,
-            CREATE_RESTRICTED_TOKEN_FLAGS(0x1), // DISABLE_MAX_PRIVILEGE
+            CREATE_RESTRICTED_TOKEN_FLAGS(0x1 | 0x4), // DISABLE_MAX_PRIVILEGE | LUA_TOKEN
             None,
             None,
             None,
@@ -668,9 +775,11 @@ pub fn spawn_sandboxed(
     env_vars: &[(String, String)],
 ) -> Result<SandboxedChild, String> {
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, STARTUPINFOW, PROCESS_INFORMATION,
+        CreateProcessAsUserW, STARTUPINFOEXW, PROCESS_INFORMATION,
         STARTF_USESTDHANDLES, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-        CREATE_SUSPENDED, ResumeThread,
+        CREATE_SUSPENDED, ResumeThread, PROCESS_CREATION_FLAGS,
+        InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+        DeleteProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     };
     use windows::core::{PWSTR, PCWSTR};
     use windows::Win32::Foundation::BOOL;
@@ -707,20 +816,57 @@ pub fn spawn_sandboxed(
         .chain(std::iter::once(0))
         .collect();
 
-    // Desktop name — required for restricted tokens to avoid STATUS_DLL_INIT_FAILED.
-    let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+    // M-4 fix: set lpDesktop to null so the child inherits the parent's desktop.
+    // A private window station (CreateDesktopW + ACL grant) is a v2 improvement;
+    // the restricted token + LUA_TOKEN already removes admin effectiveness for v1.
+    // Keeping null avoids hardcoding a session-specific name.
 
-    // STARTUPINFOW.
-    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = stdout_write;
-    si.hStdError = stderr_write;
-    si.hStdInput = HANDLE::default();
-    si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
+    // M-8 fix: open a NUL device handle for the child's stdin (valid, non-blocking).
+    let null_stdin = open_null_handle()?;
+
+    // H-9 fix: use STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST to restrict
+    // handle inheritance to ONLY stdout/stderr/null_stdin. With bInheritHandles=TRUE
+    // but a constrained attribute list, the child cannot inherit arbitrary parent
+    // handles (e.g. other pipe ends, token handles).
+    let inherit_handles: [HANDLE; 3] = [stdout_write, stderr_write, null_stdin];
+
+    // Step 1: query the required attribute-list buffer size.
+    let mut attr_size: usize = 0;
+    unsafe { let _ = InitializeProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()), 1, 0, &mut attr_size); }
+
+    // Step 2: allocate the buffer (lives until after CreateProcessAsUserW).
+    let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut std::ffi::c_void);
+
+    // Step 3: initialize + populate the single HANDLE_LIST attribute.
+    let mut handle_list = inherit_handles;
+    unsafe {
+        InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
+            .map_err(|e| format!("InitializeProcThreadAttributeList failed: {e}"))?;
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            0x00020000usize, // PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+            Some(handle_list.as_mut_ptr() as *const std::ffi::c_void),
+            std::mem::size_of_val(&handle_list),
+            None, None,
+        ).map_err(|e| format!("UpdateProcThreadAttribute failed: {e}"))?;
+    }
+
+    // STARTUPINFOEXW (superset of STARTUPINFOW, with lpAttributeList).
+    let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = stdout_write;
+    si.StartupInfo.hStdError = stderr_write;
+    si.StartupInfo.hStdInput = null_stdin;
+    si.StartupInfo.lpDesktop = windows::core::PWSTR::null();
+    si.lpAttributeList = attr_list;
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    // H-9: EXTENDED_STARTUPINFO_PRESENT (0x00080000) tells the loader this is a STARTUPINFOEXW.
+    let flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+              | PROCESS_CREATION_FLAGS(0x00080000);
 
     unsafe {
         CreateProcessAsUserW(
@@ -732,16 +878,21 @@ pub fn spawn_sandboxed(
             flags,
             Some(env_block.as_ptr() as *const _),
             PCWSTR(cwd_wide.as_ptr()),
-            &si,
+            &si as *const _ as *const _,
             &mut pi,
         ).map_err(|e| format!("CreateProcessAsUserW failed: {e}"))?;
     }
 
+    // H-9: the attribute list can be freed now (loader copied what it needed).
+    unsafe { DeleteProcThreadAttributeList(attr_list); }
+
     // Close write ends of pipes (parent doesn't need them).
     // Close the restricted token (child has its own copy).
+    // Close the NUL stdin handle (M-8) — child has its inherited copy.
     unsafe {
         let _ = CloseHandle(stdout_write);
         let _ = CloseHandle(stderr_write);
+        let _ = CloseHandle(null_stdin);
         let _ = CloseHandle(restricted_token);
     }
 
