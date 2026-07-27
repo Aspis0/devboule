@@ -47,18 +47,18 @@ rmcp = { version = "0.7", features = ["server", "transport-io", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Metal/CoreML are macOS-only — other targets must never see them.
-ort = { version = "2.0.0-rc.10", features = ["coreml"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24", "coreml"] }
 # sysctlbyname for kern.memorystatus_* pressure probes (no root required).
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # DirectML runs on any DX12 GPU (AMD/Intel/NVIDIA) with no CUDA toolkit, so it is
 # the portable Windows GPU EP; it is Windows-only and must not leak to other targets.
-ort = { version = "2.0.0-rc.10", features = ["directml"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24", "directml"] }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 # Linux/other: CPU EP only (no GPU EP feature enabled).
-ort = { version = "2.0.0-rc.10" }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
 
 [dev-dependencies]
 tempfile = "3"
