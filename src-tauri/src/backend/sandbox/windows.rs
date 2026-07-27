@@ -290,6 +290,71 @@ pub fn restore_path_policy(snapshots: Vec<PathAclSnapshot>) -> Result<(), String
     Ok(())
 }
 
+// ─── C4: Network egress layer ──────────────────────────────────────────────────
+//
+// Blocks outbound network for the child's program path via `netsh advfirewall`.
+// Per-application (not per-process), but real enforcement. Rule is added before
+// spawn and removed after child exit. For v1: NetPolicy::None only. Loopback and
+// Enabled are deferred (WFP filter complexity is out of v1 scope).
+
+/// Saved firewall rule name for restore after child exit.
+#[derive(Default)]
+pub struct NetPolicySnapshot {
+    rule_name: String,
+}
+
+/// Add a firewall rule blocking outbound network for `program` (C4).
+/// Only applies when `policy.net == NetPolicy::None`.
+pub fn apply_net_policy(policy: &SandboxPolicy, program: &str) -> Result<NetPolicySnapshot, String> {
+    use super::NetPolicy;
+    match policy.net {
+        NetPolicy::None => {
+            let rule_name = format!("devboule_sandbox_block_{}", std::process::id());
+            let out = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall", "firewall", "add", "rule",
+                    &format!("name={rule_name}"),
+                    "dir=out", "action=block",
+                    &format!("program=\"{program}\""),
+                ])
+                .output()
+                .map_err(|e| format!("netsh add rule spawn failed: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "netsh add rule failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            Ok(NetPolicySnapshot { rule_name })
+        }
+        NetPolicy::Loopback | NetPolicy::Enabled => {
+            // v1: deferred. WFP filter for loopback-permit is out of scope.
+            Ok(NetPolicySnapshot { rule_name: String::new() })
+        }
+    }
+}
+
+/// Remove the firewall rule saved by [`apply_net_policy`].
+pub fn restore_net_policy(snapshot: NetPolicySnapshot) -> Result<(), String> {
+    if snapshot.rule_name.is_empty() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "delete", "rule",
+            &format!("name={}", snapshot.rule_name),
+        ])
+        .output()
+        .map_err(|e| format!("netsh delete rule spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "netsh delete rule failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
 // ─── C2 broker: restricted token + sandboxed spawn ─────────────────────────────
 //
 // The real Windows sandbox spawn path. Replaces std::process::Command::spawn()
@@ -309,32 +374,42 @@ pub struct SandboxedChild {
     stdout_read: HANDLE,
     stderr_read: HANDLE,
     acl_snapshots: Vec<PathAclSnapshot>,
+    net_snapshot: NetPolicySnapshot,
     job: HANDLE,
-    acl_restored: bool,
+    restored: bool, // true after wait_and_restore has restored ACLs + net
 }
 
-/// RAII guard that restores filesystem ACLs when dropped (error path safety).
+/// RAII guard that restores filesystem ACLs + net policy when dropped (error path safety).
 /// Disarm with `.take()` on success.
-struct AclGuard {
-    snapshots: Option<Vec<PathAclSnapshot>>,
+struct SandboxGuard {
+    acl: Option<Vec<PathAclSnapshot>>,
+    net: Option<NetPolicySnapshot>,
 }
 
-impl AclGuard {
-    fn new(snapshots: Vec<PathAclSnapshot>) -> Self {
-        Self { snapshots: Some(snapshots) }
+impl SandboxGuard {
+    fn new(acl: Vec<PathAclSnapshot>) -> Self {
+        Self { acl: Some(acl), net: None }
     }
-    /// Disarm the guard: caller takes ownership of the snapshots (success path).
-    fn take(mut self) -> Vec<PathAclSnapshot> {
-        self.snapshots.take().unwrap_or_default()
+    fn set_net(&mut self, net: NetPolicySnapshot) {
+        self.net = Some(net);
+    }
+    /// Disarm the guard: caller takes ownership of snapshots (success path).
+    fn take(mut self) -> (Vec<PathAclSnapshot>, NetPolicySnapshot) {
+        let acl = self.acl.take().unwrap_or_default();
+        let net = self.net.take().unwrap_or(NetPolicySnapshot { rule_name: String::new() });
+        (acl, net)
     }
 }
 
-impl Drop for AclGuard {
+impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        if let Some(snapshots) = self.snapshots.take() {
+        if let Some(snapshots) = self.acl.take() {
             if !snapshots.is_empty() {
                 let _ = restore_path_policy(snapshots);
             }
+        }
+        if let Some(net) = self.net.take() {
+            let _ = restore_net_policy(net);
         }
     }
 }
@@ -361,7 +436,10 @@ impl SandboxedChild {
         // C3: restore the original ACLs.
         let snapshots = std::mem::take(&mut self.acl_snapshots);
         restore_path_policy(snapshots)?;
-        self.acl_restored = true;
+        // C4: restore the firewall rule.
+        let net = std::mem::take(&mut self.net_snapshot);
+        restore_net_policy(net)?;
+        self.restored = true;
 
         Ok(exit_code)
         // Drop closes ALL handles (child is dead, safe to close job too).
@@ -372,13 +450,15 @@ impl Drop for SandboxedChild {
     fn drop(&mut self) {
         unsafe {
             // If wait_and_restore was NOT called, kill the child + restore ACLs.
-            if !self.acl_restored {
+            if !self.restored {
                 let _ = windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1);
                 let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
                 let snapshots = std::mem::take(&mut self.acl_snapshots);
                 if !snapshots.is_empty() {
                     let _ = restore_path_policy(snapshots);
                 }
+                let net = std::mem::take(&mut self.net_snapshot);
+                let _ = restore_net_policy(net);
             }
             // Close ALL handles (including job — child is dead, KILL_ON_JOB_CLOSE is safe).
             let _ = CloseHandle(self.process_handle);
@@ -497,9 +577,10 @@ pub fn spawn_sandboxed(
     use windows::core::{PWSTR, PCWSTR};
     use windows::Win32::Foundation::BOOL;
 
-    // C3: apply filesystem ACLs before spawn.
-    // AclGuard ensures ACLs are restored even if spawn fails (CRITICAL fix #2).
-    let acl_guard = AclGuard::new(apply_path_policy(policy)?);
+    // C3+C4: apply filesystem ACLs + net policy before spawn.
+    // SandboxGuard ensures both are restored even if spawn fails.
+    let mut guard = SandboxGuard::new(apply_path_policy(policy)?);
+    guard.set_net(apply_net_policy(policy, program)?);
 
     // C1: create Job Object.
     let job = create_job_object(&policy.rlimits)?;
@@ -572,9 +653,8 @@ pub fn spawn_sandboxed(
             .map_err(|e| format!("AssignProcessToJobObject failed: {e}"))?;
     }
 
-    // Disarm the AclGuard: on success, the snapshots move into SandboxedChild.
-    // If this function returns Err before this line, AclGuard::drop restores the ACLs.
-    let acl_snapshots = acl_guard.take();
+    // Disarm the guard: on success, snapshots move into SandboxedChild.
+    let (acl_snapshots, net_snapshot) = guard.take();
 
     Ok(SandboxedChild {
         process_handle: pi.hProcess,
@@ -583,8 +663,9 @@ pub fn spawn_sandboxed(
         stdout_read,
         stderr_read,
         acl_snapshots,
+        net_snapshot,
         job,
-        acl_restored: false,
+        restored: false,
     })
 }
 
