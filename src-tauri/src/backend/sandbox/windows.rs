@@ -24,6 +24,8 @@ use super::{ResourceLimits, SandboxedCommand, SandboxPolicy};
 ///
 /// Pattern: a Windows Job Object must be created BEFORE the child spawns, and the child must be
 /// ASSIGNED to it AFTER it spawns (we need the child's PID). Hence the two-phase API.
+/// M-9: superseded by the broker's create_job_object. Kept for mod.rs public API.
+#[allow(dead_code)]
 pub fn wrap_policy(
     policy: &SandboxPolicy,
     program: &str,
@@ -45,8 +47,9 @@ thread_local! {
 
 /// Replaces the no-op `apply_rlimits` on Windows. Creates the Job Object, configures it with
 /// KILL_ON_JOB_CLOSE (+ an optional process memory limit), and stashes the HANDLE in a thread-local
-/// so the matching `attach_to_child` (called by the spawner right after `cmd.spawn()`) can assign
-/// the child to it. On any failure the child simply runs unrestricted (current behavior on Windows).
+/// M-9: superseded by the broker's create_job_object. Kept for the mod.rs public API
+/// but NOT called by the production run_windows path. Do NOT extend this.
+#[allow(dead_code)]
 pub fn apply_rlimits(_cmd: &mut Command, limits: &ResourceLimits) {
     let memory_limit: usize = limits
         .addr_space_bytes
@@ -93,6 +96,8 @@ pub fn apply_rlimits(_cmd: &mut Command, limits: &ResourceLimits) {
 /// Called by the spawner RIGHT AFTER `cmd.spawn()`. Takes the spawned child's PID, pops the stashed
 /// job handle from the thread-local, and assigns the child to the job. On success, closing the parent
 /// handle (or the parent process exiting) terminates the child via KILL_ON_JOB_CLOSE.
+/// M-9: superseded by the broker's CREATE_SUSPENDED + AssignProcessToJobObject.
+#[allow(dead_code)]
 pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
     let job = STASHED_JOB.with(|cell| cell.borrow_mut().take());
     let job = match job {
@@ -213,7 +218,8 @@ fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
 fn deny_write_everyone(path: &Path) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .arg(path.as_os_str())
-        .args(["/deny", "*S-1-1-0:(W)"])
+        // H-7 fix: (OI)(CI) for inheritance to new files/subdirs, /T for existing ones.
+        .args(["/deny", "*S-1-1-0:(OI)(CI)(W)", "/T"])
         .output()
         .map_err(|e| format!("icacls /deny spawn failed: {e}"))?;
     if !out.status.success() {
@@ -229,7 +235,8 @@ fn deny_write_everyone(path: &Path) -> Result<(), String> {
 fn allow_write_everyone(path: &Path) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .arg(path.as_os_str())
-        .args(["/grant", "*S-1-1-0:(W)"])
+        // H-7 fix: (OI)(CI) for inheritance, /T for existing files/subdirs.
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(W)", "/T"])
         .output()
         .map_err(|e| format!("icacls /grant spawn failed: {e}"))?;
     if !out.status.success() {
@@ -459,12 +466,15 @@ impl SandboxedChild {
     pub fn try_wait(&self) -> Result<Option<i32>, String> {
         use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess};
         let result = unsafe { WaitForSingleObject(self.process_handle, 0) };
-        if result.0 == 0 { // WAIT_OBJECT_0 = 0
+        // M-7 fix: distinguish WAIT_OBJECT_0 (0), WAIT_TIMEOUT (258), WAIT_FAILED (0xFFFFFFFF).
+        if result.0 == 0 { // WAIT_OBJECT_0
             let mut code: u32 = 0;
             unsafe { GetExitCodeProcess(self.process_handle, &mut code)
                 .map_err(|e| format!("GetExitCodeProcess failed: {e}"))?; }
             Ok(Some(code as i32))
-        } else {
+        } else if result.0 == 0xFFFFFFFF { // WAIT_FAILED
+            Err(format!("WaitForSingleObject failed (WAIT_FAILED)"))
+        } else { // WAIT_TIMEOUT or other — still running
             Ok(None)
         }
     }
