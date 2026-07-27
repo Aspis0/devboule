@@ -115,10 +115,39 @@ pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
     }
 }
 
+/// Apply a restricted token to the child process (C2).
+///
+/// **v1 STATUS: STUB — documented gap, NOT enforced.**
+///
+/// Windows does NOT allow token re-attachment after `CreateProcess`. The
+/// `std::process::Command::spawn()` path creates the process without a custom
+/// token, so we cannot apply `CreateRestrictedToken` post-spawn.
+///
+/// The real implementation requires spawning via `CreateProcessAsUserW` in a
+/// thin sandbox-broker shim (writes job handle + restricted token + ACL grant
+/// order). That broker is a separate sub-plan — see
+/// `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §C2 decision rule.
+///
+/// Until the broker lands, this function is a no-op that returns `Ok(())`.
+/// `is_enforced()` stays `false` on Windows, so the broker module's
+/// `effective_sandbox_mode()` correctly degrades `Unattended` to `Ask`.
+pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), String> {
+    // TODO(C2-broker): implement CreateRestrictedToken + CreateProcessAsUserW broker.
+    // See specs/PORT_MACOS_TO_WINDOWS_FINAL.md §C2. Until then, no-op.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::sandbox::ResourceLimits;
+
+    #[test]
+    fn apply_restricted_token_stub_returns_ok() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        let result = apply_restricted_token(&mut cmd);
+        assert!(result.is_ok(), "v1 stub must return Ok; got {result:?}");
+    }
 
     #[test]
     fn apply_rlimits_stashes_handle() {
