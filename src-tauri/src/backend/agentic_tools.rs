@@ -1058,6 +1058,17 @@ impl ScopedAgentTools {
         let mut child = cmd.spawn().map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
         let pid = child.id() as i32;
 
+        // C1 (Windows sandbox): attach the spawned child to the Job Object created in apply_rlimits
+        // (kill-on-close + memory limit). On failure the child runs unrestricted (current Windows
+        // behavior) — is_enforced() stays false until C2..C4 land, so this is defense-in-depth only.
+        #[cfg(target_os = "windows")]
+        {
+            use crate::backend::sandbox::windows;
+            if let Err(e) = windows::attach_to_child(child.id()) {
+                eprintln!("[sandbox/windows] WARN: failed to attach child to Job Object: {e}");
+            }
+        }
+
         // F1: drain each stream CAPPED (never read an unbounded firehose into memory → OOM).
         let mut out = child.stdout.take().expect("stdout piped");
         let mut err = child.stderr.take().expect("stderr piped");

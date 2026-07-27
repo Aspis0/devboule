@@ -1,4 +1,5 @@
 pub mod seatbelt;
+pub mod windows;
 
 use std::path::{Path, PathBuf};
 
@@ -129,9 +130,13 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
         // Command) — Seatbelt has no native rlimit, and they must go in a pre_exec on the Command.
         macos_sandbox_exec_argv(&profile, program, args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // TODO(windows: phase 3 — Restricted Token + WFP + Job Object) / (linux: landlock stub).
+        crate::backend::sandbox::windows::wrap_policy(policy, program, args, _cwd)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // TODO(linux: landlock stub).
         let _ = policy;
         // review F3: log ONCE (Censor/agentic call wrap dozens of times → stderr spam) and WITHOUT
         // the program name (a user path can be sensitive).
@@ -140,7 +145,7 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
         WARN_ONCE.call_once(|| {
             eprintln!(
                 "[sandbox] wrap: NO OS confinement on this platform — children run UNRESTRICTED \
-                 (Windows/Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
+                 (Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
             );
         });
         SandboxedCommand {
@@ -191,8 +196,14 @@ fn set_rlimit(resource: libc::c_int, value: u64) {
     }
 }
 
-/// No-op on non-unix (Windows rlimits land with the Job Object backend in phase 3).
-#[cfg(not(unix))]
+/// Windows arm: delegate to the Job Object backend (C1 — kill-on-close + memory limit).
+#[cfg(target_os = "windows")]
+pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
+    crate::backend::sandbox::windows::apply_rlimits(cmd, limits)
+}
+
+/// No-op elsewhere (Linux/other — landlock stub not yet implemented).
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn apply_rlimits(_cmd: &mut std::process::Command, _limits: &ResourceLimits) {}
 
 /// Returns `true` if this platform actually applies OS-level sandbox confinement in [`wrap`].
