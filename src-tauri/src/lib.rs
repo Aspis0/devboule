@@ -373,7 +373,7 @@ pub fn run() {
     let mini_coder_state = MiniCoderState::new();
     let design_gen_state = DesignGenState::new();
 
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // OS folder/file picker for the Polis "Open folder" action (folder-agnostic
         // map). Only the `dialog:allow-open` permission is granted in the
         // capabilities file — no save/message/ask surface is exposed.
@@ -383,14 +383,6 @@ pub fn run() {
         // the frontend requests OS permission on first use and degrades silently
         // to the in-app Header pill when denied/unsupported.
         .plugin(tauri_plugin_notification::init());
-
-    // devboule-pilot (agent UI drive for Grok/Claude on this app): DEV ONLY.
-    // Upstream crate: tauri-plugin-pilot. Host glue: tools/devboule-pilot/.
-    // Never enable for production installers.
-    #[cfg(all(debug_assertions, feature = "ui-pilot"))]
-    {
-        builder = builder.plugin(tauri_plugin_pilot::init());
-    }
 
     builder
         .manage(backend_state)
@@ -417,15 +409,6 @@ pub fn run() {
         // app's webviews; the app CSP grants it via `frame-src` in tauri.conf.json.
         .register_uri_scheme_protocol("artifact", backend::artifact_protocol::handle_artifact_request)
         .setup(|app| {
-            // DEV ONLY: register the ui-pilot ACL at runtime. The `pilot.json` capability lives
-            // OUTSIDE the auto-discovered `capabilities/` dir (in `capabilities-optional/`) so the
-            // tauri build script never validates `pilot:default` — a bare/release build (no
-            // `ui-pilot` feature) therefore compiles AND ships zero pilot surface. It is added here
-            // only when the pilot plugin (which provides `pilot:default`) is compiled in.
-            #[cfg(all(debug_assertions, feature = "ui-pilot"))]
-            {
-                app.add_capability(include_str!("../capabilities-optional/pilot.json"))?;
-            }
             // Record the bundled, read-only `oracle/` location so release builds
             // run Oracle Python only from there, never from a user "drop" dir.
             if let Ok(dir) = app.path().resource_dir() {
