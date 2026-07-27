@@ -995,6 +995,96 @@ impl ScopedAgentTools {
         }
     }
 
+    /// Windows-only spawn path: uses the full sandbox broker (spawn_sandboxed) which
+    /// integrates C1 (Job Object) + C2 (restricted token via CreateProcessAsUserW) +
+    /// C3 (filesystem ACL via icacls) + C4 (network block via netsh advfirewall).
+    /// Called from `run()` via an early `#[cfg]` return.
+    #[cfg(target_os = "windows")]
+    fn run_windows(
+        &self,
+        policy: &crate::backend::sandbox::SandboxPolicy,
+        argv: &[String],
+    ) -> Result<String, String> {
+        use std::os::windows::io::FromRawHandle;
+        use crate::backend::sandbox::windows;
+
+        // Build env vars (same list as the Unix path).
+        let env_vars: Vec<(String, String)> = [
+            "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "CARGO_HOME",
+            "RUSTUP_HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "NODE_PATH", "JAVA_HOME",
+            "ANDROID_HOME", "PYENV_ROOT", "VIRTUAL_ENV",
+            "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+        ].iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect();
+
+        // Spawn via the broker — C1+C2+C3+C4 all integrated.
+        let mut child = windows::spawn_sandboxed(
+            policy, &argv[0], &argv[1..], &self.root, &env_vars,
+        ).map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
+
+        let pid = child.pid as i32;
+
+        // Take pipe handles and convert to File for drain_capped.
+        // take_*_handle() sets the field to HANDLE::default() — SandboxedChild::Drop
+        // won't close these; the File owns them now.
+        let stdout_raw = child.take_stdout_handle();
+        let stderr_raw = child.take_stderr_handle();
+        let mut out = std::io::BufReader::new(unsafe {
+            std::fs::File::from_raw_handle(stdout_raw.0 as _)
+        });
+        let mut err = std::io::BufReader::new(unsafe {
+            std::fs::File::from_raw_handle(stderr_raw.0 as _)
+        });
+
+        // Drain in threads (same as Unix path).
+        let (tx_o, rx_o) = std::sync::mpsc::channel();
+        let (tx_e, rx_e) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx_o.send(drain_capped(&mut out)); });
+        std::thread::spawn(move || { let _ = tx_e.send(drain_capped(&mut err)); });
+
+        // Wait loop with timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(RUN_TIMEOUT_SECS);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(code)) => break Some(code),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("run wait failed: {e}")),
+            }
+        };
+
+        // Drain results (5s timeout, same as Unix path).
+        let jt = std::time::Duration::from_secs(5);
+        let stdout = rx_o.recv_timeout(jt).unwrap_or_default();
+        let stderr = rx_e.recv_timeout(jt).unwrap_or_default();
+
+        // Wait for child exit + restore ACLs (C3) + remove firewall (C4) + close handles.
+        let exit_code = child.wait_and_restore().unwrap_or(-1);
+
+        // Build body (same as Unix path).
+        let mut body = match status {
+            Some(code) => format!("exit: {code}\n"),
+            None => format!("TIMEOUT after {RUN_TIMEOUT_SECS}s (process killed)\n"),
+        };
+        body.push_str(&String::from_utf8_lossy(&stdout));
+        if !stderr.is_empty() {
+            body.push_str("\n--- stderr ---\n");
+            body.push_str(&String::from_utf8_lossy(&stderr));
+        }
+        if body.len() > MAX_RUN_OUTPUT {
+            let mut end = MAX_RUN_OUTPUT;
+            while end > 0 && !body.is_char_boundary(end) { end -= 1; }
+            body.truncate(end);
+        }
+        Ok(body)
+    }
+
     /// Execute an allowlisted command (validated by `parse_run_command`) as an argv vector with
     /// NO shell, in the scope root. Drains stdout/stderr on threads (so a full pipe can't
     /// deadlock), kills on timeout, and returns capped output. The argv-exec + allowlist + safe
@@ -1013,6 +1103,14 @@ impl ScopedAgentTools {
         // stay as defense-in-depth ON TOP of the OS sandbox. On non-macOS, wrap is a passthrough
         // (Windows lands in phase 3) and logs a warning.
         let policy = agentic_run_policy_with_working_set(&self.root, self.net.clone(), &self.working_set);
+
+        // Windows: use the full broker (spawn_sandboxed) which handles C1+C2+C3+C4 internally.
+        // The Command::spawn() path below is for macOS/Linux only.
+        #[cfg(target_os = "windows")]
+        {
+            return self.run_windows(&policy, &argv);
+        }
+
         let wrapped = crate::backend::sandbox::wrap(&policy, &argv[0], &argv[1..], &self.root);
         let mut cmd = std::process::Command::new(&wrapped.program);
         cmd.args(&wrapped.args)
@@ -1055,20 +1153,8 @@ impl ScopedAgentTools {
         // spawned process (inherited by the child). Bounds a runaway/fork-bomb in a sandboxed run.
         crate::backend::sandbox::apply_rlimits(&mut cmd, &policy.rlimits);
 
-        // C3+C4 (Windows): apply filesystem ACLs + network blocking BEFORE spawn.
-        // Saved for restore after child exit. On error, the snapshots are leaked (ACLs stay
-        // modified) — acceptable for v1; the common path (spawn success) always restores.
-        #[cfg(target_os = "windows")]
-        let _sandbox_c3_c4: (Vec<crate::backend::sandbox::windows::PathAclSnapshot>,
-                             Option<crate::backend::sandbox::windows::NetPolicySnapshot>) = {
-            use crate::backend::sandbox::windows;
-            let acl = windows::apply_path_policy(&policy).unwrap_or_else(|e| {
-                eprintln!("[sandbox/windows] WARN: apply_path_policy failed: {e}");
-                Vec::new()
-            });
-            let net = windows::apply_net_policy(&policy, &argv[0]).ok();
-            (acl, net)
-        };
+        // Windows: the full broker (spawn_sandboxed) handles C1+C2+C3+C4 internally.
+        // The Command::spawn() path below is for macOS/Linux only.
 
         let mut child = cmd.spawn().map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
         let pid = child.id() as i32;
@@ -1119,19 +1205,9 @@ impl ScopedAgentTools {
         let stdout = rx_o.recv_timeout(jt).unwrap_or_default();
         let stderr = rx_e.recv_timeout(jt).unwrap_or_default();
 
-        // C3+C4 (Windows): restore filesystem ACLs + remove firewall rule AFTER child exit.
-        #[cfg(target_os = "windows")]
-        {
-            use crate::backend::sandbox::windows;
-            if let Err(e) = windows::restore_path_policy(_sandbox_c3_c4.0) {
-                eprintln!("[sandbox/windows] WARN: restore_path_policy failed: {e}");
-            }
-            if let Some(net) = _sandbox_c3_c4.1 {
-                if let Err(e) = windows::restore_net_policy(net) {
-                    eprintln!("[sandbox/windows] WARN: restore_net_policy failed: {e}");
-                }
-            }
-        }
+        // C3+C4 restore on Windows is handled by the broker (spawn_sandboxed → wait_and_restore).
+        // This path (Command::spawn) is macOS/Linux only.
+
         let mut body = match status {
             Some(s) => format!("exit: {}\n", s.code().unwrap_or(-1)),
             None => format!("TIMEOUT after {RUN_TIMEOUT_SECS}s (process group killed)\n"),
