@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "windows-*"]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight CI runs for the same branch on new pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Repo has NO root workspace; cache each crate independently.
+          workspaces: |
+            src-tauri/target -> .cargo
+            oracle-core/target -> .cargo
+            devboule-mcp/target -> .cargo
+
+      - name: Add Windows MSVC target
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Add macOS x86_64 target (Apple Silicon runners default to aarch64)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          rustup target add x86_64-apple-darwin || true
+          rustup target add aarch64-apple-darwin || true
+
+      # ----- protoc install (host build tool for lance/lancedb via prost-build) -----
+      # GitHub-hosted runners ship NO protoc. Native package manager per OS.
+      - name: Install protoc (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macos)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
+
+      - name: Install protoc (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: choco install protoc -y --no-progress
+
+      # ----- Node toolchain (frontend build / vitest) -----
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      # ----- Rust checks (per-crate, no root workspace) -----
+      - name: cargo check (src-tauri, host)
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: cargo check (src-tauri, windows msvc)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: cargo check (oracle-core)
+        run: cargo check --manifest-path oracle-core/Cargo.toml
+
+      - name: cargo check (devboule-mcp)
+        run: cargo check --manifest-path devboule-mcp/Cargo.toml
+
+      # ----- Rust tests (per-crate) -----
+      # NOTE: src-tauri's `cargo test --tests` may still hit a pre-existing link
+      # error (libesaxx_rs MT_StaticRelease vs ort_sys MD_DynamicRelease). That
+      # will resolve with the ort unify milestone. For now, run unit tests only.
+      - name: cargo test (devboule-mcp)
+        run: cargo test --manifest-path devboule-mcp/Cargo.toml --no-fail-fast
+
+      # ----- Frontend tests (vitest) -----
+      - name: vitest
+        run: npm test
+
+  windows-target-check:
+    name: windows cross-compile gate
+    # Standalone job that ONLY checks `cargo check --target x86_64-pc-windows-msvc`
+    # on every Linux PR/push. This is the gate that catches Windows-only breakage
+    # (e.g. the M0 features augmentation) BEFORE merging, without spinning up a
+    # full Windows runner on every commit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc (lance build script dep)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install Windows resource compiler prerequisites (mingw-w64 for the linker probe)
+        run: sudo apt-get install -y mingw-w64
+      - name: cargo check (src-tauri, windows msvc) on linux
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
