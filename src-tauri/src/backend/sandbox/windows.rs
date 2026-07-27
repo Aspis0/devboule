@@ -310,6 +310,33 @@ pub struct SandboxedChild {
     stderr_read: HANDLE,
     acl_snapshots: Vec<PathAclSnapshot>,
     job: HANDLE,
+    acl_restored: bool,
+}
+
+/// RAII guard that restores filesystem ACLs when dropped (error path safety).
+/// Disarm with `.take()` on success.
+struct AclGuard {
+    snapshots: Option<Vec<PathAclSnapshot>>,
+}
+
+impl AclGuard {
+    fn new(snapshots: Vec<PathAclSnapshot>) -> Self {
+        Self { snapshots: Some(snapshots) }
+    }
+    /// Disarm the guard: caller takes ownership of the snapshots (success path).
+    fn take(mut self) -> Vec<PathAclSnapshot> {
+        self.snapshots.take().unwrap_or_default()
+    }
+}
+
+impl Drop for AclGuard {
+    fn drop(&mut self) {
+        if let Some(snapshots) = self.snapshots.take() {
+            if !snapshots.is_empty() {
+                let _ = restore_path_policy(snapshots);
+            }
+        }
+    }
 }
 
 impl SandboxedChild {
@@ -318,9 +345,9 @@ impl SandboxedChild {
     /// Returns the stderr pipe read handle.
     pub fn stderr_handle(&self) -> HANDLE { self.stderr_read }
 
-    /// Wait for the child to exit, then restore the filesystem ACLs (C3) and
-    /// close all handles. Returns the child's exit code.
-    pub fn wait_and_restore(self) -> Result<i32, String> {
+    /// Wait for the child to exit, then restore the filesystem ACLs (C3).
+    /// Handles are closed by `Drop` when the struct goes out of scope.
+    pub fn wait_and_restore(mut self) -> Result<i32, String> {
         use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess, INFINITE};
 
         let exit_code = unsafe {
@@ -332,18 +359,34 @@ impl SandboxedChild {
         };
 
         // C3: restore the original ACLs.
-        restore_path_policy(self.acl_snapshots)?;
+        let snapshots = std::mem::take(&mut self.acl_snapshots);
+        restore_path_policy(snapshots)?;
+        self.acl_restored = true;
 
+        Ok(exit_code)
+        // Drop closes ALL handles (child is dead, safe to close job too).
+    }
+}
+
+impl Drop for SandboxedChild {
+    fn drop(&mut self) {
         unsafe {
+            // If wait_and_restore was NOT called, kill the child + restore ACLs.
+            if !self.acl_restored {
+                let _ = windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1);
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
+                let snapshots = std::mem::take(&mut self.acl_snapshots);
+                if !snapshots.is_empty() {
+                    let _ = restore_path_policy(snapshots);
+                }
+            }
+            // Close ALL handles (including job — child is dead, KILL_ON_JOB_CLOSE is safe).
             let _ = CloseHandle(self.process_handle);
             let _ = CloseHandle(self.thread_handle);
             let _ = CloseHandle(self.stdout_read);
             let _ = CloseHandle(self.stderr_read);
-            // job handle: intentionally NOT closed (KILL_ON_JOB_CLOSE).
-            // If we closed it here, the child would be killed before we could
-            // read its exit code. OS frees it when the parent exits.
+            let _ = CloseHandle(self.job);
         }
-        Ok(exit_code)
     }
 }
 
@@ -374,7 +417,7 @@ fn create_pipe() -> Result<(HANDLE, HANDLE), String> {
     unsafe {
         CreatePipe(&mut read, &mut write, None, 0)
             .map_err(|e| format!("CreatePipe failed: {e}"))?;
-        SetHandleInformation(write, 0x2u32, windows::Win32::Foundation::HANDLE_FLAGS(0x2));
+        SetHandleInformation(write, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1)); // HANDLE_FLAG_INHERIT = 0x1
     }
     Ok((read, write))
 }
@@ -455,7 +498,8 @@ pub fn spawn_sandboxed(
     use windows::Win32::Foundation::BOOL;
 
     // C3: apply filesystem ACLs before spawn.
-    let acl_snapshots = apply_path_policy(policy)?;
+    // AclGuard ensures ACLs are restored even if spawn fails (CRITICAL fix #2).
+    let acl_guard = AclGuard::new(apply_path_policy(policy)?);
 
     // C1: create Job Object.
     let job = create_job_object(&policy.rlimits)?;
@@ -528,6 +572,10 @@ pub fn spawn_sandboxed(
             .map_err(|e| format!("AssignProcessToJobObject failed: {e}"))?;
     }
 
+    // Disarm the AclGuard: on success, the snapshots move into SandboxedChild.
+    // If this function returns Err before this line, AclGuard::drop restores the ACLs.
+    let acl_snapshots = acl_guard.take();
+
     Ok(SandboxedChild {
         process_handle: pi.hProcess,
         thread_handle: pi.hThread,
@@ -536,6 +584,7 @@ pub fn spawn_sandboxed(
         stderr_read,
         acl_snapshots,
         job,
+        acl_restored: false,
     })
 }
 
