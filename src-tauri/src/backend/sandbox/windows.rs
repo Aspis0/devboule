@@ -137,10 +137,143 @@ pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), St
     Ok(())
 }
 
+// ─── C3: Filesystem ACL layer ────────────────────────────────────────────────
+//
+// Applies deny-write / allow-write ACLs to paths derived from SandboxPolicy.
+// Uses `icacls` CLI (incremental ACE add, preserves existing ACEs — better than
+// SDDL replace-all-DACL for v1). Saves the original ACL to a temp file so
+// restore_path_policy can put it back after the child exits.
+//
+// Not wired into the spawner — the broker sub-plan (C2-broker) will call this
+// before spawn and restore_path_policy after child exit. is_enforced() stays false.
+
+/// Saved ACL backup for a path, so it can be restored after the sandboxed child exits.
+pub struct PathAclSnapshot {
+    path: std::path::PathBuf,
+    backup_file: std::path::PathBuf,
+}
+
+/// Canonicalize a path for ACL application (mirrors seatbelt::canonical_sandbox_path).
+fn canonicalize_path(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Save the current ACL of `path` to a temp file via `icacls /save`.
+fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
+    let backup = std::env::temp_dir().join(format!(
+        "devboule_acl_{}_{}",
+        std::process::id(),
+        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("root".into())
+    ));
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/save", &backup.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("icacls /save spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /save failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(backup)
+}
+
+/// Add a deny-write ACE for Everyone (S-1-1-0) on `path` via `icacls /deny`.
+fn deny_write_everyone(path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/deny", "*S-1-1-0:(W)"])
+        .output()
+        .map_err(|e| format!("icacls /deny spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /deny failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Add an allow-write ACE for Everyone (S-1-1-0) on `path` via `icacls /grant`.
+fn allow_write_everyone(path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/grant", "*S-1-1-0:(W)"])
+        .output()
+        .map_err(|e| format!("icacls /grant spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Restore the original ACL on `path` from a backup file via `icacls /restore`.
+fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/restore", &backup_file.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("icacls /restore spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /restore failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Apply filesystem ACLs derived from `policy` to the paths it references (C3).
+///
+/// - `readonly_root`: adds a deny-write ACE for Everyone (S-1-1-0).
+/// - `writable_paths`: adds an allow-write ACE for Everyone.
+///
+/// Uses `icacls` CLI which adds ACEs INCREMENTALLY (preserves existing ACEs —
+// better than a raw SDDL replace-all-DACL approach for v1).
+///
+/// Returns a snapshot of backup files so [`restore_path_policy`] can restore.
+///
+/// **Not wired into the spawner**: the broker sub-plan (C2-broker) will call
+/// this before spawn. `is_enforced()` stays `false` on Windows.
+pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>, String> {
+    let mut snapshots = Vec::new();
+
+    if policy.readonly_root.is_absolute() {
+        let canon = canonicalize_path(&policy.readonly_root);
+        let backup = save_acl(&canon)?;
+        deny_write_everyone(&canon)?;
+        snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+    }
+
+    for wp in &policy.writable_paths {
+        if wp.is_absolute() {
+            let canon = canonicalize_path(wp);
+            let backup = save_acl(&canon)?;
+            allow_write_everyone(&canon)?;
+            snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+        }
+    }
+
+    Ok(snapshots)
+}
+
+/// Restore the original ACLs saved by [`apply_path_policy`].
+pub fn restore_path_policy(snapshots: Vec<PathAclSnapshot>) -> Result<(), String> {
+    for snap in snapshots {
+        restore_acl(&snap.path, &snap.backup_file)?;
+        let _ = std::fs::remove_file(&snap.backup_file);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::sandbox::ResourceLimits;
+    use crate::backend::sandbox::{ResourceLimits, SandboxPolicy};
 
     #[test]
     fn apply_restricted_token_stub_returns_ok() {
@@ -198,5 +331,37 @@ mod tests {
         attach_to_child(child.id()).expect("attach child to job");
         let status = child.wait().expect("wait for child");
         assert!(status.success(), "cmd /c exit 0 should report success; got {:?}", status);
+    }
+
+    /// C3: apply deny-write on a temp file, then restore the original ACL.
+    /// Verifies the icacls save → deny → restore pipeline works end-to-end.
+    #[test]
+    fn apply_and_restore_path_policy_roundtrip() {
+        let temp = std::env::temp_dir().join(format!("devboule_c3_test_{}", std::process::id()));
+        std::fs::write(&temp, "test").expect("write temp file");
+
+        let policy = SandboxPolicy::deny(temp.clone());
+        let snapshots = apply_path_policy(&policy).expect("apply should succeed");
+        assert!(!snapshots.is_empty(), "should have at least one snapshot");
+
+        restore_path_policy(snapshots).expect("restore should succeed");
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// C3: apply allow-write on a writable path, then restore.
+    #[test]
+    fn apply_writable_path_and_restore() {
+        let temp = std::env::temp_dir().join(format!("devboule_c3_writable_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+
+        let policy = SandboxPolicy::deny("C:\\nonexistent".into())
+            .writable(temp.clone());
+        let snapshots = apply_path_policy(&policy).expect("apply should succeed");
+        assert!(!snapshots.is_empty(), "should have at least one snapshot");
+
+        restore_path_policy(snapshots).expect("restore should succeed");
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
