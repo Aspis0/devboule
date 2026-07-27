@@ -144,6 +144,10 @@ pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), St
 // SDDL replace-all-DACL for v1). Saves the original ACL to a temp file so
 // restore_path_policy can put it back after the child exits.
 //
+// Note: `Win32_Security_Authorization` feature in Cargo.toml is currently unused
+// by this icacls-based implementation. It was added for the broker sub-plan that
+// will eventually use `GetNamedSecurityInfoW` / `SetNamedSecurityInfoW` directly.
+//
 // Not wired into the spawner — the broker sub-plan (C2-broker) will call this
 // before spawn and restore_path_policy after child exit. is_enforced() stays false.
 
@@ -159,6 +163,16 @@ fn canonicalize_path(path: &Path) -> std::path::PathBuf {
 }
 
 /// Save the current ACL of `path` to a temp file via `icacls /save`.
+///
+/// Note: `icacls` ships on all Windows since Vista (not available on Nano Server
+/// or Docker without the full Windows base image). The binary backup format is
+/// machine-local — it cannot be transferred cross-machine, but save→restore on
+/// the same machine works correctly.
+///
+/// Note: this function is called via `std::process::Command`, NOT through Git
+/// Bash. Rust's `Command` uses `CreateProcessW` directly, so the `/save` flag is
+/// passed as a literal string (Git Bash's `/save` → `C:/Program Files/Git/save`
+/// path translation does NOT apply).
 fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
     let backup = std::env::temp_dir().join(format!(
         "devboule_acl_{}_{}",
@@ -180,6 +194,12 @@ fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 /// Add a deny-write ACE for Everyone (S-1-1-0) on `path` via `icacls /deny`.
+///
+/// Warning: Everyone (S-1-1-0) includes the current user. This means the Tauri
+/// app itself will also be blocked from writing to `path` while the deny ACE is
+/// active. The save/restore pattern in `apply_path_policy` / `restore_path_policy`
+/// handles this: the deny is applied BEFORE spawn and removed AFTER the child
+/// exits. The caller must ensure `restore_path_policy` is called even on error.
 fn deny_write_everyone(path: &Path) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .arg(path.as_os_str())
