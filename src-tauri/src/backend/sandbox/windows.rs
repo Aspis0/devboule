@@ -290,6 +290,255 @@ pub fn restore_path_policy(snapshots: Vec<PathAclSnapshot>) -> Result<(), String
     Ok(())
 }
 
+// ─── C2 broker: restricted token + sandboxed spawn ─────────────────────────────
+//
+// The real Windows sandbox spawn path. Replaces std::process::Command::spawn()
+// for sandboxed runs. Creates a restricted token (DISABLE_MAX_PRIVILEGE), spawns
+// via CreateProcessAsUserW, and assigns to the C1 Job Object. Also calls C3's
+// apply_path_policy before spawn and restore_path_policy after child exit.
+//
+// Pattern adapted from OpenAI Codex windows-sandbox-rs (token.rs + process.rs).
+// Simplified for devboule v1: no AppContainer capabilities, no dedicated sandbox
+// user, no private desktop. Just DISABLE_MAX_PRIVILEGE + Job Object + ACLs.
+
+/// A sandboxed child process spawned with a restricted token.
+pub struct SandboxedChild {
+    process_handle: HANDLE,
+    thread_handle: HANDLE,
+    pub pid: u32,
+    stdout_read: HANDLE,
+    stderr_read: HANDLE,
+    acl_snapshots: Vec<PathAclSnapshot>,
+    job: HANDLE,
+}
+
+impl SandboxedChild {
+    /// Returns the stdout pipe read handle. Wrap with `std::fs::File::from_raw_handle`.
+    pub fn stdout_handle(&self) -> HANDLE { self.stdout_read }
+    /// Returns the stderr pipe read handle.
+    pub fn stderr_handle(&self) -> HANDLE { self.stderr_read }
+
+    /// Wait for the child to exit, then restore the filesystem ACLs (C3) and
+    /// close all handles. Returns the child's exit code.
+    pub fn wait_and_restore(self) -> Result<i32, String> {
+        use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess, INFINITE};
+
+        let exit_code = unsafe {
+            WaitForSingleObject(self.process_handle, INFINITE);
+            let mut code: u32 = 0;
+            GetExitCodeProcess(self.process_handle, &mut code)
+                .map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
+            code as i32
+        };
+
+        // C3: restore the original ACLs.
+        restore_path_policy(self.acl_snapshots)?;
+
+        unsafe {
+            let _ = CloseHandle(self.process_handle);
+            let _ = CloseHandle(self.thread_handle);
+            let _ = CloseHandle(self.stdout_read);
+            let _ = CloseHandle(self.stderr_read);
+            // job handle: intentionally NOT closed (KILL_ON_JOB_CLOSE).
+            // If we closed it here, the child would be killed before we could
+            // read its exit code. OS frees it when the parent exits.
+        }
+        Ok(exit_code)
+    }
+}
+
+/// Build a UTF-16 environment block from (KEY, VALUE) pairs.
+/// Sorted case-insensitively by key (Windows requires this for CreateProcess).
+/// Double-null terminated.
+fn make_env_block(env_vars: &[(String, String)]) -> Vec<u16> {
+    let mut items: Vec<(String, String, String)> = env_vars.iter()
+        .map(|(k, v)| (k.to_uppercase(), k.clone(), v.clone()))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut w: Vec<u16> = Vec::new();
+    for (_, k, v) in items {
+        let entry = format!("{k}={v}");
+        w.extend(entry.encode_utf16());
+        w.push(0);
+    }
+    w.push(0);
+    w
+}
+
+/// Create an anonymous pipe and make the write end inheritable.
+fn create_pipe() -> Result<(HANDLE, HANDLE), String> {
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::Foundation::SetHandleInformation;
+    let mut read = HANDLE::default();
+    let mut write = HANDLE::default();
+    unsafe {
+        CreatePipe(&mut read, &mut write, None, 0)
+            .map_err(|e| format!("CreatePipe failed: {e}"))?;
+        SetHandleInformation(write, 0x2u32, windows::Win32::Foundation::HANDLE_FLAGS(0x2));
+    }
+    Ok((read, write))
+}
+
+/// Open the current process token and create a restricted version
+/// with DISABLE_MAX_PRIVILEGE (strips all privileges from the token).
+fn create_restricted_token() -> Result<HANDLE, String> {
+    use windows::Win32::Security::{CreateRestrictedToken, CREATE_RESTRICTED_TOKEN_FLAGS, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_ASSIGN_PRIMARY, TOKEN_ACCESS_MASK};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut primary_token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ACCESS_MASK(TOKEN_DUPLICATE.0 | TOKEN_QUERY.0 | TOKEN_ASSIGN_PRIMARY.0),
+            &mut primary_token,
+        ).map_err(|e| format!("OpenProcessToken failed: {e}"))?;
+    }
+
+    let mut restricted_token = HANDLE::default();
+    unsafe {
+        CreateRestrictedToken(
+            primary_token,
+            CREATE_RESTRICTED_TOKEN_FLAGS(0x1), // DISABLE_MAX_PRIVILEGE
+            None,
+            None,
+            None,
+            &mut restricted_token,
+        ).map_err(|e| format!("CreateRestrictedToken failed: {e}"))?;
+    }
+
+    unsafe { let _ = CloseHandle(primary_token); }
+    Ok(restricted_token)
+}
+
+/// Create a Job Object with kill-on-close + optional memory limit.
+fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
+    let memory_limit: usize = rlimits
+        .addr_space_bytes
+        .map(|b| b as usize)
+        .unwrap_or(usize::MAX);
+    unsafe {
+        let job = CreateJobObjectW(None, None)
+            .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
+        let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        let mut basic = std::mem::zeroed::<JOBOBJECT_BASIC_LIMIT_INFORMATION>();
+        basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation = basic;
+        info.ProcessMemoryLimit = memory_limit;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ).map_err(|e| format!("SetInformationJobObject failed: {e}"))?;
+        Ok(job)
+    }
+}
+
+/// Spawn a child process with a restricted token, Job Object, and filesystem ACLs.
+/// This is the C2 broker: it replaces `std::process::Command::spawn()` for Windows
+/// sandboxed runs.
+///
+/// Integrates C1 (Job Object), C2 (restricted token), and C3 (filesystem ACLs).
+/// After the child exits, call `wait_and_restore()` to restore ACLs + close handles.
+pub fn spawn_sandboxed(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_vars: &[(String, String)],
+) -> Result<SandboxedChild, String> {
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, STARTUPINFOW, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    };
+    use windows::core::{PWSTR, PCWSTR};
+    use windows::Win32::Foundation::BOOL;
+
+    // C3: apply filesystem ACLs before spawn.
+    let acl_snapshots = apply_path_policy(policy)?;
+
+    // C1: create Job Object.
+    let job = create_job_object(&policy.rlimits)?;
+
+    // C2: create restricted token.
+    let restricted_token = create_restricted_token()?;
+
+    // Create pipes for stdout/stderr.
+    let (stdout_read, stdout_write) = create_pipe()?;
+    let (stderr_read, stderr_write) = create_pipe()?;
+
+    // Build command line: "program arg1 arg2 ..."
+    let cmdline = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Build env block.
+    let env_block = make_env_block(env_vars);
+
+    // Build cwd wide string.
+    let cwd_wide: Vec<u16> = cwd.to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Desktop name — required for restricted tokens to avoid STATUS_DLL_INIT_FAILED.
+    let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+
+    // STARTUPINFOW.
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = stdout_write;
+    si.hStdError = stderr_write;
+    si.hStdInput = HANDLE::default();
+    si.lpDesktop = windows::core::PWSTR(desktop.as_mut_ptr());
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+
+    unsafe {
+        CreateProcessAsUserW(
+            restricted_token,
+            PCWSTR::null(),
+            PWSTR(cmdline_wide.as_mut_ptr()),
+            None, None,
+            BOOL(1),
+            flags,
+            Some(env_block.as_ptr() as *const _),
+            PCWSTR(cwd_wide.as_ptr()),
+            &si,
+            &mut pi,
+        ).map_err(|e| format!("CreateProcessAsUserW failed: {e}"))?;
+    }
+
+    // Close write ends of pipes (parent doesn't need them).
+    // Close the restricted token (child has its own copy).
+    unsafe {
+        let _ = CloseHandle(stdout_write);
+        let _ = CloseHandle(stderr_write);
+        let _ = CloseHandle(restricted_token);
+    }
+
+    // C1: assign child to Job Object.
+    unsafe {
+        AssignProcessToJobObject(job, pi.hProcess)
+            .map_err(|e| format!("AssignProcessToJobObject failed: {e}"))?;
+    }
+
+    Ok(SandboxedChild {
+        process_handle: pi.hProcess,
+        thread_handle: pi.hThread,
+        pid: pi.dwProcessId,
+        stdout_read,
+        stderr_read,
+        acl_snapshots,
+        job,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
