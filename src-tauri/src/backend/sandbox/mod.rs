@@ -180,9 +180,9 @@ pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
     let _ = nproc;
     unsafe {
         cmd.pre_exec(move || {
-            set_rlimit(libc::RLIMIT_CPU, cpu);
+            set_rlimit(libc::RLIMIT_CPU as libc::c_int, cpu);
             if let Some(bytes) = addr {
-                set_rlimit(libc::RLIMIT_AS, bytes);
+                set_rlimit(libc::RLIMIT_AS as libc::c_int, bytes);
             }
             Ok(())
         });
@@ -197,7 +197,7 @@ fn set_rlimit(resource: libc::c_int, value: u64) {
     };
     // best-effort; ignore failure so a rejected limit can't abort the spawn under set -e semantics
     unsafe {
-        libc::setrlimit(resource, &lim);
+        libc::setrlimit(resource as _, &lim);
     }
 }
 
