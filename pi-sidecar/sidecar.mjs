@@ -1101,8 +1101,11 @@ async function main() {
 
 	emit({ type: "ready", oracleMCP: aspisMcpAvailable });
 
+	// Log only a short prefix of each id — enough to correlate across log
+	// streams without writing the full env-derived identifier to stderr.
+	const mask = (v) => (v ? String(v).slice(0, 8) + "…" : "-");
 	console.error(
-		`[pi-sidecar] enrichment active: role=${devbouleContext.agentRole} session=${devbouleContext.sessionId} project=${devbouleContext.projectId}`,
+		`[pi-sidecar] enrichment active: role=${devbouleContext.agentRole} session=${mask(devbouleContext.sessionId)} project=${mask(devbouleContext.projectId)}`,
 	);
 }
 
