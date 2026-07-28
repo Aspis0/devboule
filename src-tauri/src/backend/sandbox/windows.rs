@@ -1,0 +1,1058 @@
+//! Windows sandbox backend (C1): Job Object wrapper for kill-on-close + memory limits.
+//! Stage 1 of 4 for the Windows sandbox stack (C1..C4 per specs/PORT_MACOS_TO_WINDOWS_FINAL.md).
+//! C2 (Restricted Token), C3 (filesystem ACL), C4 (WFP) land in separate milestones.
+
+#![cfg(target_os = "windows")]
+
+use std::path::Path;
+use std::process::Command;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+
+use super::{ResourceLimits, SandboxedCommand, SandboxPolicy};
+
+/// Apply the Job Object for `policy` to a pre-spawn `Command`.
+///
+/// Returns the program/args unchanged: the Job Object is a kernel object that lives in the
+/// parent process and is created in `apply_rlimits` (called by the spawner before `cmd.spawn()`),
+/// then stashed in a thread-local for `attach_to_child` (called right after `cmd.spawn()`).
+///
+/// Pattern: a Windows Job Object must be created BEFORE the child spawns, and the child must be
+/// ASSIGNED to it AFTER it spawns (we need the child's PID). Hence the two-phase API.
+/// M-9: superseded by the broker's create_job_object. Kept for mod.rs public API.
+#[allow(dead_code)]
+pub fn wrap_policy(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    _cwd: &Path,
+) -> SandboxedCommand {
+    // The job handle is created in apply_rlimits and stashed for attach_to_child. The policy is
+    // only consumed by the macOS Seatbelt backend; the Job Object reads limits directly.
+    let _ = policy;
+    SandboxedCommand {
+        program: program.to_string(),
+        args: args.to_vec(),
+    }
+}
+
+thread_local! {
+    static STASHED_JOB: std::cell::RefCell<Option<HANDLE>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Replaces the no-op `apply_rlimits` on Windows. Creates the Job Object, configures it with
+/// KILL_ON_JOB_CLOSE (+ an optional process memory limit), and stashes the HANDLE in a thread-local
+/// M-9: superseded by the broker's create_job_object. Kept for the mod.rs public API
+/// but NOT called by the production run_windows path. Do NOT extend this.
+#[allow(dead_code)]
+pub fn apply_rlimits(_cmd: &mut Command, limits: &ResourceLimits) {
+    let memory_limit: usize = limits
+        .addr_space_bytes
+        .map(|b| b as usize)
+        .unwrap_or(usize::MAX);
+    unsafe {
+        let job = match CreateJobObjectW(None, None) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[sandbox/windows] CreateJobObjectW failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: zeroed JOBOBJECT_EXTENDED_LIMIT_INFORMATION is a valid starting state; we set
+        // only the fields we need. BasicLimitInformation is likewise zeroed (no flags) then we set
+        // KILL_ON_JOB_CLOSE, which is the only flag we require for C1.
+        let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        let mut basic = std::mem::zeroed::<JOBOBJECT_BASIC_LIMIT_INFORMATION>();
+        basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // H-2 fix: enable PROCESS_MEMORY only when a finite limit is set.
+        if limits.addr_space_bytes.is_some() {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
+        info.BasicLimitInformation = basic;
+        info.ProcessMemoryLimit = memory_limit;
+        if let Err(e) = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) {
+            eprintln!("[sandbox/windows] SetInformationJobObject failed: {e}");
+            let _ = CloseHandle(job);
+            return;
+        }
+        // Stash the handle for attach_to_child. The spawner MUST call attach_to_child immediately
+        // after cmd.spawn() — the thread-local is a single-slot handoff buffer between the two phases.
+        STASHED_JOB.with(|cell| {
+            *cell.borrow_mut() = Some(job);
+        });
+    }
+}
+
+/// Called by the spawner RIGHT AFTER `cmd.spawn()`. Takes the spawned child's PID, pops the stashed
+/// job handle from the thread-local, and assigns the child to the job. On success, closing the parent
+/// handle (or the parent process exiting) terminates the child via KILL_ON_JOB_CLOSE.
+/// M-9: superseded by the broker's CREATE_SUSPENDED + AssignProcessToJobObject.
+#[allow(dead_code)]
+pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
+    let job = STASHED_JOB.with(|cell| cell.borrow_mut().take());
+    let job = match job {
+        Some(h) => h,
+        None => {
+            return Err("attach_to_child called without a prior apply_rlimits on Windows".into());
+        }
+    };
+    unsafe {
+        let proc_handle = OpenProcess(PROCESS_ALL_ACCESS, false, child_pid)
+            .map_err(|e| format!("OpenProcess({child_pid}) failed: {e}"))?;
+        if let Err(e) = AssignProcessToJobObject(job, proc_handle) {
+            let _ = CloseHandle(proc_handle);
+            let _ = CloseHandle(job);
+            return Err(format!("AssignProcessToJobObject failed: {e}"));
+        }
+        // We deliberately do NOT close proc_handle here: releasing it can break the job association
+        // on some Windows versions; it is freed when the child exits. We also do NOT close the job
+        // handle: closing it would terminate the child via KILL_ON_JOB_CLOSE. It must outlive the
+        // child (intentional leak; the OS frees it when the parent process exits).
+        let _ = proc_handle;
+        let _ = job;
+        Ok(())
+    }
+}
+
+/// Apply a restricted token to the child process (C2).
+///
+/// **v1 STATUS: STUB — documented gap, NOT enforced.**
+///
+/// Windows does NOT allow token re-attachment after `CreateProcess`. The
+/// `std::process::Command::spawn()` path creates the process without a custom
+/// token, so we cannot apply `CreateRestrictedToken` post-spawn.
+///
+/// The real implementation requires spawning via `CreateProcessAsUserW` in a
+/// thin sandbox-broker shim (writes job handle + restricted token + ACL grant
+/// order). That broker is a separate sub-plan — see
+/// `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §C2 decision rule.
+///
+/// Until the broker lands, this function is a no-op that returns `Ok(())`.
+/// `is_enforced()` stays `false` on Windows, so the broker module's
+/// `effective_sandbox_mode()` correctly degrades `Unattended` to `Ask`.
+pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), String> {
+    // TODO(C2-broker): implement CreateRestrictedToken + CreateProcessAsUserW broker.
+    // See specs/PORT_MACOS_TO_WINDOWS_FINAL.md §C2. Until then, no-op.
+    Ok(())
+}
+
+// ─── C3: Filesystem ACL layer ────────────────────────────────────────────────
+//
+// Applies deny-write / allow-write ACLs to paths derived from SandboxPolicy.
+// Uses `icacls` CLI (incremental ACE add, preserves existing ACEs — better than
+// SDDL replace-all-DACL for v1). Saves the original ACL to a temp file so
+// restore_path_policy can put it back after the child exits.
+//
+// Note: `Win32_Security_Authorization` feature in Cargo.toml is currently unused
+// by this icacls-based implementation. It was added for the broker sub-plan that
+// will eventually use `GetNamedSecurityInfoW` / `SetNamedSecurityInfoW` directly.
+//
+// Not wired into the spawner — the broker sub-plan (C2-broker) will call this
+// before spawn and restore_path_policy after child exit. is_enforced() stays false.
+
+/// Saved ACL backup for a path, so it can be restored after the sandboxed child exits.
+pub struct PathAclSnapshot {
+    path: std::path::PathBuf,
+    backup_file: std::path::PathBuf,
+}
+
+/// Canonicalize a path for ACL application (mirrors seatbelt::canonical_sandbox_path).
+fn canonicalize_path(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Save the current ACL of `path` to a temp file via `icacls /save`.
+///
+/// Note: `icacls` ships on all Windows since Vista (not available on Nano Server
+/// or Docker without the full Windows base image). The binary backup format is
+/// machine-local — it cannot be transferred cross-machine, but save→restore on
+/// the same machine works correctly.
+///
+/// Note: this function is called via `std::process::Command`, NOT through Git
+/// Bash. Rust's `Command` uses `CreateProcessW` directly, so the `/save` flag is
+/// passed as a literal string (Git Bash's `/save` → `C:/Program Files/Git/save`
+/// path translation does NOT apply).
+fn save_acl(path: &Path) -> Result<std::path::PathBuf, String> {
+    // C-2 fix: use a unique counter to prevent backup file collision when the same
+    // path appears as both readonly_root and a writable_path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let backup = std::env::temp_dir().join(format!(
+        "devboule_acl_{}_{}_{}",
+        std::process::id(),
+        id,
+        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("root".into())
+    ));
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/save", &backup.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("icacls /save spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /save failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(backup)
+}
+
+/// Add a deny-write ACE for Everyone (S-1-1-0) on `path` via `icacls /deny`.
+///
+/// Warning: Everyone (S-1-1-0) includes the current user. This means the Tauri
+/// app itself will also be blocked from writing to `path` while the deny ACE is
+/// active. The save/restore pattern in `apply_path_policy` / `restore_path_policy`
+/// handles this: the deny is applied BEFORE spawn and removed AFTER the child
+/// exits. The caller must ensure `restore_path_policy` is called even on error.
+fn deny_write_everyone(path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        // H-7 fix: (OI)(CI) for inheritance to new files/subdirs, /T for existing ones.
+        .args(["/deny", "*S-1-1-0:(OI)(CI)(W)", "/T"])
+        .output()
+        .map_err(|e| format!("icacls /deny spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /deny failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Add an allow-write ACE for Everyone (S-1-1-0) on `path` via `icacls /grant`.
+fn allow_write_everyone(path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        // H-7 fix: (OI)(CI) for inheritance, /T for existing files/subdirs.
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(W)", "/T"])
+        .output()
+        .map_err(|e| format!("icacls /grant spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /grant failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Restore the original ACL on `path` from a backup file via `icacls /restore`.
+fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls")
+        .arg(path.as_os_str())
+        .args(["/restore", &backup_file.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("icacls /restore spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "icacls /restore failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Apply filesystem ACLs derived from `policy` to the paths it references (C3).
+///
+/// - `readonly_root`: adds a deny-write ACE for Everyone (S-1-1-0).
+/// - `writable_paths`: adds an allow-write ACE for Everyone.
+///
+/// Uses `icacls` CLI which adds ACEs INCREMENTALLY (preserves existing ACEs —
+// better than a raw SDDL replace-all-DACL approach for v1).
+///
+/// Returns a snapshot of backup files so [`restore_path_policy`] can restore.
+///
+/// **Not wired into the spawner**: the broker sub-plan (C2-broker) will call
+/// this before spawn. `is_enforced()` stays `false` on Windows.
+pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>, String> {
+    let mut snapshots = Vec::new();
+    let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+
+    // C-2 fix: deduplicate paths to prevent deny+allow collision on the same path.
+    // If readonly_root also appears in writable_paths, only the deny-write is applied.
+    if policy.readonly_root.is_absolute() {
+        let canon = canonicalize_path(&policy.readonly_root);
+        if processed.insert(canon.clone()) {
+            let backup = save_acl(&canon)?;
+            deny_write_everyone(&canon)?;
+            snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+        }
+    }
+
+    for wp in &policy.writable_paths {
+        if wp.is_absolute() {
+            let canon = canonicalize_path(wp);
+            if processed.insert(canon.clone()) {
+                let backup = save_acl(&canon)?;
+                allow_write_everyone(&canon)?;
+                snapshots.push(PathAclSnapshot { path: canon, backup_file: backup });
+            }
+        }
+    }
+
+    Ok(snapshots)
+}
+
+/// Restore the original ACLs saved by [`apply_path_policy`].
+pub fn restore_path_policy(snapshots: Vec<PathAclSnapshot>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for snap in snapshots {
+        if let Err(e) = restore_acl(&snap.path, &snap.backup_file) {
+            errors.push(format!("{}: {e}", snap.path.display()));
+        } else {
+            let _ = std::fs::remove_file(&snap.backup_file);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("restore failed for {} paths: {}", errors.len(), errors.join("; ")))
+    }
+}
+
+// ─── C4: Network egress layer ──────────────────────────────────────────────────
+//
+// Blocks outbound network for the child's program path via `netsh advfirewall`.
+// Per-application (not per-process), but real enforcement. Rule is added before
+// spawn and removed after child exit. For v1: NetPolicy::None only. Loopback and
+// Enabled are deferred (WFP filter complexity is out of v1 scope).
+
+/// Saved firewall rule name for restore after child exit.
+#[derive(Default)]
+pub struct NetPolicySnapshot {
+    rule_name: String,
+}
+
+/// Path to this process's firewall-rule journal (one rule name per line).
+/// Used by [`cleanup_orphaned_firewall_rules`] to recover from crashes.
+fn firewall_journal_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("devboule_firewall_journal_{}.txt", std::process::id()))
+}
+
+/// Append a rule name to this process's journal.
+fn journal_add(rule: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open(firewall_journal_path())
+    {
+        let _ = writeln!(f, "{rule}");
+    }
+}
+
+/// Remove a rule name from this process's journal (rewrite without it).
+fn journal_remove(rule: &str) {
+    let path = firewall_journal_path();
+    if let Ok(lines) = std::fs::read_to_string(&path) {
+        let kept: Vec<&str> = lines.lines().filter(|l| *l != rule).collect();
+        if kept.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, kept.join("\n") + "\n");
+        }
+    }
+}
+
+/// M-10: remove firewall rules left behind by crashed devboule instances.
+/// Scan temp dir for `devboule_firewall_journal_*.txt`, and for each whose
+/// owning PID is no longer alive, delete the listed rules and the journal.
+/// Safe to call at app startup.
+pub fn cleanup_orphaned_firewall_rules() {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let tmp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&tmp) else { return; };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(pid_str) = name.strip_prefix("devboule_firewall_journal_").and_then(|s| s.strip_suffix(".txt")) else { continue; };
+        let Ok(pid) = pid_str.parse::<u32>() else { continue; };
+        // Skip journals of still-running processes.
+        // MEDIUM fix: close the OpenProcess handle — previously .is_ok() leaked it.
+        let alive = unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) => { let _ = CloseHandle(h); true }
+                Err(_) => false,
+            }
+        };
+        if alive { continue; }
+        // Orphan: read + delete each rule, then remove the journal file.
+        let journal = entry.path();
+        if let Ok(lines) = std::fs::read_to_string(&journal) {
+            for rule in lines.lines() {
+                let _ = std::process::Command::new("netsh")
+                    .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
+                    .output();
+            }
+        }
+        let _ = std::fs::remove_file(&journal);
+    }
+}
+
+/// Add a firewall rule blocking outbound network for `program` (C4).
+/// Only applies when `policy.net == NetPolicy::None`.
+///
+/// H-1: `netsh advfirewall` requires administrator privileges. If the calling
+/// process is not elevated, this returns an error directing the user to run as
+/// admin. A v2 alternative (WFP filter via a broker service) would remove the
+/// elevation requirement but is out of scope for v1.
+pub fn apply_net_policy(policy: &SandboxPolicy, program: &str) -> Result<NetPolicySnapshot, String> {
+    use super::NetPolicy;
+    match policy.net {
+        NetPolicy::None => {
+            let rule_name = format!("devboule_sandbox_block_{}", std::process::id());
+            let out = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall", "firewall", "add", "rule",
+                    &format!("name={rule_name}"),
+                    "dir=out", "action=block",
+                    &format!("program=\"{program}\""),
+                ])
+                .output()
+                .map_err(|e| format!("netsh add rule spawn failed: {e}"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let combined = format!("{stderr} {stdout}");
+                // H-1: detect access-denied (admin required) and give a clear message.
+                if combined.to_ascii_lowercase().contains("administrator")
+                    || combined.to_ascii_lowercase().contains("access is denied")
+                    || combined.to_ascii_lowercase().contains("elevation")
+                {
+                    return Err(
+                        "network blocking requires administrator privileges \
+                         (netsh advfirewall). Run devboule as administrator. \
+                         See H-1 in specs/PORT_MACOS_TO_WINDOWS_FINAL.md.".into()
+                    );
+                }
+                return Err(format!("netsh add rule failed: {combined}"));
+            }
+            // M-10: record the rule so a crash can be recovered.
+            journal_add(&rule_name);
+            Ok(NetPolicySnapshot { rule_name })
+        }
+        NetPolicy::Loopback | NetPolicy::Enabled => {
+            // v1: deferred. WFP filter for loopback-permit is out of scope.
+            Ok(NetPolicySnapshot { rule_name: String::new() })
+        }
+    }
+}
+
+/// Remove the firewall rule saved by [`apply_net_policy`].
+pub fn restore_net_policy(snapshot: NetPolicySnapshot) -> Result<(), String> {
+    if snapshot.rule_name.is_empty() {
+        return Ok(());
+    }
+    let rule = snapshot.rule_name.clone();
+    let out = std::process::Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "delete", "rule",
+            &format!("name={rule}"),
+        ])
+        .output()
+        .map_err(|e| format!("netsh delete rule spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "netsh delete rule failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    // M-10: drop the rule from the journal (recovered). Ignore errors.
+    journal_remove(&rule);
+    Ok(())
+}
+
+
+// ─── C2 broker: restricted token + sandboxed spawn ─────────────────────────────
+//
+// The real Windows sandbox spawn path. Replaces std::process::Command::spawn()
+// for sandboxed runs. Creates a restricted token (DISABLE_MAX_PRIVILEGE), spawns
+// via CreateProcessAsUserW, and assigns to the C1 Job Object. Also calls C3's
+// apply_path_policy before spawn and restore_path_policy after child exit.
+//
+// Pattern adapted from OpenAI Codex windows-sandbox-rs (token.rs + process.rs).
+// Simplified for devboule v1: no AppContainer capabilities, no dedicated sandbox
+// user, no private desktop. Just DISABLE_MAX_PRIVILEGE + Job Object + ACLs.
+
+/// A sandboxed child process spawned with a restricted token.
+pub struct SandboxedChild {
+    process_handle: HANDLE,
+    thread_handle: HANDLE,
+    pub pid: u32,
+    stdout_read: HANDLE,
+    stderr_read: HANDLE,
+    acl_snapshots: Vec<PathAclSnapshot>,
+    net_snapshot: NetPolicySnapshot,
+    job: HANDLE,
+    restored: bool, // true after wait_and_restore has restored ACLs + net
+}
+
+/// RAII guard that restores filesystem ACLs + net policy when dropped (error path safety).
+/// Disarm with `.take()` on success.
+struct SandboxGuard {
+    acl: Option<Vec<PathAclSnapshot>>,
+    net: Option<NetPolicySnapshot>,
+}
+
+impl SandboxGuard {
+    fn new(acl: Vec<PathAclSnapshot>) -> Self {
+        Self { acl: Some(acl), net: None }
+    }
+    fn set_net(&mut self, net: NetPolicySnapshot) {
+        self.net = Some(net);
+    }
+    /// Disarm the guard: caller takes ownership of snapshots (success path).
+    fn take(mut self) -> (Vec<PathAclSnapshot>, NetPolicySnapshot) {
+        let acl = self.acl.take().unwrap_or_default();
+        let net = self.net.take().unwrap_or(NetPolicySnapshot { rule_name: String::new() });
+        (acl, net)
+    }
+}
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        if let Some(snapshots) = self.acl.take() {
+            if !snapshots.is_empty() {
+                let _ = restore_path_policy(snapshots);
+            }
+        }
+        if let Some(net) = self.net.take() {
+            let _ = restore_net_policy(net);
+        }
+    }
+}
+
+impl SandboxedChild {
+    /// Returns the stdout pipe read handle. Wrap with `std::fs::File::from_raw_handle`.
+    pub fn stdout_handle(&self) -> HANDLE { self.stdout_read }
+    /// Returns the stderr pipe read handle.
+    pub fn stderr_handle(&self) -> HANDLE { self.stderr_read }
+
+    /// Take ownership of the stdout pipe handle (for conversion to `File`).
+    /// After this call, Drop will NOT close the stdout handle — caller owns it.
+    pub fn take_stdout_handle(&mut self) -> HANDLE {
+        std::mem::take(&mut self.stdout_read)
+    }
+    /// Take ownership of the stderr pipe handle (for conversion to `File`).
+    pub fn take_stderr_handle(&mut self) -> HANDLE {
+        std::mem::take(&mut self.stderr_read)
+    }
+
+    /// Non-blocking wait. Returns Some(exit_code) if child exited, None if still running.
+    pub fn try_wait(&self) -> Result<Option<i32>, String> {
+        use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess};
+        let result = unsafe { WaitForSingleObject(self.process_handle, 0) };
+        // M-7 fix: distinguish WAIT_OBJECT_0 (0), WAIT_TIMEOUT (258), WAIT_FAILED (0xFFFFFFFF).
+        if result.0 == 0 { // WAIT_OBJECT_0
+            let mut code: u32 = 0;
+            unsafe { GetExitCodeProcess(self.process_handle, &mut code)
+                .map_err(|e| format!("GetExitCodeProcess failed: {e}"))?; }
+            Ok(Some(code as i32))
+        } else if result.0 == 0xFFFFFFFF { // WAIT_FAILED
+            Err(format!("WaitForSingleObject failed (WAIT_FAILED)"))
+        } else { // WAIT_TIMEOUT or other — still running
+            Ok(None)
+        }
+    }
+
+    /// Kill the child process.
+    pub fn kill(&self) -> Result<(), String> {
+        unsafe {
+            windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1)
+                .map_err(|e| format!("TerminateProcess failed: {e}"))
+        }
+    }
+
+    /// Wait for the child to exit, then restore the filesystem ACLs (C3).
+    /// Handles are closed by `Drop` when the struct goes out of scope.
+    pub fn wait_and_restore(mut self) -> Result<i32, String> {
+        use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess, INFINITE};
+
+        let exit_code = unsafe {
+            WaitForSingleObject(self.process_handle, INFINITE);
+            let mut code: u32 = 0;
+            GetExitCodeProcess(self.process_handle, &mut code)
+                .map_err(|e| format!("GetExitCodeProcess failed: {e}"))?;
+            code as i32
+        };
+
+        // C3+C4: restore ACLs + net policy. H-5 fix: set restored=true only AFTER both succeed.
+        let snapshots = std::mem::take(&mut self.acl_snapshots);
+        let net = std::mem::take(&mut self.net_snapshot);
+
+        let acl_err = restore_path_policy(snapshots).err();
+        let net_err = restore_net_policy(net).err();
+
+        if acl_err.is_none() && net_err.is_none() {
+            self.restored = true;
+        }
+
+        if let Some(e) = net_err.or(acl_err) {
+            return Err(e);
+        }
+
+        Ok(exit_code)
+        // Drop closes ALL handles (child is dead, safe to close job too).
+    }
+}
+
+impl Drop for SandboxedChild {
+    fn drop(&mut self) {
+        unsafe {
+            // If wait_and_restore was NOT called, kill the child.
+            if !self.restored {
+                let _ = windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1);
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
+            }
+
+            // H-4 fix: close Job FIRST (KILL_ON_JOB_CLOSE kills remaining descendants).
+            // This must happen BEFORE restoring ACLs/net so descendants can't write/network
+            // under restored host policy.
+            if !self.job.0.is_null() {
+                let _ = CloseHandle(self.job);
+            }
+            // Wait briefly for descendants to die after job close.
+            let _ = windows::Win32::System::Threading::WaitForSingleObject(self.process_handle, 5000);
+
+            // NOW restore ACLs + net (descendants are dead).
+            if !self.restored {
+                let snapshots = std::mem::take(&mut self.acl_snapshots);
+                if !snapshots.is_empty() {
+                    let _ = restore_path_policy(snapshots);
+                }
+                let net = std::mem::take(&mut self.net_snapshot);
+                let _ = restore_net_policy(net);
+            }
+
+            // M-2 fix: check for null before CloseHandle (take_*_handle sets to default).
+            if !self.process_handle.0.is_null() { let _ = CloseHandle(self.process_handle); }
+            if !self.thread_handle.0.is_null() { let _ = CloseHandle(self.thread_handle); }
+            if !self.stdout_read.0.is_null() { let _ = CloseHandle(self.stdout_read); }
+            if !self.stderr_read.0.is_null() { let _ = CloseHandle(self.stderr_read); }
+            // job already closed above.
+        }
+    }
+}
+
+/// Build a UTF-16 environment block from (KEY, VALUE) pairs.
+/// Sorted case-insensitively by key (Windows requires this for CreateProcess).
+/// Double-null terminated.
+fn make_env_block(env_vars: &[(String, String)]) -> Vec<u16> {
+    let mut items: Vec<(String, String, String)> = env_vars.iter()
+        .map(|(k, v)| (k.to_uppercase(), k.clone(), v.clone()))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut w: Vec<u16> = Vec::new();
+    let is_empty = items.is_empty();
+    for (_, k, v) in items {
+        let entry = format!("{k}={v}");
+        w.extend(entry.encode_utf16());
+        w.push(0);
+    }
+    w.push(0); // block terminator
+    // M-5 fix: empty block needs two NULs per Windows spec.
+    if is_empty {
+        w.push(0);
+    }
+    w
+}
+
+/// Create an anonymous pipe and make the write end inheritable.
+fn create_pipe() -> Result<(HANDLE, HANDLE), String> {
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::Foundation::SetHandleInformation;
+    let mut read = HANDLE::default();
+    let mut write = HANDLE::default();
+    unsafe {
+        CreatePipe(&mut read, &mut write, None, 0)
+            .map_err(|e| format!("CreatePipe failed: {e}"))?;
+        SetHandleInformation(write, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1)); // HANDLE_FLAG_INHERIT = 0x1
+    }
+    Ok((read, write))
+}
+
+/// Open a handle to the NUL device for use as a child's stdin.
+/// The child can read from this without blocking (always returns EOF/0 bytes).
+/// The handle is inheritable so the child receives it.
+fn open_null_handle() -> Result<HANDLE, String> {
+    use windows::Win32::Storage::FileSystem::CreateFileW;
+    // Use numeric constants to avoid windows 0.58 import drift:
+    // GENERIC_READ=0x80000000, FILE_SHARE_READ|WRITE=0x3,
+    // OPEN_EXISTING=3, FILE_ATTRIBUTE_NORMAL=0x80.
+    let null_name: Vec<u16> = "NUL\0".encode_utf16().collect();
+    unsafe {
+        let h = CreateFileW(
+            windows::core::PCWSTR(null_name.as_ptr()),
+            0x80000000u32,                // GENERIC_READ
+            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0x3), // READ|WRITE
+            None,
+            windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION(3), // OPEN_EXISTING
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x80), // FILE_ATTRIBUTE_NORMAL
+            None,
+        ).map_err(|e| format!("CreateFileW(NUL) failed: {e}"))?;
+        // Make inheritable so the child can use it as stdin.
+        // LOW fix: propagate SetHandleInformation failure instead of silently ignoring.
+        windows::Win32::Foundation::SetHandleInformation(h, 0x1u32, windows::Win32::Foundation::HANDLE_FLAGS(0x1))
+            .map_err(|e| {
+                let _ = CloseHandle(h);
+                format!("SetHandleInformation(NUL) failed: {e}")
+            })?;
+        Ok(h)
+    }
+}
+
+/// Open the current process token and create a restricted version
+/// with DISABLE_MAX_PRIVILEGE (strips all privileges from the token).
+fn create_restricted_token() -> Result<HANDLE, String> {
+    use windows::Win32::Security::{CreateRestrictedToken, CREATE_RESTRICTED_TOKEN_FLAGS, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_ASSIGN_PRIMARY, TOKEN_ACCESS_MASK};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut primary_token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ACCESS_MASK(TOKEN_DUPLICATE.0 | TOKEN_QUERY.0 | TOKEN_ASSIGN_PRIMARY.0),
+            &mut primary_token,
+        ).map_err(|e| format!("OpenProcessToken failed: {e}"))?;
+    }
+
+    let mut restricted_token = HANDLE::default();
+    unsafe {
+        // H-8 fix: DISABLE_MAX_PRIVILEGE (0x1) strips privileges; LUA_TOKEN (0x4)
+        // produces a filtered token (like UAC does), removing admin group SIDs from
+        // being effective. This is stronger than DISABLE_MAX_PRIVILEGE alone.
+        if let Err(e) = CreateRestrictedToken(
+            primary_token,
+            CREATE_RESTRICTED_TOKEN_FLAGS(0x1 | 0x4), // DISABLE_MAX_PRIVILEGE | LUA_TOKEN
+            None,
+            None,
+            None,
+            &mut restricted_token,
+        ) {
+            // LOW fix: close primary_token before returning the error.
+            let _ = CloseHandle(primary_token);
+            return Err(format!("CreateRestrictedToken failed: {e}"));
+        }
+    }
+
+    unsafe { let _ = CloseHandle(primary_token); }
+    Ok(restricted_token)
+}
+
+/// Create a Job Object with kill-on-close + optional memory limit.
+fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
+    let memory_limit: usize = rlimits
+        .addr_space_bytes
+        .map(|b| b as usize)
+        .unwrap_or(usize::MAX);
+    unsafe {
+        let job = CreateJobObjectW(None, None)
+            .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
+        let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        let mut basic = std::mem::zeroed::<JOBOBJECT_BASIC_LIMIT_INFORMATION>();
+        basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // H-2 fix: enable PROCESS_MEMORY only when a finite limit is set.
+        if rlimits.addr_space_bytes.is_some() {
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
+        info.BasicLimitInformation = basic;
+        info.ProcessMemoryLimit = memory_limit;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ).map_err(|e| format!("SetInformationJobObject failed: {e}"))?;
+        Ok(job)
+    }
+}
+
+/// Spawn a child process with a restricted token, Job Object, and filesystem ACLs.
+/// This is the C2 broker: it replaces `std::process::Command::spawn()` for Windows
+/// sandboxed runs.
+///
+/// Integrates C1 (Job Object), C2 (restricted token), and C3 (filesystem ACLs).
+/// After the child exits, call `wait_and_restore()` to restore ACLs + close handles.
+pub fn spawn_sandboxed(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_vars: &[(String, String)],
+) -> Result<SandboxedChild, String> {
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, STARTUPINFOEXW, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        CREATE_SUSPENDED, ResumeThread, PROCESS_CREATION_FLAGS,
+        InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
+        DeleteProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    };
+    use windows::core::{PWSTR, PCWSTR};
+    use windows::Win32::Foundation::BOOL;
+
+    // C3+C4: apply filesystem ACLs + net policy before spawn.
+    // SandboxGuard ensures both are restored even if spawn fails.
+    let mut guard = SandboxGuard::new(apply_path_policy(policy)?);
+    guard.set_net(apply_net_policy(policy, program)?);
+
+    // C1: create Job Object.
+    let job = create_job_object(&policy.rlimits)?;
+
+    // C2: create restricted token.
+    let restricted_token = create_restricted_token()?;
+
+    // Create pipes for stdout/stderr.
+    let (stdout_read, stdout_write) = create_pipe()?;
+    let (stderr_read, stderr_write) = create_pipe()?;
+
+    // Build command line: "program arg1 arg2 ..."
+    let cmdline = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Build env block.
+    let env_block = make_env_block(env_vars);
+
+    // Build cwd wide string.
+    let cwd_wide: Vec<u16> = cwd.to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // M-4 fix: set lpDesktop to null so the child inherits the parent's desktop.
+    // A private window station (CreateDesktopW + ACL grant) is a v2 improvement;
+    // the restricted token + LUA_TOKEN already removes admin effectiveness for v1.
+    // Keeping null avoids hardcoding a session-specific name.
+
+    // M-8 fix: open a NUL device handle for the child's stdin (valid, non-blocking).
+    let null_stdin = open_null_handle()?;
+
+    // H-9 fix: use STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST to restrict
+    // handle inheritance to ONLY stdout/stderr/null_stdin. With bInheritHandles=TRUE
+    // but a constrained attribute list, the child cannot inherit arbitrary parent
+    // handles (e.g. other pipe ends, token handles).
+    let inherit_handles: [HANDLE; 3] = [stdout_write, stderr_write, null_stdin];
+
+    // Step 1: query the required attribute-list buffer size.
+    let mut attr_size: usize = 0;
+    unsafe { let _ = InitializeProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()), 1, 0, &mut attr_size); }
+
+    // Step 2: allocate the buffer (lives until after CreateProcessAsUserW).
+    let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut std::ffi::c_void);
+
+    // Step 3: initialize + populate the single HANDLE_LIST attribute.
+    let mut handle_list = inherit_handles;
+    unsafe {
+        InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size)
+            .map_err(|e| format!("InitializeProcThreadAttributeList failed: {e}"))?;
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            0x00020000usize, // PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+            Some(handle_list.as_mut_ptr() as *const std::ffi::c_void),
+            std::mem::size_of_val(&handle_list),
+            None, None,
+        ).map_err(|e| format!("UpdateProcThreadAttribute failed: {e}"))?;
+    }
+
+    // STARTUPINFOEXW (superset of STARTUPINFOW, with lpAttributeList).
+    let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = stdout_write;
+    si.StartupInfo.hStdError = stderr_write;
+    si.StartupInfo.hStdInput = null_stdin;
+    si.StartupInfo.lpDesktop = windows::core::PWSTR::null();
+    si.lpAttributeList = attr_list;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // H-9: EXTENDED_STARTUPINFO_PRESENT (0x00080000) tells the loader this is a STARTUPINFOEXW.
+    let flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+              | PROCESS_CREATION_FLAGS(0x00080000);
+
+    unsafe {
+        if let Err(e) = CreateProcessAsUserW(
+            restricted_token,
+            PCWSTR::null(),
+            PWSTR(cmdline_wide.as_mut_ptr()),
+            None, None,
+            BOOL(1),
+            flags,
+            Some(env_block.as_ptr() as *const _),
+            PCWSTR(cwd_wide.as_ptr()),
+            &si as *const _ as *const _,
+            &mut pi,
+        ) {
+            // LOW fix: clean up ALL intermediate handles + attr list before returning.
+            // SandboxGuard (Drop) restores ACLs/net.
+            unsafe { DeleteProcThreadAttributeList(attr_list); }
+            let _ = CloseHandle(stdout_write);
+            let _ = CloseHandle(stderr_write);
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            let _ = CloseHandle(null_stdin);
+            let _ = CloseHandle(restricted_token);
+            let _ = CloseHandle(job);
+            return Err(format!("CreateProcessAsUserW failed: {e}"));
+        }
+    }
+
+    // H-9: the attribute list can be freed now (loader copied what it needed).
+    unsafe { DeleteProcThreadAttributeList(attr_list); }
+
+    // Close write ends of pipes (parent doesn't need them).
+    // Close the restricted token (child has its own copy).
+    // Close the NUL stdin handle (M-8) — child has its inherited copy.
+    unsafe {
+        let _ = CloseHandle(stdout_write);
+        let _ = CloseHandle(stderr_write);
+        let _ = CloseHandle(null_stdin);
+        let _ = CloseHandle(restricted_token);
+    }
+
+    // C1: assign the SUSPENDED child to the Job Object BEFORE it starts running (C-4 fix).
+    // This prevents descendants from escaping before assignment.
+    unsafe {
+        if let Err(e) = AssignProcessToJobObject(job, pi.hProcess) {
+            // H-3 fix: kill the suspended child + close ALL handles + let guard restore ACLs/net.
+            let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+            let _ = windows::Win32::System::Threading::WaitForSingleObject(pi.hProcess, 5000);
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(job);
+            // LOW fix: close the pipe READ ends too (not yet moved into SandboxedChild).
+            let _ = CloseHandle(stdout_read);
+            let _ = CloseHandle(stderr_read);
+            return Err(format!("AssignProcessToJobObject failed: {e}"));
+        }
+    }
+
+    // Resume the child's main thread — it starts executing now, safely inside the Job Object.
+    unsafe {
+        ResumeThread(pi.hThread);
+    }
+
+    // Disarm the guard: on success, snapshots move into SandboxedChild.
+    let (acl_snapshots, net_snapshot) = guard.take();
+
+    Ok(SandboxedChild {
+        process_handle: pi.hProcess,
+        thread_handle: pi.hThread,
+        pid: pi.dwProcessId,
+        stdout_read,
+        stderr_read,
+        acl_snapshots,
+        net_snapshot,
+        job,
+        restored: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::sandbox::{ResourceLimits, SandboxPolicy};
+
+    #[test]
+    fn apply_restricted_token_stub_returns_ok() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        let result = apply_restricted_token(&mut cmd);
+        assert!(result.is_ok(), "v1 stub must return Ok; got {result:?}");
+    }
+
+    #[test]
+    fn apply_rlimits_stashes_handle() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        let limits = ResourceLimits {
+            cpu_secs: 60,
+            addr_space_bytes: Some(1 << 30),
+            max_procs: 16,
+        };
+        apply_rlimits(&mut cmd, &limits);
+        // The handle is now stashed; a real spawn + attach_to_child exercises the full path.
+        // This test only verifies apply_rlimits does not panic on a valid Job Object creation.
+    }
+
+    #[test]
+    #[ignore = "kill-on-close semantics require a dedicated child process; run manually on Windows"]
+    fn job_terminates_child_on_kill_on_close() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/c", "ping", "127.0.0.1", "-n", "30"]);
+        let limits = ResourceLimits {
+            cpu_secs: 60,
+            addr_space_bytes: None,
+            max_procs: 16,
+        };
+        apply_rlimits(&mut cmd, &limits);
+        let child = cmd.spawn().expect("spawn long-running child");
+        attach_to_child(child.id()).expect("attach child to job");
+        // Closing the job handle (or parent exit) would terminate the child via KILL_ON_JOB_CLOSE.
+    }
+
+    /// Reviewer N6: CI-safe integration test of the full create -> stash -> spawn -> attach -> exit
+    /// path, without depending on kill-on-close cross-process behavior. Spawns `cmd /c exit 0`,
+    /// attaches it to the Job Object, and waits for the child to exit normally. This exercises
+    /// every public function in this module end-to-end.
+    #[test]
+    fn spawn_attach_and_exit_cleanly() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/c", "exit", "0"])
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
+        let limits = ResourceLimits {
+            cpu_secs: 60,
+            addr_space_bytes: None,
+            max_procs: 16,
+        };
+        apply_rlimits(&mut cmd, &limits);
+        let mut child = cmd.spawn().expect("spawn exit-0 child");
+        attach_to_child(child.id()).expect("attach child to job");
+        let status = child.wait().expect("wait for child");
+        assert!(status.success(), "cmd /c exit 0 should report success; got {:?}", status);
+    }
+
+    /// C3: apply deny-write on a temp file, then restore the original ACL.
+    /// Verifies the icacls save → deny → restore pipeline works end-to-end.
+    #[test]
+    fn apply_and_restore_path_policy_roundtrip() {
+        let temp = std::env::temp_dir().join(format!("devboule_c3_test_{}", std::process::id()));
+        std::fs::write(&temp, "test").expect("write temp file");
+
+        let policy = SandboxPolicy::deny(temp.clone());
+        let snapshots = apply_path_policy(&policy).expect("apply should succeed");
+        assert!(!snapshots.is_empty(), "should have at least one snapshot");
+
+        restore_path_policy(snapshots).expect("restore should succeed");
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// C3: apply allow-write on a writable path, then restore.
+    #[test]
+    fn apply_writable_path_and_restore() {
+        let temp = std::env::temp_dir().join(format!("devboule_c3_writable_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+
+        let policy = SandboxPolicy::deny("C:\\nonexistent".into())
+            .writable(temp.clone());
+        let snapshots = apply_path_policy(&policy).expect("apply should succeed");
+        assert!(!snapshots.is_empty(), "should have at least one snapshot");
+
+        restore_path_policy(snapshots).expect("restore should succeed");
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+}

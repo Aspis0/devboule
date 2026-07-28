@@ -1,4 +1,5 @@
 pub mod seatbelt;
+pub mod windows;
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,11 @@ pub enum NetPolicy {
 /// OS resource limits applied to the sandboxed child (rlimit on macOS/Linux, Job Object on Windows).
 /// Enforced at the process level to prevent runaway tasks from starving the host or other agents.
 /// `addr_space_bytes == None` means "do not cap address space".
+///
+/// **Platform-specific semantics** (reviewer N2, post-C1):
+/// - `cpu_secs`: enforced via `RLIMIT_CPU` on unix; Windows has no CPU-time limit and **silently ignores** this field (relies on AgentScope/orchestrator timeouts instead).
+/// - `addr_space_bytes`: on unix maps to `RLIMIT_AS` (virtual address space); on Windows maps to `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit` which is "private commit charge" (committed, non-shareable virtual memory), NOT total virtual address space. Both are sufficient for a runaway-task guard (an infinite allocator loop hits either), but `top`/`tasklist` will report different numbers.
+/// - `max_procs`: enforced via `RLIMIT_NPROC` on unix-macOS (intentionally NOT set on macOS — see `apply_rlimits`); on Windows **silently ignored** today (would require `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`). Per-process fork-bounding belongs to the Windows Job Object's process-count, which we may set in C4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub cpu_secs: u64,
@@ -129,9 +135,13 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
         // Command) — Seatbelt has no native rlimit, and they must go in a pre_exec on the Command.
         macos_sandbox_exec_argv(&profile, program, args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // TODO(windows: phase 3 — Restricted Token + WFP + Job Object) / (linux: landlock stub).
+        crate::backend::sandbox::windows::wrap_policy(policy, program, args, _cwd)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // TODO(linux: landlock stub).
         let _ = policy;
         // review F3: log ONCE (Censor/agentic call wrap dozens of times → stderr spam) and WITHOUT
         // the program name (a user path can be sensitive).
@@ -140,7 +150,7 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
         WARN_ONCE.call_once(|| {
             eprintln!(
                 "[sandbox] wrap: NO OS confinement on this platform — children run UNRESTRICTED \
-                 (Windows/Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
+                 (Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
             );
         });
         SandboxedCommand {
@@ -170,9 +180,9 @@ pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
     let _ = nproc;
     unsafe {
         cmd.pre_exec(move || {
-            set_rlimit(libc::RLIMIT_CPU, cpu);
+            set_rlimit(libc::RLIMIT_CPU as libc::c_int, cpu);
             if let Some(bytes) = addr {
-                set_rlimit(libc::RLIMIT_AS, bytes);
+                set_rlimit(libc::RLIMIT_AS as libc::c_int, bytes);
             }
             Ok(())
         });
@@ -187,12 +197,18 @@ fn set_rlimit(resource: libc::c_int, value: u64) {
     };
     // best-effort; ignore failure so a rejected limit can't abort the spawn under set -e semantics
     unsafe {
-        libc::setrlimit(resource, &lim);
+        libc::setrlimit(resource as _, &lim);
     }
 }
 
-/// No-op on non-unix (Windows rlimits land with the Job Object backend in phase 3).
-#[cfg(not(unix))]
+/// Windows arm: delegate to the Job Object backend (C1 — kill-on-close + memory limit).
+#[cfg(target_os = "windows")]
+pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
+    crate::backend::sandbox::windows::apply_rlimits(cmd, limits)
+}
+
+/// No-op elsewhere (Linux/other — landlock stub not yet implemented).
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn apply_rlimits(_cmd: &mut std::process::Command, _limits: &ResourceLimits) {}
 
 /// Returns `true` if this platform actually applies OS-level sandbox confinement in [`wrap`].
@@ -211,7 +227,9 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Flips to `true` when the Windows Job Object backend lands (sandbox epic phase 3).
+        // Reverted to false after hostile review found unsandboxed execution paths
+        // (pi_sidecar, mini_coder) that bypass the broker. Must stay false until ALL
+        // unattended paths route through spawn_sandboxed + CREATE_SUSPENDED + Job assignment.
         false
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -291,11 +309,17 @@ mod tests {
         assert!(is_enforced());
     }
 
-    /// Off macOS, `wrap` is passthrough (no OS confinement), so `is_enforced()` is false until the
-    /// platform sandbox backend lands.
-    #[cfg(not(target_os = "macos"))]
+    /// Windows: is_enforced() is false until ALL unattended paths route through the broker
+    /// (hostile review C-1 found pi_sidecar + mini_coder bypass the broker).
+    #[cfg(target_os = "windows")]
     #[test]
-    fn is_enforced_false_off_macos() {
+    fn is_enforced_false_on_windows() {
+        assert!(!is_enforced());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn is_enforced_false_on_linux() {
         assert!(!is_enforced());
     }
 }

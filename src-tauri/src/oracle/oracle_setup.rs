@@ -827,6 +827,21 @@ pub(crate) fn rust_model_data_dir(root: &Path) -> PathBuf {
 /// bootstrap. The venv is installed under the data root; the package source and
 /// PYTHONPATH come from the package root.
 pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
+    install_oracle_runtime_with_progress(|_, _, _| {})
+}
+
+/// Install the Oracle runtime with a progress callback.
+/// `progress(stage, percent, message)` is called at each step:
+///   stage="venv"      — Python venv + pip install
+///   stage="download"  — ONNX model download from HuggingFace
+///   stage="done"      — install complete
+/// The percent is 0–100 within the current stage.
+pub fn install_oracle_runtime_with_progress<F>(
+    mut progress: F,
+) -> Result<OracleRuntimeSetup, String>
+where
+    F: FnMut(&str, u32, &str),
+{
     let data_root = oracle_data_root().ok_or_else(|| {
         "Could not locate a writable location for the Oracle runtime.".to_string()
     })?;
@@ -837,7 +852,10 @@ pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
     // Run the bootstrap (creates/reuses venv, installs requirements-mcp.txt,
     // handles fat→slim migration). The ONNX model install is separate and
     // triggered by the supervisor when the engine is Rust.
+    progress("venv", 0, "Setting up Python environment...");
     let _status = run_oracle_runtime_bootstrap(&data_root, &package_root)?;
+    progress("venv", 100, "Python environment ready.");
+
     // Prefer seeding from the full-package bundle before any network download.
     // Seed Err (corrupt/partial bundle, I/O) must not abort install — fall through
     // to HuggingFace download when the model is still missing.
@@ -855,18 +873,28 @@ pub fn install_oracle_runtime() -> Result<OracleRuntimeSetup, String> {
     }
     if !oracle_core::model_download::model_present(&data_dir, true) {
         eprintln!("[oracle-setup] ONNX model not present; downloading...");
+        progress("download", 0, "Downloading Qwen3 ONNX embedder...");
         oracle_core::model_download::ensure_qwen3_onnx(&data_dir, true, |p| {
             let pct = match p.bytes_total {
-                Some(t) if t > 0 => format!("{}%", (p.bytes_done * 100) / t),
-                _ => format!("{} bytes", p.bytes_done),
+                Some(t) if t > 0 => (p.bytes_done * 100) / t,
+                _ => 0,
             };
+            let msg = format!(
+                "{} ({}/{})",
+                p.file, p.index, p.total_files
+            );
+            progress("download", pct as u32, &msg);
             eprintln!(
-                "[rust-oracle model] {} ({}/{}) {}",
+                "[rust-oracle model] {} ({}/{}) {}%",
                 p.file, p.index, p.total_files, pct
             );
         })
         .map_err(|e| format!("ONNX model download failed: {e:#}"))?;
+        progress("download", 100, "Model download complete.");
+    } else {
+        progress("download", 100, "Model already present.");
     }
+    progress("done", 100, "Oracle runtime ready.");
     Ok(rust_runtime_setup_status(&data_root))
 }
 

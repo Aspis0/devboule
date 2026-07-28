@@ -30,14 +30,8 @@ path = "src/main.rs"
 name = "claude_consent_hook"
 path = "src/bin/claude_consent_hook.rs"
 
-# ---------------------------------------------------------------------------
-# DEV ONLY — agent UI automation for Devboule (never production `tauri build`):
-#   ui-pilot — host for devboule-pilot (tools/devboule-pilot + upstream tauri-pilot CLI)
-# Detach: drop feature + optional dep + cfg in lib.rs + tools/devboule-pilot/
-# ---------------------------------------------------------------------------
 [features]
 default = []
-ui-pilot = ["dep:tauri-plugin-pilot"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -47,10 +41,6 @@ tauri = { version = "2", features = [] }
 libc = "0.2" # process-group kill for the sandboxed `run` tool timeout (unix)
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
-# Optional: only with --features ui-pilot (debug agent UI automation).
-# Patched fork: IPC eval timeout 600s (upstream 10s kills assistant_run / long flows).
-# Source: /Users/user/Projects/vendor/tauri-plugin-pilot (based on 0.7.2).
-tauri-plugin-pilot = { path = "../../vendor/tauri-plugin-pilot", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
@@ -159,7 +149,8 @@ oracle-core = { path = "../oracle-core" }
 # `#[cfg(windows)]`-gated, so target-gate the crate too: it is never fetched or
 # built on macOS/Linux.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging", "Win32_System_JobObjects", "Win32_Security",
+    "Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_Pipes", "Win32_NetworkManagement_WindowsFilteringPlatform"] }
 # Design preview SCREENSHOT (Phase B): WebView2 `CapturePreview` (PNG) of the
 # `design-preview` window. `webview2-com` is pinned to the EXACT version already in the
 # tree transitively (via wry/tauri) so its `ICoreWebView2*` types are identical to the
@@ -184,3 +175,10 @@ objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
 objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError", "block2"] }
 block2 = "0.5"
 oracle-core = { path = "../oracle-core", features = ["metal"] }
+
+[patch.crates-io]
+# Patch esaxx-rs to use dynamic CRT (/MD) on Windows, matching ort-sys
+# prebuilt binaries (rc.12). Without this, the linker fails with LNK2038:
+# MT_StaticRelease vs MD_DynamicRelease. Must live in the manifest root
+# (src-tauri) — patches in dependency Cargo.tomls are ignored.
+esaxx-rs = { path = "../vendor/esaxx-rs-0.1.10" }

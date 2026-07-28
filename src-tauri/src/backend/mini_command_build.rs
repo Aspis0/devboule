@@ -275,6 +275,12 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
         MiniCoderBackendKind::AppleFm => {
             return Err("Apple on-device requires macOS 27+.".to_string());
         }
+        MiniCoderBackendKind::Openai => {
+            return Err(
+                "OpenAI backend runs via the api/cli bridge, not the directive executor"
+                    .to_string(),
+            );
+        }
         MiniCoderBackendKind::Cloud => {
             // Cloud is a pi-engine backend (HTTPS remote provider); the directive
             // executor's one-shot PTY/script path cannot drive it today. Fail

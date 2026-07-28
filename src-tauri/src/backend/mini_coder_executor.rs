@@ -42,6 +42,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::agents;
@@ -3863,6 +3864,7 @@ mod mini_language_tests {
 // every call site and test unchanged.
 #[allow(unused_imports)]
 pub(crate) use super::mini_command_build::*;
+pub(crate) use super::projects::ps_single_quote;
 
 /// PURE helper: mark the NON-TERMINAL directive owning `agent_id` as kill-requested.
 /// Returns true iff a directive with that `agentId` was found AND it is a live (non-

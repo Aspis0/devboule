@@ -50,6 +50,16 @@
       "resources/oracle-models",
       "../pi-sidecar/*"
     ],
-    "externalBin": ["binaries/devboule-mcp"]
+    "externalBin": ["binaries/devboule-mcp"],
+    "windows": {
+      "wix": {},
+      "nsis": {
+        "installMode": "perMachine"
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
   }
 }

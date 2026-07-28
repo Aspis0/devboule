@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "windows-*"]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight CI runs for the same branch on new pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Repo has NO root workspace; cache each crate independently.
+          workspaces: |
+            src-tauri/target -> .cargo
+            oracle-core/target -> .cargo
+            devboule-mcp/target -> .cargo
+
+      - name: Add Windows MSVC target
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Add macOS x86_64 target (Apple Silicon runners default to aarch64)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          rustup target add x86_64-apple-darwin || true
+          rustup target add aarch64-apple-darwin || true
+
+      # ----- protoc install (host build tool for lance/lancedb via prost-build) -----
+      # GitHub-hosted runners ship NO protoc. Native package manager per OS.
+      - name: Install protoc (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # ----- Linux system deps for Tauri (webkit/gtk/glib headers) -----
+      - name: Install Linux system dependencies (Tauri)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install protoc (macos)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
+
+      - name: Install protoc (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: choco install protoc -y --no-progress
+
+      # ----- Node toolchain (frontend build / vitest) -----
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      # ----- Rust checks (per-crate, no root workspace) -----
+      # Tauri's build script validates externalBin resources exist at check time.
+      # Build devboule-mcp first and stage it as binaries/devboule-mcp-<triple>[.exe].
+      - name: Build devboule-mcp (Tauri externalBin dependency)
+        shell: bash
+        run: |
+          cargo build --manifest-path devboule-mcp/Cargo.toml
+          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+          mkdir -p src-tauri/binaries
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp devboule-mcp/target/debug/devboule-mcp.exe "src-tauri/binaries/devboule-mcp-${TRIPLE}.exe"
+          else
+            cp devboule-mcp/target/debug/devboule-mcp "src-tauri/binaries/devboule-mcp-${TRIPLE}"
+          fi
+
+      - name: cargo check (src-tauri, host)
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: cargo check (src-tauri, windows msvc)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: cargo check (oracle-core)
+        run: cargo check --manifest-path oracle-core/Cargo.toml
+
+      - name: cargo check (devboule-mcp)
+        run: cargo check --manifest-path devboule-mcp/Cargo.toml
+
+      # ----- Rust tests (per-crate) -----
+      - name: cargo test (devboule-mcp)
+        run: cargo test --manifest-path devboule-mcp/Cargo.toml --no-fail-fast
+
+      # ----- Frontend tests (vitest) -----
+      - name: vitest
+        run: npm test
