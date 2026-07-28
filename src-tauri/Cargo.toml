@@ -175,3 +175,10 @@ objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
 objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError", "block2"] }
 block2 = "0.5"
 oracle-core = { path = "../oracle-core", features = ["metal"] }
+
+[patch.crates-io]
+# Patch esaxx-rs to use dynamic CRT (/MD) on Windows, matching ort-sys
+# prebuilt binaries (rc.12). Without this, the linker fails with LNK2038:
+# MT_StaticRelease vs MD_DynamicRelease. Must live in the manifest root
+# (src-tauri) — patches in dependency Cargo.tomls are ignored.
+esaxx-rs = { path = "../vendor/esaxx-rs-0.1.10" }
