@@ -1,1 +1,0 @@
-The `pi-subagents` skill isn't in the expected location. Let me search more broadly for the subagent launch mechanism.

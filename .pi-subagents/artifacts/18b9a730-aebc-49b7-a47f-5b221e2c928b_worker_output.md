@@ -1,1 +1,0 @@
-Build OK. Copio il binario nel path atteso.

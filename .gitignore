@@ -135,3 +135,9 @@ src-tauri/capabilities-optional/
 *.docx
 *.doc
 *.pdf
+
+.pi-subagents/
+advisor/
+oracle/decision-*.md
+hostile-review-full*.md
+oracle-core/golden/corpus/vendored/subpkg/somepkg/module.py

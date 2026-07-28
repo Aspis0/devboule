@@ -1,1 +1,0 @@
-Now I have the full picture. Let me write the hostile reviewreport.

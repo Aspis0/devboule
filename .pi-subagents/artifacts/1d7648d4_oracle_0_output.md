@@ -1,2 +1,0 @@
-default_context_seen: fork
-skill_catalogue_has_delegate_task: yes

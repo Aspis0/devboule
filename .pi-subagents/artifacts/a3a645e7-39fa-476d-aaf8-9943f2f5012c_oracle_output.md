@@ -1,1 +1,0 @@
-File complete (183 lines, ends cleanly with the closed acceptance-report). Final integrity check on the key sections.

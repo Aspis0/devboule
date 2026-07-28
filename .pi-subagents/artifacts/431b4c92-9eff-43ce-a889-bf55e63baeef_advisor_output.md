@@ -1,1 +1,0 @@
-Now I have all the information needed. Let me write the decision file.
