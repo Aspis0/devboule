@@ -123,7 +123,9 @@ fn path_has_forbidden_components(path: &Path) -> bool {
         }
     }
     // Raw-string empty segments (e.g. `a//b`) — Path::components may collapse them.
-    let raw = path.to_string_lossy();
+    // Strip Windows verbatim prefix first: `\\?\C:\...` has double backslashes
+    // that would otherwise look like forbidden empty segments.
+    let raw = strip_windows_verbatim_prefix(&path.to_string_lossy());
     let is_abs = raw.starts_with('/') || raw.starts_with('\\');
     for (i, seg) in raw.split(|ch| ch == '/' || ch == '\\').enumerate() {
         if seg == ".." {
@@ -551,8 +553,12 @@ impl OracleRootsRegistry {
             .find(|e| path_keys_equivalent(&e.path, &key))
     }
 
-    pub fn upsert(&mut self, entry: OracleRootEntry) {
+    pub fn upsert(&mut self, mut entry: OracleRootEntry) {
         let key = normalize_root_key(Path::new(&entry.path));
+        // Normalize the stored path so lookup_by_path (which canonicalizes) matches.
+        // Without this, Windows 8.3 short-name temp dirs (RUNNER~1) would never
+        // match their canonicalized long form (runneradmin).
+        entry.path = key.clone();
         if let Some(slot) = self
             .roots
             .iter_mut()
