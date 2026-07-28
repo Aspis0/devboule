@@ -168,38 +168,6 @@ export function OracleAdminPanel() {
     };
   }, []);
 
-  // Listen for install-progress events from the backend. The download runs on
-  // a spawn_blocking task that survives navigation, so we keep listening for the
-  // lifetime of the component. When the user returns to this page after
-  // navigating away, `installProgress` reflects the latest event received.
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    void (async () => {
-      try {
-        unlisten = await listen<{
-          stage: string;
-          percent: number;
-          message: string;
-        }>("oracle://install-progress", (event) => {
-          if (!mountedRef.current) return;
-          const { stage, percent, message } = event.payload;
-          setInstallProgress({ stage, percent, message });
-          if (stage === "done") {
-            setInstallingRuntime(false);
-          }
-        });
-      } catch {
-        // Tauri event listener unavailable (e.g. in vitest) — silently ignore.
-      }
-      if (cancelled && unlisten) unlisten();
-    })();
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, []);
-
   const loadOraclePage = useCallback(async () => {
     const seq = oracleLoadSeqRef.current + 1;
     oracleLoadSeqRef.current = seq;
@@ -268,6 +236,44 @@ export function OracleAdminPanel() {
 
   useEffect(() => {
     void loadRuntimeSetup();
+  }, [loadRuntimeSetup]);
+
+  // Listen for install-progress events from the backend. The download runs on
+  // a spawn_blocking task that survives navigation, so we keep listening for the
+  // lifetime of the component. When the user returns to this page after
+  // navigating away, `installProgress` reflects the latest event received.
+  // On "done" we clear the spinner AND re-probe runtimeSetup so the banner
+  // flips from "not ready" to "ready" immediately instead of going stale.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await listen<{
+          stage: string;
+          percent: number;
+          message: string;
+        }>("oracle://install-progress", (event) => {
+          if (!mountedRef.current) return;
+          const { stage, percent, message } = event.payload;
+          setInstallProgress({ stage, percent, message });
+          if (stage === "done") {
+            setInstallingRuntime(false);
+            // Refresh the setup probe so the banner updates without a manual
+            // re-check. Errors are swallowed: a failed probe won't clobber
+            // the (now-complete) install progress.
+            void loadRuntimeSetup().catch(() => {});
+          }
+        });
+      } catch {
+        // Tauri event listener unavailable (e.g. in vitest) — silently ignore.
+      }
+      if (cancelled && unlisten) unlisten();
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
   }, [loadRuntimeSetup]);
 
   const installRuntime = useCallback(async () => {
