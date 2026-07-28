@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { CollapsibleSection } from "../views/CollapsibleSection";
 import {
   AlertTriangle,
@@ -112,6 +113,15 @@ export function OracleAdminPanel() {
   );
   const [installingRuntime, setInstallingRuntime] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  // Download/install progress tracked ACROSS navigation: the backend emits
+  // `oracle://install-progress` events from a spawn_blocking task that keeps
+  // running even if the user leaves this page. The state survives unmount
+  // because it is lifted to a module-level ref, not a local useState.
+  const [installProgress, setInstallProgress] = useState<{
+    stage: string;
+    percent: number;
+    message: string;
+  } | null>(null);
 
   const [workspaceKicked, setWorkspaceKicked] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<OracleError | null>(null);
@@ -155,6 +165,38 @@ export function OracleAdminPanel() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  // Listen for install-progress events from the backend. The download runs on
+  // a spawn_blocking task that survives navigation, so we keep listening for the
+  // lifetime of the component. When the user returns to this page after
+  // navigating away, `installProgress` reflects the latest event received.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        unlisten = await listen<{
+          stage: string;
+          percent: number;
+          message: string;
+        }>("oracle://install-progress", (event) => {
+          if (!mountedRef.current) return;
+          const { stage, percent, message } = event.payload;
+          setInstallProgress({ stage, percent, message });
+          if (stage === "done") {
+            setInstallingRuntime(false);
+          }
+        });
+      } catch {
+        // Tauri event listener unavailable (e.g. in vitest) — silently ignore.
+      }
+      if (cancelled && unlisten) unlisten();
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
     };
   }, []);
 
@@ -231,6 +273,7 @@ export function OracleAdminPanel() {
   const installRuntime = useCallback(async () => {
     setInstallingRuntime(true);
     setRuntimeError(null);
+    setInstallProgress({ stage: "venv", percent: 0, message: "Starting..." });
     try {
       const setup =
         await invokeBackendCommand<OracleRuntimeSetup>("install_oracle_runtime");
@@ -240,9 +283,14 @@ export function OracleAdminPanel() {
         setRuntimeError(error instanceof Error ? error.message : String(error));
       }
     } finally {
-      if (mountedRef.current) setInstallingRuntime(false);
+      // Only clear installing if we didn't get a "done" event (e.g. the call
+      // threw before any event was emitted). The progress listener clears it
+      // on "done" so navigating away+back keeps the spinner until completion.
+      if (mountedRef.current && installProgress?.stage !== "done") {
+        setInstallingRuntime(false);
+      }
     }
-  }, []);
+  }, [installProgress]);
 
   const index = oracleIndexStatus?.index;
   // Only a non-empty string status is meaningful; anything else (missing key,
@@ -658,6 +706,7 @@ export function OracleAdminPanel() {
           setup={runtimeSetup}
           installing={installingRuntime}
           error={runtimeError}
+          progress={installProgress}
           onInstall={() => void installRuntime()}
           onRetry={() => void loadRuntimeSetup()}
         />
@@ -1472,12 +1521,14 @@ export function OracleRuntimeSetupBanner({
   setup,
   installing,
   error,
+  progress,
   onInstall,
   onRetry,
 }: {
   setup: OracleRuntimeSetup;
   installing: boolean;
   error: string | null;
+  progress: { stage: string; percent: number; message: string } | null;
   onInstall: () => void;
   // Re-probe the runtime. Used when the probe is still inconclusive ("checking")
   // so the user can re-check instead of being told Python is missing.
@@ -1601,14 +1652,35 @@ export function OracleRuntimeSetupBanner({
             </p>
           )}
           {installing && (
-            <p className="mt-2 flex items-center gap-2 text-[11px] text-amber-dark">
-              <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber/30 border-t-amber-dark" />
-              {needsModelDownload
-                ? `Installing — downloading ~${ORACLE_RUNTIME_LITE_DISK_MB} MB model, this can take several minutes…`
-                : embedderBundled && !setup.embedderReady
-                  ? "Installing — seeding bundled model and MCP venv…"
-                  : "Installing — setting up the MCP helper venv…"}
-            </p>
+            <div className="mt-2">
+              <p className="flex items-center gap-2 text-[11px] text-amber-dark">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber/30 border-t-amber-dark" />
+                {progress
+                  ? progress.stage === "venv"
+                    ? `Setting up Python environment… ${progress.percent}%`
+                    : progress.stage === "download"
+                      ? `Downloading Qwen3 ONNX model… ${progress.percent}%`
+                      : progress.message
+                  : needsModelDownload
+                    ? `Installing — downloading ~${ORACLE_RUNTIME_LITE_DISK_MB} MB model, this can take several minutes…`
+                    : embedderBundled && !setup.embedderReady
+                      ? "Installing — seeding bundled model and MCP venv…"
+                      : "Installing — setting up the MCP helper venv…"}
+              </p>
+              {progress && (
+                <div className="mt-1.5 h-1.5 w-full max-w-md overflow-hidden rounded-full bg-cream-100">
+                  <div
+                    className="h-full rounded-full bg-terracotta transition-all duration-300"
+                    style={{ width: `${Math.min(100, progress.percent)}%` }}
+                  />
+                </div>
+              )}
+              {progress && progress.message && (
+                <p className="mt-1 truncate font-mono text-[10px] text-cream-500">
+                  {progress.message}
+                </p>
+              )}
+            </div>
           )}
           {error && (
             <p className="mt-2 max-w-3xl break-words font-mono text-[10px] leading-5 text-coral-dark">

@@ -8,6 +8,7 @@ use super::python_oracle::{
 };
 use crate::backend::state::BackendState;
 use crate::backend::vault;
+use tauri::Emitter;
 
 /// P2: number of distinct suspect files seeded onto a card from Oracle retrieval.
 const SUSPECT_FILE_TOP_K: usize = 6;
@@ -66,14 +67,32 @@ pub async fn get_oracle_runtime_setup(
 /// Install/repair the local Oracle retrieval runtime: create the venv, install
 /// LanceDB + the Qwen3 embedder, and warm the model. Long-running and network-
 /// bound, so it runs on a blocking worker, not the UI thread.
+///
+/// Emits `oracle://install-progress` events to the frontend so the UI can show
+/// download progress even if the user navigates away from the install page.
 #[tauri::command]
 pub async fn install_oracle_runtime(
+    app: tauri::AppHandle,
     auth_state: tauri::State<'_, BackendState>,
 ) -> Result<super::oracle_setup::OracleRuntimeSetup, String> {
     require_graph_auth(&auth_state)?;
-    tauri::async_runtime::spawn_blocking(super::oracle_setup::install_oracle_runtime)
-        .await
-        .map_err(|e| format!("Oracle runtime setup task failed: {e}"))?
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        super::oracle_setup::install_oracle_runtime_with_progress(
+            move |stage, pct, msg| {
+                let _ = app_handle.emit(
+                    "oracle://install-progress",
+                    serde_json::json!({
+                        "stage": stage,
+                        "percent": pct,
+                        "message": msg,
+                    }),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Oracle runtime setup task failed: {e}"))?
 }
 
 fn oracle_root_query(root: &std::path::PathBuf) -> String {
