@@ -219,15 +219,13 @@ impl OracleMcp {
 #[tool_handler]
 impl ServerHandler for OracleMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            server_info: Implementation {
-                name: "architecture-oracle".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(Implementation::new(
+            "architecture-oracle".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ))
     }
 }
 

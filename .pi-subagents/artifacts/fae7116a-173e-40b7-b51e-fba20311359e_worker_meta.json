@@ -1,0 +1,119 @@
+{
+  "runId": "fae7116a-173e-40b7-b51e-fba20311359e",
+  "agent": "worker",
+  "task": "You are a delegated subagent running from a fork of the parent session. Treat the inherited conversation as reference-only context, not a live thread to continue. Do not continue or answer prior messages as if they are waiting for a reply. Your sole job is to execute the task below and return a focused result for that task using your tools.\n\nTask:\nDevboule C2 — Restricted Token (v1 stub with documented gap). Pure coding task. Read the plan, write the code, commit. No delegation, no oracle, no investigations.\n\n**Working dir**: `C:\\Users\\gualt\\Desktop\\devboule`\n**Branch**: `windows-port`, HEAD `bf3ce46`. Working tree CLEAN except untracked `.pi-subagents/`, `oracle/`, `advisor/` (DO NOT touch).\n\n**Plan SSOT**: `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §Milestone C2. Read it.\n\n**Decision (locked by parent)**: v1 ships C2 as a **documented stub**. The broker shim (CreateProcessAsUserW) is deferred to a follow-on sub-plan. This matches the plan's accepted option: \"Out of v1 scope as a sub-plan if it gets too complex; document the limitation in code comments.\"\n\n**Why stub is correct**:\n- Windows does NOT allow token re-attachment after `CreateProcess`. `std::process::Command::spawn()` creates the process without a custom token.\n- The real fix requires `CreateProcessAsUserW` which replaces `Command::spawn()` entirely on Windows — that's 200+ lines of unsafe Win32 (pipe handling, env block, exit code). Out of v1 scope.\n- `is_enforced()` STAYS `false` on Windows. No false sense of security.\n- C3 (filesystem ACL) is independent and CAN land with C2 as stub.\n\n**What to implement**:\n\nA. **Add `apply_restricted_token` to `src-tauri/src/backend/sandbox/windows.rs`**:\n\n```rust\n/// Apply a restricted token to the child process (C2).\n///\n/// **v1 STATUS: STUB — documented gap, NOT enforced.**\n///\n/// Windows does NOT allow token re-attachment after `CreateProcess`. The\n/// `std::process::Command::spawn()` path creates the process without a custom\n/// token, so we cannot apply `CreateRestrictedToken` post-spawn.\n///\n/// The real implementation requires spawning via `CreateProcessAsUserW` in a\n/// thin sandbox-broker shim (writes job handle + restricted token + ACL grant\n/// order). That broker is a separate sub-plan — see\n/// `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §C2 decision rule.\n///\n/// Until the broker lands, this function is a no-op that returns `Ok(())`.\n/// `is_enforced()` stays `false` on Windows, so the broker module's\n/// `effective_sandbox_mode()` correctly degrades `Unattended` to `Ask`.\npub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), String> {\n    // TODO(C2-broker): implement CreateRestrictedToken + CreateProcessAsUserW broker.\n    // See specs/PORT_MACOS_TO_WINDOWS_FINAL.md §C2. Until then, no-op.\n    Ok(())\n}\n```\n\nPlace it AFTER `attach_to_child` and BEFORE the `#[cfg(test)] mod tests` block.\n\nB. **Add a test** in the `tests` module of `windows.rs`:\n\n```rust\n/// C2 stub: apply_restricted_token is a no-op that returns Ok for v1.\n/// When the broker lands, this test will be replaced with a real token-restriction test.\n#[test]\nfn apply_restricted_token_stub_returns_ok() {\n    let mut cmd = std::process::Command::new(\"cmd.exe\");\n    let result = apply_restricted_token(&mut cmd);\n    assert!(result.is_ok(), \"v1 stub must return Ok; got {result:?}\");\n}\n```\n\nC. **Do NOT modify `agentic_tools.rs`**. The spawner does NOT call `apply_restricted_token` yet — the broker sub-plan will wire it in when it lands. Adding a call site now would be dead code (the stub does nothing).\n\nD. **Do NOT modify `mod.rs`**. C2 does not change the `wrap()` or `apply_rlimits()` dispatch. `is_enforced()` STAYS `false`.\n\nE. **Do NOT modify `Cargo.toml`**. No new features needed for the stub (the `Win32_Security` feature from M0 is enough for the real implementation later, but the stub uses none of it).\n\n**Hard constraints**:\n- async: true\n- context: fork\n- ONLY modify `src-tauri/src/backend/sandbox/windows.rs`\n- Do NOT touch any other file\n- Do NOT touch `is_enforced()`, `mod.rs`, `agentic_tools.rs`, `Cargo.toml`, `seatbelt.rs`\n- Single atomic commit. NO amend.\n- Commit message: `feat(sandbox): add C2 restricted token stub with documented broker gap`\n\n**After committing**, verify:\n```bash\ncd 'C:\\Users\\gualt\\Desktop\\devboule'\nPROTOC='C:/Users/gualt/AppData/Local/Microsoft/WinGet/Packages/Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe/bin/protoc.exe' cargo check --tests --manifest-path src-tauri/Cargo.toml 2>&1 | tail -n 5\ngit show HEAD --stat\n```\n\nMust show: 0 errors, 1 file modified (`windows.rs` only), no other files.\n\n**Output at the end**: print commit hash, `cargo check --tests` result, `git show HEAD --stat`. NO `acceptance-report` JSON block. Plain output. Do NOT run more tools after committing.\n\n## Acceptance Contract\nAcceptance level: checked\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Implement the requested change without widening scope\n- criterion-2: Return evidence sufficient for an independent acceptance review\n\nRequired evidence: changed-files, tests-added, commands-run, residual-risks, no-staged-files\n\nReview gate: required by reviewer.\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    },\n    {\n      \"id\": \"criterion-2\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 1,
+  "model": "openrouter/tencent/hy3:high",
+  "attemptedModels": [
+    "openrouter/tencent/hy3:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openrouter/tencent/hy3:high",
+      "success": false,
+      "exitCode": 1,
+      "error": "Subagent timed out after 600000ms.",
+      "usage": {
+        "input": 70103,
+        "output": 11113,
+        "cacheRead": 434000,
+        "cacheWrite": 0,
+        "cost": 0.029443260000000002,
+        "turns": 14
+      }
+    }
+  ],
+  "error": "Subagent timed out after 600000ms.",
+  "acceptance": {
+    "status": "rejected",
+    "evidenceStatus": "rejected",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "checked",
+      "explicit": false,
+      "inferredReason": [
+        "async write-capable or risky run"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Implement the requested change without widening scope",
+          "evidence": [
+            "changed-files",
+            "tests-added",
+            "commands-run",
+            "residual-risks",
+            "no-staged-files"
+          ],
+          "severity": "required"
+        },
+        {
+          "id": "criterion-2",
+          "must": "Return evidence sufficient for an independent acceptance review",
+          "evidence": [
+            "changed-files",
+            "tests-added",
+            "commands-run",
+            "residual-risks",
+            "no-staged-files"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "changed-files",
+        "tests-added",
+        "commands-run",
+        "residual-risks",
+        "no-staged-files"
+      ],
+      "verify": [],
+      "review": {
+        "agent": "reviewer",
+        "required": true
+      },
+      "stopRules": []
+    },
+    "inferredReason": [
+      "async write-capable or risky run"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Implement the requested change without widening scope",
+        "evidence": [
+          "changed-files",
+          "tests-added",
+          "commands-run",
+          "residual-risks",
+          "no-staged-files"
+        ],
+        "severity": "required"
+      },
+      {
+        "id": "criterion-2",
+        "must": "Return evidence sufficient for an independent acceptance review",
+        "evidence": [
+          "changed-files",
+          "tests-added",
+          "commands-run",
+          "residual-risks",
+          "no-staged-files"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [
+      {
+        "id": "timeout",
+        "status": "failed",
+        "message": "Acceptance was not evaluated because the subagent timed out."
+      }
+    ],
+    "verifyRuns": []
+  },
+  "launchContractDigest": "2007beb65a9e1bd25d2df012437f2094baf8fc4ecf49590b9c85f1001009e3a6",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\fae7116a-173e-40b7-b51e-fba20311359e_worker_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785179581919
+}

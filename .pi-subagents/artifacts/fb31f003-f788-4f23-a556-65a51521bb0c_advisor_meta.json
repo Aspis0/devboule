@@ -1,0 +1,86 @@
+{
+  "runId": "fb31f003-f788-4f23-a556-65a51521bb0c",
+  "agent": "advisor",
+  "task": "Advisory on devboule — pre-existing test compile errors blocking Milestone A verification and all future milestones.\n\n**Context**: I just shipped Milestone A (`6b6ba64`) on branch `windows-port`. It includes a new integration test `src-tauri/tests/tauri_conf_windows.rs` (65 lines, valid Rust, 2 tests). But `cargo test --tests --manifest-path src-tauri/Cargo.toml` FAILS before my test even runs, because the devboule lib has 7 pre-existing compile errors in `#[cfg(test)]` modules. They are NOT caused by my A commit (verified — same errors on parent `68f72fb`).\n\n**The 7 errors (verbatim)**:\n\n1. `src-tauri/src/backend/mini_coder_executor.rs:4292` — `cannot find type CommandBuilder` (undefined)\n2. `src-tauri/src/backend/mini_coder_executor.rs:185-...` — uses `CommandBuilder` (look at line 4292 for definition attempt or surrounding impl block)\n3. `src-tauri/src/backend/mini_coder_executor_tests.rs:3348,3349,3357` — `cannot find function ps_single_quote` (defined in `projects.rs:5351` but not imported in test module)\n4. `src-tauri/src/backend/mini_command_build.rs:181` — `non-exhaustive patterns: MiniCoderBackendKind::Openai not covered` (enum has 8+ variants, match is non-exhaustive; one match in this file missing the Openai arm)\n5. `src-tauri/src/backend/projects.rs:8874` — `cannot find function macos_codex_launch_line` (used in cfg(test) block, defined elsewhere or removed)\n6. `src-tauri/src/backend/censor/orchestrator.rs:1314` and a few other censor files — symbol resolution (censor module split is in progress)\n7. `src-tauri/src/backend/mini_coder_executor.rs:4292` repeats (same as #1)\n\n**Origin hypothesis**: orphaned from commit `7c8c56e` \"refactor(app): remove ui-pilot dev-only plugin\" — that commit removed the `tauri-plugin-pilot` host glue, but the test file `mini_coder_executor_tests.rs` was kept in the source tree and still references pilot-related symbols (`CommandBuilder`, `ps_single_quote`). Similarly, the `MiniCoderBackendKind::Openai` variant was added in some in-flight work (commit `aa75d2d` maybe?) and a match in `mini_command_build.rs` was not updated.\n\n**Question**: should we fix these errors as a separate chore commit BEFORE C1 (sandbox work), or proceed with M0+A landing as-is and defer the test compile fix?\n\n**My lean**: fix now in a `chore(tests): repair pre-existing test compile errors from ui-pilot removal and MiniCoderBackendKind::Openai addition` commit, gate the rest of the work on it. C1+ will need to write and run tests, and the broken test build blocks that.\n\n**What I need from you** (be concise, max 80 lines total):\n\n1. **Recommendation**: fix now, fix later, or fix-during-C1? Justify.\n2. **If fix now**: which of the 7 errors are TRIVIAL (one-line add/fix) and which require design decisions? List each.\n3. **If fix now**: should this be one atomic commit or split (e.g. orphaned-from-ui-pilot vs in-flight-MiniCoderBackendKind)?\n4. **Risk of NOT fixing before C1**: C1 writes `sandbox/windows.rs` + tests gated `#[cfg(target_os = \"windows\")]`. Will the broken `mini_coder_executor_tests` prevent C1's tests from being discovered/compiled?\n5. **Specific fix for each trivial error**:\n   - `CommandBuilder` not found: add a stub struct, or remove the usage, or import the right one? Investigate `mini_coder_executor.rs:4292` and the surrounding code to know.\n   - `ps_single_quote` not found: add `use super::super::projects::ps_single_quote;` or similar to `mini_coder_executor_tests.rs`.\n   - `MiniCoderBackendKind::Openai` not covered: find the match in `mini_command_build.rs:181` and add the missing arm.\n   - `macos_codex_launch_line`: search for it, decide to add a stub or remove the use.\n   - Censor symbol errors: list them, recommend per-error.\n6. **Commit message shape** for the chore fix(es).\n\n**Constraints**:\n\n- async: true\n- context: fresh\n- output: `advisor/decision-fix-tests.md` (outputMode: file-only)\n- READ-ONLY — no file edits\n- ONE websearch MAX (don't research, just verify the broad claim if you want)\n- Return path + one-line verdict\n\nBe fast. Time budget: 5 min.\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\fb31f003-f788-4f23-a556-65a51521bb0c\\advisor\\decision-fix-tests.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 1,
+  "model": "openrouter/qwen/qwen3.7-plus:high",
+  "attemptedModels": [
+    "openrouter/qwen/qwen3.7-plus:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openrouter/qwen/qwen3.7-plus:high",
+      "success": false,
+      "exitCode": 1,
+      "error": "Subagent timed out after 600000ms.",
+      "usage": {
+        "input": 37295,
+        "output": 5218,
+        "cacheRead": 184704,
+        "cacheWrite": 0,
+        "cost": 0.030434496000000002,
+        "turns": 9
+      }
+    }
+  ],
+  "error": "Subagent timed out after 600000ms.",
+  "acceptance": {
+    "status": "rejected",
+    "evidenceStatus": "rejected",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only task wording"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only task wording"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [
+      {
+        "id": "timeout",
+        "status": "failed",
+        "message": "Acceptance was not evaluated because the subagent timed out."
+      }
+    ],
+    "verifyRuns": []
+  },
+  "launchContractDigest": "296d6f33c9b9e88fc6dd152bf404c76a06f866c2d1a425f6663f0e4453e8444a",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\fb31f003-f788-4f23-a556-65a51521bb0c_advisor_transcript.jsonl",
+  "skills": [
+    "delegate-task",
+    "request-review",
+    "diagnose-stall"
+  ],
+  "timestamp": 1785174670773
+}

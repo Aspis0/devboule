@@ -1,0 +1,120 @@
+{
+  "runId": "751d4ab7-c5b7-40a5-9b48-3ac1389abf49",
+  "agent": "scout",
+  "task": "Mappa in profondità il backend sandbox di devboule. Leggi il piano finale Windows e segui mod.rs, sandbox/*, policy, spawner/process launch, test e Cargo manifest. Non modificare file. Determina cosa esiste già, punti d'integrazione per C1-C4, API/ownership/error handling e blocker concreti. Cita file e linee.\n\n---\nUpdate progress at: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\progress\\751d4ab7-c5b7-40a5-9b48-3ac1389abf49\\progress.md\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\751d4ab7-c5b7-40a5-9b48-3ac1389abf49\\scouts\\sandbox-architecture.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "deepseek/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 86346,
+        "output": 8620,
+        "cacheRead": 745856,
+        "cacheWrite": 0,
+        "cost": 0.016590436800000004,
+        "turns": 16
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Concrete findings with file paths and line ranges across sandbox/mod.rs (1–325), seatbelt.rs (1–384), broker/mod.rs (44–138), agentic_tools.rs (1011–1056), agent_spawn.rs, Cargo.toml (152–180), oracle-core Cargo.toml, tauri.conf.json, and ort_backend.rs (24–82). Severity classified for 5 blockers (B1 HIGH, B2 MEDIUM, B3 LOW, B4 MEDIUM, B5 LOW) and 6 residual risks."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "find, grep, read (multiple file reads across 30+ files)",
+          "result": "passed",
+          "summary": "Mapped sandbox module, broker, spawner, Cargo deps, tauri.conf.json, oracle-core embed, and test coverage across the entire devboule Rust backend"
+        }
+      ],
+      "validationOutput": [
+        "Windows sandbox file (windows.rs) does NOT exist yet — must be created",
+        "tauri.conf.json is missing bundle.windows block (Milestone A pending)",
+        "No src-tauri/tests/ directory exists",
+        "No .github/workflows/ci.yml exists",
+        "windows = \"0.58\" feature set is missing 4 required features for C1-C4",
+        "oracle-core uses ort rc.10 on all targets (plan calls for rc.12 unification)"
+      ],
+      "residualRisks": [
+        "C2 token re-attachment is impossible on Windows — broker sub-process required or v1 ships with documented gap",
+        "C4 WFP Loopback/Enabled deferred — v1 ships NetPolicy::None only, breaking loopback-dependent workflows",
+        "ort rc.10→rc.12 may cause Cargo workspace unification issues (Cargo #11779)",
+        "ORACLE_RS_EP=directml default on Windows is entirely UNTESTED",
+        "is_enforced() flip to true on Windows auto-enables Unattended mode — must gate on full C1+C2+C3+C4 + manual sign-off",
+        "Path canonicalization fallback (C3) may produce ACE rules that kernel rejects for non-existent paths"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "No changes made. Comprehensive map of sandbox backend architecture for C1-C4 Windows port planning.",
+      "reviewFindings": [
+        "blocker: C2 token re-attachment impossible on Windows — needs broker sub-process or v1 stub",
+        "blocker: M0 not executed — windows=0.58 feature set missing JobObjects, Security, WFP, Memory",
+        "blocker: No Windows test infrastructure — all C1-C4 tests must be written from scratch",
+        "finding: agentic_tools.rs:1011-1056 is THE single spawn site — all C1-C4 apply logic must hook here",
+        "finding: broker/mod.rs:132-138 effective_sandbox_mode() gates Unattended on is_enforced() — no broker changes needed when Windows sandbox lands",
+        "finding: oracle-core ort_backend.rs:68-72 default_ep() defaults to DirectML on Windows but is documented as UNTESTED",
+        "finding: tauri.conf.json has no bundle.windows block — Milestone A prerequisite",
+        "finding: sandbox/mod.rs:101-118 non-macOS wrap() is passthrough with warning — first code to replace"
+      ],
+      "manualNotes": "Sandbox architecture mapping complete. 6 blocker/finding categories identified. M0 (Windows crate feature prep) is the prerequisite gate — must pass cargo check for x86_64-pc-windows-msvc before any C1+ code. The final plan requires reviewer + oracle sign-off before flipping is_enforced() to true. No files were modified."
+    }
+  },
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\751d4ab7-c5b7-40a5-9b48-3ac1389abf49_scout_1_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785164257271
+}

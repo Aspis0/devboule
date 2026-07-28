@@ -1,0 +1,105 @@
+{
+  "runId": "3d46445c-bfcf-40ae-86e0-9e3957f04d82",
+  "agent": "oracle",
+  "task": "You are a delegated subagent running from a fork of the parent session. Treat the inherited conversation as reference-only context, not a live thread to continue. Do not continue or answer prior messages as if they are waiting for a reply. Your sole job is to execute the task below and return a focused result for that task using your tools.\n\nTask:\nTool-capability smoke test. One round, no skills.\n\nUse `web_search` to find the current published version of the `win32job` Rust crate on crates.io. Cite the URL in your reply. Then return the version number and your source URL. Nothing else.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "openrouter/z-ai/glm-5.2:max",
+  "attemptedModels": [
+    "openrouter/z-ai/glm-5.2:max"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openrouter/z-ai/glm-5.2:max",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 4760,
+        "output": 2651,
+        "cacheRead": 582656,
+        "cacheWrite": 0,
+        "cost": 0.0874567644,
+        "turns": 4
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Queried crates.io API via bash+curl (web_search tool not available to oracle). Response JSON confirms default_version=2.0.3, max_version=2.0.3, updated_at=2025-05-15, author=ohadravid. Source: https://crates.io/api/v1/crates/win32job"
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "curl -sS -H 'User-Agent: oracle-smoke-test' --max-time 10 'https://crates.io/api/v1/crates/win32job'",
+          "result": "passed",
+          "summary": "Returned valid JSON: win32job v2.0.3, updated 2025-05-15, 1.09M downloads, MIT OR Apache-2.0"
+        }
+      ],
+      "validationOutput": [
+        "crates.io API response confirms win32job max_stable_version = 2.0.3"
+      ],
+      "residualRisks": [
+        "oracle does NOT have web_search tool — only bash+curl. Parent should do synthesized websearch itself and pass findings to subagents.",
+        "researcher (DeepSeek V4 Flash) likely has the same tool surface — needs its own smoke test to confirm."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "No files changed. Smoke test only.",
+      "reviewFindings": [
+        "no blockers: smoke test completed. Key finding: web_search tool is NOT available to oracle subagent; bash+curl IS available as a fallback."
+      ],
+      "manualNotes": "Reported to parent via contact_supervisor: subagents cannot web_search, they can bash+curl. Parent should adjust plan execution to do websearch-heavy work itself."
+    }
+  },
+  "launchContractDigest": "8c65869b9aa347ca2200e9c131d3f6a0fcf4ab6d79d78db10540fa17af019067",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\3d46445c-bfcf-40ae-86e0-9e3957f04d82_oracle_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785126956318
+}

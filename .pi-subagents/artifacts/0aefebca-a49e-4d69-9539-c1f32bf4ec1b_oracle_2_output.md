@@ -1,0 +1,67 @@
+I have all the evidence needed. The ordering is confirmed: `apply_path_policy` (line 617) runs and mutates on-disk ACLs *before* `apply_net_policy` (line 618) fails on an unprivileged app, and the `SandboxGuard` drop then restores from a corrupted backup. Here is my complete hostile review.
+
+---
+
+# Hostile Review — Windows Port (diff `d97cb1d..3399a82`)
+
+## Inherited decisions (baseline contract)
+
+From `PORT_MACOS_TO_WINDOWS_FINAL.md`:
+- **Hard invariant (§0):** "No macOS file/block/test gets removed, simplified, or regressed."
+- **is_enforced() gate (§1/§3):** `true` on Windows is gated on C1+C2+C3+C4 + reviewer + **oracle sign-off**; flip is the **last** step. "Do NOT flip until all six hold."
+- **Sandbox fidelity (§0):** Job Object + Restricted Token + filesystem ACL + WFP/ACL network layer (Anthropic srt-win pattern).
+- **Unprivileged mandate (§6):** "devboule must run unprivileged" — elevation-required features are out of scope.
+- **`is_enforced()` semantics (mod.rs docstring):** "no agent runs unsupervised code without OS isolation."
+
+## Diagnosis
+
+The diff ships C1–C4 and flips `is_enforced()→true`, but the integration is **not actually safe to enable**. Three independent critical defects mean the Windows sandbox either (a) corrupts the user's filesystem ACLs on every `run` invocation, (b) breaks the `run` tool entirely on the mandated unprivileged app, and (c) enables Unattended autonomy for code-execution paths (pi sidecar, mini-coder) that receive **zero** OS confinement on Windows. The CI gate is hollow: it never runs the src-tauri test suite, so none of this is caught.
+
+## Drift / contradiction check
+
+| # | Severity | Conf. | Category | Finding |
+|---|---|---|---|---|
+| 1 | **CRITICAL** | High | misleading is_enforced / omitted integration | `is_enforced()→true` on Windows (mod.rs:235) enables Unattended autonomy, but the broker `spawn_sandboxed` is wired **only** into the `run` tool path (agentic_tools.rs:1109-1111). The **pi sidecar** — the LLM coder with edit/write/bash — runs with `sandboxed = sandbox_enabled && cfg!(target_os="macos")` (pi_sidecar.rs:1494) = **false on Windows**, so it spawns `node` with no Job/Token/ACL/net confinement. The **mini-coder** spawns via `portable_pty::CommandBuilder` (mini_coder_executor.rs:45), also unconfined. On macOS both get Seatbelt; on Windows neither does. This directly violates the `is_enforced()` contract ("no agent runs unsupervised code without OS isolation"). |
+| 2 | **CRITICAL** | High | lifecycle / data-integrity | C4 `apply_net_policy(NetPolicy::None,…)` calls `netsh advfirewall firewall add rule` (windows.rs:540-557), which **requires administrator elevation**. The spec mandates an unprivileged app (§6). The default run policy is `NetPolicy::None` (`ScopedAgentTools::new` default → `agentic_run_policy_with_working_set` at agentic_tools.rs:1255-1257). In `spawn_sandboxed`, `guard.set_net(apply_net_policy(policy, program)?)` (windows.rs:618) propagates the error via `?`, so **every default `run` invocation fails** with "netsh add rule failed: The requested operation requires elevation." The `run` tool is broken out of the box. |
+| 3 | **CRITICAL** | High | data-integrity | C3 **permanently corrupts the project root ACL on every `run_windows` call**. `agentic_run_policy_with_working_set` sets `readonly_root=root` **and** `.writable(root)` (same path). `apply_path_policy` (windows.rs:262-280) calls `save_acl(root)`→`deny_write_everyone(root)`→`save_acl(root)`→`allow_write_everyone(root)`. Both `save_acl` calls write to the **same backup filename** (derived from `process::id()` + `path.file_name()`, windows.rs:191-195), so the second save **overwrites the original backup** with the ACL-after-deny. Then `apply_net_policy` fails (#2), `spawn_sandboxed` returns Err, `SandboxGuard::drop`→`restore_path_policy` restores from the **corrupted backup** → the project root is left with a permanent `deny-write` ACE for Everyone (`*S--1-1-0:(W)`), and the original ACL is **unrecoverable**. |
+| 4 | **HIGH** | High | data-integrity | C3 deny/allow conflict: even if #2 were fixed, `deny_write_everyone(root)` + `allow_write_everyone(root)` on the same path → Windows DACL **deny-precedence** → the restricted-token child **and the Tauri app itself** (Everyone includes the user) cannot write to the project root. Builds/tests that write to `target/`, `node_modules/` fail. The macOS model does **not** deny `readonly_root` — it is simply absent from the write-allowlist (seatbelt.rs:25); the Windows port mis-translates "read-only" as an explicit deny ACE. |
+| 5 | **HIGH** | High | data-integrity / lifecycle | C3 uses `icacls` which mutates **persistent on-disk ACLs**, unlike macOS Seatbelt (process-scoped, zero persistent state). If the app crashes between `apply_path_policy` and `restore_path_policy`, the project root stays deny-write to Everyone — locking the user out of their own project with no recovery mechanism. No journaling, no startup self-heal. |
+| 6 | **HIGH** | Med-High | omitted integration | `run_windows` builds the env block from a **Unix-oriented** var list (HOME, TMPDIR, LD_LIBRARY_PATH; agentic_tools.rs:1009-1019) and omits Windows-critical vars: `SystemRoot`, `TEMP`, `TMP`, `USERPROFILE`, `APPDATA`, `COMSPEC`, `PATHEXT`, `SystemDrive`. A restricted-token child without `SystemRoot` may fail to resolve system DLLs; MSVC link.exe and many tools need these. |
+| 7 | **HIGH** | Med-High | lifecycle | Timeout kill does **not** propagate to the process tree. `spawn_sandboxed` uses `CREATE_NO_WINDOW \| CREATE_UNICODE_ENVIRONMENT` (windows.rs:651) but **not** `CREATE_NEW_PROCESS_GROUP`. On timeout, `child.kill()`=`TerminateProcess` (direct child only, windows.rs:475). Grandchildren survive holding the pipe write-end until `Drop` closes the job **after** the 5 s drain timeout → stdout/stderr from timed-out runs is lost. The Unix path uses `process_group(0)` + `kill_process_group` for immediate tree kill. |
+| 8 | **HIGH** | High | omitted integration / verification | CI (ci.yml) runs `cargo test` **only for `devboule-mcp`**; `src-tauri` tests are never run on any OS. The Windows sandbox tests (`is_enforced_true_on_windows`, C3 roundtrips) and the **Milestone A smoke test** (`tauri_conf_windows.rs`) never execute in CI. The `windows-target-check` job only `cargo check`s (no link, no tests) on Linux. The Milestone H acceptance ("Windows job exercises… Milestone A smoke test") is **unmet**. The entire broker spawn path (`spawn_sandboxed`, `run_windows`) has **zero** test coverage. |
+| 9 | **MEDIUM** | High | misleading | Stale `is_enforced()` comment (mod.rs:230-234): claims C2 "is implemented but not wired into the spawn path yet" and "The broker (spawn_sandboxed) is available for future wiring." But commit `3399a82` wired `run_windows`→`spawn_sandboxed`. Comment contradicts code; could mislead a future reviewer into thinking C2 is still a stub. |
+| 10 | **MEDIUM** | High | misleading / lifecycle | Dead code + stale comment in `run()` (agentic_tools.rs:1154-1171): the `#[cfg(target_os="windows")]` `apply_rlimits` and `attach_to_child` blocks are **unreachable** on Windows (early return at 1109-1111) yet still compile. Comment at 1162-1164 says "is_enforced() stays false until C2..C4 land" — now false. |
+| 11 | **MEDIUM** | High | process-spec | `is_enforced()` was flipped to `true` in commit `b855366` (before C2 wiring in `3399a82`). The spec §1/§3 requires the flip to be **last**, gated on C1+C2+C3+C4 + reviewer + **oracle sign-off**. This review (the oracle gate) is finding blockers, so the flip was **premature** relative to the spec's own gate. |
+| 12 | **MEDIUM** | Med | lifecycle | `apply_rlimits` Windows (windows.rs:50-85) stashes the job HANDLE in a thread-local `STASHED_JOB`. If `cmd.spawn()` fails after `apply_rlimits`, or `attach_to_child` is never called, the handle **leaks** in the thread-local (silently overwritten on next call). Not currently reachable in production (early return prevents it; pi_sidecar `sandboxed=false` on Windows), but the two-phase thread-local API is fragile by design. |
+| 13 | **MEDIUM** | Med | spec deviation | C4 deviates from the spec's two documented patterns (WFP filter preferred / AppContainer fallback) — it uses `netsh advfirewall` (a third, undocumented approach). The `Win32_NetworkManagement_WindowsFilteringPlatform` feature (Cargo.toml:152) is now **unused**. The netsh rule also uses a bare program name `program="cargo"` (windows.rs:549) where netsh expects a full path. |
+| 14 | **LOW** | Med | macOS regression / coverage | `projects.rs:8849` gates the pure-string test `user_server_with_empty_args_omits_the_args_token` to `#[cfg(target_os="macos")]`. This test previously ran on all platforms; now it doesn't run on Windows/Linux CI. If gated because it failed cross-platform, the underlying issue is hidden than fixed. |
+| 15 | **LOW** | High | data-integrity | `spawn_sandboxed` builds the command line as `format!("{program} {}", args.join(" "))` (windows.rs:633-636) with **no quoting**. `CreateProcessAsUserW` re-parses the string; paths/args with spaces break. Safe today only because `parse_run_command` rejects spaces, but the broker is a general API. |
+| 16 | **LOW** | Med | verify | Linux/other `ort` config (oracle-core/Cargo.toml:62) uses `default-features = false, features = ["std","ndarray"]` **without `api-24`**, despite the spec's explicit blocker that `default-features=false` requires `api-*`. Likely masked by `fastembed`'s transitive ort features, but unverified — confirm the ubuntu `cargo check (oracle-core)` is actually green. |
+| 17 | **LOW** | High | minor | Unused `let pid = child.pid as i32;` in `run_windows` (agentic_tools.rs:1026); unused `Win32_Security_Authorization` feature (Cargo.toml:152, acknowledged in windows.rs:148). |
+
+## Recommendation
+
+**Do not merge `3399a82` to main.** The `is_enforced()` flip must be reverted to `false` on Windows until the three critical blockers are resolved. Specifically:
+
+1. **Revert `is_enforced()`→`false` on Windows** (mod.rs:235) immediately. This restores the Unattended→Ask degradation so no unconfined code-execution path runs autonomously. This honors the spec's "flip is last + oracle sign-off" gate.
+2. **Fix C4 before any flip:** `netsh advfirewall add rule` cannot work unprivileged. Either implement the WFP filter (spec Pattern 1) for an unprivileged per-process block, or make `NetPolicy::None` a no-op on v1 (documented gap) than a hard `?` failure. As written, C4 is a functional blocker, not a security feature.
+3. **Fix C3 model mismatch:** the Windows port must mirror macOS's "deny-by-default + explicit allow" model, not "explicit deny on readonly_root." Do not add `deny_write_everyone` to a path that is also in `writable_paths`. Fix the backup-filename collision (include a disambiguating hash/index, not just `file_name()`). Add crash-recovery (e.g., record applied ACEs in a journal restored at startup).
+4. **Wire the broker (or Seatbelt-equivalent) into the pi sidecar and mini-coder** before claiming `is_enforced()`, or document explicitly that those paths are unsandboxed on Windows and keep `is_enforced()=false`.
+5. **Run src-tauri tests in CI** (at least on windows-latest) and add an end-to-end `spawn_sandboxed` test. The current CI green status proves nothing about the sandbox code.
+
+This is **not** a recommendation to pivot away from the FINAL plan's architecture — the C1/C2 raw-API approach and the `windows=0.58`/`ort rc.12` decisions are sound. The defects are in the C3/C4 integration and the premature `is_enforced()` flip, all fixable within the existing plan.
+
+## Risks
+
+- The ACL corruption (#3) is **already live** in the `windows-port` branch history: anyone who ran `run_windows` against an user-owned project root on unprivileged Windows has a permanent deny-write ACE on that root. A remediation script (`icacls /remove`) may be needed for affected checkouts.
+- If #2 is "fixed" by making `NetPolicy::None` a no-op, #4 surfaces immediately (child can't write to project root) — they must be fixed together.
+- The `ort` unify (rc.10→rc.12, `default-features=false`) on macOS is a dependency change that could regress macOS if a previously-default feature was dropped; CI checks oracle-core on macos-latest but I could not run the build to confirm (#16). This is the main macOS-regression risk and should be verified by a green macos CI run.
+- I could not execute `cargo check`/`cargo test` in this environment (read-only review on Windows host, long build); all findings are from static code analysis against the FINAL spec and the actual diff.
+
+## Need from main agent
+
+None blocking. The review is self-contained. The one decision worth surfacing: **confirm whether any developer checkout has already been ACL-corrupted by a `run_windows` test/call** — if so, a remediation step is needed beyond the code fix.
+
+## Suggested execution prompt
+
+No `worker` handoff is warranted from this oracle review — the deliverable is the review itself. If the parent chooses to act on the findings, the first concrete step is a single-line revert (`is_enforced()`→`false` on Windows) plus the C4/C3 fixes, which the parent can delegate via `delegate-task` with the five-point recommendation above as the spec.

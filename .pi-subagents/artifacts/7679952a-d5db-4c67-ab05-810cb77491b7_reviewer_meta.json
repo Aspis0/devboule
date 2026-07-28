@@ -1,0 +1,143 @@
+{
+  "runId": "7679952a-d5db-4c67-ab05-810cb77491b7",
+  "agent": "reviewer",
+  "task": "Hostile review of test-fix commit on devboule branch. Fresh context, deepseek-v4-pro.\n\n**Commit under review**: `5522a31` on branch `windows-port`.\n**Parent commit**: `6b6ba64`.\n\n**Expected diff** (6 files, +9/-83):\n\n```\n.pi/agents/main-coder.md                     |  8 ----  (deleted)\n.pi/agents/mini-coder.md                     |  8 ----  (deleted)\n.pi/agents/reviewer.md                       | 67 ----------------------------  (deleted)\nsrc-tauri/src/backend/mini_coder_executor.rs |  2 +\nsrc-tauri/src/backend/mini_command_build.rs  |  6 +++\nsrc-tauri/src/backend/projects.rs            |  1 +\n```\n\n**What the commit does** (fixes 4 pre-existing test compile errors orphaned by commit `7c8c56e` ui-pilot removal + a new variant `MiniCoderBackendKind::Openai`):\n\n1. **`src-tauri/src/backend/mini_coder_executor.rs`** — adds `use portable_pty::CommandBuilder;` to the top-level imports (line ~30), and adds `pub(crate) use super::projects::ps_single_quote;` next to the existing `pub(crate) use super::mini_command_build::*;` line. The `ps_single_quote` re-export is needed because the test module (`mini_coder_executor_tests.rs`) does `use super::*;` and needs the symbol visible.\n\n2. **`src-tauri/src/backend/mini_command_build.rs`** — adds a new match arm for `MiniCoderBackendKind::Openai` (returns `Err(\"OpenAI backend runs via the api/cli bridge, not the directive executor\")`). This completes a non-exhaustive match that previously omitted the Openai variant.\n\n3. **`src-tauri/src/backend/projects.rs`** — adds `#[cfg(target_os = \"macos\")]` to the test `user_server_with_empty_args_omits_the_args_token` which calls `macos_codex_launch_line` (a `#[cfg(target_os = \"macos\")]`-gated symbol from `agent_spawn.rs`).\n\n4. **3 deleted `.pi/agents/*.md` files** — project-scope agent definitions that referenced `model: auto` (Pigeon) which doesn't exist on this box. Replaced by builtin-only subagent routing.\n\n**Verification (7 checks with file:line citations)**:\n\n1. `cd 'C:\\Users\\gualt\\Desktop\\devboule' && git show 5522a31 --stat` — confirm exactly 6 files (3 deleted, 3 modified, no extras).\n\n2. Open `src-tauri/src/backend/mini_coder_executor.rs` and confirm:\n   - `use portable_pty::CommandBuilder;` is at the top-level imports (line ~30, alphabetically placed)\n   - The new `pub(crate) use super::projects::ps_single_quote;` is added next to the existing `pub(crate) use super::mini_command_build::*;` line (NOT replacing it)\n   - No other lines in the file changed\n\n3. Open `src-tauri/src/backend/mini_command_build.rs` and confirm:\n   - The new `MiniCoderBackendKind::Openai` arm is added INSIDE the match block (not at the end of the file, not in a new match)\n   - It returns an `Err(...)` with a message that includes \"api/cli bridge\" or similar\n   - The other 6 arms (Codex, Ollama, Api, Omlx, AppleFm, Cloud) are byte-identical to parent\n   - No other lines in the file changed\n\n4. Open `src-tauri/src/backend/projects.rs` and confirm:\n   - `#[cfg(target_os = \"macos\")]` is added IMMEDIATELY before `fn user_server_with_empty_args_omits_the_args_token()`\n   - The test body is unchanged\n   - No other lines in the file changed\n\n5. Confirm `cargo check --tests --manifest-path src-tauri/Cargo.toml` from `src-tauri/` now reports 0 errors (run: `cd src-tauri && PROTOC='C:/Users/gualt/AppData/Local/Microsoft/WinGet/Packages/Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe/bin/protoc.exe' cargo check --tests 2>&1 | grep -E 'error\\[E[0-9]+\\]' | head -n 5`). Should be empty.\n\n6. Confirm Conventional Commits format on the commit message: `chore(tests):` prefix, body explains the 4 fixes, mentions the pre-existing link error not addressed.\n\n7. Confirm the 3 deleted `.pi/agents/*.md` files were unused (no remaining reference to them in `.pi/settings.json` or in any active subagent call): `cat .pi/settings.json 2>&1` and `grep -rn 'main-coder\\|mini-coder' .pi 2>&1` should NOT show references to the deleted files.\n\n**Out of scope (NOT A BLOCKER, but should be noted)**:\n- A pre-existing `cargo test` linking error (`libesaxx_rs MT_StaticRelease vs ort_sys MD_DynamicRelease`) remains. This is a separate issue in the ort/lance dependency graph and is NOT caused by this commit. The commit message body honestly acknowledges this.\n\n**Verdict shape**:\n\n```\n## Review\n- Correct: <evidence>\n- Blocker: <issue> or \"none\"\n- Note: <observation>\n\n## Verdict\n✅ PASS / ⚠️ NEEDS-FIX / ❌ FAILED\n```\n\n**Constraints**:\n- async: true\n- context: fresh\n- output: `reviewer/audit-fix-tests.md` (outputMode: file-only)\n- READ-ONLY — do NOT modify files\n- Use read/grep/find/ls/bash/git\n- Be specific: file:line for every finding\n\nReturn path + verdict line.\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\7679952a-d5db-4c67-ab05-810cb77491b7\\reviewer\\audit-fix-tests.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "deepseek/deepseek-v4-pro:max",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-pro:max"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-pro:max",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 13303,
+        "output": 7788,
+        "cacheRead": 208384,
+        "cacheWrite": 0,
+        "cost": 0.013317756999999998,
+        "turns": 15
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "7 verification checks performed with file:line citations for every finding. All pass."
+        }
+      ],
+      "changedFiles": [
+        "src-tauri/src/backend/mini_coder_executor.rs",
+        "src-tauri/src/backend/mini_command_build.rs",
+        "src-tauri/src/backend/projects.rs",
+        ".pi/agents/main-coder.md",
+        ".pi/agents/mini-coder.md",
+        ".pi/agents/reviewer.md"
+      ],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "git show 5522a31 --stat",
+          "result": "passed",
+          "summary": "6 files, +9/-83, exactly as expected"
+        },
+        {
+          "command": "git diff 6b6ba64..5522a31 -- src-tauri/src/backend/mini_coder_executor.rs",
+          "result": "passed",
+          "summary": "2 hunks: import line 45, re-export line 3867. No other changes."
+        },
+        {
+          "command": "git diff 6b6ba64..5522a31 -- src-tauri/src/backend/mini_command_build.rs",
+          "result": "passed",
+          "summary": "1 hunk: Openai arm at line 278. No other changes."
+        },
+        {
+          "command": "git diff 6b6ba64..5522a31 -- src-tauri/src/backend/projects.rs",
+          "result": "passed",
+          "summary": "1 hunk: cfg gate at line 8849. No other changes."
+        },
+        {
+          "command": "cargo check --tests (with PROTOC env)",
+          "result": "passed",
+          "summary": "0 errors (grep for error[E...] empty)"
+        },
+        {
+          "command": "grep -rn 'main-coder|mini-coder|reviewer' .pi",
+          "result": "passed",
+          "summary": "Only disabled overrides in settings.json; no .md file references"
+        }
+      ],
+      "validationOutput": [
+        "Check 1: 6 files confirmed",
+        "Check 2: mini_coder_executor.rs — use portable_pty::CommandBuilder at line 45, pub(crate) use ps_single_quote at line 3867 adjacent to existing re-export",
+        "Check 3: mini_command_build.rs — Openai arm at line 278 inside match block, other arms byte-identical to parent",
+        "Check 4: projects.rs — #[cfg(target_os = \"macos\")] at line 8849 before test, no other changes",
+        "Check 5: cargo check --tests — 0 errors",
+        "Check 6: Conventional Commits format — chore(tests): prefix, body explains all 4 fixes",
+        "Check 7: .pi/agents/ empty, no active references to deleted files"
+      ],
+      "residualRisks": [
+        "Pre-existing cargo test linking error (ort + libesaxx_rs RuntimeLibrary mismatch) remains, not caused by this commit",
+        ".pi/settings.json has orphaned disabled agent overrides for main-coder/mini-coder — harmless dead config"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "6 files: +9/-83. 3 Rust fixes for pre-existing compile errors + 3 deleted unused agent definition files.",
+      "reviewFindings": [
+        "no blockers — all 7 checks pass"
+      ],
+      "manualNotes": "Commit is clean, minimal, and correct. The .pi/settings.json disabled overrides for main-coder/mini-coder are unrelated dead config that could be removed in a future chore but don't cause any issues now."
+    }
+  },
+  "launchContractDigest": "34ff808400590ba828b7d1b840c36a63aefba6982d66171e91e47b2a2c57fbd6",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\7679952a-d5db-4c67-ab05-810cb77491b7_reviewer_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785176421503
+}

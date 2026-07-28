@@ -1,0 +1,128 @@
+{
+  "runId": "d4c42f4c-1180-4513-9321-b566d8ae25e8",
+  "agent": "reviewer",
+  "task": "Hostile review of C2 broker wiring commit. Fresh context, deepseek-v4-pro. Be FAST: 5 checks, write file, STOP.\n\n**Commit**: `3399a82` on branch `windows-port`. **Parent**: `b855366`.\n\n**What it does**: Replaces `Command::spawn()` on Windows with `spawn_sandboxed()` (the full broker). Adds `run_windows()` method that:\n- Builds env vars\n- Calls `spawn_sandboxed(policy, program, args, cwd, env_vars)` — integrates C1+C2+C3+C4\n- Takes stdout/stderr HANDLEs via `take_stdout_handle()`/`take_stderr_handle()`, converts to `File` via `FromRawHandle`\n- Drains pipes in threads (same `drain_capped` as Unix)\n- Wait loop: `try_wait()` + `kill()` + timeout\n- `wait_and_restore()` at end (restores ACLs + removes firewall + closes handles via Drop)\n\nThe `run()` function has `#[cfg(target_os = \"windows\")] return self.run_windows(&policy, &argv);` early return.\n\n**5 checks**:\n\n1. `git show 3399a82 --stat` — 1 file (agentic_tools.rs), +103/-27. No other files.\n\n2. `run_windows` calls `spawn_sandboxed` (not `Command::spawn`). Pipe handles taken via `take_stdout_handle`/`take_stderr_handle` and converted via `FromRawHandle`. `wait_and_restore` called at end.\n\n3. `run()` has early `#[cfg(target_os = \"windows\")] return self.run_windows(...)` BEFORE `Command::spawn()`. The `Command::spawn()` path is macOS/Linux only now.\n\n4. `cargo check --tests` has 0 errors.\n\n5. No Cargo.toml changes in this commit.\n\n**Output** `reviewer/audit-broker-wiring.md`:\n```\n## Review\n### Correct\n### Blocker (or \"none\")\n### Note (3 even on PASS — this is critical code)\n## Verdict\nPASS / NEEDS-FIX / FAILED\n```\n\nAfter writing file, respond: DONE — <verdict>. Output: reviewer/audit-broker-wiring.md. Do NOT run more tools. STOP.\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\d4c42f4c-1180-4513-9321-b566d8ae25e8\\reviewer\\audit-broker-wiring.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "deepseek/deepseek-v4-pro:max",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-pro:max"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-pro:max",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 17740,
+        "output": 7549,
+        "cacheRead": 311040,
+        "cacheWrite": 0,
+        "cost": 0.01541205,
+        "turns": 21
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "File paths cited: src-tauri/src/backend/agentic_tools.rs lines 998-1093 (run_windows), 1108-1112 (cfg early return), 1026 (unused pid), 1068 (unused exit_code). Cargo check output confirms 0 errors. git show --stat confirms single file diff (+103/-27). git diff confirms zero Cargo.toml changes."
+        }
+      ],
+      "changedFiles": [
+        "src-tauri/src/backend/agentic_tools.rs"
+      ],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "git show 3399a82 --stat",
+          "result": "passed",
+          "summary": "1 file changed, +103/-27, src-tauri/src/backend/agentic_tools.rs"
+        },
+        {
+          "command": "git show 3399a82 -p",
+          "result": "passed",
+          "summary": "Full diff reviewed — run_windows() added, cfg early return added, old C3+C4 shortcut code removed"
+        },
+        {
+          "command": "cargo check --tests (in src-tauri)",
+          "result": "passed",
+          "summary": "0 errors; 2 new warnings (unused pid, unused exit_code) attributable to this commit"
+        },
+        {
+          "command": "git diff 3399a82~1..3399a82 -- '**/Cargo.toml'",
+          "result": "passed",
+          "summary": "No output — zero Cargo.toml changes"
+        }
+      ],
+      "validationOutput": [
+        "spawn_sandboxed signature matches call site: (policy, program, args, cwd, env_vars)",
+        "take_stdout_handle / take_stderr_handle present on SandboxedChild (windows.rs:425,429)",
+        "wait_and_restore present on SandboxedChild (windows.rs:457)",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set in create_job_object (windows.rs:68,583)",
+        "make_env_block builds env from scratch — no parent leakage (windows.rs:512-526)",
+        "env allowlist in run_windows (lines 1012-1019) byte-identical to Unix path (lines 1127-1137)"
+      ],
+      "residualRisks": [
+        "Unused pid variable (line 1026) — cosmetic",
+        "Unused exit_code variable (line 1068) — cosmetic",
+        "kill() uses TerminateProcess (single-process); tree cleanup relies on Job Object Drop — brief window where grandchildren survive between kill() and Drop"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Replaced Command::spawn() on Windows with spawn_sandboxed() (full broker integrating C1+C2+C3+C4). Added run_windows() method (+96 lines). Added cfg-gated early return in run() (+5 lines). Removed old C3+C4 shortcut code that applied ACLs/net before Command::spawn (-24 lines). Net: +103/-27 in agentic_tools.rs.",
+      "reviewFindings": [
+        "no blockers — broker wiring is correct and compiles cleanly"
+      ],
+      "manualNotes": "The two unused-variable warnings (pid, exit_code) should be cleaned up in a follow-up but do not block merge. The unreachable_code warning on line 1114 is expected when compiling for Windows."
+    }
+  },
+  "launchContractDigest": "e242f2cb7ccae8692b069e237b483cf89d5f7771486ca237b7b4bace6fb138db",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\d4c42f4c-1180-4513-9321-b566d8ae25e8_reviewer_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785187147630
+}

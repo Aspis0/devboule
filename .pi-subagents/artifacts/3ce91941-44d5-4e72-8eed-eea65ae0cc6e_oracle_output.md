@@ -1,0 +1,1 @@
+Now I have the key insight: the macOS build function ALREADY has an `Openai` arm (line 1012), but the Windows match at :181 is missing it. Let me confirm the macOS Openai arm's complexity and the test gating around `macos_codex_launch_line`.

@@ -1,0 +1,115 @@
+{
+  "runId": "6b07c4ce-f5b2-4133-b7ae-008ea2287ef7",
+  "agent": "reviewer",
+  "task": "Hostile review of C2 broker + fixes. Fresh context, deepseek-v4-pro. Be FAST: verify the 5 checks below, write the output file, STOP.\n\n**Commit**: `dfc0ddd` (fixes) + `e86e526` (original broker). Branch `windows-port`.\n\n**Context**: The parent wrote 250 lines of unsafe Win32 broker code (CreateProcessAsUserW + restricted token + pipes + Job Object). Parent self-audited and found 4 issues. This commit (`dfc0ddd`) fixes them. Verify the fixes are correct.\n\n**5 checks only**:\n\n1. `HANDLE_FLAG_INHERIT` fix: `grep -n 'HANDLE_FLAG\\|0x1.*HANDLE_FLAGS\\|SetHandleInformation' src-tauri/src/backend/sandbox/windows.rs` — confirm the value is `0x1` (INHERIT), NOT `0x2` (PROTECT_FROM_CLOSE). Microsoft docs: HANDLE_FLAG_INHERIT = 0x00000001.\n\n2. `AclGuard` struct: confirm it exists, has `Drop` that calls `restore_path_policy`, and `take()` disarms it. Confirm `spawn_sandboxed` wraps `apply_path_policy` result in `AclGuard::new(...)` and calls `acl_guard.take()` on success.\n\n3. `Drop` for `SandboxedChild`: confirm it exists, kills child via `TerminateProcess` if `!self.acl_restored`, restores ACLs, closes ALL handles (including job).\n\n4. `wait_and_restore`: confirm it sets `self.acl_restored = true` after restoring ACLs, and does NOT manually close handles (Drop does that).\n\n5. `cargo check --tests` compiles with 0 errors: `cd src-tauri && PROTOC='C:/Users/gualt/AppData/Local/Microsoft/WinGet/Packages/Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe/bin/protoc.exe' cargo check --tests --manifest-path Cargo.toml 2>&1 | tail -3`\n\n**Output file** `reviewer/audit-broker-fixes.md`:\n\n```markdown\n## Review\n### Correct (list what passed)\n### Blocker (critical issues or \"none\")\n### Note (2-3 observations even on PASS)\n## Verdict\nPASS / NEEDS-FIX / FAILED\n```\n\nAfter writing the file, your final response MUST be:\nDONE — <verdict>. Output: reviewer/audit-broker-fixes.md\nDo NOT run more tools. STOP.\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\6b07c4ce-f5b2-4133-b7ae-008ea2287ef7\\reviewer\\audit-broker-fixes.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "deepseek/deepseek-v4-pro:max",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-pro:max"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-pro:max",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 15060,
+        "output": 3210,
+        "cacheRead": 78720,
+        "cacheWrite": 0,
+        "cost": 0.009629160000000001,
+        "turns": 6
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "All 5 checks verified against windows.rs with file paths and line numbers. HANDLE_FLAG_INHERIT = 0x1 at :420, AclGuard struct with Drop + take() at :288-314, SandboxedChild Drop at :332-348, wait_and_restore at :319-330, cargo check passed with 0 errors."
+        }
+      ],
+      "changedFiles": [
+        "src-tauri/src/backend/sandbox/windows.rs"
+      ],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "grep -n 'HANDLE_FLAG\\|0x1.*HANDLE\\|SetHandleInformation' windows.rs",
+          "result": "passed",
+          "summary": "Confirmed line 420: SetHandleInformation(write, 0x1u32, HANDLE_FLAGS(0x1)) — correct INHERIT flag"
+        },
+        {
+          "command": "cargo check --tests",
+          "result": "passed",
+          "summary": "0 errors, 187 pre-existing naming warnings only; compiles cleanly"
+        }
+      ],
+      "validationOutput": [
+        "Check 1: HANDLE_FLAG_INHERIT = 0x1 (not 0x2 PROTECT_FROM_CLOSE) — PASS",
+        "Check 2: AclGuard exists, Drop calls restore_path_policy, take() disarms, spawn_sandboxed uses it — PASS",
+        "Check 3: Drop for SandboxedChild kills child if !acl_restored, restores ACLs, closes all 5 handles — PASS",
+        "Check 4: wait_and_restore sets acl_restored=true after restore, no manual CloseHandle — PASS",
+        "Check 5: cargo check --tests compiles with 0 errors — PASS"
+      ],
+      "residualRisks": [
+        "None."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Commit dfc0ddd fixes 4 issues: (1) HANDLE_FLAG_INHERIT=0x1 not 0x2, (2) AclGuard RAII for ACL restore on error, (3) SandboxedChild Drop kills child + restores ACLs + closes all handles, (4) wait_and_restore sets acl_restored=true and defers handle cleanup to Drop.",
+      "reviewFindings": [
+        "no blockers — all 4 fixes verified correct; cargo check passes with 0 errors"
+      ],
+      "manualNotes": ""
+    }
+  },
+  "launchContractDigest": "300858244a871ee22f99ed9e11482b6ab06630ba1d1b2ccb551dcbe429c8cea3",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\6b07c4ce-f5b2-4133-b7ae-008ea2287ef7_reviewer_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785183903808
+}

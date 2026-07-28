@@ -1,0 +1,122 @@
+{
+  "runId": "7f77fce3-8e7e-4f1d-9a5c-718e610e21b4",
+  "agent": "advisor",
+  "task": "Esegui un audit read-only, ostile e approfondito del Windows port sul branch windows-port, range d97cb1d..3399a82, contro specs/PORT_MACOS_TO_WINDOWS_FINAL.md. NON modificare alcun file del repository e NON lanciare subagent. Ispeziona direttamente diff e file, soprattutto src-tauri/src/backend/sandbox/windows.rs, sandbox/mod.rs, agentic_tools.rs (run e run_windows), Cargo.toml, tauri.conf.json, .github/workflows/ci.yml, oracle-core/Cargo.toml e test. Verifica i 15 punti richiesti: CreateRestrictedToken flags/security boundary, HANDLE_FLAG_INHERIT contro documentazione Microsoft, error ownership/cleanup, handle closure, job lifecycle, firewall rule cleanup/collision, lpDesktop, environment block ordering, Windows quoting, honesty is_enforced, CI/no root workspace and ort builds, macOS regressions, dead code cfg, pipe ownership, ort rc.12 features/coexistence. Cerca bug reali aggiuntivi, con file:line precisi e fonti Microsoft/ort quando servono. Classifica CRITICAL/HIGH/MEDIUM/Correct e proponi fix minimi. Non fidarti dei commenti del codice. Restituisci una review fattuale completa; non creare il file finale, lo sintetizzerà il parent.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 0,
+  "model": "openrouter/qwen/qwen3.7-plus:high",
+  "attemptedModels": [
+    "openrouter/qwen/qwen3.7-plus:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openrouter/qwen/qwen3.7-plus:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 190439,
+        "output": 19807,
+        "cacheRead": 769536,
+        "cacheWrite": 0,
+        "cost": 0.135543744,
+        "turns": 15
+      }
+    }
+  ],
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only task wording"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only task wording"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "15 audit points covered with file:line references: C1 (missing JOB_OBJECT_LIMIT_PROCESS_MEMORY flag at windows.rs:68,583), C2 (no cmdline quoting at windows.rs:635-639), C3 (unchecked SetHandleInformation at windows.rs:536), H1 (proc_handle leak at windows.rs:108-112), H2 (firewall PID collision at windows.rs:312), H3 (handle leak on error path at windows.rs:621-635), H4 (dead code dual Job Object), M1 (ort Linux missing api-24 at oracle-core/Cargo.toml:61), M2 (test scope regression at projects.rs:8849), M3 (Unix env vars on Windows), M4 (shallow security boundary documented, not a bug). 15 additional OK items enumerated."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo check --manifest-path src-tauri/Cargo.toml",
+          "result": "passed",
+          "summary": "Compiled with 174 pre-existing warnings + 1 new unused_must_use warning at windows.rs:536 confirming C3 finding"
+        }
+      ],
+      "validationOutput": [
+        "3 CRITICAL findings (C1: memory limit never enforced, C2: cmdline quoting broken, C3: set handle info unchecked)",
+        "4 HIGH findings (H1: process handle leak, H2: firewall rule collision, H3: handle leak on error path, H4: dead code dual Job path)",
+        "4 MEDIUM findings (M1: ort Linux missing api-24, M2: macOS test scope narrowing, M3: Unix env vars on Windows, M4: shallow token restriction documented)",
+        "15 OK items (CI, bundle, ort coexistence, pipe ownership, lpDesktop, env block, etc.)"
+      ],
+      "residualRisks": [
+        "Cross-compile target x86_64-pc-windows-msvc not separately tested (host IS Windows so non-cfg-gated code compiled natively)",
+        "ort rc.12 link-time behavior with api-24 on each target not smoke-tested",
+        "CI pipeline not invoked on windows-port branch"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "21 files changed, +2557/-313 lines. Net-new: sandbox/windows.rs (802 lines, C1-C4 stack + broker), CI matrix (3-OS), bundle.windows block, ort rc.12 unify, run_windows() spawn path in agentic_tools.rs. Refactored: removed ui-pilot, gate macOS-only test.",
+      "reviewFindings": [
+        "CRITICAL: windows.rs:68,583 — JOB_OBJECT_LIMIT_PROCESS_MEMORY flag never set in LimitFlags; ProcessMemoryLimit is silently ignored by kernel (MSDN-documented)",
+        "CRITICAL: windows.rs:635-639 — no argv quoting for CreateProcessAsUserW command line; spaces/special chars in args corrupt or inject tokens",
+        "CRITICAL: windows.rs:536 — SetHandleInformation Result unchecked; compiler warns unused_must_use; pipe inheritance may silently fail causing deadlock",
+        "HIGH: windows.rs:108-112 — proc_handle from OpenProcess intentionally leaked; MSDN confirms closing it does NOT break job association",
+        "HIGH: windows.rs:312 — firewall rule name keyed by PID; concurrent spawns from same process produce identical names causing collision",
+        "HIGH: windows.rs:621-635 — job/token handles leak if create_restricted_token or create_pipe fails; no cleanup guard for kernel handles",
+        "HIGH: mod.rs:205 + windows.rs:48-114 — apply_rlimits/STASHED_JOB/attach_to_child are dead code on Windows (superseded by spawn_sandboxed broker)",
+        "MEDIUM: oracle-core/Cargo.toml:61 — Linux ort fallback missing api-24 feature; FINAL plan calls this a blocker",
+        "MEDIUM: projects.rs:8849 — #[cfg(target_os = macos)] added to non-platform-specific test, hides Windows regressions",
+        "MEDIUM: agentic_tools.rs:1014-1024 — Unix-only env vars (HOME, USER, SHELL) forwarded to Windows children without adaptation"
+      ],
+      "manualNotes": "This is a read-only audit. No files were modified. All severity classifications are based on Microsoft API documentation and the project's own FINAL plan constraints. The parent should prioritize C1 (memory limit non-functional) and C2 (cmdline injection) as security-relevant blockers before merge."
+    }
+  },
+  "launchContractDigest": "1f94b9f81cb6f32c30851e1a1eb3f6e037602e6afb8a0f694e66ca161245c4cd",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\7f77fce3-8e7e-4f1d-9a5c-718e610e21b4_advisor_transcript.jsonl",
+  "skills": [
+    "delegate-task",
+    "request-review",
+    "diagnose-stall"
+  ],
+  "timestamp": 1785191546454
+}

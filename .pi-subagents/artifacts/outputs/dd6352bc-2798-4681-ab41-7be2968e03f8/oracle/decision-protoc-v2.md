@@ -1,0 +1,38 @@
+# Oracle decision — protoc unblock for devboule Windows port
+
+## Verdict
+`choco install protoc -y` is correct. Proceed. No blind spot blocks it.
+
+## 1. Choice validation
+- protoc is a host build-tool (not a target artifact). Installing on the Windows dev box is the standard, expected fix for `prost-build` shelling out.
+- Chocolatey `protoc` = official Google binary; recent enough for prost 0.14.
+- Only `protoc` (the compiler) is needed — `prost-build` runs it to compile `.proto`→descriptors; codegen itself is Rust-native. No `protoc-gen-*` plugin required.
+- Single-maintainer box → no shared-toolchain pollution concern.
+
+## 2. CI per-OS install (Milestone H) — CONFIRMED, one caveat
+- ubuntu-latest:  `sudo apt-get install -y protobuf-compiler` ✅
+- macos-latest:  `brew install protobuf` ✅
+- windows-latest:`choco install protoc -y` ✅
+
+⚠️ Blind spot: `.github/workflows/` does NOT exist in this repo yet (verified via `ls`). The matrix `ci.yml` you reference is still to be authored — these commands are guidance for that future file, not edits to an existing one. Avoid `arduino/setup-protoc` (broken on Node 24, per your facts); the native package-manager installs above are the clean path.
+
+## 3. README prerequisites
+YES — one line. README already has a `## Requirements` section (Node.js 20+, Rust). Append there, not a new section:
+`- Protocol Buffers compiler (protoc) — for the Oracle embedder (lance/lancedb)`
+
+## 4. Risk
+- Zero regression risk to existing build: protoc is additive; its absence was the only failure mode.
+- No PATH conflict with other Rust projects: protoc is a leaf tool; projects with no `.proto` never invoke it.
+- Chocolatey installs to `C:\ProgramData\chocolatey\bin\protoc.exe` and adds that dir to PATH. **Open a fresh terminal after install** — running shells don't pick up PATH env updates. If a new shell still can't find it, that's the cause.
+- Future lance bump needing newer protoc: `choco upgrade protoc -y` handles it; no lock-in.
+
+## 5. Commit specs/?
+YES — commit all 4 in one `docs(specs): commit Windows port plan and amendments`.
+- `_FINAL.md` is the SSOT and is referenced from MEMORY.md; an untracked SSOT is a liability (fresh clone / CI / new agent loses the plan).
+- The 3 superseded docs are the decision trail (MEMORY.md cites them by name) — keep for audit, cheap.
+- Tracked-but-superseded is strictly safer than untracked-then-lost.
+- Do NOT gitignore `specs/`; do NOT keep untracked forever.
+
+## Residual risks
+- New-shell PATH propagation after `choco install` (mitigation: fresh terminal).
+- No CI reproducibility pinning of protoc version yet — acceptable now; revisit if a strict reproducibility gate is added.

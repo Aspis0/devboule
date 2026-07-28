@@ -1,0 +1,83 @@
+{
+  "runId": "744082b4-ac77-4fee-abe3-0e55a19b016d",
+  "agent": "reviewer",
+  "task": "Hostile review of M0 commit on the devboule Windows port branch.\n\n**Commit under review**: `92a9ed64eca64a3c090cd03676353100d5cce2f2` on branch `windows-port`.\n\n**Diff**:\n```\nsrc-tauri/Cargo.toml | 2 +-\n1 file changed, 1 insertion(+), 1 deletion(d)\n```\n\nThe change appends 4 features to the existing `windows = \"0.58\"` block in `[target.'cfg(windows)'.dependencies]`:\n- `Win32_System_JobObjects` (C1)\n- `Win32_Security` (C2, C3)\n- `Win32_System_Memory` (G)\n- `Win32_NetworkManagement_WindowsFilteringPlatform` (C4)\n\nPre-existing 9 features were preserved exactly.\n\n**Plan SSOT**: `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §M0.\n\n**Context**:\n- The repo has NO root workspace Cargo.toml — 3 independent crates: `src-tauri/`, `oracle-core/`, `devboule-mcp/`.\n- `windows_capture` already pins `windows = \"=0.61.3\"` (second version in tree, expected).\n- `sysinfo v0.33.1` transitively pulls `windows v0.57.0` (third version, pre-existing, NOT caused by this change).\n- Verification: `cargo check --target x86_64-pc-windows-msvc` was attempted, `protoc` was missing on the dev box, `protoc 35.1` was installed via winget, build proceeded past windows resolution into lance/lancedb and reached `devboule` build script before failing on `binaries\\devboule-mcp-x86_64-pc-windows-msvc.exe doesn't exist` (separate blocker, not M0's).\n- `Cargo.lock` did NOT change after M0 (no version bumps, no dep additions — only feature flags).\n\n**Your job**: hostile audit. Don't trust the worker. Verify each claim yourself.\n\n**Checks (with file:line citations)**:\n\n1. Open `src-tauri/Cargo.toml` and confirm:\n   - The 9 original features are byte-identical (compare to parent commit `7c8c56e`).\n   - Exactly 4 new features added, no extras.\n   - No other line of the file changed.\n   - The block is still inside `[target.'cfg(windows)'.dependencies]`, not base `[dependencies]`.\n   - No accidental removal of `windows_capture`, `webview2-com`, or any other windows-related entry.\n\n2. Confirm `Cargo.lock` is unchanged from parent `7c8c56e`: `git diff 7c8c56e 92a9ed6 -- src-tauri/Cargo.lock` must be empty.\n\n3. Confirm `git diff 7c8c56e 92a9ed6` shows ONLY `src-tauri/Cargo.toml` modified. No stray file changes, no schemas/, no other Cargo.toml touched.\n\n4. Confirm `git log --format=%s 92a9ed6^..92a9ed6` shows a single, well-formed Conventional Commits message.\n\n5. Confirm the 4 feature names match exactly what `docs.rs/crate/windows/0.58.0/features` exposes (no typos like `Win32_System_Job_Object` or `Win32_NetworkManagementWindowsFilteringPlatform`).\n\n6. Confirm no `.cargo/config.toml` was added (the worker should NOT add one — `cargo check` works without it on this box).\n\n7. Confirm `specs/` is NOT in this commit (separate commit `specs` docs landed later, your review is ONLY on `92a9ed6`).\n\n8. Check the commit author and email are reasonable (gualt / gualt@devboule.local — confirm not garbage).\n\n**Verdict shape**:\n\n```\n### Critical (must fix)\n- file.ext:line - issue\n\n### Warnings (should fix)\n- file.ext:line - issue\n\n### Verdict\n✅ PASS / ⚠️ NEEDS-FIX / ❌ FAILED\n```\n\n**Constraints**:\n\n- async: true\n- context: fresh\n- output: `reviewer/audit-m0.md` (outputMode: file-only)\n- read-only — do NOT modify files\n- do NOT spin up further subagents; do your own verification with read/bash/git/grep\n- be specific: file:line citations for every finding\n- if you find a critical issue, do NOT try to fix it — just report\n\nReturn only the path + verdict line when done.\n\n---\n**Output:**\nWrite your findings to exactly this path: C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\outputs\\744082b4-ac77-4fee-abe3-0e55a19b016d\\reviewer\\audit-m0.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone. End with a structured acceptance report.\n\nCriteria:\n- criterion-1: Return concrete findings with file paths and severity when applicable\n\nRequired evidence: review-findings, residual-risks\n\nFinish with a fenced JSON block tagged `acceptance-report` in this shape:\nUse empty arrays when no items apply; array fields contain strings unless object entries are shown.\n`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.\n`commandsRun[].result` must be exactly one of: passed, failed, not-run.\n`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.\n```acceptance-report\n{\n  \"criteriaSatisfied\": [\n    {\n      \"id\": \"criterion-1\",\n      \"status\": \"satisfied\",\n      \"evidence\": \"specific proof\"\n    }\n  ],\n  \"changedFiles\": [\n    \"src/file.ts\"\n  ],\n  \"testsAddedOrUpdated\": [\n    \"test/file.test.ts\"\n  ],\n  \"commandsRun\": [\n    {\n      \"command\": \"command\",\n      \"result\": \"passed\",\n      \"summary\": \"short result\"\n    }\n  ],\n  \"validationOutput\": [\n    \"validation output or concise summary\"\n  ],\n  \"residualRisks\": [\n    \"none\"\n  ],\n  \"noStagedFiles\": true,\n  \"diffSummary\": \"short description of the diff\",\n  \"reviewFindings\": [\n    \"blocker: file.ts:12 - issue found, or no blockers\"\n  ],\n  \"manualNotes\": \"anything else the parent should know\"\n}\n```",
+  "exitCode": 1,
+  "model": "auto   # Pigeon → Moderate tier:max",
+  "attemptedModels": [
+    "auto   # Pigeon → Moderate tier:max"
+  ],
+  "modelAttempts": [
+    {
+      "model": "auto   # Pigeon → Moderate tier:max",
+      "success": false,
+      "exitCode": 1,
+      "error": "[m3-clean] host=pi agentDir=C:\\Users\\gualt\\.pi\\agent\nError: Model \"auto   # Pigeon → Moderate tier:max\" not found. Use --list-models to see available models.",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "cost": 0,
+        "turns": 0
+      }
+    }
+  ],
+  "error": "[m3-clean] host=pi agentDir=C:\\Users\\gualt\\.pi\\agent\nError: Model \"auto   # Pigeon → Moderate tier:max\" not found. Use --list-models to see available models.",
+  "acceptance": {
+    "status": "rejected",
+    "evidenceStatus": "rejected",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [
+      {
+        "id": "attestation",
+        "status": "failed",
+        "message": "Structured acceptance report not found."
+      }
+    ],
+    "verifyRuns": [],
+    "childReportParseError": "Structured acceptance report not found."
+  },
+  "launchContractDigest": "e8c39161cc88a2adcf5cce62455131af063cddb255c6d170a1b07ffa2421dbd6",
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\744082b4-ac77-4fee-abe3-0e55a19b016d_reviewer_transcript.jsonl",
+  "skills": [],
+  "timestamp": 1785170983726
+}

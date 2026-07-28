@@ -1,0 +1,121 @@
+{
+  "runId": "1259857e",
+  "agent": "delegate",
+  "task": "Smoke test. One round.\n\nUse `web_search` to fetch the current published version of the `win32job` Rust crate on crates.io. Cite the URL. Return the version number (e.g. \"2.0.3\") and the crates.io URL. Nothing else.",
+  "exitCode": 0,
+  "usage": {
+    "input": 4386,
+    "output": 638,
+    "cacheRead": 3200,
+    "cacheWrite": 0,
+    "cost": 0.0010214160000000003,
+    "turns": 2
+  },
+  "model": "openrouter/tencent/hy3:high",
+  "attemptedModels": [
+    "openrouter/tencent/hy3:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openrouter/tencent/hy3:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 4386,
+        "output": 638,
+        "cacheRead": 3200,
+        "cacheWrite": 0,
+        "cost": 0.0010214160000000003,
+        "turns": 2
+      }
+    }
+  ],
+  "durationMs": 17446,
+  "toolCount": 1,
+  "launchContractDigest": "7ce0c6bd0b797ac8b0520f273638cdc12884af564e0a609c5bd177cd9fa2168a",
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "default lightweight attestation"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return a concise result and residual risks when applicable",
+          "evidence": [
+            "manual-notes",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "manual-notes",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "default lightweight attestation"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return a concise result and residual risks when applicable",
+        "evidence": [
+          "manual-notes",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "crates.io API response for win32job reports newest_version/max_version/default_version = 2.0.3 (published 2025-05-15)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "curl -s https://crates.io/api/v1/crates/win32job",
+          "result": "passed",
+          "summary": "Fetched crate metadata; newest_version is 2.0.3."
+        }
+      ],
+      "validationOutput": [
+        "win32job current published version: 2.0.3",
+        "crates.io URL: https://crates.io/crates/win32job"
+      ],
+      "residualRisks": [
+        "web_search tool was unavailable; used the crates.io REST API as the data source instead, which is the authoritative published-version source."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "none",
+      "reviewFindings": [
+        "no blockers"
+      ],
+      "manualNotes": "Task specified web_search, but no such tool is available in this environment; data was retrieved from the official crates.io API endpoint, which is equivalent and authoritative for the published version."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "C:\\Users\\gualt\\Desktop\\devboule\\.pi-subagents\\artifacts\\1259857e_delegate_0_transcript.jsonl",
+  "timestamp": 1785130248086
+}

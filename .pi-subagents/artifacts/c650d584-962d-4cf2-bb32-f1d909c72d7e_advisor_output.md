@@ -1,0 +1,1 @@
+Starting both investigations in parallel. Let me first read devboule's actual Cargo.toml and Cargo.lock, then fire websearches and fetch_content on Anthropic + OpenAI sources.

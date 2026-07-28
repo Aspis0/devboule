@@ -1305,21 +1305,17 @@ impl DevbouleMcp {
 #[tool_handler]
 impl ServerHandler for DevbouleMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Devboule app-tools MCP (Rust). P6: lifecycle + project/Kanban + human gates + mini/main coder + oracle_ask/context/find (HTTP loopback fail-closed) + project_structure + get_neighborhood/find_imports + censor_findings/dispose + visual_check + design_request. Scope fail-closed; path confinement; design outcome path validation (F-02-013). Never log secrets. Agents never self-approve plans/pushes."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "devboule-mcp".into(),
-                title: Some("Devboule MCP".into()),
-                version: DEVBOULE_MCP_VERSION.into(),
-                icons: None,
-                website_url: None,
-            },
-            ..Default::default()
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(Implementation::new(
+            "devboule-mcp".to_string(),
+            DEVBOULE_MCP_VERSION.to_string(),
+        ))
+        .with_instructions(
+            "Devboule app-tools MCP (Rust). P6: lifecycle + project/Kanban + human gates + mini/main coder + oracle_ask/context/find (HTTP loopback fail-closed) + project_structure + get_neighborhood/find_imports + censor_findings/dispose + visual_check + design_request. Scope fail-closed; path confinement; design outcome path validation (F-02-013). Never log secrets. Agents never self-approve plans/pushes."
+                .to_string(),
+        )
     }
 }
 

@@ -1,0 +1,63 @@
+# Task for scout
+
+Mappa il progetto devboule rispetto ai piani Windows. Leggi specs/PORT_MACOS_TO_WINDOWS_FINAL.md e gli amendment necessari, poi ispeziona il repository reale. Concentrati su stato git, struttura workspace Rust/Tauri, Cargo.toml e differenze piano-vs-HEAD. Non modificare file. Restituisci findings compressi con percorsi e linee, fatti verificati, discrepanze e rischi.
+
+---
+Update progress at: C:\Users\gualt\Desktop\devboule\.pi-subagents\artifacts\progress\751d4ab7-c5b7-40a5-9b48-3ac1389abf49\progress.md
+
+---
+**Output:**
+Write your findings to exactly this path: C:\Users\gualt\Desktop\devboule\.pi-subagents\artifacts\outputs\751d4ab7-c5b7-40a5-9b48-3ac1389abf49\scouts\windows-plan-vs-head.md
+This path is authoritative for this run.
+Ignore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.
+
+## Acceptance Contract
+Acceptance level: attested
+Completion is not accepted from prose alone. End with a structured acceptance report.
+
+Criteria:
+- criterion-1: Return concrete findings with file paths and severity when applicable
+
+Required evidence: review-findings, residual-risks
+
+Finish with a fenced JSON block tagged `acceptance-report` in this shape:
+Use empty arrays when no items apply; array fields contain strings unless object entries are shown.
+`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.
+`commandsRun[].result` must be exactly one of: passed, failed, not-run.
+`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.
+```acceptance-report
+{
+  "criteriaSatisfied": [
+    {
+      "id": "criterion-1",
+      "status": "satisfied",
+      "evidence": "specific proof"
+    }
+  ],
+  "changedFiles": [
+    "src/file.ts"
+  ],
+  "testsAddedOrUpdated": [
+    "test/file.test.ts"
+  ],
+  "commandsRun": [
+    {
+      "command": "command",
+      "result": "passed",
+      "summary": "short result"
+    }
+  ],
+  "validationOutput": [
+    "validation output or concise summary"
+  ],
+  "residualRisks": [
+    "none"
+  ],
+  "noStagedFiles": true,
+  "diffSummary": "short description of the diff",
+  "reviewFindings": [
+    "blocker: file.ts:12 - issue found, or no blockers"
+  ],
+  "manualNotes": "anything else the parent should know"
+}
+```
