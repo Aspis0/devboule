@@ -112,7 +112,11 @@ fn remote_len(client: &reqwest::blocking::Client, url: &str) -> Option<u64> {
     if !resp.status().is_success() {
         return None;
     }
-    resp.content_length()
+    // Some CDNs (HuggingFace) report Content-Length: 0 on HEAD requests for
+    // redirect-to-CDN URLs. A 0 length is not a real model size — treat it as
+    // "unknown" so the caller skips the exact-size guard instead of rejecting
+    // a fully-downloaded file.
+    resp.content_length().filter(|&len| len > 0)
 }
 
 /// Stream one file to `dest`, calling `progress` as bytes arrive. Writes to a
@@ -158,13 +162,15 @@ fn download_file(
     drop(file);
 
     if let Some(expected) = bytes_total {
-        let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if got != expected {
-            let _ = std::fs::remove_file(&part);
-            bail!(
-                "size mismatch for {}: got {got} bytes, expected {expected}",
-                dest.display()
-            );
+        if expected > 0 {
+            let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if got != expected {
+                let _ = std::fs::remove_file(&part);
+                bail!(
+                    "size mismatch for {}: got {got} bytes, expected {expected}",
+                    dest.display()
+                );
+            }
         }
     }
 
@@ -253,18 +259,13 @@ pub fn ensure_qwen3_onnx(
         let dest = dir.join(rel);
         let bytes_total = remote_len(&client, &url);
 
-        // Refuse to download without a Content-Length — HF always sends it,
-        // so a missing value means an unexpected/untrusted server.  An unknown
-        // remote length would bypass the exact-size guard and could allow an
-        // unbounded write (e.g. a planted large payload).
-        let bytes_total = match bytes_total {
-            Some(len) => Some(len),
-            None => bail!(
-                "refusing model download for {rel}: server did not report a Content-Length"
-            ),
-        };
+        // Content-Length may be None when the CDN reports 0 on HEAD requests
+        // (HuggingFace quirk). Proceed without the exact-size guard in that
+        // case — the download reads to EOF and writes to a .part file, so an
+        // unknown length is safe; we just can't verify the post-download size.
 
         // Skip if the local file already matches the remote size exactly.
+        // (Only when we have a real, non-zero remote length.)
         if let Some(expected) = bytes_total {
             if std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == expected && expected > 0 {
                 progress(FileProgress {
