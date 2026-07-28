@@ -255,7 +255,7 @@ pub fn exa_key_status() -> Result<AuxCredentialStatus, String> {
             configured: false,
             status: "missing".into(),
             last_checked_at: Some(now()),
-            message: Some("Required for the local orchestrator's web-search egress.".into()),
+            message: Some("Optional. Without a key, web search falls back to the free rate-limited Exa MCP server (mcp.exa.ai).".into()),
         }),
         Err(e) => Ok(AuxCredentialStatus {
             id: EXA_KEY_ID.into(),
