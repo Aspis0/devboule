@@ -196,9 +196,10 @@ pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), St
 // SDDL replace-all-DACL for v1). Saves the original ACL to a temp file so
 // restore_path_policy can put it back after the child exits.
 //
-// Note: `Win32_Security_Authorization` feature in Cargo.toml is currently unused
-// by this icacls-based implementation. It was added for the broker sub-plan that
-// will eventually use `GetNamedSecurityInfoW` / `SetNamedSecurityInfoW` directly.
+// NOTE: the ACL layer is implemented via `SetNamedSecurityInfoW` with
+// package-SID ACEs (see apply_restricted_sid_acl); the icacls-based deny/
+// grant helpers below are retained for the Everyone-mode path. The
+// `Win32_Security_Authorization` feature covers both.
 //
 // WIRED since C5: `spawn_sandboxed_internal` calls this before spawn and
 // `wait_and_restore` restores after child exit. is_enforced() is TRUE since C6.
@@ -653,7 +654,8 @@ fn apply_restricted_sid_acl(
 /// Returns snapshots for restoration.
 ///
 /// `package_sid` is the per-spawn AppContainer package SID (C5) — the same SID
-/// the broker put into the token's SidsToRestrict. Grants target that SID, so
+/// the broker passed via SECURITY_CAPABILITIES (PROC_THREAD_ATTRIBUTE_
+/// SECURITY_CAPABILITIES) when creating the child. Grants target that SID, so
 /// only this spawn's child can use the granted paths.
 fn apply_restricted_sid_policy(
     policy: &SandboxPolicy,

@@ -1,7 +1,9 @@
 //! Slice 5b: generate a per-project Claude Code `settings.json` (as serializable structs)
-//! from the project's sandbox knobs. We do NOT sandbox Claude's process; instead we drive
-//! its native permission system + a PreToolUse hook that bridges every tool call to OUR
-//! consent UI over the `.aspis-agents.json` file-bridge.
+//! from the project's sandbox knobs. Claude's PROCESS is OS-sandboxed by the caller's
+//! broker (cloud_duplex launches it via spawn_sandboxed_with_stdin — AppContainer on
+//! Windows, is_enforced()==true since C6); on top of that we drive its native permission
+//! system + a PreToolUse hook that bridges every tool call to OUR consent UI over the
+//! `.aspis-agents.json` file-bridge.
 //!
 //! ⚠️ Claude settings.json has NO `sandbox.filesystem`/`sandbox.network` block (verified —
 //! not in the official schema). Filesystem/network confinement is enforced by the hook +
