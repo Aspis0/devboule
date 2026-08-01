@@ -611,9 +611,16 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   of fs_replace — agent ledger/state, censor shard are host-process writers)
   keep strictly atomic semantics: 0x80070005 from a plain host (broken ACLs)
   is indistinguishable from the AppContainer double-check, so without BOTH
-  gates the original error is returned. The fallback capability exists for a
-  FUTURE genuinely-sandboxed writer; unit tests simulate the AppContainer
-  context to exercise it.
+  gates the original error is returned. The fallback is wired into the ONE
+  genuinely-sandboxed production writer: `write_agent_live_state`
+  (agents.rs:1009) — it is also the consent-hook BINARY's writer
+  (`mutate_agent_live_state_at_path`, called from the standalone
+  `src/bin/claude_consent_hook.rs` that runs INSIDE the cloud-duplex
+  AppContainer; there MoveFileExW REPLACE_EXISTING fails in the double-check,
+  so without the fallback the hook's ledger update fails closed and Unattended
+  cloud cannot function — round-13 review). The TokenIsAppContainer gate keeps
+  the host-side launch-time callers strictly atomic. Unit tests simulate the
+  AppContainer context to exercise the fallback.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job

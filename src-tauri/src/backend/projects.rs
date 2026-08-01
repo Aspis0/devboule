@@ -1848,6 +1848,17 @@ pub(crate) fn unattended_external_is_rejected(
             == crate::backend::broker::SandboxMode::Unattended
 }
 
+/// Non-Windows: no gate (macOS/Linux have no conhost-equivalent unconfined
+/// external carrier introduced by this port; macOS status quo is documented
+/// in the spec §10.6(d) scope note).
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn unattended_external_is_rejected(
+    _host: &str,
+    _sandbox_mode: crate::backend::broker::SandboxMode,
+) -> bool {
+    false
+}
+
 fn prepare_or_launch_project_agent(
     app: tauri::AppHandle,
     input: ProjectAgentLaunchInput,
@@ -1882,7 +1893,7 @@ fn prepare_or_launch_project_agent(
     // host="app" is the supported Unattended carrier on Windows.
     // cfg!(target_os) is a compile-time constant here, so the runtime branch
     // below is dead on every other platform — no behaviour change on macOS/Linux.
-    if cfg!(target_os = "windows") && unattended_external_is_rejected(host, project.metadata.sandbox_mode)
+    if unattended_external_is_rejected(host, project.metadata.sandbox_mode)
     {
         return Err(
             "Unattended autonomy on Windows requires the app-hosted (sandboxed) agent \

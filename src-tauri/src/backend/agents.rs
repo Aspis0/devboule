@@ -1,4 +1,4 @@
-use super::fs_replace::replace_file_with_backup;
+use super::fs_replace::{replace_file_with_backup, replace_file_with_backup_with_fallback};
 use super::model::{AgentClaim, AgentEvent, AgentLiveState, AgentRoleRule, AgentSession};
 use super::state::BackendState;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1006,7 +1006,15 @@ fn write_agent_live_state(path: &Path, state: &AgentLiveState) -> Result<(), Str
         std::process::id(),
         Utc::now().timestamp_millis()
     ));
-    replace_file_with_backup(&temp_path, path, &backup_path, "agent state file")
+    // C6 round-13 hostile review: write_agent_live_state is ALSO the consent-
+    // hook BINARY's writer (mutate_agent_live_state_at_path is the hook's
+    // AppHandle-free path — the hook runs INSIDE the cloud-duplex
+    // AppContainer, where MoveFileExW(REPLACE_EXISTING) returns ACCESS_DENIED
+    // in the double-check even with DELETE+DELETE_CHILD granted). Without the
+    // fallback the hook's ledger update fails closed and Unattended cloud
+    // runs cannot function. The TokenIsAppContainer gate inside the fallback
+    // keeps host-side callers strictly atomic.
+    replace_file_with_backup_with_fallback(&temp_path, path, &backup_path, "agent state file")
 }
 
 // SSoT (2026-07, role-untangle follow-up): agent role rules are authored ONCE
