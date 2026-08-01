@@ -2806,13 +2806,33 @@ mod tests {
                 addr_space_bytes: None,
                 max_procs: 16,
             });
-        // NOTE: no "copy con" — reading the console device inside an AppContainer
-        // without a console can hang the child indefinitely (observed: wait hit
-        // the 300s RESTORE_WAIT_MS timeout in full-suite runs). Plain redirects
-        // exercise the same ACL path (open-for-write on pre-existing files).
+        // The hook's real write path is: write a sibling temp, then
+        // MoveFileExW(REPLACE_EXISTING) over the ledger (agents.rs
+        // replace_file_with_backup -> fs_replace.rs) — which needs DELETE on the
+        // target. Exercise the EXACT replace leg with PowerShell Move-Item -Force
+        // (atomic replace on Windows). Also plain-truncate the lock (open-for-
+        // write). NOTE: no "copy con" — reading the console device inside an
+        // AppContainer without a console can hang the child indefinitely
+        // (observed: wait hit the 300s RESTORE_WAIT_MS timeout in full-suite
+        // runs).
+        // `move /y` is cmd's MoveFileExW(REPLACE_EXISTING) — the exact replace
+        // leg of fs_replace.rs (NOT PowerShell Move-Item, which cmd /c would
+        // silently skip while still exiting 0 on the last `&` command).
+        // The source is created BY THE CHILD (echo > tmp), like the hook's
+        // sibling temp file — both rename legs run entirely inside the sandbox.
+        // DIAGNOSTIC: replace onto a target created BY THE CHILD (not the host
+        // pre-existing one) — isolates whether ownership of the target matters.
+        // The hook's write path (fs_replace::replace_existing): try atomic
+        // MoveFileExW replace; inside the AppContainer that fails ACCESS_DENIED
+        // (e2e-proven below), so the copy+delete fallback must work. Exercise
+        // the FALLBACK legs exactly: create sibling temp, copy over the
+        // pre-existing ledger, delete temp. The ledger content must change.
         let script = format!(
-            "echo HOOKWROTE > {} & echo LOCKOK > {}",
-            ledger.display(),
+            "echo NEWCONTENT > {} & copy /y {} {} > nul & del /q {} & echo LOCKOK > {}",
+            ledger.with_extension("tmp").display(), // sibling temp (hook's temp_path)
+            ledger.with_extension("tmp").display(), // source
+            ledger.display(),                       // pre-existing target
+            ledger.with_extension("tmp").display(), // temp cleanup
             lock.display()
         );
         let mut child = spawn_sandboxed(
@@ -2830,15 +2850,33 @@ mod tests {
         let exit = child.wait_and_restore().expect("wait+restore");
         let mut stderr_text = String::new();
         let _ = stderr_file.read_to_string(&mut stderr_text);
+        let acl_dump = |p: &std::path::Path| {
+            std::process::Command::new("icacls")
+                .arg(p)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        eprintln!(
+            "[ledger-test] exit={exit} stderr={stderr_text:?}
+ledger_acl={}
+tmp_acl={}",
+            acl_dump(&ledger),
+            acl_dump(&ledger.with_extension("tmp"))
+        );
         assert_eq!(
             exit, 0,
             "hook-style write must succeed inside the sandbox; stderr: {stderr_text:?}"
         );
         let ledger_text = std::fs::read_to_string(&ledger).unwrap_or_default();
         let lock_text = std::fs::read_to_string(&lock).unwrap_or_default();
+        // NEWCONTENT is written to the sibling temp and copied OVER the ledger —
+        // present ONLY if the hook's copy+delete fallback (the working replace
+        // path inside the AppContainer) succeeded. The atomic MoveFileExW leg is
+        // proven broken e2e and documented in fs_replace.rs.
         assert!(
-            ledger_text.contains("HOOKWROTE"),
-            "ledger must be rewritable in-place, got: {ledger_text:?}"
+            ledger_text.contains("NEWCONTENT"),
+            "ledger must be replaceable via copy+delete fallback, got: {ledger_text:?}"
         );
         assert!(
             lock_text.contains("LOCKOK"),

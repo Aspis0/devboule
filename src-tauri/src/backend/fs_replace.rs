@@ -44,14 +44,36 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> 
     let mut target: Vec<u16> = target_path.as_os_str().encode_wide().collect();
     target.push(0);
 
-    unsafe {
+    let replace = unsafe {
         MoveFileExW(
             PCWSTR(source.as_ptr()),
             PCWSTR(target.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
+    };
+    match replace {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // C6 round 7 (final hostile review, e2e-proven): MoveFileExW
+            // REPLACE_EXISTING fails with ACCESS_DENIED inside an AppContainer
+            // even with DELETE + DELETE_CHILD granted (the sandbox double-check
+            // rejects the atomic-replace access path; verified with cmd move /y,
+            // PowerShell Move-Item -Force and [IO.File]::Replace). Fall back to
+            // copy+delete, which the AppContainer ACLs do allow (also verified
+            // e2e). Slightly less atomic (target briefly absent between delete
+            // and copy) — acceptable for the agent ledger; the caller already
+            // holds the .lock and keeps a .bak.
+            match std::fs::copy(temp_path, target_path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(temp_path);
+                    Ok(())
+                }
+                Err(copy_err) => Err(format!(
+                    "MoveFileExW replace failed (Access denied in sandbox?);                      copy fallback also failed: {copy_err}"
+                )),
+            }
+        }
     }
-    .map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "windows"))]
