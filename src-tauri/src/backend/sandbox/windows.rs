@@ -1680,8 +1680,13 @@ static PENDING_REVOKES: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(V
 /// (round-34 review): the OS exemption list is global, so two devboule
 /// instances with Loopback children would clobber each other's exemptions.
 /// The first instance to create the mutex wins; a second instance FAILS
-/// CLOSED on any Loopback grant.
-static LOOPBACK_INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// CLOSED on any Loopback grant. Guarded by a std Mutex (NOT OnceLock) so
+/// concurrent first-grants in the same process serialize: exactly one
+/// CreateMutexW call wins, the rest see the cached handle (round-35 review:
+/// OnceLock's get-then-set is racy — two threads could both call
+/// CreateMutexW and one would see ERROR_ALREADY_EXISTS against its own
+/// process).
+static LOOPBACK_INSTANCE_MUTEX: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 
 /// Copy a PSID's bytes (GetLengthSid + CopySid) for registry storage.
 fn sid_to_bytes(sid: PSID) -> Option<Vec<u8>> {
@@ -1768,11 +1773,10 @@ fn rebuild_exemption_list(
 /// Grant loopback exemption for `package_sid`: add to the registry set and
 /// rebuild the GLOBAL list (never clobber other active children's exemptions).
 fn acquire_loopback_instance_mutex() -> Result<(), String> {
-    // One acquisition per PROCESS (OnceLock): subsequent Loopback spawns in
-    // this instance must NOT re-check (CreateMutexW would report
-    // ERROR_ALREADY_EXISTS against our own handle). The mutex therefore
-    // guards the instance, not each spawn.
-    if LOOPBACK_INSTANCE_MUTEX.get().is_some() {
+    // Serialize acquisition: the std Mutex guarantees exactly one
+    // CreateMutexW per process (subsequent callers see the cached handle).
+    let mut cached = LOOPBACK_INSTANCE_MUTEX.lock().map_err(|e| e.to_string())?;
+    if cached.is_some() {
         return Ok(());
     }
     unsafe {
@@ -1802,7 +1806,7 @@ fn acquire_loopback_instance_mutex() -> Result<(), String> {
             );
         }
         // Keep the handle for the process lifetime (released by the OS at exit).
-        let _ = LOOPBACK_INSTANCE_MUTEX.set(h as usize);
+        *cached = Some(h as usize);
         Ok(())
     }
 }
@@ -1839,6 +1843,12 @@ fn revoke_loopback_exemption(package_sid: PSID) -> Result<(), String> {
 /// On API failure the SID goes into PENDING_REVOKES so ownership is NOT lost
 /// (round-34 review): the next grant/revoke drains the list and retries.
 fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
+    // Also drain pending entries first (round-35 review: the spec promises
+    // 'next grant/revoke' drains; a direct revoke must too, else pending
+    // records can linger indefinitely when no further grant happens).
+    if !PENDING_REVOKES.lock().map(|p| p.is_empty()).unwrap_or(true) {
+        let _ = drain_pending_revokes();
+    }
     let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
     let removed = set.remove(bytes);
@@ -1858,18 +1868,26 @@ fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
     res
 }
 
-/// Retry every SID recorded in PENDING_REVOKES (best-effort); remove from
-/// the pending list those that now revoke cleanly.
+/// Retry every SID recorded in PENDING_REVOKES; RETAIN those whose retry
+/// still failed (round-35 review: unconditional clear lost ownership again
+/// after the first retry). Note: revoke_loopback_exemption_bytes itself
+/// re-adds the SID to PENDING_REVOKES on failure, so this only needs to
+/// remove the entries that succeeded.
 fn drain_pending_revokes() -> Result<(), String> {
     let pending = match PENDING_REVOKES.lock() {
         Ok(p) => p.clone(),
         Err(_) => return Ok(()),
     };
+    let mut still_pending = Vec::new();
     for bytes in &pending {
-        let _ = revoke_loopback_exemption_bytes(bytes);
+        if revoke_loopback_exemption_bytes(bytes).is_err() {
+            still_pending.push(bytes.clone());
+        }
     }
     if let Ok(mut p) = PENDING_REVOKES.lock() {
-        p.clear();
+        // Reconcile: keep only the entries that failed this round (the
+        // revoke helper re-adds failures, so rebuild from the successes).
+        *p = still_pending;
     }
     Ok(())
 }
@@ -3228,21 +3246,20 @@ mod tests {
             false
         };
 
-        // Child 2 is LONG-LIVED: it probes its port, then SLEEPS, then probes
-        // AGAIN and exits with the AND of both results. The second probe
-        // happens AFTER child1's revocation below, so child2's exit code
-        // proves its exemption survived child1's revoke (round-34 review:
-        // the old test's child2b was a fresh spawn with a NEW SID — vacuous).
+        // Round-35 hostile review: the fixed 8s sleep did NOT prove temporal
+        // survival — child2's second connection could be queued before
+        // child1's revocation and merely accepted after. Now child2 waits for
+        // an explicit parent-written marker file (go.marker, in the writable
+        // cwd) before its SECOND probe. The parent writes the marker ONLY
+        // AFTER child1's revocation succeeds, so the second connection is
+        // causally AFTER the revoke.
         let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
         let port1 = listener1.local_addr().unwrap().port();
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let port2 = listener2.local_addr().unwrap().port();
 
-        // Two SEQUENTIAL probes with a sleep between (verified syntax: a
-        // `;`-separated subexpression inside an -and group is NOT valid
-        // PowerShell — this sequential form parses and runs).
         let script2 = format!(
-            "$ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; Start-Sleep -Seconds 8; $ok2 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; if ($ok1 -and $ok2) {{ exit 0 }} else {{ exit 1 }}"
+            "$ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; $deadline = (Get-Date).AddSeconds(30); while (-not (Test-Path 'go.marker') -and (Get-Date) -lt $deadline) {{ Start-Sleep -Milliseconds 200 }}; $ok2 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; if ($ok1 -and $ok2) {{ exit 0 }} else {{ exit 1 }}"
         );
         let mut child1 = spawn_sandboxed(
             &make_policy(temp.clone()),
@@ -3263,7 +3280,7 @@ mod tests {
             &temp,
             &env_vars,
         )
-        .expect("spawn child 2 (long-lived)");
+        .expect("spawn child 2 (signal-gated long-lived)");
 
         let mut l1 = listener1;
         let mut l2 = listener2;
@@ -3277,9 +3294,9 @@ mod tests {
         let _ = child1.wait_and_restore();
         drop(child1);
 
-        // Child2's SECOND probe arrives ~8s after its first — accept it on
-        // the same listener (still bound), THEN reap child2 and assert exit 0.
-        let ok2b = accept_one(&mut l2, 20);
+        // NOW signal child2 to run its second probe (causally after the revoke).
+        std::fs::write(temp.join("go.marker"), b"go").expect("write go.marker");
+        let ok2b = accept_one(&mut l2, 35);
         let exit2 = child2.wait_and_restore();
         assert!(
             ok2b && exit2 == Ok(0),
