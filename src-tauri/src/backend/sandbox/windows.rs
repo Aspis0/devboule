@@ -1669,16 +1669,18 @@ fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         }
         // CPU time limit: JOB_OBJECT_LIMIT_PROCESS_TIME with PerJobUserTimeLimit in 100ns units.
+        // Set the limit fields on `basic` FIRST, then copy into info: assigning a zeroed
+        // struct over info.BasicLimitInformation afterwards would clobber them (reviewer
+        // finding, 2026-07-31 — the fields must not be written after the copy).
         if rlimits.cpu_secs > 0 {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
             // cpu_secs is seconds; convert to 100-nanosecond units (1 sec = 10,000,000 100ns units).
-            info.BasicLimitInformation.PerJobUserTimeLimit =
-                (rlimits.cpu_secs as i64) * 10_000_000;
+            basic.PerJobUserTimeLimit = (rlimits.cpu_secs as i64) * 10_000_000;
         }
         // Active process limit: JOB_OBJECT_LIMIT_ACTIVE_PROCESS with ActiveProcessLimit.
         if rlimits.max_procs > 0 {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-            info.BasicLimitInformation.ActiveProcessLimit = rlimits.max_procs as u32;
+            basic.ActiveProcessLimit = rlimits.max_procs as u32;
         }
         info.BasicLimitInformation = basic;
         info.ProcessMemoryLimit = memory_limit;
@@ -2026,6 +2028,15 @@ mod tests {
         apply_rlimits(&mut cmd, &limits);
         // The handle is now stashed; a real spawn + attach_to_child exercises the full path.
         // This test only verifies apply_rlimits does not panic on a valid Job Object creation.
+        // Close the stashed handle so the test does not leak a job across the suite
+        // (reviewer finding, 2026-07-31).
+        STASHED_JOB.with(|cell| {
+            if let Some(h) = cell.borrow_mut().take() {
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+            }
+        });
     }
 
     #[test]
