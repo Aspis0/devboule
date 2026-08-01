@@ -412,8 +412,12 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 ## 10.5 Implementation status (2026-07-31, post-execution pass)
 
 > **UPDATE (2026-07-31, C5 landed): the elevation blocker below is RESOLVED** —
-> the sandbox now uses AppContainers (§10.6). `is_enforced()` is `true` on
-> Windows, verified by the broker integration test on a non-elevated host.
+> the sandbox now uses AppContainers (§10.6), verified by the broker
+> integration test on a non-elevated host. **The flip is still `false`**:
+> hostile review on 479e355 found the interactive-agent PTY paths
+> (agent_pty.rs, one-shot mini via portable_pty) are NOT routed through the
+> broker on Windows yet — milestone **C6** must sandbox those before
+> `is_enforced()` flips (fail-closed: Unattended degrades to Ask meanwhile).
 
 
 | item | status | evidence |
@@ -427,7 +431,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
 | ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
 | G — memory backpressure | ⏸ deferred | per plan (optional) |
-| **Flip `is_enforced()` → true** | ✅ **DONE (C5)** | `mod.rs` windows arm = `true`, test `is_enforced_true_on_windows` |
+| **Flip `is_enforced()` → true** | ⏸ **C6-gated** | broker C5 verified; PTY paths unsandboxed → flip deferred (hostile review 479e355) |
 
 ### Why the flip is still BLOCKED (new evidence, not plan-anticipated)
 
@@ -520,6 +524,17 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
    SeRestorePrivilege — they cover the legacy path, not the broker).
 4. Final gate: flip `is_enforced()` → `true` on Windows AFTER reviewer + oracle
    sign-off on the C5 diff.
+
+### C6 (next milestone) — sandbox the PTY paths
+
+Hostile review on `479e355` (blocker): `agent_pty.rs:192` spawns interactive
+agent terminals via `portable_pty` and the one-shot mini path uses the same
+PTY — on Windows these bypass the broker entirely (full user token, no Job
+Object, no AppContainer). `is_enforced()` stays `false` until both route
+through `spawn_sandboxed`. Open question: `portable_pty` on Windows uses
+ConPTY — the broker needs a ConPTY-compatible spawn (pass ConPTY handles as
+stdin/stdout in `STARTUPINFOEXW` while keeping CREATE_SUSPENDED +
+SECURITY_CAPABILITIES). Spike required.
 
 ### Known trade-offs (accepted for v1)
 

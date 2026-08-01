@@ -661,7 +661,13 @@ fn apply_restricted_sid_policy(
     let mut collect_read_root = |candidate: &Path| -> Result<(), String> {
         let canonical = canonicalize_path(candidate)?;
         if under_system_root(&canonical) {
-            // Skip: already covered by ALL APPLICATION PACKAGES ACEs.
+            // Skip: already covered by ALL APPLICATION PACKAGES ACEs. Loud log:
+            // if the project itself lives under C:\Windows, this is a silent
+            // confinement drop the caller needs to know about.
+            eprintln!(
+                "[sandbox/windows] skipping ACL grant for system-root path {} (AppContainer                  already reads it via ALL APPLICATION PACKAGES)",
+                canonical.display()
+            );
             return Ok(());
         }
         if !read_roots.contains(&canonical) {
@@ -733,8 +739,14 @@ fn apply_restricted_sid_policy(
                     return Err(e);
                 }
             };
-            // C5: never grant write ACEs under SystemRoot either.
+            // C5: never grant write ACEs under SystemRoot either. Loud log: a
+            // writable path under C:\Windows would silently fail writes at
+            // runtime (the ACE is dropped here).
             if under_system_root(&canon) {
+                eprintln!(
+                    "[sandbox/windows] WARNING: writable path {} is under SystemRoot;                      write ACE dropped (AppContainer would need admin to write there)",
+                    canon.display()
+                );
                 continue;
             }
             // If already processed as read root, we need to upgrade the ACL.
@@ -1054,6 +1066,71 @@ impl Drop for RestrictedSandboxGuard {
 /// Owns temporary broker handles until the spawn transaction succeeds. This
 /// closes every handle on all early-return paths, including failures after a
 /// token or pipe has already been created.
+/// RAII: frees a derived AppContainer package SID (PSID) on drop, and deletes
+/// the AppContainer profile when the spawn never completed (C5). The manual
+/// free_package_sid closure leaked on several early-return paths (reviewer
+/// finding 2026-07-31); a guard cannot. When the spawn succeeds the seq is
+/// moved into SandboxedChild (whose Drop deletes the profile), and the SID is
+/// disarmed here.
+struct PackageSidGuard {
+    sid: Option<PSID>,
+    appcontainer_seq: Option<u64>,
+}
+
+impl PackageSidGuard {
+    fn new(sid: PSID, appcontainer_seq: u64) -> Self {
+        Self {
+            sid: Some(sid),
+            appcontainer_seq: Some(appcontainer_seq),
+        }
+    }
+    /// Disarm on success: the SID was consumed by CreateProcessAsUserW and the
+    /// profile lifecycle moved into SandboxedChild.
+    fn disarm(&mut self) {
+        self.sid.take();
+        self.appcontainer_seq.take();
+    }
+}
+
+impl Drop for PackageSidGuard {
+    fn drop(&mut self) {
+        if let Some(sid) = self.sid.take() {
+            unsafe {
+                let _ = FreeSid(sid);
+            }
+        }
+        // The spawn failed before SandboxedChild existed — do not orphan the
+        // profile in %LOCALAPPDATA%\Packages.
+        if let Some(seq) = self.appcontainer_seq.take() {
+            delete_appcontainer_profile(seq);
+        }
+    }
+}
+
+/// RAII: frees LocalAlloc'd capability SIDs on drop (same leak class).
+struct CapabilitySidsGuard {
+    sids: Vec<PSID>,
+}
+
+impl CapabilitySidsGuard {
+    fn new(sids: Vec<PSID>) -> Self {
+        Self { sids }
+    }
+    fn disarm(&mut self) {
+        self.sids.clear();
+    }
+}
+
+impl Drop for CapabilitySidsGuard {
+    fn drop(&mut self) {
+        for sid in self.sids.drain(..) {
+            unsafe {
+                let _ = LocalFree(windows::Win32::Foundation::HLOCAL(sid.0 as *mut _));
+            }
+        }
+    }
+}
+
 struct SpawnHandleCleanup {
     handles: Vec<HANDLE>,
 }
@@ -1295,6 +1372,13 @@ impl Drop for SandboxedChild {
                 }
                 let net = std::mem::take(&mut self.net_snapshot);
                 let _ = restore_net_policy(net);
+            }
+
+            // C5: delete the per-spawn AppContainer profile on EVERY exit path
+            // (Drop runs whether or not wait_and_restore did). wait_and_restore
+            // takes the seq, so this only fires when it was never called.
+            if let Some(seq) = self.appcontainer_seq.take() {
+                delete_appcontainer_profile(seq);
             }
 
             // M-2 fix: check for null before CloseHandle (take_*_handle sets to default).
@@ -1724,16 +1808,13 @@ fn spawn_sandboxed_internal(
         Ok(pair) => pair,
         Err(e) => return Err(e),
     };
-    let free_package_sid = || unsafe {
-        let _ = FreeSid(package_sid);
-    };
+    let mut package_sid_guard = PackageSidGuard::new(package_sid, appcontainer_seq);
 
     // C3+C4: apply filesystem ACLs + net policy before spawn.
     // SandboxGuard ensures both are restored even if spawn fails.
     let restricted_snapshots = match apply_restricted_sid_policy(policy, cwd, program, package_sid) {
         Ok(snaps) => snaps,
         Err(e) => {
-            free_package_sid();
             return Err(e);
         }
     };
@@ -1741,7 +1822,6 @@ fn spawn_sandboxed_internal(
     match apply_net_policy(policy, program) {
         Ok(net) => guard.set_net(net),
         Err(e) => {
-            free_package_sid();
             return Err(e);
         }
     }
@@ -1752,7 +1832,6 @@ fn spawn_sandboxed_internal(
     let job = match create_job_object(&policy.rlimits) {
         Ok(j) => cleanup.track(j),
         Err(e) => {
-            free_package_sid();
             return Err(e);
         }
     };
@@ -1767,18 +1846,15 @@ fn spawn_sandboxed_internal(
     let primary_token = match open_process_token() {
         Ok(t) => cleanup.track(t),
         Err(e) => {
-            free_package_sid();
             return Err(e);
         }
     };
-    // Capability SIDs (internetClient only when Enabled). Freed after spawn.
+    // Capability SIDs (internetClient only when Enabled). Freed via guard.
     let caps = match build_capability_sids(policy) {
         Ok(c) => c,
-        Err(e) => {
-            free_package_sid();
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
+    let mut caps_guard = CapabilitySidsGuard::new(caps.iter().map(|c| c.Sid).collect());
     // NOTE: package_sid is NOT freed here — SECURITY_CAPABILITIES (built later)
     // references it by pointer and UpdateProcThreadAttribute only shallow-copies
     // the struct. Freed after CreateProcessAsUserW succeeds (or on each error
@@ -1814,7 +1890,6 @@ fn spawn_sandboxed_internal(
     let (localappdata, temp_dir) = match appcontainer_env_paths(package_sid) {
         Ok(p) => p,
         Err(e) => {
-            free_package_sid();
             return Err(e);
         }
     };
@@ -1855,7 +1930,14 @@ fn spawn_sandboxed_internal(
     // the SIDs are referenced, not copied).
     let mut security_capabilities = windows::Win32::Security::SECURITY_CAPABILITIES {
         AppContainerSid: package_sid,
-        Capabilities: caps.as_ptr() as *mut _,
+        // Explicit null when there are no capabilities (an empty Vec's dangling
+        // as_ptr would be UB-ish; count==0 makes the kernel ignore it, but pass
+        // null per the MS sample).
+        Capabilities: if caps.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            caps.as_ptr() as *mut _
+        },
         CapabilityCount: caps.len() as u32,
         Reserved: 0,
     };
@@ -1887,11 +1969,9 @@ fn spawn_sandboxed_internal(
         }
     };
     if let Some(error) = sizing_error {
-        free_package_sid();
         return Err(error);
     }
     if attr_size == 0 {
-        free_package_sid();
         return Err("InitializeProcThreadAttributeList sizing returned zero bytes".to_string());
     }
 
@@ -1910,7 +1990,6 @@ fn spawn_sandboxed_internal(
             0,
             &mut initialized_size,
         ) {
-            free_package_sid();
             return Err(format!("InitializeProcThreadAttributeList failed: {e}"));
         }
         if let Err(e) = UpdateProcThreadAttribute(
@@ -1926,7 +2005,6 @@ fn spawn_sandboxed_internal(
             None,
         ) {
             DeleteProcThreadAttributeList(attr_list);
-            free_package_sid();
             return Err(format!("UpdateProcThreadAttribute failed: {e}"));
         }
         // C5: SECURITY_CAPABILITIES (0x00020009) — the AppContainer identity.
@@ -1941,7 +2019,6 @@ fn spawn_sandboxed_internal(
             None,
         ) {
             DeleteProcThreadAttributeList(attr_list);
-            free_package_sid();
             return Err(format!(
                 "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {e}"
             ));
@@ -1982,7 +2059,6 @@ fn spawn_sandboxed_internal(
             // LOW fix: clean up ALL intermediate handles + attr list before returning.
             // SandboxGuard (Drop) restores ACLs/net.
             DeleteProcThreadAttributeList(attr_list);
-            free_package_sid();
             return Err(format!("CreateProcessAsUserW failed: {e}"));
         }
     }
@@ -1996,15 +2072,10 @@ fn spawn_sandboxed_internal(
     cleanup.close(stderr_write);
     cleanup.close(child_stdin);
     cleanup.close(primary_token);
-    free_package_sid();
-    // C5: the capability SIDs were LocalAlloc'd by DeriveCapabilitySidsFromName
-    // (the struct itself lives on our stack); free each SID now that the child
-    // token exists.
-    for cap in &caps {
-        unsafe {
-            let _ = LocalFree(windows::Win32::Foundation::HLOCAL(cap.Sid.0 as *mut _));
-        }
-    }
+    // C5: the child token exists; package SID + capability SIDs are no longer
+    // referenced by SECURITY_CAPABILITIES. Disarm both guards.
+    package_sid_guard.disarm();
+    caps_guard.disarm();
     cleanup.track(pi.hProcess);
     cleanup.track(pi.hThread);
 

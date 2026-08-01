@@ -227,15 +227,16 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // TRUE since 2026-07-31 (C5, AppContainer): the broker now spawns every
-        // sandboxed child as a per-spawn AppContainer (derived package SID +
-        // SECURITY_CAPABILITIES + Job Object + restricted-SID ACL grants). The
-        // §10.5 elevation blocker is gone: system DLL access comes from the
-        // stock ALL APPLICATION PACKAGES ACEs, network deny-by-default comes
-        // from the missing internetClient capability — no C:\Windows ACL
-        // writes, no netsh, no admin. Verified by the broker integration test
-        // (TokenIsAppContainer=1) on a non-elevated host.
-        true
+        // FALSE (reverted 2026-07-31, hostile review on 479e355): the C5
+        // AppContainer broker works and is verified (TokenIsAppContainer=1 on a
+        // non-elevated host), but NOT every unattended path routes through it
+        // yet — agent_pty.rs spawns interactive agent terminals and the
+        // one-shot mini path via portable_pty WITHOUT the broker on Windows
+        // (mini_command_build.rs "P5: Windows is NOT sandboxed this phase").
+        // is_enforced() must stay false until those PTY paths route through
+        // spawn_sandboxed (milestone C6). Fail-closed: Unattended silently
+        // degrades to Ask via broker::effective_sandbox_mode.
+        false
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -314,13 +315,14 @@ mod tests {
         assert!(is_enforced());
     }
 
-    /// Windows: is_enforced() is true since C5 — the broker spawns every
-    /// sandboxed child as an AppContainer (verified TokenIsAppContainer=1 on a
-    /// non-elevated host). This is what unlocks Unattended autonomy on Windows.
+    /// Windows: is_enforced() is false until the PTY paths (agent_pty,
+    /// one-shot mini) also route through the AppContainer broker (C6). The C5
+    /// broker itself is verified, but partial coverage must not unlock
+    /// Unattended autonomy (hostile review on 479e355).
     #[cfg(target_os = "windows")]
     #[test]
-    fn is_enforced_true_on_windows() {
-        assert!(is_enforced());
+    fn is_enforced_false_on_windows() {
+        assert!(!is_enforced());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
