@@ -337,9 +337,10 @@ finally {{\n\
     // MINI-EXCLUSION (design §6): scrub the orchestrator-only user-MCP env var so the mini
     // child can NEVER inherit it from the host process env (CommandBuilder snapshots it).
     cmd.env_remove(FORBIDDEN_USER_MCP_ENV);
-    // P5: Windows is NOT sandboxed this phase (Seatbelt is macOS-only); no `.sb` profile,
-    // so the second tuple element is always `None` — the script/argv are byte-for-byte
-    // unchanged vs. pre-P5.
+    // P5 (updated C6): on macOS a `.sb` Seatbelt profile wraps the command; on
+    // Windows the AppContainer broker (spawn_sandboxed) provides the sandbox
+    // at spawn time (is_enforced()==true since C6), so this builder emits no
+    // profile — the script/argv are byte-for-byte unchanged.
     Ok((cmd, None))
 }
 

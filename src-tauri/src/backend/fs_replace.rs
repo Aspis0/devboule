@@ -117,7 +117,7 @@ mod win32_error {
 /// rollback path can be exercised deterministically.
 #[cfg(target_os = "windows")]
 fn copy_file_fallback(source: &Path, target: &Path) -> Result<u64, String> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if COPY_FAULT.with(|c| c.replace(false)) {
         // Simulate CopyFileW failing mid-copy: destination created/truncated
         // (create(true) so a first-write partial target is also simulated),
@@ -134,7 +134,7 @@ fn copy_file_fallback(source: &Path, target: &Path) -> Result<u64, String> {
 /// "restore fails -> .bak kept" path can be forced deterministically.
 #[cfg(target_os = "windows")]
 fn restore_copy(source: &Path, target: &Path) -> Result<u64, std::io::Error> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if RESTORE_FAULT.with(|c| c.replace(false)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -157,7 +157,7 @@ fn move_file_ex(
     target: *const u16,
     flags: windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS,
 ) -> windows::core::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if MOVE_FAULT.with(|c| c.replace(false)) {
         // windows-result 0.2: Error::from_win32() takes no args (uses
         // GetLastError); build the HRESULT 0x80070005 explicitly instead.
@@ -211,7 +211,7 @@ struct ReplaceFailure {
 /// that motivates the fallback) may use it.
 #[cfg(target_os = "windows")]
 fn process_is_appcontainer() -> bool {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if APPCONTAINER_SIM.with(|c| c.replace(false)) {
         return true;
     }

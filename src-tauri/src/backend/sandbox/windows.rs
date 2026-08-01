@@ -1,6 +1,10 @@
-//! Windows sandbox backend (C1): Job Object wrapper for kill-on-close + memory limits.
-//! Stage 1 of 4 for the Windows sandbox stack (C1..C4 per specs/PORT_MACOS_TO_WINDOWS_FINAL.md).
-//! C2 (Restricted Token), C3 (filesystem ACL), C4 (WFP) land in separate milestones.
+//! Windows sandbox backend: the C5 AppContainer broker (per-spawn profiles +
+//! SECURITY_CAPABILITIES + Job Object + ACL layer) — the full sandbox stack,
+//! wired since 2026-07-31 (C6). `is_enforced()` is TRUE on Windows; every
+//! app-hosted spawn path routes through `spawn_sandboxed[_with_stdin|_pty]`.
+//! The S-1-5-12 restricted-token path (C2) was replaced by AppContainers
+//! (package SID + capabilities) and network deny is the `internetClient`
+//! capability (kernel-enforced), not netsh.
 
 #![cfg(target_os = "windows")]
 
