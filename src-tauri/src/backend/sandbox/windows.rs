@@ -27,6 +27,17 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 const SECURITY_RESTRICTED_CODE_RID: u32 = 12;
+
+/// Access mask for writable paths: read+write+execute+DELETE+DELETE_CHILD.
+/// DELETE/FILE_DELETE_CHILD are REQUIRED for MoveFileExW(REPLACE_EXISTING)
+/// atomic replaces (consent-hook ledger, git/npm workspace writes) — the final
+/// hostile review (round 7) proved FILE_GENERIC_WRITE alone lacks them and the
+/// hook's ledger replace silently failed. Asserted in tests.
+const WRITABLE_ACCESS_MASK: u32 = FILE_GENERIC_READ.0
+    | FILE_GENERIC_WRITE.0
+    | FILE_GENERIC_EXECUTE.0
+    | windows::Win32::Storage::FileSystem::DELETE.0
+    | FILE_DELETE_CHILD.0;
 use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_ALL_ACCESS};
 use windows::Win32::Security::SetFileSecurityW;
 use windows::Win32::Storage::FileSystem::{
@@ -737,7 +748,8 @@ fn apply_restricted_sid_policy(
         }
     }
 
-    // Apply read+write+execute (modify) on writable paths.
+    // Apply read+write+execute+delete (modify, incl. DELETE/DELETE_CHILD) on
+    // writable paths.
     // Writable wins over read-only if paths overlap.
     for wp in &policy.writable_paths {
         if wp.is_absolute() {
@@ -781,7 +793,13 @@ fn apply_restricted_sid_policy(
                         return Err(e);
                     }
                 };
-                let access = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
+                // C6 round 7 (final hostile review): writable MUST include DELETE +
+                // FILE_DELETE_CHILD — MoveFileExW(REPLACE_EXISTING) (fs_replace.rs,
+                // used by the consent-hook ledger write AND by git/npm atomic
+                // replaces in the workspace) fails without them. FILE_GENERIC_WRITE
+                // alone lacks DELETE (0x10000) and FILE_DELETE_CHILD (0x40).
+                // Parity with macOS seatbelt (allow file-write* includes delete).
+                let access = WRITABLE_ACCESS_MASK;
                 if let Err(e) = apply_restricted_sid_acl(&canon, package_sid, GRANT_ACCESS, access, canon.is_dir()) {
                     let _ = restore_security_descriptor(&canon, &sd_backup);
                     let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
@@ -2750,6 +2768,23 @@ mod tests {
         );
         assert!(stderr_text.is_empty(), "stderr: {stderr_text:?}");
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// C6 round 7: the writable mask MUST include DELETE + FILE_DELETE_CHILD —
+    /// the consent hook's MoveFileExW(REPLACE_EXISTING) ledger replace fails
+    /// without them (FILE_GENERIC_WRITE alone lacks both). This is the
+    /// regression the reviewer proved; keep it asserted.
+    #[test]
+    fn writable_mask_includes_delete_rights() {
+        let delete = windows::Win32::Storage::FileSystem::DELETE.0;
+        let delete_child = FILE_DELETE_CHILD.0;
+        assert_ne!(WRITABLE_ACCESS_MASK & delete, 0, "writable must include DELETE");
+        assert_ne!(
+            WRITABLE_ACCESS_MASK & delete_child, 0,
+            "writable must include FILE_DELETE_CHILD"
+        );
+        // Sanity: it still contains the generic write bits.
+        assert_ne!(WRITABLE_ACCESS_MASK & FILE_GENERIC_WRITE.0, 0);
     }
 
     /// C3: apply deny-write on a temp file, then restore the original ACL.

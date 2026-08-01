@@ -586,7 +586,16 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   ACE fails (user not owner) and the spawn is refused — run the hook from a
   user-writable path (dev layout: target/debug) until a degradation path lands;
   (c) the --settings scan grants only %TEMP%-prefixed paths (no arbitrary
-  self-grants).
+  self-grants);
+  (d) CROSS-AGENT ledger write (review round 7): writable grants include
+  DELETE/FILE_DELETE_CHILD (required for MoveFileExW atomic replaces), so an
+  agent CAN rewrite the shared .aspis-agents.json in place — forge verdicts for
+  OTHER agents' pending requests or DoS the queue for the session duration
+  (ACLs restore at child exit). This is a real widening beyond self-forgery;
+  accepted for v1 with the same accountability-grade caveat — the consent
+  bridge is a UX gate, not a security boundary; a per-agent ledger or
+  signed-verdict follow-up is required before Unattended is trusted with
+  multiple concurrent agents.
 
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as
