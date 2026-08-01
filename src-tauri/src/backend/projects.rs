@@ -2487,6 +2487,15 @@ fn prepare_or_launch_project_agent(
         if let Some(hook) = resolve_claude_consent_hook_path() {
             hook_read_roots.push(std::path::PathBuf::from(hook));
         }
+        // C6 round 6: the ledger FILE already exists (record_launch_pending ran
+        // before spawn) and its DACL has no package SID — OI/CI inheritance only
+        // covers NEW files. Grant the file itself, or the hook's
+        // MoveFileExW(REPLACE_EXISTING) fails and every gated tool is denied.
+        let mut writable_roots: Vec<std::path::PathBuf> = vec![projects_path.clone()];
+        let ledger_file = projects_path.join(crate::backend::agents::AGENTS_STATE_FILE);
+        if ledger_file.exists() {
+            writable_roots.push(ledger_file);
+        }
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -2503,7 +2512,7 @@ fn prepare_or_launch_project_agent(
             &input.project_id,
             input.model.as_deref(),
             hook_read_roots,
-            vec![projects_path.clone()],
+            writable_roots,
             codex_policy,
         )?;
         if let Err(record_err) = record_agent_launch(

@@ -576,6 +576,17 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   PTY, one-shot mini, cloud duplex. The real gitconfig grant is level-1 only
   (includeIf targets not covered) and is a documented widening (users may store
   PATs in http.extraHeader; copying identity keys only is a follow-up).
+- **Consent hook (review rounds 5-6)**: the Claude PreToolUse hook binary is
+  granted read+exec and the ledger dir + ledger FILE (exists pre-spawn, so
+  OI/CI inheritance alone would not cover it) are writable. Known limits,
+  documented as accountability-grade: (a) the agent itself shares the sandbox
+  with the hook and knows ASPIS_CONSENT_BRIDGE, so the ledger is forgeable by
+  the gated entity — consent is accountability, not a security boundary;
+  (b) if the hook ships in Program Files (perMachine install), the package-SID
+  ACE fails (user not owner) and the spawn is refused — run the hook from a
+  user-writable path (dev layout: target/debug) until a degradation path lands;
+  (c) the --settings scan grants only %TEMP%-prefixed paths (no arbitrary
+  self-grants).
 
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as

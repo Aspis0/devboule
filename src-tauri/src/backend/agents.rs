@@ -14,7 +14,7 @@ use std::time::Duration;
 use tauri::{Manager, State};
 
 const PROJECTS_DIR: &str = "projects";
-const AGENTS_STATE_FILE: &str = ".aspis-agents.json";
+pub(crate) const AGENTS_STATE_FILE: &str = ".aspis-agents.json";
 // Rust-owned ledger mapping agentId -> launch CLI. The MCP server may rewrite
 // the session file without the `client` field, so the app keeps its own flat
 // `{ "<agentId>": "codex" }` map next to the agent state and re-stamps each
