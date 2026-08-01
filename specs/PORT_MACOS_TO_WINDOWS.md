@@ -10,12 +10,18 @@
 
 ---
 
+> **SUPERSEDED (2026-07-31)**: this plan's C2/C3 decisions were revised by
+> `PORT_MACOS_TO_WINDOWS_FINAL.md` — the shipped broker uses per-spawn
+> AppContainers (C5, §10.6), not the restricted-token/rappct follow-up
+> described below. Keep this file for history; the FINAL plan is the
+> reference.
+
 ## 0. Scope decisions (locked)
 
 | Decision | Choice |
 |---|---|
 | Scope bracket | "Movable only" — port what has a clean Windows analogue, skip cleanly otherwise |
-| Sandbox fidelity | Best effort via `windows` crate + `win32job`. AppContainer via `rappct` evaluated as a follow-up. |
+| Sandbox fidelity | **RESOLVED (C5)**: per-spawn AppContainer profiles (see FINAL plan §10.6). The original choice — best effort via `windows` crate + `win32job`, AppContainer via `rappct` as follow-up — is historical. |
 | Apple FM (Censor on-device LLM) | **Skip this plan** — add `TODO(next-plan)` comment on `AppleFmClient` |
 | GPU/embedder | **A**: `ort` w/ `directml` feature on Windows; keep `candle-metal` on macOS |
 | Bundle config | **A**: explicit `bundle.windows` block in `tauri.conf.json` |
@@ -470,9 +476,11 @@ Add `apply_restricted_token(cmd: &mut Command) -> Result<(), String>` in `sandbo
 Tests:
 - `restricted_token_blocks_token_specific_writes` — child tries `echo x > <token-only-deny>/file.txt`; the file must not be created.
 
-#### C3 — Optional, deferred until C1+C2 green
+#### C3 — Optional, deferred until C1+C2 green (SUPERSEDED)
 
-AppContainer via `rappct`. **Decision rule**: if C1+C2 work, ship them and write up "AppContainer is the next step" as a separate plan. If C1+C2 hit Windows API issues, fall back to the documented restricted-token + DACL approach.
+AppContainer via `rappct`. **Historical**: C3 shipped as the C5 AppContainer
+broker (per-spawn profiles, package-SID ACLs) — see
+`PORT_MACOS_TO_WINDOWS_FINAL.md` §10.6.
 
 ### Milestone D — Auth (Windows Hello)
 

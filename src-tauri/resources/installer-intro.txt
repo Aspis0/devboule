@@ -85,12 +85,15 @@ Web search works out of the box with no key (rate-limited). Add an Exa key
 in Settings for higher volume.
 
 
-IMPORTANT — WHAT IS NOT DONE
-----------------------------
-- The Windows sandbox code exists in the repository but is NOT active.
-  The agent runs with the same permissions as your user account. It can
-  read and modify any file your user can. Do not point it at sensitive
-  folders and do not let it run unattended.
+SECURITY STATUS
+----------------
+- The Windows sandbox IS ACTIVE: every app-hosted agent runs inside a
+  per-launch AppContainer (OS-level isolation: restricted token, package-SID
+  filesystem ACLs, network deny-by-default, Job Object). Unattended autonomy
+  is only allowed for these app-hosted sessions.
+- LIMITATION: the legacy EXTERNAL console window path is not sandboxed and
+  therefore refuses Unattended mode (Ask/AutoAccept stay supervised). Use the
+  in-app terminal (host="app") for unattended runs.
 - This is alpha software built with heavy AI assistance. Expect bugs.
 - macOS is the primary development platform; Windows support is new and
   still being verified.
