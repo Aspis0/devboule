@@ -623,7 +623,20 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   (host="app", fully broker-gated) is the only Unattended carrier. Ask and
   AutoAccept remain supervised by the broker consent flow and are unaffected.
   On macOS/Linux the gate compiles out (cfg! constant) — zero behaviour
-  change. Rollback
+  change.
+- **MACOS SCOPE NOTE (round-13 hostile review, deferred by DESIGN)**: the
+  reviewer correctly notes that macOS also reports `is_enforced()==true`
+  while BOTH its carriers are unconfined: the external path spawns
+  Terminal.app and the app-hosted PTY spawns `portable_pty` directly (no
+  seatbelt wrap — verified in `agent_pty.rs::to_command_builder`). Fixing
+  that (gating Unattended on macOS too, or flipping macOS `is_enforced()` to
+  false) would REGRESS the historical macOS behaviour. The port's hard
+  invariant — "no macOS file/block/test may be removed or regressed" — is an
+  explicit user constraint, so this is left as a DOCUMENTED, PRE-EXISTING
+  gap with a follow-up: macOS needs either seatbelt-wrapped PTY/external
+  spawns or a platform-specific Unattended gate before its invariant is
+  sound. The Windows gate introduced here is strictly tighter than the
+  macOS status quo. Rollback
   semantics: on copy failure the backup is restored UNCONDITIONALLY (even if
   the target still exists — round-8 bug), the .bak is KEPT if restoration
   itself fails, a committed target with a leaked temp is preserved and only
