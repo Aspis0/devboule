@@ -650,7 +650,12 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   os.replace winerror=5) cover fallback success, unconditional restore,
   first-write cleanup and .bak retention on restore failure. New Windows
   tests use fault seams MOVE_FAULT / COPY_FALLBACK_FAULT / BACKUP_COPY_FAULT
-  / RESTORE_FAULT; all discriminating.
+  / RESTORE_FAULT; all discriminating. Every seam reference in fs_replace.rs
+  and devboule-mcp carries the SAME guard as its definition
+  (cfg(all(test, target_os = "windows"))) — uniform by audit (round 21). The
+  polis meta_store / augure ledger writers use strict rename but are HOST-side
+  only (never inside an AppContainer child), so they stay atomic and are
+  outside the sandbox-writer scope.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job
