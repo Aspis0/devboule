@@ -468,7 +468,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
         // losing the original data. had_backup says the target existed;
         // backup_created says we hold a VALID copy of it.
         if had_backup {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "windows"))]
             if BACKUP_COPY_FAULT.with(|c| c.replace(false)) {
                 // Simulate the backup copy failing mid-way: leave a truncated
                 // .bak behind (the partial-backup damage mode).
@@ -480,7 +480,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
                 }
                 BACKUP_COPY_FAULTED.with(|c| c.set(true));
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "windows"))]
             if BACKUP_COPY_FAULTED.with(|c| c.replace(false)) {
                 // Remove a partial backup so it can never be restored over
                 // the target on the error path.
@@ -492,7 +492,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
                 // the target on the error path.
                 let _ = std::fs::remove_file(&backup_path);
             }
-            #[cfg(not(test))]
+            #[cfg(not(all(test, target_os = "windows")))]
             if std::fs::copy(path, &backup_path).is_ok() {
                 backup_created = true;
             } else {
@@ -517,7 +517,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
             // fallback copy can leave the target truncated but still present,
             // and `!path.exists()` would skip the restore and delete the only
             // good copy. Keep the .bak if the restore itself fails.
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "windows"))]
             let restore_result = if RESTORE_FAULT.with(|c| c.replace(false)) {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -526,7 +526,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
             } else {
                 std::fs::copy(&backup_path, path).map(|_| ())
             };
-            #[cfg(not(test))]
+            #[cfg(not(all(test, target_os = "windows")))]
             let restore_result = std::fs::copy(&backup_path, path).map(|_| ());
             match restore_result {
                 Ok(_) => {

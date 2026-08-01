@@ -1834,12 +1834,6 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
                         f"failed ({restore_exc}) — keeping {label} backup at "
                         f"{backup_path}"
                     ) from restore_exc
-                finally:
-                    # Ensure the .bak survives even when an assertion-level
-                    # re-raise happens; the raise above already exits, but a
-                    # defensive unlink after a SUCCESSFUL restore is intended.
-                    # (No-op here: the raise path never reaches this.)
-                    pass
             elif had_backup:
                 # Round-16: the target existed but we hold NO valid backup
                 # (the backup copy itself failed). Do NOT restore from a

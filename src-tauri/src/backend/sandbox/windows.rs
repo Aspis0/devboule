@@ -167,12 +167,17 @@ pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
 /// order). That broker is a separate sub-plan — see
 /// `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §C2 decision rule.
 ///
-/// Until the broker lands, this function is a no-op that returns `Ok(())`.
-/// `is_enforced()` stays `false` on Windows, so the broker module's
-/// `effective_sandbox_mode()` correctly degrades `Unattended` to `Ask`.
+/// NOTE (C6, 2026-07-31): superseded by the AppContainer broker (C5) — the
+/// S-1-5-12 restricted-token path was REPLACED by per-spawn AppContainer
+/// profiles (see `spawn_sandboxed_internal` / `create_appcontainer_profile`).
+/// `is_enforced()` is TRUE on Windows since C6; `effective_sandbox_mode()`
+/// unlocks Unattended only for broker-gated app-hosted launches (the external
+/// conhost path rejects Unattended — see projects.rs
+/// `unattended_external_is_rejected`). This legacy entry point is retained as
+/// a no-op for callers that predate the broker; do not reintroduce
+/// CreateRestrictedToken (package SIDs fail with ERROR_INVALID_PARAMETER
+/// there — use SECURITY_CAPABILITIES instead).
 pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), String> {
-    // TODO(C2-broker): implement CreateRestrictedToken + CreateProcessAsUserW broker.
-    // See specs/PORT_MACOS_TO_WINDOWS_FINAL.md §C2. Until then, no-op.
     Ok(())
 }
 
@@ -187,8 +192,8 @@ pub fn apply_restricted_token(_cmd: &mut std::process::Command) -> Result<(), St
 // by this icacls-based implementation. It was added for the broker sub-plan that
 // will eventually use `GetNamedSecurityInfoW` / `SetNamedSecurityInfoW` directly.
 //
-// Not wired into the spawner — the broker sub-plan (C2-broker) will call this
-// before spawn and restore_path_policy after child exit. is_enforced() stays false.
+// WIRED since C5: `spawn_sandboxed_internal` calls this before spawn and
+// `wait_and_restore` restores after child exit. is_enforced() is TRUE since C6.
 
 /// Saved ACL backup for a path, so it can be restored after the sandboxed child exits.
 #[derive(Clone)]
@@ -320,8 +325,9 @@ fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
 ///
 /// Returns a snapshot of backup files so [`restore_path_policy`] can restore.
 ///
-/// **Not wired into the spawner**: the broker sub-plan (C2-broker) will call
-/// this before spawn. `is_enforced()` stays `false` on Windows.
+/// **Wired since C5**: `spawn_sandboxed_internal` calls this before spawn;
+/// `wait_and_restore` restores after child exit. `is_enforced()` is TRUE
+/// since C6.
 pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>, String> {
     let mut snapshots = Vec::new();
     let mut processed: std::collections::HashSet<std::path::PathBuf> =

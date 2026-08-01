@@ -1164,8 +1164,9 @@ impl ScopedAgentTools {
         let pid = child.id() as i32;
 
         // C1 (Windows sandbox): attach the spawned child to the Job Object created in apply_rlimits
-        // (kill-on-close + memory limit). On failure the child runs unrestricted (current Windows
-        // behavior) — is_enforced() stays false until C2..C4 land, so this is defense-in-depth only.
+        // (kill-on-close + memory limit). NOTE (C6): is_enforced() is TRUE since C6 — this path
+        // runs only for agentic_tools children that are additionally wrapped by the AppContainer
+        // broker upstream; the attach is defense-in-depth for descendants.
         #[cfg(target_os = "windows")]
         {
             use crate::backend::sandbox::windows;

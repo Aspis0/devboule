@@ -133,9 +133,11 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
         finally:
             os.replace = real_replace
             shutil.copy2 = real_copy2
-        # .bak KEPT on disk (name carries a pid-ns suffix).
+        # .bak KEPT on disk (name carries a pid-ns suffix) AND the error names
+        # its exact path (round-18 review: path reporting must be asserted).
         baks = [p for p in self.dir.iterdir() if p.name.endswith(".bak")]
         self.assertEqual(len(baks), 1, f"one .bak must be KEPT: {[b.name for b in baks]}")
+        self.assertIn(str(baks[0]), msg, "error must name the retained .bak path")
 
 
 if __name__ == "__main__":
