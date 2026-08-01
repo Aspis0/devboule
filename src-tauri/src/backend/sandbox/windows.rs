@@ -1464,10 +1464,11 @@ impl Drop for SandboxedChild {
             // later revoke (or the next grant rebuild) stays consistent.
             if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
                 let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
-                // Best-effort final attempt; the registry retains the SID on
-                // failure (documented residual: a devboule crash between
-                // grant and revoke can leave the exemption until the next
-                // grant rebuild — see spec §10.6 multi-instance note).
+                // Round-34: on failure the SID lands in PENDING_REVOKES (the
+                // registry keeps it too), so ownership survives this Drop —
+                // the next grant/revoke drains and retries. The flag is
+                // cleared because this object is gone; the pending record is
+                // the durable ownership.
                 let _ = revoke_loopback_exemption(sid);
                 self.loopback_exempted = false;
             }
@@ -1669,6 +1670,19 @@ fn open_null_handle() -> Result<HANDLE, String> {
 static LOOPBACK_SIDS: std::sync::Mutex<Option<std::collections::HashSet<Vec<u8>>>> =
     std::sync::Mutex::new(None);
 
+/// SIDs whose OS exemption is still active but whose owning SandboxedChild is
+/// gone (revoke failed on Drop). The next grant/revoke attempt drains this
+/// list first, so the OS state and the registry converge (round-34 review:
+/// ownership must survive a failed Drop revoke).
+static PENDING_REVOKES: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// Session-scoped named mutex enforcing SINGLE-INSTANCE Loopback operation
+/// (round-34 review): the OS exemption list is global, so two devboule
+/// instances with Loopback children would clobber each other's exemptions.
+/// The first instance to create the mutex wins; a second instance FAILS
+/// CLOSED on any Loopback grant.
+static LOOPBACK_INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 /// Copy a PSID's bytes (GetLengthSid + CopySid) for registry storage.
 fn sid_to_bytes(sid: PSID) -> Option<Vec<u8>> {
     unsafe {
@@ -1753,10 +1767,53 @@ fn rebuild_exemption_list(
 
 /// Grant loopback exemption for `package_sid`: add to the registry set and
 /// rebuild the GLOBAL list (never clobber other active children's exemptions).
+fn acquire_loopback_instance_mutex() -> Result<(), String> {
+    // One acquisition per PROCESS (OnceLock): subsequent Loopback spawns in
+    // this instance must NOT re-check (CreateMutexW would report
+    // ERROR_ALREADY_EXISTS against our own handle). The mutex therefore
+    // guards the instance, not each spawn.
+    if LOOPBACK_INSTANCE_MUTEX.get().is_some() {
+        return Ok(());
+    }
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateMutexW(
+                attrs: *const core::ffi::c_void,
+                initial_owner: i32,
+                name: *const u16,
+            ) -> *mut core::ffi::c_void;
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        let name: Vec<u16> = "Local\\devboule-sandbox-loopback"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if h.is_null() {
+            return Err("CreateMutexW(loopback registry) failed".to_string());
+        }
+        let already_exists = std::io::Error::last_os_error().raw_os_error() == Some(183); // ERROR_ALREADY_EXISTS
+        if already_exists {
+            let _ = CloseHandle(h);
+            return Err(
+                "another devboule instance holds the loopback-exemption registry;                  Loopback sessions require single-instance operation (the OS exemption                  list is global). Close the other instance or use NetPolicy::Enabled/None."
+                    .to_string(),
+            );
+        }
+        // Keep the handle for the process lifetime (released by the OS at exit).
+        let _ = LOOPBACK_INSTANCE_MUTEX.set(h as usize);
+        Ok(())
+    }
+}
+
 fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
     let bytes = sid_to_bytes(package_sid).ok_or_else(|| {
         "GetLengthSid/CopySid failed; loopback exemption not granted".to_string()
     })?;
+    // Drain pending revokes first so OS state and registry converge.
+    drain_pending_revokes()?;
+    acquire_loopback_instance_mutex()?;
     let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
     set.insert(bytes.clone());
@@ -1779,6 +1836,8 @@ fn revoke_loopback_exemption(package_sid: PSID) -> Result<(), String> {
 }
 
 /// Bytes-based revoke (used by SandboxedChild after the profile SID is freed).
+/// On API failure the SID goes into PENDING_REVOKES so ownership is NOT lost
+/// (round-34 review): the next grant/revoke drains the list and retries.
 fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
     let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
@@ -1789,9 +1848,30 @@ fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
     let list = rebuild_exemption_list(set)?;
     let res = call_net_isolation(list.len() as u32, list.as_ptr(), "revoke");
     if res.is_err() {
-        set.insert(bytes.to_vec()); // roll back the registry on API failure (retry later)
+        set.insert(bytes.to_vec()); // roll back the registry on API failure
+        if let Ok(mut pending) = PENDING_REVOKES.lock() {
+            if !pending.contains(&bytes.to_vec()) {
+                pending.push(bytes.to_vec());
+            }
+        }
     }
     res
+}
+
+/// Retry every SID recorded in PENDING_REVOKES (best-effort); remove from
+/// the pending list those that now revoke cleanly.
+fn drain_pending_revokes() -> Result<(), String> {
+    let pending = match PENDING_REVOKES.lock() {
+        Ok(p) => p.clone(),
+        Err(_) => return Ok(()),
+    };
+    for bytes in &pending {
+        let _ = revoke_loopback_exemption_bytes(bytes);
+    }
+    if let Ok(mut p) = PENDING_REVOKES.lock() {
+        p.clear();
+    }
+    Ok(())
 }
 
 fn create_appcontainer_profile() -> Result<(PSID, u64), String> {
@@ -3099,8 +3179,6 @@ mod tests {
     #[test]
     fn concurrent_loopback_children_keep_each_others_exemption() {
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
         use std::time::{Duration, Instant};
 
         let temp = std::env::temp_dir().join(format!(
@@ -3126,171 +3204,107 @@ mod tests {
                 .writable(root.clone())
                 .net(NetPolicy::Loopback)
         };
-
-        // Child 1.
-        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port1 = listener1.local_addr().unwrap().port();
-        let mut child1 = spawn_sandboxed(
-            &make_policy(temp.clone()),
-            "powershell",
-            &[
+        let probe = |port: u16| -> Vec<String> {
+            vec![
                 "-NoProfile".to_string(),
                 "-Command".to_string(),
                 format!(
-                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port1} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
                 ),
-            ],
+            ]
+        };
+        let accept_one = |l: &mut TcpListener, secs: u64| -> bool {
+            l.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < deadline {
+                match l.accept() {
+                    Ok(_) => return true,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+
+        // Child 2 is LONG-LIVED: it probes its port, then SLEEPS, then probes
+        // AGAIN and exits with the AND of both results. The second probe
+        // happens AFTER child1's revocation below, so child2's exit code
+        // proves its exemption survived child1's revoke (round-34 review:
+        // the old test's child2b was a fresh spawn with a NEW SID — vacuous).
+        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+
+        // Two SEQUENTIAL probes with a sleep between (verified syntax: a
+        // `;`-separated subexpression inside an -and group is NOT valid
+        // PowerShell — this sequential form parses and runs).
+        let script2 = format!(
+            "$ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; Start-Sleep -Seconds 8; $ok2 = Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue; if ($ok1 -and $ok2) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        let mut child1 = spawn_sandboxed(
+            &make_policy(temp.clone()),
+            "powershell",
+            &probe(port1),
             &temp,
             &env_vars,
         )
         .expect("spawn child 1");
-
-        // Child 2 (concurrent — registry must keep BOTH exemptions).
-        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port2 = listener2.local_addr().unwrap().port();
         let mut child2 = spawn_sandboxed(
             &make_policy(temp.clone()),
             "powershell",
             &[
                 "-NoProfile".to_string(),
                 "-Command".to_string(),
-                format!(
-                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-                ),
+                script2,
             ],
             &temp,
             &env_vars,
         )
-        .expect("spawn child 2");
+        .expect("spawn child 2 (long-lived)");
 
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_secs(30);
         let mut l1 = listener1;
         let mut l2 = listener2;
-        l1.set_nonblocking(true).unwrap();
-        l2.set_nonblocking(true).unwrap();
-        while Instant::now() < deadline && accepts.load(Ordering::Relaxed) < 2 {
-            for l in [&mut l1, &mut l2] {
-                match l.accept() {
-                    Ok(_) => {
-                        accepts.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // First probes: both children connect while both exemptions are live.
+        let ok1a = accept_one(&mut l1, 30);
+        let ok2a = accept_one(&mut l2, 30);
+        assert!(ok1a && ok2a, "initial concurrent probes must connect (ok1a={ok1a}, ok2a={ok2a})");
 
-        // Drop child1 FIRST: its revocation must not remove child2's exemption.
+        // Revoke child1's exemption (wait + drop). The registry rebuild must
+        // keep child2's exemption.
         let _ = child1.wait_and_restore();
         drop(child1);
 
-        // Round-33 review: child2 must STILL connect AFTER child1's revoke —
-        // l2 (child2's listener, still bound) polled only post-revocation
-        // proves the exemption survived the registry rebuild. The initial
-        // poll loop may have already accepted child2's connection, so spawn a
-        // fresh Test-NetConnection from child2's sandbox... simpler: use the
-        // still-running child2 to make a NEW connection to its own port.
-        let deadline2b = Instant::now() + Duration::from_secs(20);
-        let mut accepted2b = false;
-        while Instant::now() < deadline2b {
-            match l2.accept() {
-                Ok(_) => {
-                    accepted2b = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => break,
-            }
-        }
-        // If the earlier loop already consumed child2's connection, bind a
-        // fresh listener on the SAME port and probe again via a fresh child.
-        if !accepted2b {
-            drop(l2); // release the original bound socket first
-            let l2c = TcpListener::bind(("127.0.0.1", port2)).unwrap();
-            l2c.set_nonblocking(true).unwrap();
-            let mut child2b = spawn_sandboxed(
-                &make_policy(temp.clone()),
-                "powershell",
-                &[
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    format!(
-                        "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-                    ),
-                ],
-                &temp,
-                &env_vars,
-            )
-            .expect("spawn child2b (post-revoke probe)");
-            let deadline2c = Instant::now() + Duration::from_secs(20);
-            let mut l2c = l2c;
-            while Instant::now() < deadline2c {
-                match l2c.accept() {
-                    Ok(_) => {
-                        accepted2b = true;
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = child2b.wait_and_restore();
-        }
+        // Child2's SECOND probe arrives ~8s after its first — accept it on
+        // the same listener (still bound), THEN reap child2 and assert exit 0.
+        let ok2b = accept_one(&mut l2, 20);
+        let exit2 = child2.wait_and_restore();
+        assert!(
+            ok2b && exit2 == Ok(0),
+            "child2's post-revoke probe must connect and exit 0 (ok2b={ok2b}, exit={exit2:?})"
+        );
 
-        // Child 3 (fresh spawn after the revoke) must also get loopback.
+        // Fresh spawn after the revoke must also get loopback.
         let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
         let port3 = listener3.local_addr().unwrap().port();
         let mut child3 = spawn_sandboxed(
             &make_policy(temp.clone()),
             "powershell",
-            &[
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                format!(
-                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port3} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-                ),
-            ],
+            &probe(port3),
             &temp,
             &env_vars,
         )
         .expect("spawn child 3 (post-revoke)");
         let mut l3 = listener3;
-        l3.set_nonblocking(true).unwrap();
-        let deadline3 = Instant::now() + Duration::from_secs(20);
-        let mut accepted3 = false;
-        while Instant::now() < deadline3 {
-            match l3.accept() {
-                Ok(_) => {
-                    accepted3 = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = child2.wait_and_restore();
-        let _ = child3.wait_and_restore();
+        let ok3 = accept_one(&mut l3, 20);
+        let exit3 = child3.wait_and_restore();
         assert!(
-            accepts.load(Ordering::Relaxed) >= 2,
-            "both concurrent children must connect, got {}",
-            accepts.load(Ordering::Relaxed)
+            ok3 && exit3 == Ok(0),
+            "fresh child after a revoke must still get loopback (ok3={ok3}, exit={exit3:?})"
         );
-        assert!(
-            accepted2b,
-            "child2 must connect AFTER child1's revocation (exemption survived the rebuild)"
-        );
-        assert!(
-            accepted3,
-            "child spawned AFTER a revoke must still get loopback (registry rebuild)"
-        );
+
         let _ = std::fs::remove_dir_all(&temp);
     }
 
