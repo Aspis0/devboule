@@ -119,9 +119,18 @@ jobs:
         run: cargo test --manifest-path devboule-mcp/Cargo.toml --no-fail-fast
 
       # ----- Python MCP backend tests (sandbox fallback parity, round 27) -----
+      # Windows-only assertions skip themselves on other OSes (round 29);
+      # pytest is installed explicitly (no runner preinstall assumption).
+      - name: setup-python (pytest)
+        if: always()
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: pytest (aspis_mcp fallback suite)
         if: always()
-        run: python -m pytest oracle/server/tests/test_write_crash_safe_fallback.py -q
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest oracle/server/tests/test_write_crash_safe_fallback.py -q
 
       # ----- Frontend tests (vitest) -----
       - name: vitest

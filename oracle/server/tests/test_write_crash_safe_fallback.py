@@ -29,6 +29,11 @@ def _fake_replace_denied(*args, **kwargs):
     raise OSError(13, "Permission denied", None, 5)  # winerror=5 ACCESS_DENIED
 
 
+@unittest.skipUnless(
+    sys.platform == "win32",
+    "AppContainer fallback + ctypes token check are Windows-only; on Linux/"
+    "macOS the fallback never fires (no winerror) and the handles stay None",
+)
 class WriteTextCrashSafeFallbackTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="aspis-mcp-fallback-"))
