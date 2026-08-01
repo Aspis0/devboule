@@ -1028,6 +1028,10 @@ pub struct SandboxedChild {
     /// child exits, before the profile is deleted, so stale network-isolation
     /// config cannot survive the child.
     loopback_exempted: bool,
+    /// Raw SID bytes of the package (round-32): needed to revoke the
+    /// exemption in wait_and_restore/Drop after the profile SID has been
+    /// freed. Empty when no exemption was granted.
+    loopback_sid_bytes: Vec<u8>,
     restored: bool, // true after wait_and_restore has restored ACLs + net
 }
 
@@ -1121,6 +1125,11 @@ impl Drop for RestrictedSandboxGuard {
 struct PackageSidGuard {
     sid: Option<PSID>,
     appcontainer_seq: Option<u64>,
+    /// Round-32: true once the loopback exemption was granted for this SID —
+    /// the guard revokes it on Drop so a spawn failure AFTER the grant cannot
+    /// leak the exemption (the SandboxedChild path revokes in
+    /// wait_and_restore/Drop instead, and clears this flag via disarm).
+    loopback_granted: bool,
 }
 
 impl PackageSidGuard {
@@ -1128,18 +1137,31 @@ impl PackageSidGuard {
         Self {
             sid: Some(sid),
             appcontainer_seq: Some(appcontainer_seq),
+            loopback_granted: false,
         }
+    }
+    fn mark_loopback_granted(&mut self) {
+        self.loopback_granted = true;
     }
     /// Disarm on success: the SID was consumed by CreateProcessAsUserW and the
     /// profile lifecycle moved into SandboxedChild.
     fn disarm(&mut self) {
         self.sid.take();
         self.appcontainer_seq.take();
+        self.loopback_granted = false;
     }
 }
 
 impl Drop for PackageSidGuard {
     fn drop(&mut self) {
+        if self.loopback_granted {
+            if let Some(sid) = self.sid {
+                // Best-effort; the registry keeps the SID on failure so a
+                // later retry (or the next grant) can rebuild correctly.
+                let _ = revoke_loopback_exemption(sid);
+            }
+            self.loopback_granted = false;
+        }
         if let Some(sid) = self.sid.take() {
             unsafe {
                 let _ = FreeSid(sid);
@@ -1372,13 +1394,14 @@ impl SandboxedChild {
             return Err(e);
         }
 
-        // C6 round-31: revoke the loopback exemption BEFORE deleting the
-        // profile — NetworkIsolationSetAppContainerConfig with 0 SIDs clears
-        // the package's exemption list, so no stale network-isolation config
-        // outlives the child. Best-effort (a leaked exemption on a deleted
-        // profile is inert, but revoke anyway for hygiene).
-        if self.loopback_exempted {
-            let _ = revoke_loopback_exemption();
+        // C6 round-31/32: revoke the loopback exemption BEFORE deleting the
+        // profile. The registry rebuild keeps other concurrent children's
+        // exemptions intact (round-32 review: (0,NULL) would clear the whole
+        // global list). Best-effort: on failure the registry retains the SID
+        // for a later retry.
+        if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
+            let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
+            let _ = revoke_loopback_exemption(sid);
             self.loopback_exempted = false;
         }
 
@@ -1428,6 +1451,17 @@ impl Drop for SandboxedChild {
                 }
                 let net = std::mem::take(&mut self.net_snapshot);
                 let _ = restore_net_policy(net);
+            }
+
+            // C6 round-32: revoke the loopback exemption on EVERY exit path
+            // (Drop runs whether or not wait_and_restore did — e.g. a child
+            // dropped without restore, or wait_and_restore errored early).
+            // The registry set keeps the SID if the API call fails, so a
+            // later revoke (or the next grant rebuild) stays consistent.
+            if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
+                let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
+                let _ = revoke_loopback_exemption(sid);
+                self.loopback_exempted = false;
             }
 
             // C5: delete the per-spawn AppContainer profile on EVERY exit path
@@ -1613,19 +1647,47 @@ fn open_null_handle() -> Result<HANDLE, String> {
 /// `wait_and_restore` via [`delete_appcontainer_profile`].
 /// The caller owns the returned PSID (free with FreeSid); the seq is needed
 /// later to delete the profile in `wait_and_restore`.
-/// Grant the per-spawn AppContainer package loopback EXEMPTION via
-/// `NetworkIsolationSetAppContainerConfig` (C6 round-30 hostile review: the
-/// pi sidecar uses `NetPolicy::Loopback` for local Ollama/oMLX sessions, but
-/// AppContainers block 127.0.0.1 by default — without this the sidecar could
-/// never reach a local model server). Verified callable from a NON-elevated
-/// process (HRESULT 0x0 probe). `NetworkIsolationSetAppContainerConfig` is a
-/// pure Win32 export in firewallapi — used directly to avoid a windows-crate
-/// feature dependency.
-fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
-    // Resolve dynamically: `firewallapi.lib` is not part of the default
-    // linker lib set (LNK1181 without the Windows SDK firewall import lib),
-    // but `firewallapi.dll` ships on every Windows 8.1+ and exports the
-    // function. Verified callable from a NON-elevated process (HRESULT 0x0).
+/// Registry-backed loopback exemption management (round-32 hostile review).
+///
+/// `NetworkIsolationSetAppContainerConfig` is a GLOBAL "set" operation — it
+/// replaces the whole loopback-exemption list with the SIDs given. Two
+/// hazards follow: (a) calling it with (0, NULL) clears EVERY package's
+/// exemption (a "per-package revoke" does not exist), and (b) concurrent
+/// Loopback children would overwrite each other's exemption. This module
+/// keeps a process-wide, mutex-protected set of active package SIDs and
+/// REBUILDS the full list on every grant/revoke, so concurrent children keep
+/// each other's exemptions and revocation only removes the one SID. The SID
+/// is stored as raw bytes (the PSID from the profile is freed after spawn).
+static LOOPBACK_SIDS: std::sync::Mutex<Option<std::collections::HashSet<Vec<u8>>>> =
+    std::sync::Mutex::new(None);
+
+/// Copy a PSID's bytes (GetLengthSid + CopySid) for registry storage.
+fn sid_to_bytes(sid: PSID) -> Option<Vec<u8>> {
+    unsafe {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetLengthSid(sid: PSID) -> u32;
+            fn CopySid(dest_len: u32, dest: *mut u8, src: PSID) -> i32;
+        }
+        let len = GetLengthSid(sid) as usize;
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        if CopySid(len as u32, buf.as_mut_ptr(), sid) == 0 {
+            return None;
+        }
+        Some(buf)
+    }
+}
+
+/// Resolve the firewallapi export (LoadLibraryW + GetProcAddress), call the
+/// function with `count` SIDs from `attrs`, and FreeLibrary on every path.
+fn call_net_isolation(
+    count: u32,
+    attrs: *const SID_AND_ATTRIBUTES,
+    op: &str,
+) -> Result<(), String> {
     unsafe {
         #[link(name = "kernel32")]
         extern "system" {
@@ -1641,31 +1703,23 @@ fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let name = b"NetworkIsolationSetAppContainerConfig ";
+        let name = b"NetworkIsolationSetAppContainerConfig\0";
         let module = LoadLibraryW(dll.as_ptr());
         if module.is_null() {
-            return Err("LoadLibraryW(firewallapi.dll) failed".to_string());
+            return Err(format!("LoadLibraryW(firewallapi.dll) failed ({op})"));
         }
-        // Round-31 hostile review: pair LoadLibraryW with FreeLibrary — every
-        // Loopback spawn previously leaked a DLL reference.
         let proc = GetProcAddress(module, name.as_ptr());
         if proc.is_null() {
             let _ = FreeLibrary(module);
-            return Err("GetProcAddress(NetworkIsolationSetAppContainerConfig) failed".to_string());
+            return Err(format!(
+                "GetProcAddress(NetworkIsolationSetAppContainerConfig) failed ({op})"
+            ));
         }
-        let mut sid_and_attrs = SID_AND_ATTRIBUTES {
-            Sid: package_sid,
-            Attributes: 0,
-        };
-        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(
-            1,
-            &mut sid_and_attrs,
-        );
-        // The function pointer is no longer needed; release the module ref.
+        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(count, attrs);
         let _ = FreeLibrary(module);
         if hr < 0 {
             return Err(format!(
-                "NetworkIsolationSetAppContainerConfig failed (HRESULT 0x{:08X});                  loopback exemption not granted — local model sessions (Ollama/oMLX)                  will be unable to reach 127.0.0.1",
+                "NetworkIsolationSetAppContainerConfig failed ({op}, HRESULT 0x{:08X})",
                 hr as u32
             ));
         }
@@ -1673,45 +1727,63 @@ fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
     Ok(())
 }
 
-/// Clear the current package's loopback exemption list (0 SIDs). Best-effort
-/// rollback for `apply_loopback_exemption` (round-31 review).
-fn revoke_loopback_exemption() -> Result<(), String> {
-    unsafe {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
-            fn GetProcAddress(
-                module: *mut core::ffi::c_void,
-                name: *const u8,
-            ) -> *mut core::ffi::c_void;
-            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
-        }
-        type NetIsolationFn = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> i32;
-        let dll: Vec<u16> = "firewallapi.dll"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let name = b"NetworkIsolationSetAppContainerConfig ";
-        let module = LoadLibraryW(dll.as_ptr());
-        if module.is_null() {
-            return Err("LoadLibraryW(firewallapi.dll) failed".to_string());
-        }
-        let proc = GetProcAddress(module, name.as_ptr());
-        if proc.is_null() {
-            let _ = FreeLibrary(module);
-            return Err("GetProcAddress(NetworkIsolationSetAppContainerConfig) failed".to_string());
-        }
-        // 0 SIDs + null array = clear the exemption list for the package.
-        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(0, std::ptr::null());
-        let _ = FreeLibrary(module);
-        if hr < 0 {
-            return Err(format!(
-                "NetworkIsolationSetAppContainerConfig(revoke) failed (HRESULT 0x{:08X})",
-                hr as u32
-            ));
-        }
+/// Rebuild the global exemption list from the registry set, under the lock.
+/// Returns the list snapshot so callers can pass it to the API.
+fn rebuild_exemption_list(
+    set: &std::collections::HashSet<Vec<u8>>,
+) -> Result<Vec<SID_AND_ATTRIBUTES>, String> {
+    let mut list = Vec::with_capacity(set.len());
+    for bytes in set {
+        let sid = PSID(bytes.as_ptr() as *mut core::ffi::c_void);
+        list.push(SID_AND_ATTRIBUTES {
+            Sid: sid,
+            Attributes: 0,
+        });
     }
-    Ok(())
+    Ok(list)
+}
+
+/// Grant loopback exemption for `package_sid`: add to the registry set and
+/// rebuild the GLOBAL list (never clobber other active children's exemptions).
+fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
+    let bytes = sid_to_bytes(package_sid).ok_or_else(|| {
+        "GetLengthSid/CopySid failed; loopback exemption not granted".to_string()
+    })?;
+    let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    set.insert(bytes.clone());
+    let list = rebuild_exemption_list(set)?;
+    let res = call_net_isolation(list.len() as u32, list.as_ptr(), "grant");
+    if res.is_err() {
+        set.remove(&bytes); // roll back the registry on API failure
+    }
+    res
+}
+
+/// Revoke loopback exemption: remove from the registry set and rebuild the
+/// GLOBAL list (a no-op SID that is not in the set changes nothing).
+fn revoke_loopback_exemption(package_sid: PSID) -> Result<(), String> {
+    let bytes = match sid_to_bytes(package_sid) {
+        Some(b) => b,
+        None => return Ok(()), // nothing to revoke for an unusable SID
+    };
+    revoke_loopback_exemption_bytes(&bytes)
+}
+
+/// Bytes-based revoke (used by SandboxedChild after the profile SID is freed).
+fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
+    let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    let removed = set.remove(bytes);
+    if !removed {
+        return Ok(()); // not in the registry — nothing changes globally
+    }
+    let list = rebuild_exemption_list(set)?;
+    let res = call_net_isolation(list.len() as u32, list.as_ptr(), "revoke");
+    if res.is_err() {
+        set.insert(bytes.to_vec()); // roll back the registry on API failure (retry later)
+    }
+    res
 }
 
 fn create_appcontainer_profile() -> Result<(PSID, u64), String> {
@@ -2005,9 +2077,15 @@ fn spawn_sandboxed_internal(
     // an exemption failure aborts the spawn (a local session that cannot
     // reach its model is a silent hang otherwise).
     let mut loopback_exempted = false;
+    let mut loopback_sid_bytes: Vec<u8> = Vec::new();
     if policy.net == crate::backend::sandbox::NetPolicy::Loopback {
         apply_loopback_exemption(package_sid)?;
         loopback_exempted = true;
+        loopback_sid_bytes = sid_to_bytes(package_sid).unwrap_or_default();
+        // Round-32: the guard revokes on Drop if the spawn fails after the
+        // grant; on success disarm() clears the flag (SandboxedChild owns
+        // the revocation lifecycle).
+        package_sid_guard.mark_loopback_granted();
     }
 
     // C5 oracle sentinel (2026-07-31): the AppContainer child inherits the
@@ -2410,6 +2488,7 @@ fn spawn_sandboxed_internal(
         job,
         appcontainer_seq: Some(appcontainer_seq),
         loopback_exempted,
+        loopback_sid_bytes,
         restored: false,
     })
 }
@@ -2998,6 +3077,147 @@ mod tests {
     /// MoveFileExW replace). This is the regression reviewers proved twice
     /// (rounds 6-7); the unit mask test cannot catch it.
     #[test]
+    /// C6 round-32: concurrent Loopback children must not revoke each other's
+    /// exemption — the registry rebuilds the GLOBAL list with all active SIDs.
+    /// Two children, two listeners: both connect; dropping one child and
+    /// revoking its exemption must not break the other.
+    #[test]
+    fn concurrent_loopback_children_keep_each_others_exemption() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = std::env::temp_dir().join(format!(
+            "aspis-loopback-2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let env_vars: Vec<(String, String)> = [
+            "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC",
+            "PATHEXT", "APPDATA", "LOCALAPPDATA", "ProgramData", "WINDIR",
+        ]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+        .collect();
+
+        let make_policy = |root: std::path::PathBuf| {
+            SandboxPolicy::deny(root.clone())
+                .writable(root.clone())
+                .net(NetPolicy::Loopback)
+        };
+
+        // Child 1.
+        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        let mut child1 = spawn_sandboxed(
+            &make_policy(temp.clone()),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port1} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ],
+            &temp,
+            &env_vars,
+        )
+        .expect("spawn child 1");
+
+        // Child 2 (concurrent — registry must keep BOTH exemptions).
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+        let mut child2 = spawn_sandboxed(
+            &make_policy(temp.clone()),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ],
+            &temp,
+            &env_vars,
+        )
+        .expect("spawn child 2");
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut l1 = listener1;
+        let mut l2 = listener2;
+        l1.set_nonblocking(true).unwrap();
+        l2.set_nonblocking(true).unwrap();
+        while Instant::now() < deadline && accepts.load(Ordering::Relaxed) < 2 {
+            for l in [&mut l1, &mut l2] {
+                match l.accept() {
+                    Ok(_) => {
+                        accepts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Drop child1 FIRST: its revocation must not remove child2's exemption.
+        let _ = child1.wait_and_restore();
+        drop(child1);
+
+        // Child 2 must still be able to connect (its exemption survived).
+        let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port3 = listener3.local_addr().unwrap().port();
+        let mut child3 = spawn_sandboxed(
+            &make_policy(temp.clone()),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port3} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ],
+            &temp,
+            &env_vars,
+        )
+        .expect("spawn child 3 (post-revoke)");
+        let mut l3 = listener3;
+        l3.set_nonblocking(true).unwrap();
+        let deadline3 = Instant::now() + Duration::from_secs(20);
+        let mut accepted3 = false;
+        while Instant::now() < deadline3 {
+            match l3.accept() {
+                Ok(_) => {
+                    accepted3 = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child2.wait_and_restore();
+        let _ = child3.wait_and_restore();
+        assert!(
+            accepts.load(Ordering::Relaxed) >= 2,
+            "both concurrent children must connect, got {}",
+            accepts.load(Ordering::Relaxed)
+        );
+        assert!(
+            accepted3,
+            "child spawned AFTER a revoke must still get loopback (registry rebuild)"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     fn preexisting_ledger_and_lock_are_writable_in_sandbox() {
         use std::io::{Read, Write};
         use std::os::windows::io::FromRawHandle;

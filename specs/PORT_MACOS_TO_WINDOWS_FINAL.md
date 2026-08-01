@@ -508,7 +508,16 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
   local Ollama/oMLX sessions. e2e-tested:
   `loopback_policy_allows_localhost_connection` (sandboxed PowerShell
   Test-NetConnection reaches a host-side 127.0.0.1 listener, exit 0).
-  Fail-closed: an exemption error aborts the spawn.
+  Fail-closed: an exemption error aborts the spawn. Round 32 hardened the
+  lifecycle: the exemption registry is a process-wide Mutex-guarded set of
+  active package SIDs; every grant/revoke REBUILDS the global list (the API
+  is a "set", not "add" — a bare (0,NULL) revoke would clear concurrent
+  children's exemptions). Revocation is RAII-complete: PackageSidGuard revokes
+  on spawn-failure Drop, SandboxedChild revokes in wait_and_restore AND in
+  Drop (every exit path), before profile deletion; a failed revoke keeps the
+  SID in the registry for retry. e2e: concurrent_loopback_children_keep_each_
+  others_exemption (two children connect; revoking one does not break the
+  other).
 - Package SID comes from a **per-spawn registered profile**
   (`CreateAppContainerProfile` with a pid+seq moniker — no admin needed, lands
   under `%LOCALAPPDATA%\Packages`). NOTE: a bare derived SID
