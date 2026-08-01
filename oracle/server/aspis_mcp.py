@@ -1762,15 +1762,27 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
     # Round-15 hostile review: track whether a backup was taken BEFORE the
     # replace, so a failed fallback copy (target truncated but still present)
     # can be rolled back UNCONDITIONALLY — the handler must not rely on
-    # `path.exists()`.
+    # `path.exists()`. Round-16: backup_created is set ONLY after a SUCCESSFUL
+    # copy — a partial .bak (copy failed mid-way) must never be restored over
+    # the target and then deleted.
     had_backup = path.exists()
+    backup_created = False
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         if had_backup:
-            shutil.copy2(path, backup_path)
+            try:
+                shutil.copy2(path, backup_path)
+                backup_created = True
+            except OSError:
+                # Remove a partial backup so it can never be restored over the
+                # target on the error path.
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
         try:
             os.replace(temp_path, path)
         except OSError as exc:
@@ -1783,8 +1795,9 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
             # files — without this fallback every write fails closed and
             # Unattended cloud runs cannot function. Fall back to copy+delete
             # ONLY on ERROR_ACCESS_DENIED (winerror 5); any other error keeps
-            # original semantics.
-            if exc.winerror != 5:
+            # original semantics. getattr: winerror is Windows-only and may be
+            # absent (not None) on other platforms (round-16 review).
+            if getattr(exc, "winerror", None) != 5:
                 raise
             shutil.copy2(temp_path, path)
             try:
@@ -1801,7 +1814,7 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
             if temp_path.exists():
                 temp_path.unlink()
         finally:
-            if had_backup:
+            if backup_created:
                 # Round-15: restore UNCONDITIONALLY — a failed fallback copy
                 # can leave the target truncated but still present, and the
                 # old `not path.exists()` guard would skip the restore and
@@ -1815,6 +1828,14 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
                         pass
                 except Exception:
                     pass
+            elif had_backup:
+                # Round-16: the target existed but we hold NO valid backup
+                # (the backup copy itself failed). Do NOT restore from a
+                # partial .bak (already removed); the caller must know.
+                raise McpError(
+                    f"Could not save {label}: {exc}; no valid backup could be "
+                    f"created — original {label} may be damaged at {path}"
+                ) from exc
             elif path.exists():
                 # First write with no backup: a partially-created target must
                 # not survive a failed save.

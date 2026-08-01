@@ -633,9 +633,16 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   had_backup is tracked BEFORE the replace, a failed fallback copy (target
   truncated but still present) restores the backup UNCONDITIONALLY (keeping
   the .bak if the restore itself fails), and first-write failures remove the
-  partially-created target. New Windows tests (fault seams MOVE_FAULT /
-  COPY_FALLBACK_FAULT) prove both paths; the Python backend mirrors the same
-  logic.
+  partially-created target. Round 16 closed the last rollback hole: the BACKUP
+  copy itself can fail mid-way (partial .bak) — `backup_created` is set only
+  after a SUCCESSFUL copy, a partial .bak is removed (never restored over the
+  target then deleted), and the no-valid-backup case is reported explicitly
+  (`backup_copy_failure_reports_no_valid_backup` test); restore failure keeps
+  the .bak and names it in the error (`restore_failure_keeps_backup` test).
+  The Python backend mirrors the same logic and reads the winerror via
+  getattr (Windows-only attribute, round-16 review). New Windows tests use
+  fault seams MOVE_FAULT / COPY_FALLBACK_FAULT / BACKUP_COPY_FAULT /
+  RESTORE_FAULT; all discriminating.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job

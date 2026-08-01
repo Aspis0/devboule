@@ -438,6 +438,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
     let temp_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.tmp"));
     let backup_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.bak"));
     let had_backup = path.exists();
+    let mut backup_created = false;
     let write_result = (|| -> std::io::Result<()> {
         {
             use std::io::Write;
@@ -461,8 +462,42 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
         }
+        // Round-16 hostile review: track backup_created ONLY after a
+        // SUCCESSFUL copy — a partial/corrupt .bak (copy failed mid-way) must
+        // never be restored over the target and then deleted, permanently
+        // losing the original data. had_backup says the target existed;
+        // backup_created says we hold a VALID copy of it.
         if had_backup {
-            let _ = std::fs::copy(path, &backup_path);
+            #[cfg(test)]
+            if BACKUP_COPY_FAULT.with(|c| c.replace(false)) {
+                // Simulate the backup copy failing mid-way: leave a truncated
+                // .bak behind (the partial-backup damage mode).
+                if let Ok(mut f) =
+                    std::fs::OpenOptions::new().create(true).write(true).open(&backup_path)
+                {
+                    use std::io::Write;
+                    let _ = f.set_len(0);
+                }
+                BACKUP_COPY_FAULTED.with(|c| c.set(true));
+            }
+            #[cfg(test)]
+            if BACKUP_COPY_FAULTED.with(|c| c.replace(false)) {
+                // Remove a partial backup so it can never be restored over
+                // the target on the error path.
+                let _ = std::fs::remove_file(&backup_path);
+            } else if std::fs::copy(path, &backup_path).is_ok() {
+                backup_created = true;
+            } else {
+                // Remove a partial backup so it can never be restored over
+                // the target on the error path.
+                let _ = std::fs::remove_file(&backup_path);
+            }
+            #[cfg(not(test))]
+            if std::fs::copy(path, &backup_path).is_ok() {
+                backup_created = true;
+            } else {
+                let _ = std::fs::remove_file(&backup_path);
+            }
         }
         replace_existing(&temp_path, path)?;
         #[cfg(unix)]
@@ -477,12 +512,23 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
     })();
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&temp_path);
-        if had_backup {
+        if backup_created {
             // Round-15 hostile review: restore UNCONDITIONALLY — a failed
             // fallback copy can leave the target truncated but still present,
             // and `!path.exists()` would skip the restore and delete the only
             // good copy. Keep the .bak if the restore itself fails.
-            match std::fs::copy(&backup_path, path) {
+            #[cfg(test)]
+            let restore_result = if RESTORE_FAULT.with(|c| c.replace(false)) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "simulated restore failure",
+                ))
+            } else {
+                std::fs::copy(&backup_path, path).map(|_| ())
+            };
+            #[cfg(not(test))]
+            let restore_result = std::fs::copy(&backup_path, path).map(|_| ());
+            match restore_result {
                 Ok(_) => {
                     let _ = std::fs::remove_file(&backup_path);
                 }
@@ -493,6 +539,15 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
                     )));
                 }
             }
+        } else if had_backup {
+            // Round-16 hostile review: the target existed but we hold NO valid
+            // backup (backup copy itself failed). The target is untouched or
+            // damaged by the failed replace — do NOT restore from a partial
+            // .bak (already removed above); report the situation.
+            return Err(ToolError::new(format!(
+                "Could not save {label}: {e}; no valid backup could be created —                  original {label} may be damaged at {}",
+                path.display()
+            )));
         } else if path.exists() {
             // First write with no backup: a partially-created target must not
             // survive a failed save.
@@ -513,6 +568,14 @@ thread_local! {
     /// Test seam: make the fallback copy truncate the target then fail
     /// (observed damage mode of a mid-copy I/O failure).
     static COPY_FALLBACK_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: make the BACKUP copy (target -> .bak) fail, so the
+    /// no-valid-backup error path is exercised deterministically.
+    static BACKUP_COPY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: make the RESTORE copy (.bak -> target) fail, so the
+    /// .bak-kept path is exercised deterministically.
+    static RESTORE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Internal: one-shot latch bridging the backup-copy fault branches.
+    static BACKUP_COPY_FAULTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(windows)]
@@ -1244,6 +1307,86 @@ mod tests {
             .filter(|n| n.ends_with(".bak"))
             .collect();
         assert!(leftovers.is_empty(), "backup consumed by restore: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6 round-16 hostile review: the backup copy itself fails (partial
+    /// .bak) — the target existed but no VALID backup exists; the error must
+    /// say so and no partial .bak may be restored or left to be deleted.
+    #[cfg(windows)]
+    #[test]
+    fn backup_copy_failure_reports_no_valid_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-bakfail-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(&path, "GOOD-OLD").unwrap();
+
+        BACKUP_COPY_FAULT.with(|c| c.set(true));
+        MOVE_FAULT.with(|c| c.set(true)); // replace also fails
+
+        let res = write_text_crash_safe(&path, "NEW", "test file");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("no valid backup"),
+            "must report the missing valid backup, got: {msg}"
+        );
+        // No .bak may remain (partial backup removed, never restored).
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        assert!(leftovers.is_empty(), "partial .bak must be removed: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6 round-16: restore itself fails — the .bak MUST be kept (a stale
+    /// backup beats a corrupted file) and the error must name it.
+    #[cfg(windows)]
+    #[test]
+    fn restore_failure_keeps_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-restfail-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(&path, "GOOD-OLD").unwrap();
+
+        MOVE_FAULT.with(|c| c.set(true)); // replace fails -> fallback path
+        COPY_FALLBACK_FAULT.with(|c| c.set(true)); // fallback copy fails
+        RESTORE_FAULT.with(|c| c.set(true)); // restore fails
+
+        let res = write_text_crash_safe(&path, "NEW", "test file");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("restoration ALSO failed"),
+            "must report the restore failure, got: {msg}"
+        );
+        assert!(
+            msg.contains("keeping"),
+            "must state the backup is kept, got: {msg}"
+        );
+        // The .bak is still on disk.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        assert_eq!(leftovers.len(), 1, "one .bak must be KEPT: {leftovers:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
