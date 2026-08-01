@@ -1023,6 +1023,11 @@ pub struct SandboxedChild {
     /// the profile once the child has exited. None on error paths that never
     /// created one.
     appcontainer_seq: Option<u64>,
+    /// True when a NetPolicy::Loopback exemption was granted to this spawn's
+    /// package (round-31 review): the exemption must be REVOKED after the
+    /// child exits, before the profile is deleted, so stale network-isolation
+    /// config cannot survive the child.
+    loopback_exempted: bool,
     restored: bool, // true after wait_and_restore has restored ACLs + net
 }
 
@@ -1367,6 +1372,16 @@ impl SandboxedChild {
             return Err(e);
         }
 
+        // C6 round-31: revoke the loopback exemption BEFORE deleting the
+        // profile — NetworkIsolationSetAppContainerConfig with 0 SIDs clears
+        // the package's exemption list, so no stale network-isolation config
+        // outlives the child. Best-effort (a leaked exemption on a deleted
+        // profile is inert, but revoke anyway for hygiene).
+        if self.loopback_exempted {
+            let _ = revoke_loopback_exemption();
+            self.loopback_exempted = false;
+        }
+
         // C5: the child is dead and all host state is restored — delete the
         // per-spawn AppContainer profile so %LOCALAPPDATA%\Packages does not
         // accumulate one entry per spawned command. Best-effort: a leftover
@@ -1619,6 +1634,57 @@ fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
                 module: *mut core::ffi::c_void,
                 name: *const u8,
             ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+        }
+        type NetIsolationFn = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> i32;
+        let dll: Vec<u16> = "firewallapi.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let name = b"NetworkIsolationSetAppContainerConfig ";
+        let module = LoadLibraryW(dll.as_ptr());
+        if module.is_null() {
+            return Err("LoadLibraryW(firewallapi.dll) failed".to_string());
+        }
+        // Round-31 hostile review: pair LoadLibraryW with FreeLibrary — every
+        // Loopback spawn previously leaked a DLL reference.
+        let proc = GetProcAddress(module, name.as_ptr());
+        if proc.is_null() {
+            let _ = FreeLibrary(module);
+            return Err("GetProcAddress(NetworkIsolationSetAppContainerConfig) failed".to_string());
+        }
+        let mut sid_and_attrs = SID_AND_ATTRIBUTES {
+            Sid: package_sid,
+            Attributes: 0,
+        };
+        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(
+            1,
+            &mut sid_and_attrs,
+        );
+        // The function pointer is no longer needed; release the module ref.
+        let _ = FreeLibrary(module);
+        if hr < 0 {
+            return Err(format!(
+                "NetworkIsolationSetAppContainerConfig failed (HRESULT 0x{:08X});                  loopback exemption not granted — local model sessions (Ollama/oMLX)                  will be unable to reach 127.0.0.1",
+                hr as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Clear the current package's loopback exemption list (0 SIDs). Best-effort
+/// rollback for `apply_loopback_exemption` (round-31 review).
+fn revoke_loopback_exemption() -> Result<(), String> {
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
         }
         type NetIsolationFn = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> i32;
         let dll: Vec<u16> = "firewallapi.dll"
@@ -1632,19 +1698,15 @@ fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
         }
         let proc = GetProcAddress(module, name.as_ptr());
         if proc.is_null() {
+            let _ = FreeLibrary(module);
             return Err("GetProcAddress(NetworkIsolationSetAppContainerConfig) failed".to_string());
         }
-        let mut sid_and_attrs = SID_AND_ATTRIBUTES {
-            Sid: package_sid,
-            Attributes: 0,
-        };
-        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(
-            1,
-            &mut sid_and_attrs,
-        );
+        // 0 SIDs + null array = clear the exemption list for the package.
+        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(0, std::ptr::null());
+        let _ = FreeLibrary(module);
         if hr < 0 {
             return Err(format!(
-                "NetworkIsolationSetAppContainerConfig failed (HRESULT 0x{:08X});                  loopback exemption not granted — local model sessions (Ollama/oMLX)                  will be unable to reach 127.0.0.1",
+                "NetworkIsolationSetAppContainerConfig(revoke) failed (HRESULT 0x{:08X})",
                 hr as u32
             ));
         }
@@ -1942,8 +2004,10 @@ fn spawn_sandboxed_internal(
     // profile is registered, before the token/ACL transaction. Fail-closed:
     // an exemption failure aborts the spawn (a local session that cannot
     // reach its model is a silent hang otherwise).
+    let mut loopback_exempted = false;
     if policy.net == crate::backend::sandbox::NetPolicy::Loopback {
         apply_loopback_exemption(package_sid)?;
+        loopback_exempted = true;
     }
 
     // C5 oracle sentinel (2026-07-31): the AppContainer child inherits the
@@ -2345,6 +2409,7 @@ fn spawn_sandboxed_internal(
         net_snapshot,
         job,
         appcontainer_seq: Some(appcontainer_seq),
+        loopback_exempted,
         restored: false,
     })
 }
@@ -2850,13 +2915,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
-    /// C6 rounds 6-8 e2e: a PRE-EXISTING ledger file + .lock sidecar (created by
-    /// record_launch_pending before spawn, user-only DACL, no package SID) must
-    /// be openable+rewritable by the AppContainer child when granted as writable
-    /// roots — the consent hook's exact access pattern (open lock, write ledger,
-    /// MoveFileExW replace). This is the regression reviewers proved twice
-    /// (rounds 6-7); the unit mask test cannot catch it.
-    #[test]
     /// C6 round-30: NetPolicy::Loopback grants the per-package loopback
     /// exemption — a sandboxed child can reach a 127.0.0.1 listener. Without
     /// the exemption the AppContainer blocks loopback and this fails.
@@ -2921,7 +2979,11 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let _ = child.wait_and_restore();
+        // Round-31 review: assert the child exited 0 (Test-NetConnection
+        // success) AND the connection was accepted — cleanup + status are
+        // part of the contract, not optional.
+        let exit = child.wait_and_restore();
+        assert_eq!(exit, Ok(0), "Test-NetConnection must exit 0, got {exit:?}");
         assert!(
             accepted,
             "sandboxed child with NetPolicy::Loopback must reach a 127.0.0.1 listener"
@@ -2929,6 +2991,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    /// C6 rounds 6-8 e2e: a PRE-EXISTING ledger file + .lock sidecar (created by
+    /// record_launch_pending before spawn, user-only DACL, no package SID) must
+    /// be openable+rewritable by the AppContainer child when granted as writable
+    /// roots — the consent hook's exact access pattern (open lock, write ledger,
+    /// MoveFileExW replace). This is the regression reviewers proved twice
+    /// (rounds 6-7); the unit mask test cannot catch it.
+    #[test]
     fn preexisting_ledger_and_lock_are_writable_in_sandbox() {
         use std::io::{Read, Write};
         use std::os::windows::io::FromRawHandle;

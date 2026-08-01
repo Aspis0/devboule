@@ -108,6 +108,16 @@ jobs:
         shell: bash
         run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
 
+      # C6 round-31 hostile review: CI previously ran only `cargo check` for
+      # src-tauri — the Windows broker/ACL/AppContainer/ConPTY integration
+      # tests never executed in CI. Run the lib test suite on Windows
+      # (sandbox tests requiring a real host skip themselves on non-elevated
+      # runners by design; the suite is what must be exercised).
+      - name: cargo test (src-tauri, windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --no-fail-fast
+
       - name: cargo check (oracle-core)
         run: cargo check --manifest-path oracle-core/Cargo.toml
 
