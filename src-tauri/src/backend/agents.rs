@@ -1,4 +1,4 @@
-use super::fs_replace::replace_file_with_backup;
+use super::fs_replace::{replace_file_with_backup, replace_file_with_backup_with_fallback};
 use super::model::{AgentClaim, AgentEvent, AgentLiveState, AgentRoleRule, AgentSession};
 use super::state::BackendState;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -320,7 +320,7 @@ fn write_agent_ledger(
         std::process::id(),
         Utc::now().timestamp_millis()
     ));
-    replace_file_with_backup(&temp_path, &path, &backup_path, "agent client ledger")
+    replace_file_with_backup_with_fallback(&temp_path, &path, &backup_path, "agent client ledger")
 }
 
 /// Upsert one agentId -> entry in the ledger. Locked the same way as the agent
@@ -1006,7 +1006,7 @@ fn write_agent_live_state(path: &Path, state: &AgentLiveState) -> Result<(), Str
         std::process::id(),
         Utc::now().timestamp_millis()
     ));
-    replace_file_with_backup(&temp_path, path, &backup_path, "agent state file")
+    replace_file_with_backup_with_fallback(&temp_path, path, &backup_path, "agent state file")
 }
 
 // SSoT (2026-07, role-untangle follow-up): agent role rules are authored ONCE

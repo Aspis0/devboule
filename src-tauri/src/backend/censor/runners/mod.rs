@@ -1601,22 +1601,34 @@ mod tests {
     fn run_capture_kills_on_timeout() {
         // A guaranteed-long-running child invoked DIRECTLY (no shell wrapper), so
         // killing the child closes its stdout pipe and the reader unblocks. On
-        // Windows `ping -n 30 -w 1000 127.0.0.1` runs ~30s; on unix `sleep 30`.
+        // Windows `cmd /c for /L` is a pure CPU loop (~minutes, no network —
+        // ping would exit immediately inside the AppContainer: loopback is
+        // blocked and `net(None)` grants no capability, so "Unable to contact
+        // IP driver" -> test became invalid, round 11); on unix `sleep 30`.
         #[cfg(windows)]
-        let (prog, args): (&str, Vec<&str>) = ("ping", vec!["-n", "30", "-w", "1000", "127.0.0.1"]);
+        let (prog, args): (&str, Vec<&str>) = (
+            "cmd",
+            vec!["/c", "for /L %i in (1,1,9999999) do ver >nul"],
+        );
         #[cfg(not(windows))]
         let (prog, args): (&str, Vec<&str>) = ("sleep", vec!["30"]);
 
         if !crate::backend::projects::command_exists(prog) {
             return; // environment without the helper tool; nothing to assert.
         }
+        // C6 round 11 (hostile review): do NOT run the sandbox policy directly
+        // on %TEMP% — deny_write_everyone applies icacls /deny /T recursively
+        // over the whole temp tree (tens of thousands of files -> minutes of
+        // ACL churn, and the test hangs). Use a dedicated subdir instead; the
+        // sandbox behavior under test (prompt kill on timeout) is unchanged.
+        let root = std::env::temp_dir().join(format!(
+            "aspis-censor-kill-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
         let start = std::time::Instant::now();
-        let out = run_capture_with_timeout(
-            prog,
-            &args,
-            std::env::temp_dir().as_path(),
-            Duration::from_millis(300),
-        );
+        let out = run_capture_with_timeout(prog, &args, root.as_path(), Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&root);
         // Timed out → None, and we did NOT wait the full 30s (killed promptly).
         assert!(out.is_none());
         assert!(

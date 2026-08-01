@@ -595,20 +595,27 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   same accountability-grade caveat — the consent bridge is a UX gate, not a
   security boundary; a per-agent ledger or signed-verdict follow-up is
   required before Unattended is trusted with multiple concurrent agents.
-- **REPLACE-LEG FAILURE (review round 8, e2e-proven)**: MoveFileExW
+- **REPLACE-LEG FAILURE (review rounds 8-11, e2e-proven)**: MoveFileExW
   REPLACE_EXISTING fails ACCESS_DENIED inside the AppContainer even with
   DELETE + FILE_DELETE_CHILD granted — verified three ways: cmd `move /y`,
   PowerShell `Move-Item -Force` and `[IO.File]::Replace` (the sandbox
   double-check rejects the atomic-replace access path; the ACE grant alone
-  cannot fix it). `fs_replace::replace_existing` now tries the atomic move
-  first and falls back to copy+delete on ERROR_ACCESS_DENIED /
-  ERROR_SHARING_VIOLATION only (cross-volume and other errors keep original
-  semantics). Slightly less atomic (brief delete/copy window) — acceptable for
-  the agent ledger under the held .lock + .bak; rollback on copy failure is
-  unconditional (restore from .bak even if the target still exists, and KEEP
-  the .bak if restoration itself fails) — review round 9 regression tests
-  cover move-denied→copy, copy-failure→restore, restore-failure→.bak-kept,
-  all passing on the non-elevated host.
+  cannot fix it). `fs_replace::replace_existing` tries the atomic move first
+  and falls back to copy+delete, but ONLY (a) for ERROR_ACCESS_DENIED
+  (FACILITY_WIN32 validated) and (b) through the explicit
+  `replace_file_with_backup_with_fallback` capability — used only by the
+  sandboxed ledger writers (agent client ledger, agent state file, censor
+  shard). Host-side shared callers (design/projects/config/oracle saves)
+  keep strictly atomic semantics: 0x80070005 from a plain host (broken ACLs)
+  is indistinguishable from the AppContainer double-check, so without the
+  capability the original error is returned (round-11 review). Rollback
+  semantics: on copy failure the backup is restored UNCONDITIONALLY (even if
+  the target still exists — round-8 bug), the .bak is KEPT if restoration
+  itself fails, a committed target with a leaked temp is preserved and only
+  the leak reported (round-10 bug), and first-write failures clean up
+  partially-created targets. Round 9-11 regression tests (fault-injection
+  seams: arm_move_fault/arm_copy_fault/arm_restore_fault) cover all paths on
+  the non-elevated host.
 
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as

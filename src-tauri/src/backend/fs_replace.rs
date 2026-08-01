@@ -1,11 +1,38 @@
 use std::fs;
 use std::path::Path;
 
+/// Atomic replace with backup. Host-side shared callers (design/projects/
+/// config/oracle saves) MUST NOT pass `allow_copy_fallback` — that capability
+/// is reserved for sandboxed ledger writers, where the AppContainer
+/// double-check denies MoveFileExW(REPLACE_EXISTING) with ACCESS_DENIED even
+/// when DELETE+DELETE_CHILD are granted (e2e-proven). Everywhere else the
+/// replace stays strictly atomic or fails.
 pub(crate) fn replace_file_with_backup(
     temp_path: &Path,
     target_path: &Path,
     backup_path: &Path,
     label: &str,
+) -> Result<(), String> {
+    replace_file_with_backup_impl(temp_path, target_path, backup_path, label, false)
+}
+
+/// Like `replace_file_with_backup` but with the AppContainer copy+delete
+/// fallback capability enabled (see the wrapper doc).
+pub(crate) fn replace_file_with_backup_with_fallback(
+    temp_path: &Path,
+    target_path: &Path,
+    backup_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    replace_file_with_backup_impl(temp_path, target_path, backup_path, label, true)
+}
+
+fn replace_file_with_backup_impl(
+    temp_path: &Path,
+    target_path: &Path,
+    backup_path: &Path,
+    label: &str,
+    allow_copy_fallback: bool,
 ) -> Result<(), String> {
     // First-write detection: if no backup was taken, the target did not exist
     // before this call, so a partially-created target on the error path must
@@ -16,13 +43,21 @@ pub(crate) fn replace_file_with_backup(
             .map_err(|e| format!("Could not back up existing {label}: {e}"))?;
     }
 
-    match replace_existing(temp_path, target_path) {
+    match replace_existing(temp_path, target_path, allow_copy_fallback) {
         Ok(()) => {
             // Success: remove the .bak (best-effort — a leftover backup is inert).
             let _ = fs::remove_file(backup_path);
             Ok(())
         }
-        Err(e) => {
+        Err(f) => {
+            if f.target_committed {
+                // Round-10 hostile review: the fallback copy LANDED the new
+                // content and only the temp cleanup failed. The target holds a
+                // valid save — never restore over it or delete it. Report the
+                // leak; drop the now-useless .bak.
+                let _ = fs::remove_file(backup_path);
+                return Err(format!("{label} saved, but temp cleanup failed: {}", f.message));
+            }
             // Round-8 hostile review: on failure the target may be TRUNCATED but
             // still present (copy-over in the fallback), so the old
             // `!target_path.exists()` guard would skip restoration and delete the
@@ -30,16 +65,20 @@ pub(crate) fn replace_file_with_backup(
             // was taken, and KEEP the .bak if restoration fails — a stale backup
             // is safer than a corrupted ledger. Restoration runs BEFORE temp
             // cleanup so a locked temp file can never suppress the restore.
-            if backup_path.exists() {
+            if had_backup {
+                // Branch on had_backup, NOT on backup_path.exists(): a stale
+                // pre-existing backup file at the same path must not be
+                // restored over a first-write failure (round-10 review).
                 if let Err(restore_err) = restore_copy(backup_path, target_path) {
                     return Err(format!(
-                        "Could not save {label}: {e}; backup restoration ALSO failed                          ({restore_err}) — keeping {label} backup at {}",
+                        "Could not save {label}: {}; backup restoration ALSO failed                          ({restore_err}) — keeping {label} backup at {}",
+                        f.message,
                         backup_path.display()
                     ));
                 }
                 // Restoration succeeded — the backup served its purpose.
                 let _ = fs::remove_file(backup_path);
-            } else if !had_backup && target_path.exists() {
+            } else if target_path.exists() {
                 // Round-9 hostile review: a first write with no backup leaves a
                 // partially-created target on failure — remove it (best-effort;
                 // the error below already tells the caller the save failed).
@@ -47,11 +86,12 @@ pub(crate) fn replace_file_with_backup(
             }
             if let Err(cleanup_err) = fs::remove_file(temp_path) {
                 return Err(format!(
-                    "Could not save {label}: {e}; temp cleanup also failed ({cleanup_err}) —                      {label} temp file left at {}",
+                    "Could not save {label}: {}; temp cleanup also failed ({cleanup_err}) —                      {label} temp file left at {}",
+                    f.message,
                     temp_path.display()
                 ));
             }
-            Err(format!("Could not save {label}: {e}"))
+            Err(format!("Could not save {label}: {}", f.message))
         }
     }
 }
@@ -79,8 +119,10 @@ mod win32_error {
 fn copy_file_fallback(source: &Path, target: &Path) -> Result<u64, String> {
     #[cfg(test)]
     if COPY_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        // Simulate CopyFileW failing mid-copy: destination truncated, then error.
-        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(target) {
+        // Simulate CopyFileW failing mid-copy: destination created/truncated
+        // (create(true) so a first-write partial target is also simulated),
+        // then error.
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).write(true).open(target) {
             let _ = f.set_len(0);
         }
         return Err("simulated mid-copy failure".to_string());
@@ -152,8 +194,22 @@ fn arm_move_fault() {
     MOVE_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Failure of the replace step. `target_committed` distinguishes the
+/// round-10 case: the fallback copy landed the new content and only the temp
+/// cleanup failed (target MUST be preserved) from a genuine copy failure
+/// (target unreliable, restore required).
 #[cfg(target_os = "windows")]
-fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> {
+struct ReplaceFailure {
+    message: String,
+    target_committed: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn replace_existing(
+    temp_path: &Path,
+    target_path: &Path,
+    allow_copy_fallback: bool,
+) -> Result<(), ReplaceFailure> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
@@ -173,19 +229,31 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> 
     match replace {
         Ok(()) => Ok(()),
         Err(e) => {
-            // C6 round 10 (hostile review): fall back to copy+delete ONLY for
-            // ACCESS_DENIED — the AppContainer double-check rejects the atomic
-            // replace access path even with DELETE+DELETE_CHILD granted
-            // (e2e-proven with cmd move /y, Move-Item -Force,
-            // [IO.File]::Replace). Any other code (SHARING_VIOLATION,
-            // NOT_SAME_DEVICE, ...) keeps original semantics so host-side
-            // shared callers never silently degrade to a non-atomic overwrite.
-            // `e.code()` on a win32 failure surfaces the FACILITY_WIN32
-            // HRESULT (0x80070005), not the bare win32 code — validate the
-            // facility as well as the low 16 bits.
+            if !allow_copy_fallback {
+                // Round-10 hostile review: the copy+delete fallback is a
+                // non-atomic capability reserved for sandboxed ledger writers.
+                // Host-side callers never degrade: 0x80070005 from a plain
+                // host (e.g. broken ACLs) is indistinguishable from the
+                // AppContainer double-check, so without the explicit
+                // capability we keep the original error semantics.
+                return Err(ReplaceFailure {
+                    message: e.to_string(),
+                    target_committed: false,
+                });
+            }
+            // C6 round 10: fall back to copy+delete ONLY for ACCESS_DENIED —
+            // the AppContainer double-check rejects the atomic replace access
+            // path even with DELETE+DELETE_CHILD granted (e2e-proven with cmd
+            // move /y, Move-Item -Force, [IO.File]::Replace). Any other code
+            // (SHARING_VIOLATION, NOT_SAME_DEVICE, ...) keeps original
+            // semantics. `e.code()` surfaces the FACILITY_WIN32 HRESULT
+            // (0x80070005) — validate the facility as well as the low 16 bits.
             let code = e.code().0 as u32;
             if (code >> 16) != 0x8007 || (code & 0xFFFF) != win32_error::ERROR_ACCESS_DENIED as u32 {
-                return Err(e.to_string());
+                return Err(ReplaceFailure {
+                    message: e.to_string(),
+                    target_committed: false,
+                });
             }
             // Copy+delete are the legs the AppContainer ACLs do allow
             // (e2e-verified). Non-atomic: CopyFileW overwrites the target in
@@ -195,18 +263,24 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> 
             match copy_file_fallback(temp_path, target_path) {
                 Ok(_) => match fs::remove_file(temp_path) {
                     Ok(()) => Ok(()),
-                    // Round-9 hostile review: cleanup failure must be reported
-                    // (not silently swallowed) so the wrapper restores the
-                    // backup and the caller knows the temp leaked.
-                    Err(cleanup_err) => Err(format!(
-                        "Copy fallback succeeded but temp cleanup failed ({cleanup_err}) — \
-                         temp file left at {}",
-                        temp_path.display()
-                    )),
+                    // Round-9/10 hostile review: the copy LANDED — this is a
+                    // committed save plus a leaked temp, NOT a failure of the
+                    // target. target_committed=true keeps the wrapper from
+                    // restoring over valid content or deleting it.
+                    Err(cleanup_err) => Err(ReplaceFailure {
+                        message: format!(
+                            "copy fallback committed the target but temp cleanup failed                              ({cleanup_err}); temp file left at {}",
+                            temp_path.display()
+                        ),
+                        target_committed: true,
+                    }),
                 },
-                Err(copy_err) => Err(format!(
-                    "MoveFileExW replace failed (Access denied in sandbox?);                      copy fallback also failed: {copy_err}"
-                )),
+                Err(copy_err) => Err(ReplaceFailure {
+                    message: format!(
+                        "MoveFileExW replace failed (Access denied in sandbox?);                          copy fallback also failed: {copy_err}"
+                    ),
+                    target_committed: false,
+                }),
             }
         }
     }
@@ -276,7 +350,9 @@ mod tests {
 
         arm_move_fault(); // emulated ERROR_ACCESS_DENIED from the move
 
-        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
         assert!(res.is_ok(), "copy fallback must succeed when move is denied: {res:?}");
         assert_eq!(
             fs::read_to_string(&target_path).unwrap(),
@@ -307,7 +383,9 @@ mod tests {
         arm_move_fault(); // move -> ACCESS_DENIED
         arm_copy_fault(); // copy fallback truncates target then fails
 
-        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
         assert!(res.is_err(), "replace must fail: {res:?}");
         let restored = fs::read_to_string(&target_path).unwrap_or_default();
         assert!(
@@ -337,7 +415,9 @@ mod tests {
         arm_copy_fault(); // copy fallback fails
         arm_restore_fault(); // restore copy fails -> .bak kept
 
-        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
         assert!(res.is_err(), "replace must fail");
         let msg = res.unwrap_err();
         assert!(
@@ -394,14 +474,81 @@ mod tests {
         fs::write(&temp_path, b"NEW").unwrap();
 
         arm_move_fault(); // move -> ACCESS_DENIED
-        arm_copy_fault(); // copy fallback truncates target (creates empty) then fails
+        arm_copy_fault(); // copy fallback creates+truncates target then fails
 
-        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
         assert!(res.is_err(), "replace must fail");
         assert!(
             !target_path.exists(),
             "partially-created target must be removed on first-write failure"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-11 regression: the fallback copy lands the content but the temp
+    /// cleanup fails (source share-locked without DELETE after the copy). The
+    /// target holds a VALID save — the wrapper must NOT restore over it or
+    /// delete it; it reports the leak and drops the .bak.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn committed_target_with_temp_leak_is_preserved() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        arm_move_fault(); // move -> ACCESS_DENIED (emulated double-check)
+        // Lock the temp with READ|WRITE but NO DELETE: the fallback copy reads
+        // it fine, but the temp cleanup (DELETE) fails -> committed + leak.
+        let _lock = share_lock(&temp_path, 0x3);
+
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
+        assert!(res.is_err(), "temp leak must be reported");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("saved, but temp cleanup failed"),
+            "must report the leak without claiming save failure, got: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "NEW",
+            "committed target must be preserved, not restored over"
+        );
+        assert!(!backup_path.exists(), ".bak dropped after a committed save");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-11 regression: WITHOUT the sandbox capability, even a real
+    /// ACCESS_DENIED from the move must NOT trigger the copy+delete fallback —
+    /// host-side callers keep strictly atomic semantics.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn access_denied_without_capability_does_not_fall_back() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        arm_move_fault(); // ACCESS_DENIED — but NO capability requested
+
+        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        assert!(res.is_err(), "must fail without the fallback capability");
+        let msg = res.unwrap_err();
+        assert!(
+            !msg.contains("copy fallback"),
+            "fallback must not run without the capability, got: {msg}"
+        );
+        // Old content restored from backup (had_backup=true).
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "OLD");
+        assert!(!backup_path.exists(), "backup consumed by successful restore");
         let _ = fs::remove_dir_all(&dir);
     }
 

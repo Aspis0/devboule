@@ -2579,7 +2579,7 @@ impl portable_pty::ChildKiller for SandboxedChildKiller {
 
 mod tests {
     use super::*;
-    use crate::backend::sandbox::{ResourceLimits, SandboxPolicy};
+    use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
 
     #[test]
     fn apply_restricted_token_stub_returns_ok() {
