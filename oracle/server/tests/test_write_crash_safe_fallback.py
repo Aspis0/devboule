@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Make the server package importable (oracle/server is a package dir).
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -29,6 +30,11 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix="aspis-mcp-fallback-"))
         self.path = self.dir / "state.json"
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        # All fallback tests simulate the sandboxed writer: the fallback is
+        # context-gated on TokenIsAppContainer (round-25c review).
+        patcher = mock.patch.object(mcp, "_process_is_appcontainer", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_fallback_copy_lands_content(self):
         self.path.write_text("OLD", encoding="utf-8")
@@ -101,6 +107,25 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
             shutil.copy2 = real_copy2
         # Partially-created target removed.
         self.assertFalse(self.path.exists(), "partial target must be removed")
+
+    def test_host_context_access_denied_does_not_fall_back(self):
+        # HOST-side server: NOT an AppContainer -> the fallback must NOT run;
+        # the save fails with the original error and the old content survives
+        # via the .bak restore.
+        self.path.write_text("GOOD-OLD", encoding="utf-8")
+        real_replace = os.replace
+        os.replace = _fake_replace_denied
+        with mock.patch.object(mcp, "_process_is_appcontainer", return_value=False):
+            try:
+                mcp.write_text_crash_safe(self.path, "NEW", "test file")
+                self.fail("host save must fail")
+            except mcp.McpError:
+                pass
+        os.replace = real_replace
+        self.assertEqual(
+            self.path.read_text(encoding="utf-8"), "GOOD-OLD",
+            "host-side save must restore the old content atomically",
+        )
 
     def test_restore_failure_keeps_backup_and_reports_path(self):
         self.path.write_text("GOOD-OLD", encoding="utf-8")

@@ -1755,6 +1755,46 @@ def replace_frontmatter(content: str, metadata: dict[str, Any]) -> str:
     return f"{frontmatter}{content[frontmatter_end:]}"
 
 
+def _process_is_appcontainer() -> bool:
+    """True when the current process runs inside an AppContainer.
+
+    Round-25c hostile review: the copy+delete fallback is a NON-ATOMIC
+    capability that must only fire when the writer is ACTUALLY sandboxed (the
+    AppContainer double-check is the only reason os.replace fails there). A
+    host-side MCP server hitting an ordinary ACL ACCESS_DENIED must keep
+    strictly atomic semantics. Mirrors fs_replace.rs / devboule-mcp gates.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        class _TOKEN_ELEVATION(ctypes.Structure):
+            _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+        h_process = kernel32.GetCurrentProcess()
+        token = wintypes.HANDLE()
+        TOKEN_QUERY = 0x0008
+        if not advapi32.OpenProcessToken(h_process, TOKEN_QUERY, ctypes.byref(token)):
+            return False
+        try:
+            TokenIsAppContainer = 29
+            buf = (ctypes.c_ubyte * 4)()
+            returned = wintypes.DWORD()
+            ok = advapi32.GetTokenInformation(
+                token, TokenIsAppContainer, buf, len(buf), ctypes.byref(returned)
+            )
+            return bool(ok) and int.from_bytes(bytes(buf), "little") != 0
+        finally:
+            kernel32.CloseHandle(token)
+    except Exception:
+        return False
+
+
 def write_text_crash_safe(path: Path, content: str, label: str) -> None:
     suffix = f"{os.getpid()}-{time.time_ns()}"
     temp_path = path.with_suffix(path.suffix + f".{suffix}.tmp")
@@ -1797,7 +1837,10 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
             # ONLY on ERROR_ACCESS_DENIED (winerror 5); any other error keeps
             # original semantics. getattr: winerror is Windows-only and may be
             # absent (not None) on other platforms (round-16 review).
-            if getattr(exc, "winerror", None) != 5:
+            # Round-25c: TWO gates — the error code AND the execution context
+            # (TokenIsAppContainer). A host-side server hitting an ordinary
+            # ACL ACCESS_DENIED must not degrade to a non-atomic overwrite.
+            if getattr(exc, "winerror", None) != 5 or not _process_is_appcontainer():
                 raise
             shutil.copy2(temp_path, path)
             try:

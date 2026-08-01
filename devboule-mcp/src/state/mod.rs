@@ -578,6 +578,63 @@ thread_local! {
     static RESTORE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Internal: one-shot latch bridging the backup-copy fault branches.
     static BACKUP_COPY_FAULTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: simulate running inside an AppContainer (the test process
+    /// itself is a plain host process).
+    static APPCONTAINER_SIM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True when the CURRENT process runs inside an AppContainer. Round-25c
+/// hostile review: the copy+delete fallback is a NON-ATOMIC capability that
+/// must only fire when the writer is ACTUALLY sandboxed (the AppContainer
+/// double-check is the only reason the atomic replace fails); a host-side
+/// MCP server hitting an ordinary ACL ACCESS_DENIED must keep strictly
+/// atomic semantics. Mirrors fs_replace.rs::process_is_appcontainer.
+#[cfg(windows)]
+fn process_is_appcontainer() -> bool {
+    #[cfg(all(test, target_os = "windows"))]
+    if APPCONTAINER_SIM.with(|c| c.replace(false)) {
+        return true;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut core::ffi::c_void,
+            desired_access: u32,
+            token_handle: *mut *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetTokenInformation(
+            token_handle: *mut core::ffi::c_void,
+            token_information_class: u32,
+            token_information: *mut core::ffi::c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_IS_APPCONTAINER: u32 = 29;
+    unsafe {
+        let proc = GetCurrentProcess();
+        let mut token: *mut core::ffi::c_void = std::ptr::null_mut();
+        if OpenProcessToken(proc, TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut is_app = 0u32;
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_IS_APPCONTAINER,
+            (&mut is_app as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        ) != 0;
+        let _ = CloseHandle(token);
+        ok && is_app != 0
+    }
 }
 
 #[cfg(windows)]
@@ -634,7 +691,12 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()>
     // registration/heartbeat/claim write fails closed and Unattended cloud
     // runs cannot function. Fall back to copy+delete ONLY on
     // ERROR_ACCESS_DENIED (0x5); any other error keeps original semantics.
-    if err.raw_os_error() != Some(5) {
+    // Round-25c hostile review: two gates — the error code AND the execution
+    // context. A host-side MCP server that hits an ordinary ACL ACCESS_DENIED
+    // must NOT silently degrade to a non-atomic overwrite; only a writer that
+    // is ITSELF inside an AppContainer (the double-check that motivates the
+    // fallback) may use it.
+    if err.raw_os_error() != Some(5) || !process_is_appcontainer() {
         return Err(err);
     }
     #[cfg(all(test, target_os = "windows"))]
@@ -1291,8 +1353,10 @@ mod tests {
         COPY_FALLBACK_FAULT.with(|c| c.set(true));
         // Simulate the AppContainer double-check denying the atomic replace:
         // we can't inject into MoveFileExW directly, so arm the move fault —
-        // replace_existing returns ACCESS_DENIED when armed.
+        // replace_existing returns ACCESS_DENIED when armed. Also simulate
+        // the AppContainer context (the fallback is context-gated).
         MOVE_FAULT.with(|c| c.set(true));
+        APPCONTAINER_SIM.with(|c| c.set(true));
 
         let res = write_text_crash_safe(&path, "NEW", "test file");
         assert!(res.is_err(), "save must fail");
@@ -1309,6 +1373,45 @@ mod tests {
             .filter(|n| n.ends_with(".bak"))
             .collect();
         assert!(leftovers.is_empty(), "backup consumed by restore: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6 round-25c hostile review: the fallback is context-gated — a HOST-side
+    /// MCP server hitting an ordinary ACL ACCESS_DENIED (no AppContainer) must
+    /// NOT degrade to a non-atomic copy+delete; the error propagates and the
+    /// old content is restored from the .bak.
+    #[cfg(windows)]
+    #[test]
+    fn host_context_access_denied_does_not_fall_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-hostdeny-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(&path, "GOOD-OLD").unwrap();
+
+        MOVE_FAULT.with(|c| c.set(true)); // ACCESS_DENIED emulated
+        COPY_FALLBACK_FAULT.with(|c| c.set(true));
+        // NOTE: NO APPCONTAINER_SIM — this process is a plain host.
+
+        let res = write_text_crash_safe(&path, "NEW", "test file");
+        assert!(res.is_err(), "host save must fail");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            !msg.contains("copy fallback"),
+            "fallback must not run outside an AppContainer, got: {msg}"
+        );
+        // Old content restored from backup (had_backup=true).
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "GOOD-OLD",
+            "host-side save must restore the old content atomically"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1332,6 +1435,7 @@ mod tests {
 
         BACKUP_COPY_FAULT.with(|c| c.set(true));
         MOVE_FAULT.with(|c| c.set(true)); // replace also fails
+        APPCONTAINER_SIM.with(|c| c.set(true)); // fallback context gate
 
         let res = write_text_crash_safe(&path, "NEW", "test file");
         let msg = res.unwrap_err().to_string();
@@ -1370,6 +1474,7 @@ mod tests {
         MOVE_FAULT.with(|c| c.set(true)); // replace fails -> fallback path
         COPY_FALLBACK_FAULT.with(|c| c.set(true)); // fallback copy fails
         RESTORE_FAULT.with(|c| c.set(true)); // restore fails
+        APPCONTAINER_SIM.with(|c| c.set(true)); // fallback context gate
 
         let res = write_text_crash_safe(&path, "NEW", "test file");
         let msg = res.unwrap_err().to_string();
@@ -1411,6 +1516,7 @@ mod tests {
 
         COPY_FALLBACK_FAULT.with(|c| c.set(true));
         MOVE_FAULT.with(|c| c.set(true));
+        APPCONTAINER_SIM.with(|c| c.set(true)); // fallback context gate
 
         let res = write_text_crash_safe(&path, "NEW", "test file");
         assert!(res.is_err(), "save must fail");
