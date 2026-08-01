@@ -980,13 +980,12 @@ pub fn apply_net_policy(
 ) -> Result<NetPolicySnapshot, String> {
     use super::NetPolicy;
     match policy.net {
-        NetPolicy::None | NetPolicy::Enabled => Ok(NetPolicySnapshot {
+        // C6 round-30: Loopback is implemented per-token via
+        // NetworkIsolationSetAppContainerConfig at profile creation
+        // (see apply_loopback_exemption); no firewall rule here.
+        NetPolicy::None | NetPolicy::Enabled | NetPolicy::Loopback => Ok(NetPolicySnapshot {
             rule_name: String::new(),
         }),
-        NetPolicy::Loopback => Err(
-            "Windows loopback-only network policy is not implemented; refusing an unrestricted spawn"
-                .into(),
-        ),
     }
 }
 
@@ -1599,6 +1598,60 @@ fn open_null_handle() -> Result<HANDLE, String> {
 /// `wait_and_restore` via [`delete_appcontainer_profile`].
 /// The caller owns the returned PSID (free with FreeSid); the seq is needed
 /// later to delete the profile in `wait_and_restore`.
+/// Grant the per-spawn AppContainer package loopback EXEMPTION via
+/// `NetworkIsolationSetAppContainerConfig` (C6 round-30 hostile review: the
+/// pi sidecar uses `NetPolicy::Loopback` for local Ollama/oMLX sessions, but
+/// AppContainers block 127.0.0.1 by default — without this the sidecar could
+/// never reach a local model server). Verified callable from a NON-elevated
+/// process (HRESULT 0x0 probe). `NetworkIsolationSetAppContainerConfig` is a
+/// pure Win32 export in firewallapi — used directly to avoid a windows-crate
+/// feature dependency.
+fn apply_loopback_exemption(package_sid: PSID) -> Result<(), String> {
+    // Resolve dynamically: `firewallapi.lib` is not part of the default
+    // linker lib set (LNK1181 without the Windows SDK firewall import lib),
+    // but `firewallapi.dll` ships on every Windows 8.1+ and exports the
+    // function. Verified callable from a NON-elevated process (HRESULT 0x0).
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+        }
+        type NetIsolationFn = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> i32;
+        let dll: Vec<u16> = "firewallapi.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let name = b"NetworkIsolationSetAppContainerConfig ";
+        let module = LoadLibraryW(dll.as_ptr());
+        if module.is_null() {
+            return Err("LoadLibraryW(firewallapi.dll) failed".to_string());
+        }
+        let proc = GetProcAddress(module, name.as_ptr());
+        if proc.is_null() {
+            return Err("GetProcAddress(NetworkIsolationSetAppContainerConfig) failed".to_string());
+        }
+        let mut sid_and_attrs = SID_AND_ATTRIBUTES {
+            Sid: package_sid,
+            Attributes: 0,
+        };
+        let hr = std::mem::transmute::<*mut core::ffi::c_void, NetIsolationFn>(proc)(
+            1,
+            &mut sid_and_attrs,
+        );
+        if hr < 0 {
+            return Err(format!(
+                "NetworkIsolationSetAppContainerConfig failed (HRESULT 0x{:08X});                  loopback exemption not granted — local model sessions (Ollama/oMLX)                  will be unable to reach 127.0.0.1",
+                hr as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn create_appcontainer_profile() -> Result<(PSID, u64), String> {
     use windows::Win32::Security::Isolation::CreateAppContainerProfile;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1882,6 +1935,16 @@ fn spawn_sandboxed_internal(
         Err(e) => return Err(e),
     };
     let mut package_sid_guard = PackageSidGuard::new(package_sid, appcontainer_seq);
+
+    // C6 round-30: NetPolicy::Loopback needs the per-package loopback
+    // EXEMPTION (AppContainers block 127.0.0.1 by default). The pi sidecar
+    // uses Loopback for local Ollama/oMLX sessions. Applied right after the
+    // profile is registered, before the token/ACL transaction. Fail-closed:
+    // an exemption failure aborts the spawn (a local session that cannot
+    // reach its model is a silent hang otherwise).
+    if policy.net == crate::backend::sandbox::NetPolicy::Loopback {
+        apply_loopback_exemption(package_sid)?;
+    }
 
     // C5 oracle sentinel (2026-07-31): the AppContainer child inherits the
     // caller's token identity — kernel-enforced Low IL + package-SID filtering
@@ -2794,6 +2857,78 @@ mod tests {
     /// MoveFileExW replace). This is the regression reviewers proved twice
     /// (rounds 6-7); the unit mask test cannot catch it.
     #[test]
+    /// C6 round-30: NetPolicy::Loopback grants the per-package loopback
+    /// exemption — a sandboxed child can reach a 127.0.0.1 listener. Without
+    /// the exemption the AppContainer blocks loopback and this fails.
+    #[test]
+    fn loopback_policy_allows_localhost_connection() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let temp = std::env::temp_dir().join(format!(
+            "aspis-loopback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+
+        // Host-side listener the sandboxed child must be able to reach.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let policy = SandboxPolicy::deny(temp.clone())
+            .writable(temp.clone())
+            .net(NetPolicy::Loopback);
+        // powershell Test-NetConnection returns exit 0 iff the TCP connect
+        // succeeds; -InformationLevel Quiet prints True/False.
+        let env_vars: Vec<(String, String)> = [
+            "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC",
+            "PATHEXT", "APPDATA", "LOCALAPPDATA", "ProgramData", "WINDIR",
+        ]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+        .collect();
+        let mut child = spawn_sandboxed(
+            &policy,
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!(
+                    "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ],
+            &temp,
+            &env_vars,
+        )
+        .expect("spawn loopback child");
+
+        // Accept the connection (or time out).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            match listener.set_nonblocking(true).and_then(|_| listener.accept()) {
+                Ok((_, _)) => {
+                    accepted = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.wait_and_restore();
+        assert!(
+            accepted,
+            "sandboxed child with NetPolicy::Loopback must reach a 127.0.0.1 listener"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     fn preexisting_ledger_and_lock_are_writable_in_sandbox() {
         use std::io::{Read, Write};
         use std::os::windows::io::FromRawHandle;

@@ -433,7 +433,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | C1 — Job Object | ✅ shipped | `sandbox/windows.rs` `create_job_object` (KILL_ON_JOB_CLOSE, PROCESS_MEMORY, ACTIVE_PROCESS, PROCESS_TIME) |
 | C2 — Restricted Token + broker spawn | ✅ shipped, **SUPERSEDED by C5** | commit `840d142` (historical restricted-token path) replaced by per-spawn AppContainer profiles (C5, §10.6): `create_appcontainer_profile` + SECURITY_CAPABILITIES via PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, CreateProcessAsUserW, CREATE_SUSPENDED, proc-thread-attr list, ResumeThread |
 | C3 — filesystem ACL layer | ✅ shipped | commit `840d142` — restricted-SID DACL grants via SetNamedSecurityInfoW, SD save/restore, .git/.devboule deny-write, rollback guards |
-| C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
+| C4 — network egress layer | ✅ shipped | commit `840d142` (netsh layer, historical) → C5 rewrite: per-token capability SIDs; Loopback added round-30 via NetworkIsolationSetAppContainerConfig (e2e-tested) |
 | ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
 | G — memory backpressure | ⏸ deferred | per plan (optional) |
 | **Flip `is_enforced()` → true** | ✅ **DONE (C6)** | `mod.rs` = `true`; PTY + one-shot paths sandboxed via ConPTY broker; `is_enforced_true_on_windows` |
@@ -500,8 +500,15 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
   outbound sockets (kernel-enforced via WFP ALE, see Project Zero's analysis). The
   `netsh advfirewall` rule (admin-required) is deleted; `NetPolicy::None` = no
   capability SIDs, `NetPolicy::Enabled` = `internetClient` capability
-  (`DeriveCapabilitySidsFromName`). Loopback stays rejected for v1 (needs
-  `NetworkIsolationSetAppContainerConfig`, deferred).
+  (`DeriveCapabilitySidsFromName`). **Loopback IMPLEMENTED (round 30)**:
+  `NetPolicy::Loopback` now calls `NetworkIsolationSetAppContainerConfig`
+  (resolved dynamically from `firewallapi.dll` — no import-lib needed,
+  verified HRESULT 0x0 from a NON-elevated process) with the per-spawn
+  package SID right after profile creation. This unblocks the pi sidecar's
+  local Ollama/oMLX sessions. e2e-tested:
+  `loopback_policy_allows_localhost_connection` (sandboxed PowerShell
+  Test-NetConnection reaches a host-side 127.0.0.1 listener, exit 0).
+  Fail-closed: an exemption error aborts the spawn.
 - Package SID comes from a **per-spawn registered profile**
   (`CreateAppContainerProfile` with a pid+seq moniker — no admin needed, lands
   under `%LOCALAPPDATA%\Packages`). NOTE: a bare derived SID
