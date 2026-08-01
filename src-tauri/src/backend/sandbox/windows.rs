@@ -2770,6 +2770,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    /// C6 rounds 6-8 e2e: a PRE-EXISTING ledger file + .lock sidecar (created by
+    /// record_launch_pending before spawn, user-only DACL, no package SID) must
+    /// be openable+rewritable by the AppContainer child when granted as writable
+    /// roots — the consent hook's exact access pattern (open lock, write ledger,
+    /// MoveFileExW replace). This is the regression reviewers proved twice
+    /// (rounds 6-7); the unit mask test cannot catch it.
+    #[test]
+    fn preexisting_ledger_and_lock_are_writable_in_sandbox() {
+        use std::io::{Read, Write};
+        use std::os::windows::io::FromRawHandle;
+
+        let temp = std::env::temp_dir().join(format!(
+            "devboule_ledger_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).expect("create test dir");
+        // Pre-existing ledger + lock, exactly like record_launch_pending leaves them.
+        let ledger = temp.join(".aspis-agents.json");
+        let lock = temp.join(".aspis-agents.json.lock");
+        std::fs::write(&ledger, "{\"v\":1}").expect("write ledger");
+        std::fs::write(&lock, "").expect("write lock");
+
+        let policy = SandboxPolicy::deny(temp.clone())
+            .writable(temp.clone())
+            .writable(ledger.clone())
+            .writable(lock.clone())
+            .net(crate::backend::sandbox::NetPolicy::Enabled)
+            .rlimits(ResourceLimits {
+                cpu_secs: 60,
+                addr_space_bytes: None,
+                max_procs: 16,
+            });
+        // NOTE: no "copy con" — reading the console device inside an AppContainer
+        // without a console can hang the child indefinitely (observed: wait hit
+        // the 300s RESTORE_WAIT_MS timeout in full-suite runs). Plain redirects
+        // exercise the same ACL path (open-for-write on pre-existing files).
+        let script = format!(
+            "echo HOOKWROTE > {} & echo LOCKOK > {}",
+            ledger.display(),
+            lock.display()
+        );
+        let mut child = spawn_sandboxed(
+            &policy,
+            "cmd.exe",
+            &["/c".to_string(), script],
+            &temp,
+            &[],
+        )
+        .expect("broker spawn");
+        // Capture stderr so a failure is diagnosable (cmd reports the real error).
+        let stderr_handle = child.take_stderr_handle();
+        let mut stderr_file =
+            unsafe { std::fs::File::from_raw_handle(stderr_handle.0) };
+        let exit = child.wait_and_restore().expect("wait+restore");
+        let mut stderr_text = String::new();
+        let _ = stderr_file.read_to_string(&mut stderr_text);
+        assert_eq!(
+            exit, 0,
+            "hook-style write must succeed inside the sandbox; stderr: {stderr_text:?}"
+        );
+        let ledger_text = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let lock_text = std::fs::read_to_string(&lock).unwrap_or_default();
+        assert!(
+            ledger_text.contains("HOOKWROTE"),
+            "ledger must be rewritable in-place, got: {ledger_text:?}"
+        );
+        assert!(
+            lock_text.contains("LOCKOK"),
+            "lock sidecar must be writable, got: {lock_text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     /// C6 round 7: the writable mask MUST include DELETE + FILE_DELETE_CHILD —
     /// the consent hook's MoveFileExW(REPLACE_EXISTING) ledger replace fails
     /// without them (FILE_GENERIC_WRITE alone lacks both). This is the

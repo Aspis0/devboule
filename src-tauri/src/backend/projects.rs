@@ -2492,9 +2492,21 @@ fn prepare_or_launch_project_agent(
         // covers NEW files. Grant the file itself, or the hook's
         // MoveFileExW(REPLACE_EXISTING) fails and every gated tool is denied.
         let mut writable_roots: Vec<std::path::PathBuf> = vec![projects_path.clone()];
+        // C6 rounds 6-8: the ledger FILE and its .lock sidecar both exist BEFORE
+        // spawn (record_launch_pending ran first) — OI/CI inheritance covers only
+        // NEW files, so each must be granted explicitly. The hook opens the lock
+        // on EVERY bridge access (mutate + 250ms poll); without it the open fails
+        // ACCESS_DENIED before the ledger replace is even reached.
         let ledger_file = projects_path.join(crate::backend::agents::AGENTS_STATE_FILE);
         if ledger_file.exists() {
             writable_roots.push(ledger_file);
+        }
+        let ledger_lock = projects_path.join(format!(
+            "{}.lock",
+            crate::backend::agents::AGENTS_STATE_FILE
+        ));
+        if ledger_lock.exists() {
+            writable_roots.push(ledger_lock);
         }
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
