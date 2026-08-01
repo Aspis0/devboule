@@ -171,10 +171,9 @@ pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
 /// process without a custom
 /// token, so we cannot apply `CreateRestrictedToken` post-spawn.
 ///
-/// The real implementation requires spawning via `CreateProcessAsUserW` in a
-/// thin sandbox-broker shim (writes job handle + restricted token + ACL grant
-/// order). That broker is a separate sub-plan — see
-/// `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §C2 decision rule.
+/// The real implementation (per the historical C2 sub-plan — spawning via
+/// `CreateProcessAsUserW` with a restricted token) was REPLACED by the C5
+/// AppContainer broker; see `specs/PORT_MACOS_TO_WINDOWS_FINAL.md` §10.6.
 ///
 /// NOTE (C6, 2026-07-31): superseded by the AppContainer broker (C5) — the
 /// S-1-5-12 restricted-token path was REPLACED by per-spawn AppContainer
@@ -437,14 +436,14 @@ fn restore_path_policy_with_remaining(
     (remaining, error)
 }
 
-// ─── C3-restricted: Filesystem ACL layer using WinRestrictedCodeSid (S-1-5-12) ───────
+// ─── C3 filesystem ACL layer: package SID (AppContainer) mode ─────────────────
 //
-// Replaces the Everyone-based deny/grant ACLs with a restricted-SID ACL mode.
-// The child process runs with a restricted token containing WinRestrictedCodeSid,
-// so the second access check evaluates this SID instead of the user's groups.
-// We grant this SID read+execute on explicit read roots and modify on writable paths,
-// with inheritance. Unspecified paths become inaccessible because the restricted SID
-// has no grant on them.
+// Since C5 the ACL layer grants the AppContainer PACKAGE SID (S-1-15-2-*, per-
+// spawn profile) read+execute on explicit read roots and modify on writable
+// paths, with inheritance; the double access check evaluates the package SID
+// against the child's AppContainer token. Unspecified paths stay inaccessible
+// (deny-by-default). The historical S-1-5-12 restricted-SID mode (C2-era) is
+// superseded — see apply_restricted_sid_policy.
 //
 // This uses SetNamedSecurityInfoW directly (not icacls) for precise control and
 // to avoid the Everyone deny/grant side effects on the host process.
@@ -1005,7 +1004,8 @@ pub fn restore_net_policy(_snapshot: NetPolicySnapshot) -> Result<(), String> {
 // Job Object + ACL layer unchanged. See spawn_sandboxed_internal /
 // create_appcontainer_profile. is_enforced() is TRUE since C6.
 
-/// A sandboxed child process spawned with a restricted token.
+/// A sandboxed child process: AppContainer token (per-spawn profile, C5) +
+/// Job Object + package-SID ACL snapshots. See `spawn_sandboxed_internal`.
 pub struct SandboxedChild {
     process_handle: HANDLE,
     thread_handle: HANDLE,
@@ -1785,12 +1785,14 @@ fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
     }
 }
 
-/// Spawn a child process with a restricted token, Job Object, and filesystem ACLs.
-/// This is the C2 broker: it replaces `std::process::Command::spawn()` for Windows
-/// sandboxed runs.
+/// Spawn a child process with an AppContainer token (C5), Job Object, and
+/// filesystem ACLs. This is the Windows sandbox broker: it replaces
+/// `std::process::Command::spawn()` for Windows sandboxed runs.
 ///
-/// Integrates C1 (Job Object), C2 (restricted token), and C3 (filesystem ACLs).
-/// After the child exits, call `wait_and_restore()` to restore ACLs + close handles.
+/// Integrates the AppContainer profile (per-spawn package SID +
+/// SECURITY_CAPABILITIES net capability), Job Object (C1), and the
+/// filesystem ACL layer (C3). After the child exits, call `wait_and_restore()`
+/// to restore ACLs + delete the profile.
 ///
 /// Child stdin is connected to NUL (non-blocking, always returns EOF).
 pub fn spawn_sandboxed(

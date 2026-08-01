@@ -139,7 +139,9 @@ fn macos_sandbox_exec_argv(profile: &str, program: &str, args: &[String]) -> San
 
 /// Wrap `program`+`args` so they run confined to `policy`. On macOS: builds the Seatbelt
 /// profile from `policy` and prefixes `/usr/bin/sandbox-exec -p <profile> --`. On other OSes:
-/// returns the command UNCHANGED (Windows lands in a later phase; Linux is a stub).
+/// returns the command UNCHANGED (Windows is sandboxed by the AppContainer
+/// broker at spawn time, NOT by wrap — is_enforced() == true since C6; Linux
+/// is a stub).
 /// `_cwd` is reserved for the Windows backend (workspace ACL grant); unused on macOS.
 pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path) -> SandboxedCommand {
     #[cfg(target_os = "macos")]

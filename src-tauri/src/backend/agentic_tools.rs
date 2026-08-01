@@ -1104,8 +1104,9 @@ impl ScopedAgentTools {
 
         // OS sandbox (macOS Seatbelt): confine writes to the scope root + deny network. The
         // app-level RCE gate (parse_run_command allowlist), env_clear, and process_group below
-        // stay as defense-in-depth ON TOP of the OS sandbox. On non-macOS, wrap is a passthrough
-        // (Windows lands in phase 3) and logs a warning.
+        // stay as defense-in-depth ON TOP of the OS sandbox. On Windows the broker
+        // (spawn_sandboxed, AppContainer since C5) provides the OS sandbox instead; on other
+        // non-macOS platforms wrap is a passthrough.
         let policy = agentic_run_policy_with_working_set(&self.root, self.net.clone(), &self.working_set);
 
         // Windows: use the full broker (spawn_sandboxed) which handles C1+C2+C3+C4 internally.

@@ -904,7 +904,7 @@ mod tests {
     /// deny *autonomy* (Unattended's gate-bypass), not to make Unattended more restrictive than Ask.
     #[test]
     fn degraded_unattended_behaves_as_full_ask_not_stricter() {
-        let enforced = false; // e.g. Windows today
+        let enforced = false; // e.g. Linux (no OS confinement yet); Windows is true since C6
         let effective = effective_sandbox_mode(SandboxMode::Unattended, enforced);
         assert_eq!(effective, SandboxMode::Ask, "degrades to Ask on un-enforced platform");
         // Under the degraded mode, a user-approved one-shot (transient) grant IS honoured — same

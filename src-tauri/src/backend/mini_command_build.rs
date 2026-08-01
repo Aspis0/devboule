@@ -101,7 +101,9 @@ pub(crate) struct MiniCommandBuild {
     /// P5: the per-launch Seatbelt `.sb` profile temp, present ONLY on the sandboxed
     /// local-loopback macOS path. The in-script EXIT trap removes it on success/abort; the
     /// SPAWN caller removes it (via `remove_mini_temp_files`) on a spawn failure (where the
-    /// script never ran). `None` on every unsandboxed path (codex/api/non-loopback/Windows).
+    /// script never ran). `None` on every non-Seatbelt path (codex/api/
+    /// non-loopback; Windows is broker-sandboxed at spawn time, not via a
+    /// profile — is_enforced() == true since C6).
     pub(crate) profile_file: Option<PathBuf>,
     /// C6: inspectable launch components (the PTY path on Windows spawns through
     /// the AppContainer broker, which cannot read a portable_pty CommandBuilder).
@@ -926,7 +928,8 @@ pub(crate) fn build_mini_command_impl(
     // an unresolved `fm` binary). On the SANDBOXED path the `.sb` profile is already on
     // disk by now, so capture the body in a Result and, on Err, remove the profile temp
     // before propagating — otherwise a body error would leak the `.sb` (the in-script trap
-    // never ran). The unsandboxed path has `profile_path == None`, so this is a no-op there.
+    // never ran). The non-Seatbelt path has `profile_path == None` (incl.
+    // Windows, broker-sandboxed at spawn), so this is a no-op there.
     let body_result: Result<String, String> = (|| -> Result<String, String> {
         Ok(match backend.kind {
             MiniCoderBackendKind::Codex => {
