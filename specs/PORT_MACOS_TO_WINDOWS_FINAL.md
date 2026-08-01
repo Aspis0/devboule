@@ -495,9 +495,12 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
   capability SIDs, `NetPolicy::Enabled` = `internetClient` capability
   (`DeriveCapabilitySidsFromName`). Loopback stays rejected for v1 (needs
   `NetworkIsolationSetAppContainerConfig`, deferred).
-- Package SID is **derived per spawn** (`DeriveAppContainerSidFromAppContainerName`
-  with a pid+seq moniker, no `CreateAppContainerProfile`) — same pattern Chromium's
-  sandbox uses (`app_container_base.cc`). No profile registration, no admin.
+- Package SID comes from a **per-spawn registered profile**
+  (`CreateAppContainerProfile` with a pid+seq moniker — no admin needed, lands
+  under `%LOCALAPPDATA%\Packages`). NOTE: a bare derived SID
+  (`DeriveAppContainerSidFromAppContainerName` alone, Chromium's pattern) makes
+  CreateProcess* fail with ERROR_FILE_NOT_FOUND — the registered profile is
+  REQUIRED (verified 2026-07-31; spec corrected post-oracle).
 - File ACL layer (C3) keeps its exact snapshot/restore machinery but targets the
   **package SID** instead of S-1-5-12. Grants are now required for EVERY path the
   child needs (deny-by-default), which is stricter than the S-1-5-12 double-check.
@@ -506,10 +509,13 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
 
 1. `Cargo.toml`: add `"Win32_Security_Isolation"` to the `windows 0.58` features.
 2. `sandbox/windows.rs`:
-   - `create_restricted_token` → `create_appcontainer_token(policy)`: derive package
-     SID (moniker `devboule.sandbox.<pid>.<seq>`), `CreateRestrictedToken` with
-     `SidsToRestrict = [package_sid]` + (only when `NetPolicy::Enabled`)
-     `internetClient` capability SID with `SE_GROUP_ENABLED`.
+   - `create_restricted_token` → `create_appcontainer_profile()` +
+     `build_capability_sids(policy)`: registered per-spawn profile
+     (`devboule.sandbox.<pid>.<seq>`), `SECURITY_CAPABILITIES` (package SID +
+     `internetClient` capability with `SE_GROUP_ENABLED` iff `NetPolicy::Enabled`)
+     passed via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` to
+     `CreateProcessAsUserW` — NOT `CreateRestrictedToken`, which rejects a
+     package SID with ERROR_INVALID_PARAMETER (verified 2026-07-31).
    - `apply_restricted_sid_policy` → package-SID grants; **delete the SystemRoot/
      System32 grant block**; add the user home as a READ-ONLY root (npm/git/python
      read `~/.npmrc`, `~/.gitconfig`, `~/.config`; matches macOS seatbelt broad reads).
