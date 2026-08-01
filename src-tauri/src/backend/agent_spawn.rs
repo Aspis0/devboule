@@ -256,7 +256,7 @@ fn spawn_agent_terminal_app_impl(
     // -NoExit/-ExecutionPolicy Bypass/-Command script the external path runs.
     // C6: PtyCommand keeps the components inspectable so the Windows broker can
     // spawn the child inside the AppContainer sandbox with a ConPTY.
-    let cmd = PtyCommand::new(
+    let mut cmd = PtyCommand::new(
         "powershell.exe",
         vec!["-NoExit".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-Command".into(), script],
         root_path.to_path_buf(),
@@ -265,6 +265,20 @@ fn spawn_agent_terminal_app_impl(
             .map(|e| (e.name.clone(), e.value.clone()))
             .collect(),
     );
+    // C6: the AppContainer child cannot read user-only %TEMP% files — grant the
+    // prompt dir + session gitconfig dir as read roots (Windows only; on macOS
+    // the seatbelt profile allows broad reads so these are no-ops there).
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(parent) = prompt_file.parent() {
+            cmd = cmd.read_root(parent.to_path_buf());
+        }
+        if let Ok(gitconfig) = write_session_gitconfig() {
+            if let Some(parent) = gitconfig.parent() {
+                cmd = cmd.read_root(parent.to_path_buf());
+            }
+        }
+    }
 
     let sessions = app
         .try_state::<crate::backend::agent_pty::AgentPtySessions>()

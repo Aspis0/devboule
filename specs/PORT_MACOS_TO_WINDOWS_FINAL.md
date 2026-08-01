@@ -554,6 +554,23 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
 (PTY echo roundtrip inside the AppContainer, TokenIsAppContainer=1) and
 `fast_exit_child_does_not_orphan_session_in_map` both pass.
 
+**C6 review fixes (2026-07-31, hostile review on 49146ae):**
+- Blocker fixed: the sandboxed child could NOT read the per-launch prompt file
+  or session gitconfig (user-only %TEMP% dirs, AppContainer deny-by-default) —
+  real agent launches would have failed inside the sandbox. `SandboxPolicy`
+  gained `readonly_paths` (builder `.readonly()`), `PtyCommand` gained
+  `extra_read_roots`, and agent_spawn/mini_command_build grant the prompt dir
+  + gitconfig dir as read roots. The PTY integration test now spawns a child
+  that `type`s the prompt file from the granted root and asserts the marker
+  arrives (end-to-end, not just an echo).
+- Documented, not changed: the external conhost terminal (host="external") is
+  the legacy ATTENDED path (full-token, window title = kill handle), parity
+  with macOS Terminal.app; host="app" (default) is the sandboxed PTY. The
+  "every unattended path" claim in 49146ae refers to app-hosted paths.
+- Known limitation: `writable(cwd)` ACL propagation is O(files in cwd) — a
+  node_modules-heavy repo can take seconds at spawn+restore. Accepted for v1;
+  a file-count guard is a follow-up.
+
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as
   lpValue (like a scalar), NOT a pointer to it — unlike SECURITY_CAPABILITIES.

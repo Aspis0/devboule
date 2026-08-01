@@ -157,6 +157,11 @@ pub struct PtyCommand {
     pub args: Vec<String>,
     pub cwd: std::path::PathBuf,
     pub env: Vec<(String, String)>,
+    /// Extra read-only paths the child must access beyond `cwd` (per-launch
+    /// support files: prompt temp dir, session gitconfig). On Windows these are
+    /// granted package-SID read ACEs by the broker (C6 reviewer finding — the
+    /// deny-by-default AppContainer cannot read user-only %TEMP% files).
+    pub extra_read_roots: Vec<std::path::PathBuf>,
 }
 
 impl PtyCommand {
@@ -166,7 +171,13 @@ impl PtyCommand {
         cwd: std::path::PathBuf,
         env: Vec<(String, String)>,
     ) -> Self {
-        Self { program: program.into(), args, cwd, env }
+        Self { program: program.into(), args, cwd, env, extra_read_roots: Vec::new() }
+    }
+
+    /// Add a read-only path the child must access (prompt dir, gitconfig dir).
+    pub fn read_root(mut self, path: std::path::PathBuf) -> Self {
+        self.extra_read_roots.push(path);
+        self
     }
 
     /// Build a portable_pty CommandBuilder (macOS path).
@@ -203,7 +214,7 @@ impl PtyCommand {
             .iter_extra_env_as_str()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        Self { program, args, cwd, env }
+        Self { program, args, cwd, env, extra_read_roots: Vec::new() }
     }
 }
 
@@ -251,10 +262,16 @@ pub fn spawn_agent_pty(
 
         // Agents need outbound network (LLM API calls) — same policy the
         // external-terminal path gets: full sandbox, network enabled.
-        let policy = SandboxPolicy::deny(command.cwd.clone())
+        let mut policy = SandboxPolicy::deny(command.cwd.clone())
             .writable(command.cwd.clone())
             .net(NetPolicy::Enabled)
             .rlimits(ResourceLimits::default());
+        // C6: the launch script reads the prompt + gitconfig from %TEMP% (user-only
+        // ACLs) — grant those dirs as read roots or the AppContainer child cannot
+        // start the agent (reviewer finding on 49146ae).
+        for root in &command.extra_read_roots {
+            policy = policy.readonly(root.clone());
+        }
 
         // C6: the broker builds the child env from scratch (make_env_block), so
         // it must receive the FULL environment — host base + PtyCommand extras.
@@ -1075,20 +1092,29 @@ mod tests {
         // minutes). Real project roots are small; this mirrors production.
         let cwd = std::env::temp_dir().join(format!("devboule_pty_test_{}", std::process::id()));
         std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+        // C6 reviewer fix: a per-launch "prompt" dir OUTSIDE the cwd, user-only,
+        // granted as a read root — exactly the %TEMP%spis-agent-prompt-*.d shape
+        // the real agent script reads. Without the grant the AppContainer child
+        // cannot read it (deny-by-default).
+        let prompt_dir = std::env::temp_dir().join(format!("devboule_pty_prompt_{}", std::process::id()));
+        std::fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+        std::fs::write(prompt_dir.join("prompt.txt"), "PROMPTREADMARKER").expect("write prompt");
+
         let policy = SandboxPolicy::deny(cwd.clone())
             .writable(cwd.clone())
+            .readonly(prompt_dir.clone())
             .net(NetPolicy::Enabled)
             .rlimits(ResourceLimits::default());
         let full_env: Vec<(String, String)> = std::env::vars().collect();
 
-        // A unique marker printed via PowerShell Write-Host, invoked directly (no
-        // nested `cmd /c` quoting). Write-Host writes straight to the console
-        // buffer ConPTY streams out, so the marker is reliably captured. The marker
-        // is unusual enough not to collide with the ConPTY init escape sequences.
+        // cmd reads the prompt file from the granted read root and echoes it —
+        // proves the AppContainer child can read per-launch support files.
+        let prompt_file_arg = prompt_dir.join("prompt.txt").to_string_lossy().into_owned();
         let mut child = spawn_sandboxed_pty(
             &policy,
             "cmd.exe",
-            &["/c".to_string(), "echo".to_string(), "ASPISPTYMARKER".to_string()],
+            &["/c".to_string(), "type".to_string(), prompt_file_arg],
             &cwd,
             &full_env,
             hpc,
@@ -1178,7 +1204,7 @@ mod tests {
         while Instant::now() < deadline {
             let bytes: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
             captured = String::from_utf8_lossy(&bytes).into_owned();
-            if captured.contains("ASPISPTYMARKER") {
+            if captured.contains("PROMPTREADMARKER") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1200,15 +1226,16 @@ mod tests {
         // Re-read the final ring (it may have grown after the poll loop broke).
         let final_bytes: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
         let final_text = String::from_utf8_lossy(&final_bytes);
-        let text = if final_text.contains("ASPISPTYMARKER") {
+        let text = if final_text.contains("PROMPTREADMARKER") {
             final_text.into_owned()
         } else {
             captured
         };
         assert!(
-            text.contains("ASPISPTYMARKER"),
-            "ring buffer should contain echoed output, got: {text:?}"
+            text.contains("PROMPTREADMARKER"),
+            "ring buffer should contain the prompt file contents, got: {text:?}"
         );
+        let _ = std::fs::remove_dir_all(&prompt_dir);
     }
 
     // INTEGRATION (FIX 2): a child that exits immediately must NOT orphan its

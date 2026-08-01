@@ -134,11 +134,21 @@ pub(crate) fn build_mini_command(
         fix_pass_thinking,
     );
     match cmd {
-        Ok((command, profile_file)) => Ok(MiniCommandBuild {
-            prompt_file: Some(prompt_file),
-            profile_file,
-            command: crate::backend::agent_pty::PtyCommand::from_command_builder(&command),
-        }),
+        Ok((command, profile_file)) => {
+            let mut pty_cmd = crate::backend::agent_pty::PtyCommand::from_command_builder(&command);
+            // C6: the mini script reads the prompt from a user-only %TEMP% dir;
+            // the AppContainer child needs it as a read root (Windows). macOS
+            // seatbelt allows broad reads, so this is a no-op there.
+            #[cfg(target_os = "windows")]
+            if let Some(parent) = prompt_file.parent() {
+                pty_cmd = pty_cmd.read_root(parent.to_path_buf());
+            }
+            Ok(MiniCommandBuild {
+                prompt_file: Some(prompt_file),
+                profile_file,
+                command: pty_cmd,
+            })
+        }
         Err(e) => {
             super::projects::remove_restricted_temp_file(&prompt_file);
             Err(e)

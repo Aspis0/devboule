@@ -52,6 +52,11 @@ impl Default for ResourceLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     pub readonly_root: PathBuf,
+    /// Additional read-only paths granted to the child (beyond `readonly_root`).
+    /// Used by the PTY path to expose per-launch support files (prompt temp dir,
+    /// session gitconfig) that live outside the project root — without these,
+    /// the deny-by-default AppContainer cannot read them (C6 reviewer finding).
+    pub readonly_paths: Vec<PathBuf>,
     pub writable_paths: Vec<PathBuf>,
     pub net: NetPolicy,
     pub rlimits: ResourceLimits,
@@ -71,10 +76,19 @@ impl SandboxPolicy {
     pub fn deny(readonly_root: PathBuf) -> Self {
         Self {
             readonly_root,
+            readonly_paths: Vec::new(),
             writable_paths: Vec::new(),
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
         }
+    }
+
+    /// Adds a path to the read-only whitelist (beyond `readonly_root`). Used for
+    /// per-launch support files (prompt file, session gitconfig) the child must
+    /// read but that live outside the project root.
+    pub fn readonly(mut self, path: PathBuf) -> Self {
+        self.readonly_paths.push(path);
+        self
     }
 
     /// Adds a path to the whitelist of directories the child may write to.

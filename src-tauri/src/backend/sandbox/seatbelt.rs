@@ -120,6 +120,7 @@ mod tests {
     fn net_none_denies_all() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
@@ -133,6 +134,7 @@ mod tests {
     fn net_loopback_allows_only_localhost() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![],
             net: NetPolicy::Loopback,
             rlimits: ResourceLimits::default(),
@@ -149,6 +151,7 @@ mod tests {
     fn net_enabled_allows_all_network() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![],
             net: NetPolicy::Enabled,
             rlimits: ResourceLimits::default(),
@@ -168,6 +171,7 @@ mod tests {
         let writable = PathBuf::from("/tmp/scratch-xyz");
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![writable],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
@@ -182,6 +186,7 @@ mod tests {
     fn non_absolute_writable_path_is_skipped() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![PathBuf::from("../../etc")],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
@@ -194,6 +199,7 @@ mod tests {
     fn reads_are_broad_and_default_deny() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
+            readonly_paths: vec![],
             writable_paths: vec![],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
@@ -219,6 +225,7 @@ mod tests {
 
         let policy = SandboxPolicy {
             readonly_root: readonly.clone(),
+            readonly_paths: vec![],
             writable_paths: vec![writable.clone()],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
@@ -314,6 +321,7 @@ mod tests {
     fn macos_enabled_profile_accepted_by_kernel() {
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/private/tmp"),
+            readonly_paths: vec![],
             writable_paths: vec![],
             net: NetPolicy::Enabled,
             rlimits: ResourceLimits::default(),

@@ -681,6 +681,15 @@ fn apply_restricted_sid_policy(
             return Err(e);
         }
     }
+    // C6: per-launch support files (prompt dir, session gitconfig) live outside
+    // the project root but the child MUST read them — grant them as read roots
+    // too. They are small (1-2 files), so ACL propagation is cheap.
+    for extra in &policy.readonly_paths {
+        if let Err(e) = collect_read_root(extra) {
+            let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
+            return Err(e);
+        }
+    }
     if cwd.is_absolute() {
         if let Err(e) = collect_read_root(cwd) {
             let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
