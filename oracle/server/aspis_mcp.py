@@ -1792,6 +1792,7 @@ def _process_is_appcontainer() -> bool:
         # and the check would always fail (even inside an AppContainer), so
         # the Python MCP fallback would never fire. Declare exact prototypes
         # BEFORE calling (idempotent).
+        kernel32.GetCurrentProcess.argtypes = []  # exact prototype: no args
         kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL

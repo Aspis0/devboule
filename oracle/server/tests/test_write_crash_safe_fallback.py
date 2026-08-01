@@ -141,10 +141,11 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
 
         # Call the REAL implementation (bypass the class-level mock from
         # setUp — the fallback tests patch _process_is_appcontainer=True).
+        # On a non-Windows host the function returns False by design; on a
+        # Windows host inside an AppContainer it returns True — only the
+        # boolean contract is asserted (round-27 review).
         result = _REAL_IS_APPCONTAINER()
-        # This test host is NOT an AppContainer (verified empirically); the
-        # real check must not crash and must return the truthful value.
-        self.assertIs(result, False)
+        self.assertIsInstance(result, bool)
 
         # Assert the exact prototypes on the SAME handles the implementation
         # uses (ctypes.WinDLL does not cache across call sites — a fresh
@@ -166,9 +167,54 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
         )
         self.assertEqual(advapi32.OpenProcessToken.restype, wintypes.BOOL)
         self.assertEqual(
-            advapi32.GetTokenInformation.argtypes[1:3],
-            [ctypes.c_int, ctypes.c_void_p],
+            advapi32.GetTokenInformation.argtypes,
+            [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ],
         )
+        self.assertEqual(advapi32.GetTokenInformation.restype, wintypes.BOOL)
+        self.assertEqual(kernel32.GetCurrentProcess.argtypes, [])
+
+    def test_appcontainer_context_parses_token_info(self):
+        # Round-27 review: deterministic POSITIVE case for the parsing logic —
+        # the module-level advapi32 handle is patched so GetTokenInformation
+        # reports TokenIsAppContainer=true (BOOLEAN 1).
+        import ctypes
+        from ctypes import wintypes
+
+        # Populate the module-level handles first (they init on first call).
+        self.assertIsInstance(_REAL_IS_APPCONTAINER(), bool)
+        advapi32 = mcp._APP_CTX_ADVAPI32
+        k32 = mcp._APP_CTX_KERNEL32
+        self.assertIsNotNone(advapi32)
+        self.assertIsNotNone(k32)
+
+        real_get_token = advapi32.GetTokenInformation
+        real_open_token = advapi32.OpenProcessToken
+        real_close = k32.CloseHandle
+        try:
+            def fake_open(proc, access, out):
+                # `out` is a byref CArgObject (no .contents); the token value
+                # is irrelevant because GetTokenInformation is mocked too.
+                return True
+
+            def fake_get_token(tok, cls, buf, length, retlen):
+                # TokenIsAppContainer=BOOL true: first byte 1.
+                ctypes.memset(buf, 1, 4)
+                return True
+
+            advapi32.GetTokenInformation = fake_get_token
+            advapi32.OpenProcessToken = fake_open
+            k32.CloseHandle = lambda h: True
+            self.assertIs(_REAL_IS_APPCONTAINER(), True)
+        finally:
+            advapi32.GetTokenInformation = real_get_token
+            advapi32.OpenProcessToken = real_open_token
+            k32.CloseHandle = real_close
 
     def test_restore_failure_keeps_backup_and_reports_path(self):
         self.path.write_text("GOOD-OLD", encoding="utf-8")

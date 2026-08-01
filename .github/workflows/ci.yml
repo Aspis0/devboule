@@ -118,6 +118,11 @@ jobs:
       - name: cargo test (devboule-mcp)
         run: cargo test --manifest-path devboule-mcp/Cargo.toml --no-fail-fast
 
+      # ----- Python MCP backend tests (sandbox fallback parity, round 27) -----
+      - name: pytest (aspis_mcp fallback suite)
+        if: always()
+        run: python -m pytest oracle/server/tests/test_write_crash_safe_fallback.py -q
+
       # ----- Frontend tests (vitest) -----
       - name: vitest
         run: npm test
