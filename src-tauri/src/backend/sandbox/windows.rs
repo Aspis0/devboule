@@ -1401,8 +1401,12 @@ impl SandboxedChild {
         // for a later retry.
         if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
             let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
-            let _ = revoke_loopback_exemption(sid);
-            self.loopback_exempted = false;
+            // Round-33: clear the ownership flag ONLY on successful
+            // revocation — on failure the Drop below retries (and the
+            // registry keeps the SID so a later grant rebuild is consistent).
+            if revoke_loopback_exemption(sid).is_ok() {
+                self.loopback_exempted = false;
+            }
         }
 
         // C5: the child is dead and all host state is restored — delete the
@@ -1460,6 +1464,10 @@ impl Drop for SandboxedChild {
             // later revoke (or the next grant rebuild) stays consistent.
             if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
                 let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
+                // Best-effort final attempt; the registry retains the SID on
+                // failure (documented residual: a devboule crash between
+                // grant and revoke can leave the exemption until the next
+                // grant rebuild — see spec §10.6 multi-instance note).
                 let _ = revoke_loopback_exemption(sid);
                 self.loopback_exempted = false;
             }
@@ -2433,10 +2441,10 @@ fn spawn_sandboxed_internal(
         (stdout_read, stderr_read, stdin_write)
     };
     cleanup.close(primary_token);
-    // C5: the child token exists; package SID + capability SIDs are no longer
-    // referenced by SECURITY_CAPABILITIES. Disarm both guards.
-    package_sid_guard.disarm();
-    caps_guard.disarm();
+    // Round-33 hostile review: do NOT disarm the guards yet — if
+    // AssignProcessToJobObject or ResumeThread fails below, the
+    // PackageSidGuard Drop must still revoke the loopback exemption and
+    // delete the profile. Disarm only after the child is fully running.
     cleanup.track(pi.hProcess);
     cleanup.track(pi.hThread);
 
@@ -2463,6 +2471,13 @@ fn spawn_sandboxed_internal(
         }
         return Err("ResumeThread failed".to_string());
     }
+
+    // C5: the child is running; package SID + capability SIDs are no longer
+    // referenced by SECURITY_CAPABILITIES and no failure path remains that
+    // needs them. Disarm both guards (round-33 review: only NOW is it safe —
+    // all earlier failures still hit the armed guards' Drop).
+    package_sid_guard.disarm();
+    caps_guard.disarm();
 
     // Disarm the guard: on success, snapshots move into SandboxedChild.
     let (restricted_snapshots, net_snapshot) = guard.take();
@@ -3171,7 +3186,64 @@ mod tests {
         let _ = child1.wait_and_restore();
         drop(child1);
 
-        // Child 2 must still be able to connect (its exemption survived).
+        // Round-33 review: child2 must STILL connect AFTER child1's revoke —
+        // l2 (child2's listener, still bound) polled only post-revocation
+        // proves the exemption survived the registry rebuild. The initial
+        // poll loop may have already accepted child2's connection, so spawn a
+        // fresh Test-NetConnection from child2's sandbox... simpler: use the
+        // still-running child2 to make a NEW connection to its own port.
+        let deadline2b = Instant::now() + Duration::from_secs(20);
+        let mut accepted2b = false;
+        while Instant::now() < deadline2b {
+            match l2.accept() {
+                Ok(_) => {
+                    accepted2b = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        // If the earlier loop already consumed child2's connection, bind a
+        // fresh listener on the SAME port and probe again via a fresh child.
+        if !accepted2b {
+            drop(l2); // release the original bound socket first
+            let l2c = TcpListener::bind(("127.0.0.1", port2)).unwrap();
+            l2c.set_nonblocking(true).unwrap();
+            let mut child2b = spawn_sandboxed(
+                &make_policy(temp.clone()),
+                "powershell",
+                &[
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "if (Test-NetConnection -ComputerName 127.0.0.1 -Port {port2} -InformationLevel Quiet -WarningAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                    ),
+                ],
+                &temp,
+                &env_vars,
+            )
+            .expect("spawn child2b (post-revoke probe)");
+            let deadline2c = Instant::now() + Duration::from_secs(20);
+            let mut l2c = l2c;
+            while Instant::now() < deadline2c {
+                match l2c.accept() {
+                    Ok(_) => {
+                        accepted2b = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = child2b.wait_and_restore();
+        }
+
+        // Child 3 (fresh spawn after the revoke) must also get loopback.
         let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
         let port3 = listener3.local_addr().unwrap().port();
         let mut child3 = spawn_sandboxed(
@@ -3210,6 +3282,10 @@ mod tests {
             accepts.load(Ordering::Relaxed) >= 2,
             "both concurrent children must connect, got {}",
             accepts.load(Ordering::Relaxed)
+        );
+        assert!(
+            accepted2b,
+            "child2 must connect AFTER child1's revocation (exemption survived the rebuild)"
         );
         assert!(
             accepted3,

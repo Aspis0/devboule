@@ -517,7 +517,15 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
   Drop (every exit path), before profile deletion; a failed revoke keeps the
   SID in the registry for retry. e2e: concurrent_loopback_children_keep_each_
   others_exemption (two children connect; revoking one does not break the
-  other).
+  other; a post-revoke probe still gets loopback). Round 33: the guards stay
+  ARMED until the child is fully running (AssignProcessToJobObject +
+  ResumeThread done) — any earlier failure revokes via PackageSidGuard.Drop;
+  the SandboxedChild clears loopback_exempted only after a SUCCESSFUL revoke
+  (Drop retries). KNOWN LIMITATION (documented, not multi-instance-safe):
+  the registry is process-local while the OS exemption list is global — two
+  devboule instances running concurrently with Loopback children can still
+  overwrite each other's exemptions; single-instance operation is assumed
+  for v1 (a cross-process named-mutex + shared state is the follow-up).
 - Package SID comes from a **per-spawn registered profile**
   (`CreateAppContainerProfile` with a pid+seq moniker — no admin needed, lands
   under `%LOCALAPPDATA%\Packages`). NOTE: a bare derived SID
