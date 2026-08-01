@@ -1,5 +1,11 @@
 # Plan amendment: `PORT_MACOS_TO_WINDOWS_AMENDMENT_1.md`
 
+> **SUPERSEDED (2026-07-31)**: the C-milestone status below is historical.
+> The shipped broker is the C5 AppContainer implementation — see
+> `PORT_MACOS_TO_WINDOWS_FINAL.md` §10.6 — with `is_enforced()` == true
+> since C6. Keep for history; do not treat 'insufficient / future work /
+> must remain false' statements as current.
+
 > **Status**: This amends `specs/PORT_MACOS_TO_WINDOWS.md`. Read it after that doc.
 
 > All citations now web-search-verified with the `EXA_API_KEY` enabled. Anything previously tagged `TODO(verify)` is either cleared below or remains an explicit `TODO(verify)`.
