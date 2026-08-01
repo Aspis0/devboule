@@ -587,15 +587,28 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   user-writable path (dev layout: target/debug) until a degradation path lands;
   (c) the --settings scan grants only %TEMP%-prefixed paths (no arbitrary
   self-grants);
-  (d) CROSS-AGENT ledger write (review round 7): writable grants include
-  DELETE/FILE_DELETE_CHILD (required for MoveFileExW atomic replaces), so an
-  agent CAN rewrite the shared .aspis-agents.json in place — forge verdicts for
-  OTHER agents' pending requests or DoS the queue for the session duration
-  (ACLs restore at child exit). This is a real widening beyond self-forgery;
-  accepted for v1 with the same accountability-grade caveat — the consent
-  bridge is a UX gate, not a security boundary; a per-agent ledger or
-  signed-verdict follow-up is required before Unattended is trusted with
-  multiple concurrent agents.
+  (d) CROSS-AGENT ledger write (review rounds 7-9): writable grants include
+  DELETE/FILE_DELETE_CHILD, so an agent CAN rewrite the shared
+  .aspis-agents.json in place — forge verdicts for OTHER agents' pending
+  requests or DoS the queue for the session duration (ACLs restore at child
+  exit). This is a real widening beyond self-forgery; accepted for v1 with the
+  same accountability-grade caveat — the consent bridge is a UX gate, not a
+  security boundary; a per-agent ledger or signed-verdict follow-up is
+  required before Unattended is trusted with multiple concurrent agents.
+- **REPLACE-LEG FAILURE (review round 8, e2e-proven)**: MoveFileExW
+  REPLACE_EXISTING fails ACCESS_DENIED inside the AppContainer even with
+  DELETE + FILE_DELETE_CHILD granted — verified three ways: cmd `move /y`,
+  PowerShell `Move-Item -Force` and `[IO.File]::Replace` (the sandbox
+  double-check rejects the atomic-replace access path; the ACE grant alone
+  cannot fix it). `fs_replace::replace_existing` now tries the atomic move
+  first and falls back to copy+delete on ERROR_ACCESS_DENIED /
+  ERROR_SHARING_VIOLATION only (cross-volume and other errors keep original
+  semantics). Slightly less atomic (brief delete/copy window) — acceptable for
+  the agent ledger under the held .lock + .bak; rollback on copy failure is
+  unconditional (restore from .bak even if the target still exists, and KEEP
+  the .bak if restoration itself fails) — review round 9 regression tests
+  cover move-denied→copy, copy-failure→restore, restore-failure→.bak-kept,
+  all passing on the non-elevated host.
 
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as

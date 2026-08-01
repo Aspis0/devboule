@@ -14,21 +14,51 @@ pub(crate) fn replace_file_with_backup(
 
     match replace_existing(temp_path, target_path) {
         Ok(()) => {
+            // Success: remove the .bak (best-effort — a leftover backup is inert).
             let _ = fs::remove_file(backup_path);
             Ok(())
         }
         Err(e) => {
-            let _ = fs::remove_file(temp_path);
-            if backup_path.exists() && !target_path.exists() {
-                let _ = fs::copy(backup_path, target_path);
+            // Round-8 hostile review: on failure the target may be TRUNCATED but
+            // still present (copy-over in the fallback), so the old
+            // `!target_path.exists()` guard would skip restoration and delete the
+            // only good copy. Restore UNCONDITIONALLY from the backup when one
+            // was taken, and KEEP the .bak if restoration fails — a stale backup
+            // is safer than a corrupted ledger. Restoration runs BEFORE temp
+            // cleanup so a locked temp file can never suppress the restore.
+            if backup_path.exists() {
+                if let Err(restore_err) = fs::copy(backup_path, target_path) {
+                    return Err(format!(
+                        "Could not save {label}: {e}; backup restoration ALSO failed                          ({restore_err}) — keeping {label} backup at {}",
+                        backup_path.display()
+                    ));
+                }
+                // Restoration succeeded — the backup served its purpose.
+                let _ = fs::remove_file(backup_path);
             }
-            // Best-effort: never leave the .bak behind on the error path. The success path
-            // already removes it; here the restore-copy (if any) has happened, so the
-            // backup is no longer needed and would otherwise leak next to the target.
-            let _ = fs::remove_file(backup_path);
+            if let Err(cleanup_err) = fs::remove_file(temp_path) {
+                return Err(format!(
+                    "Could not save {label}: {e}; temp cleanup also failed ({cleanup_err}) —                      {label} temp file left at {}",
+                    temp_path.display()
+                ));
+            }
             Err(format!("Could not save {label}: {e}"))
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+mod win32_error {
+    // MoveFileExW failure codes that justify the copy+delete fallback:
+    //  - ERROR_ACCESS_DENIED (5): the AppContainer double-check rejects the
+    //    atomic-replace access path even with DELETE+DELETE_CHILD granted
+    //    (e2e-proven).
+    //  - ERROR_SHARING_VIOLATION (32): transient locks (AV, editors) on the
+    //    source/target — copy+delete can still complete the save.
+    // Cross-volume (ERROR_NOT_SAME_DEVICE=17) and other errors keep their
+    // original semantics: never silently degrade to a non-atomic overwrite.
+    pub const ERROR_ACCESS_DENIED: i32 = 5;
+    pub const ERROR_SHARING_VIOLATION: i32 = 32;
 }
 
 #[cfg(target_os = "windows")]
@@ -53,16 +83,25 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> 
     };
     match replace {
         Ok(()) => Ok(()),
-        Err(_) => {
-            // C6 round 7 (final hostile review, e2e-proven): MoveFileExW
-            // REPLACE_EXISTING fails with ACCESS_DENIED inside an AppContainer
-            // even with DELETE + DELETE_CHILD granted (the sandbox double-check
-            // rejects the atomic-replace access path; verified with cmd move /y,
-            // PowerShell Move-Item -Force and [IO.File]::Replace). Fall back to
-            // copy+delete, which the AppContainer ACLs do allow (also verified
-            // e2e). Slightly less atomic (target briefly absent between delete
-            // and copy) — acceptable for the agent ledger; the caller already
-            // holds the .lock and keeps a .bak.
+        Err(e) => {
+            // C6 round 9 (hostile review): fall back to copy+delete ONLY for
+            // ACCESS_DENIED (AppContainer double-check rejects the atomic
+            // replace access path — e2e-proven with cmd move /y, Move-Item
+            // -Force, [IO.File]::Replace) and SHARING_VIOLATION (transient
+            // locks). Any other error (e.g. cross-volume NOT_SAME_DEVICE)
+            // keeps its original semantics instead of silently degrading to a
+            // non-atomic overwrite.
+            // `e.code()` on a win32 failure surfaces the FACILITY_WIN32
+            // HRESULT (0x80070005/0x80070020), not the bare win32 code.
+            let code = e.code().0 as u32 & 0xFFFF;
+            if code != win32_error::ERROR_ACCESS_DENIED as u32
+                && code != win32_error::ERROR_SHARING_VIOLATION as u32
+            {
+                return Err(e.to_string());
+            }
+            // Copy+delete are the legs the AppContainer ACLs do allow (e2e-verified).
+            // Slightly less atomic (target briefly absent between delete and copy) —
+            // acceptable for the agent ledger; the caller already holds the .lock.
             match std::fs::copy(temp_path, target_path) {
                 Ok(_) => {
                     let _ = std::fs::remove_file(temp_path);
@@ -122,6 +161,133 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Round-9 hostile-review regression: the fallback must fire when the ATOMIC
+    /// move is denied (share-locked source: no FILE_SHARE_DELETE on the temp),
+    /// and the copy+delete legs must land the new content. Mirrors the
+    /// AppContainer case (e2e-proven: MoveFileExW ACCESS_DENIED, copy allowed).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn atomic_move_denied_falls_back_to_copy() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        // Lock the SOURCE with share READ|WRITE but NO DELETE: MoveFileExW
+        // fails (sharing violation on the source's delete path), but the copy
+        // fallback (needs READ on source, granted) succeeds. The fallback's
+        // temp cleanup is best-effort, so the locked source doesn't fail the
+        // save.
+        let _lock = share_lock(&temp_path, 0x3 /* READ|WRITE, no DELETE */);
+
+        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        assert!(res.is_ok(), "copy fallback must succeed when move is denied: {res:?}");
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "NEW",
+            "fallback must land the new content"
+        );
+        // NOTE: the artificial share-lock keeps the temp alive (cleanup is
+        // best-effort in the fallback); the real AppContainer case has no open
+        // handles, and temp consumption is covered by the success-path test.
+        assert!(!backup_path.exists(), "backup removed on success");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-9 regression: if the fallback copy itself fails, the target may be
+    /// present but stale/truncated — the backup must be restored UNCONDITIONALLY
+    /// (no `!target.exists()` guard) and the .bak consumed only by a successful
+    /// restore.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_replace_restores_backup_even_if_target_still_exists() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"GOOD-OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        // Lock the source with NO sharing at all: MoveFileExW fails AND the copy
+        // fallback fails, but the target file remains present.
+        let _lock = share_lock(&temp_path, 0x0);
+
+        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        assert!(res.is_err(), "replace must fail: {res:?}");
+        let restored = fs::read_to_string(&target_path).unwrap_or_default();
+        assert!(
+            restored.contains("GOOD-OLD"),
+            "backup must be restored unconditionally, got: {restored:?}"
+        );
+        assert!(
+            !backup_path.exists(),
+            "backup must be consumed by a successful restore"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-9: if the restore itself fails, the .bak MUST be kept (a stale
+    /// backup is safer than a corrupted ledger) and the error must say so.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn restore_failure_keeps_backup() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        // Lock the SOURCE with no sharing (replace + copy fallback fail) AND the
+        // TARGET with no WRITE share (restore copy fails). Both locks are held
+        // for the whole call, so: backup = OLD (read allowed), replace fails,
+        // restore fails -> .bak kept.
+        let _src_lock = share_lock(&temp_path, 0x0);
+        let _dst_lock = share_lock(&target_path, 0x1 /* READ only */);
+
+        let res = replace_file_with_backup(&temp_path, &target_path, &backup_path, "thing");
+        assert!(res.is_err(), "replace must fail");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("keeping"),
+            "error must state the backup is kept, got: {msg}"
+        );
+        assert!(
+            backup_path.exists(),
+            ".bak must be KEPT when restoration fails"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Open a handle with a restricted share mode (share = READ|WRITE|DELETE
+    /// bitmask). Returns the handle; the caller keeps it alive for the duration
+    /// of the failure window.
+    #[cfg(target_os = "windows")]
+    fn share_lock(path: &Path, share: u32) -> std::os::windows::io::OwnedHandle {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+        };
+        let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        w.push(0);
+        let h = unsafe {
+            CreateFileW(
+                PCWSTR(w.as_ptr()),
+                0x80000000u32, // GENERIC_READ
+                FILE_SHARE_MODE(share),
+                None,
+                FILE_CREATION_DISPOSITION(3),    // OPEN_EXISTING
+                FILE_FLAGS_AND_ATTRIBUTES(0x80), // FILE_ATTRIBUTE_NORMAL
+                None,
+            )
+        }
+        .expect("share_lock: CreateFileW must open the pre-created file");
+        unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h.0 as *mut _) }
+    }
     /// Guard the UNCHANGED success path: a normal replace removes the backup and writes
     /// the new content.
     #[test]
