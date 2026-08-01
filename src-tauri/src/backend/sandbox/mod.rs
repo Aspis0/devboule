@@ -231,9 +231,11 @@ pub fn apply_rlimits(_cmd: &mut std::process::Command, _limits: &ResourceLimits)
 /// (Unattended) behaviour on it so that no agent runs unsupervised code without OS isolation
 /// (see `broker::effective_sandbox_mode`). Zero-I/O, compile-time only.
 ///
-/// Forward-compatible: when the Windows Job Object backend lands (sandbox epic phase 3 — Restricted
-/// Token + WFP + Job Object, the `#[cfg(not(target_os = "macos"))]` passthrough branch in `wrap`),
-/// Windows go-live is JUST flipping the `windows` arm below to `true`. No other code changes.
+/// Windows has been go-live since 2026-07-31 (C6): the AppContainer broker
+/// (C5, per-spawn profiles + SECURITY_CAPABILITIES + Job Object + net
+/// capability) covers every app-hosted spawn path; the external conhost path
+/// rejects Unattended (projects.rs `unattended_external_is_rejected`). See
+/// the `windows` arm below.
 pub fn is_enforced() -> bool {
     #[cfg(target_os = "macos")]
     {

@@ -456,8 +456,10 @@ confinement that the shipped broker cannot deliver in the supported run mode.
    previously deferred.
 3. Accept admin-required sandboxing (documented UX wall; contradicts §6).
 
-Until one lands, `is_enforced()` stays `false` on Windows (fail-closed: Unattended
-silently degrades to Ask, per `broker::effective_sandbox_mode`).
+**RESOLVED 2026-07-31 (C6)**: option 2 landed — the per-spawn AppContainer
+broker (§10.6). `is_enforced()` is `true` on Windows; Unattended is honoured
+for app-hosted (broker-gated) launches and rejected on the legacy external
+conhost path (projects.rs `unattended_external_is_rejected`).
 
 ---
 

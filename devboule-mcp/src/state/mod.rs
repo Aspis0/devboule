@@ -583,7 +583,7 @@ thread_local! {
 #[cfg(windows)]
 fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if MOVE_FAULT.with(|c| c.replace(false)) {
         return Err(std::io::Error::from_raw_os_error(5)); // ERROR_ACCESS_DENIED
     }
@@ -637,7 +637,7 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()>
     if err.raw_os_error() != Some(5) {
         return Err(err);
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     if COPY_FALLBACK_FAULT.with(|c| c.replace(false)) {
         // Simulate CopyFileW failing mid-copy: destination truncated, then error.
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).open(target_path) {

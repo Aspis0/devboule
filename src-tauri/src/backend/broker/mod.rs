@@ -124,9 +124,10 @@ pub fn resolve_net_enabled(persistent: bool, transient: bool, mode: SandboxMode)
 ///
 /// `sandbox_enforced` comes from [`crate::backend::sandbox::is_enforced`] — the single platform
 /// truth. On macOS it is `true`, so this function is the **identity** there (zero behaviour
-/// change). On a not-yet-sandboxed platform (Windows today) an `Unattended` project behaves like
-/// `Ask` until the Job Object backend lands and `is_enforced()` flips to `true` — at which point
-/// `Unattended` lights up with **no change to this code**.
+/// change). On Windows it is also `true` since C6 (2026-07-31, AppContainer broker), so
+/// `Unattended` is honoured for app-hosted launches; the legacy external conhost path rejects
+/// Unattended at the launch gate (projects.rs `unattended_external_is_rejected`) because it is
+/// not broker-routed.
 ///
 /// `Ask` and `AutoAcceptInWorkspace` are never altered (they are already supervised). Pure, no I/O.
 pub fn effective_sandbox_mode(mode: SandboxMode, sandbox_enforced: bool) -> SandboxMode {

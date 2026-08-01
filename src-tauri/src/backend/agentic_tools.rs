@@ -996,8 +996,8 @@ impl ScopedAgentTools {
     }
 
     /// Windows-only spawn path: uses the full sandbox broker (spawn_sandboxed) which
-    /// integrates C1 (Job Object) + C2 (restricted token via CreateProcessAsUserW) +
-    /// C3 (filesystem ACL via icacls) + C4 (network block via netsh advfirewall).
+    /// integrates the C5 AppContainer profile (SECURITY_CAPABILITIES package SID +
+    /// net capability, deny-by-default) + Job Object (C1) + filesystem ACL layer (C3).
     /// Called from `run()` via an early `#[cfg]` return.
     #[cfg(target_os = "windows")]
     fn run_windows(
