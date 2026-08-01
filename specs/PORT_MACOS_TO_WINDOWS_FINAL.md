@@ -613,7 +613,17 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   is indistinguishable from the AppContainer double-check, so without BOTH
   gates the original error is returned. The fallback capability exists for a
   FUTURE genuinely-sandboxed writer; unit tests simulate the AppContainer
-  context to exercise it. Rollback
+  context to exercise it.
+- **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
+  `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
+  EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job
+  Object, no package-SID ACLs, no net deny). `prepare_or_launch_project_agent`
+  now rejects external+Unattended on Windows fail-closed
+  (`unattended_external_is_rejected`, unit-tested); the in-app PTY path
+  (host="app", fully broker-gated) is the only Unattended carrier. Ask and
+  AutoAccept remain supervised by the broker consent flow and are unaffected.
+  On macOS/Linux the gate compiles out (cfg! constant) — zero behaviour
+  change. Rollback
   semantics: on copy failure the backup is restored UNCONDITIONALLY (even if
   the target still exists — round-8 bug), the .bak is KEPT if restoration
   itself fails, a committed target with a leaked temp is preserved and only

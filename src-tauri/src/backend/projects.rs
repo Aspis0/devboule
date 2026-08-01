@@ -1830,6 +1830,24 @@ fn fence_stale_orchestrator(
     }
 }
 
+/// C6 round-12 hostile review gate: on Windows, Unattended (unsupervised
+/// autonomy, unlocked by `is_enforced()`==true since C6) must NEVER run on
+/// the legacy EXTERNAL conhost path — that path launches raw conhost.exe
+/// outside the AppContainer broker (no Job Object, no package-SID ACLs, no
+/// net deny). Ask / AutoAccept stay supervised by the broker consent flow and
+/// are unaffected; host="app" (in-app PTY, fully broker-gated) is the
+/// supported Unattended carrier. Pure predicate, unit-tested below.
+#[cfg(target_os = "windows")]
+pub(crate) fn unattended_external_is_rejected(
+    host: &str,
+    sandbox_mode: crate::backend::broker::SandboxMode,
+) -> bool {
+    use crate::backend::broker::effective_sandbox_mode;
+    host == HOST_EXTERNAL
+        && effective_sandbox_mode(sandbox_mode, crate::backend::sandbox::is_enforced())
+            == crate::backend::broker::SandboxMode::Unattended
+}
+
 fn prepare_or_launch_project_agent(
     app: tauri::AppHandle,
     input: ProjectAgentLaunchInput,
@@ -1855,6 +1873,24 @@ fn prepare_or_launch_project_agent(
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
     let host = normalize_agent_host(input.host.as_deref());
+    // C6 round-12 hostile review: on Windows, Unattended (unsupervised
+    // autonomy) is unlocked by is_enforced()=true — but the legacy EXTERNAL
+    // conhost path is NOT broker-gated (raw conhost.exe, no AppContainer, no
+    // Job Object). An Unattended agent must never run outside OS isolation:
+    // reject external+Unattended fail-closed with an actionable error.
+    // Ask/AutoAccept stay supervised (broker consent) and are unaffected;
+    // host="app" is the supported Unattended carrier on Windows.
+    // cfg!(target_os) is a compile-time constant here, so the runtime branch
+    // below is dead on every other platform — no behaviour change on macOS/Linux.
+    if cfg!(target_os = "windows") && unattended_external_is_rejected(host, project.metadata.sandbox_mode)
+    {
+        return Err(
+            "Unattended autonomy on Windows requires the app-hosted (sandboxed) agent \
+             terminal; the external console is not OS-isolated. Launch with host=\"app\", \
+             or use Ask / AutoAccept modes which remain supervised."
+                .to_string(),
+        );
+    }
     let root_path = resolve_project_agent_root(&project)?;
     // Phase D — when this is a design "Save & hand off" dispatch, validate the bundle
     // folder against the canonical project root BEFORE building the prompt. A rejection
@@ -6147,6 +6183,28 @@ pub(crate) fn hash_launch_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C6 round-12: the Unattended+external rejection gate — Unattended
+    /// autonomy on Windows must never run on the non-broker-gated external
+    /// conhost path. Ask/AutoAccept and host="app" are never rejected.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unattended_external_rejection_gate() {
+        use crate::backend::broker::SandboxMode;
+        // Unattended + external -> REJECTED (is_enforced()==true on Windows).
+        assert!(unattended_external_is_rejected(HOST_EXTERNAL, SandboxMode::Unattended));
+        // Unattended + app-hosted -> allowed (broker-gated PTY).
+        assert!(!unattended_external_is_rejected(HOST_APP, SandboxMode::Unattended));
+        // Supervised modes + external -> allowed (broker consent flow).
+        assert!(!unattended_external_is_rejected(
+            HOST_EXTERNAL,
+            SandboxMode::Ask
+        ));
+        assert!(!unattended_external_is_rejected(
+            HOST_EXTERNAL,
+            SandboxMode::AutoAcceptInWorkspace
+        ));
+    }
 
     /// P7 default MCP backend is Rust. Tests that assert the Python launch shape
     /// (module args, PYTHONPATH, interpreter command) pin Python via the

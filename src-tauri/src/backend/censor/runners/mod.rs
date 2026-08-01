@@ -1610,12 +1610,13 @@ mod tests {
             "cmd",
             vec![
                 "/c",
-                // Round-11 hostile review: the child FIRST writes a start
-                // marker into its writable cwd, THEN loops forever. The test
-                // asserts the marker afterwards so `out.is_none()` cannot be
-                // satisfied vacuously by a spawn failure or an immediate
-                // child exit — None is meaningful only if the child started.
-                "echo started > started.marker & for /L %i in (1,1,9999999) do ver >nul",
+                // Round-12 hostile review: the child MUST emit nonempty
+                // stdout BEFORE looping forever. If it died immediately (or
+                // never started), the runner would return Some("STARTED...")
+                // and the test would fail — so None below is only reachable
+                // via the 300ms timeout kill of a live, outputting child.
+                // The marker file additionally proves writable-cwd access.
+                "echo STARTED-MARKER & echo started > started.marker & for /L %i in (1,1,9999999) do ver >nul",
             ],
         );
         #[cfg(not(windows))]

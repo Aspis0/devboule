@@ -118,7 +118,7 @@ mod win32_error {
 #[cfg(target_os = "windows")]
 fn copy_file_fallback(source: &Path, target: &Path) -> Result<u64, String> {
     #[cfg(test)]
-    if COPY_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if COPY_FAULT.with(|c| c.replace(false)) {
         // Simulate CopyFileW failing mid-copy: destination created/truncated
         // (create(true) so a first-write partial target is also simulated),
         // then error.
@@ -135,7 +135,7 @@ fn copy_file_fallback(source: &Path, target: &Path) -> Result<u64, String> {
 #[cfg(target_os = "windows")]
 fn restore_copy(source: &Path, target: &Path) -> Result<u64, std::io::Error> {
     #[cfg(test)]
-    if RESTORE_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if RESTORE_FAULT.with(|c| c.replace(false)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "simulated restore failure",
@@ -158,7 +158,7 @@ fn move_file_ex(
     flags: windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS,
 ) -> windows::core::Result<()> {
     #[cfg(test)]
-    if MOVE_FAULT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if MOVE_FAULT.with(|c| c.replace(false)) {
         // windows-result 0.2: Error::from_win32() takes no args (uses
         // GetLastError); build the HRESULT 0x80070005 explicitly instead.
         return Err(windows::core::Error::from_hresult(
@@ -175,23 +175,23 @@ fn move_file_ex(
 }
 
 #[cfg(all(test, target_os = "windows"))]
-static COPY_FAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static COPY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(all(test, target_os = "windows"))]
-static RESTORE_FAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static RESTORE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(all(test, target_os = "windows"))]
-static MOVE_FAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static MOVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(all(test, target_os = "windows"))]
 fn arm_copy_fault() {
-    COPY_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+    COPY_FAULT.with(|c| c.set(true));
 }
 #[cfg(all(test, target_os = "windows"))]
 fn arm_restore_fault() {
-    RESTORE_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+    RESTORE_FAULT.with(|c| c.set(true));
 }
 #[cfg(all(test, target_os = "windows"))]
 fn arm_move_fault() {
-    MOVE_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+    MOVE_FAULT.with(|c| c.set(true));
 }
 
 /// Failure of the replace step. `target_committed` distinguishes the
@@ -212,7 +212,7 @@ struct ReplaceFailure {
 #[cfg(target_os = "windows")]
 fn process_is_appcontainer() -> bool {
     #[cfg(test)]
-    if APPCONTAINER_SIM.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if APPCONTAINER_SIM.with(|c| c.replace(false)) {
         return true;
     }
     unsafe {
@@ -241,11 +241,11 @@ fn process_is_appcontainer() -> bool {
 }
 
 #[cfg(all(test, target_os = "windows"))]
-static APPCONTAINER_SIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static APPCONTAINER_SIM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(all(test, target_os = "windows"))]
 fn arm_appcontainer_sim() {
-    APPCONTAINER_SIM.store(true, std::sync::atomic::Ordering::SeqCst);
+    APPCONTAINER_SIM.with(|c| c.set(true));
 }
 
 #[cfg(target_os = "windows")]
@@ -641,6 +641,30 @@ mod tests {
         );
         // Old content restored from backup (had_backup=true).
         assert_eq!(fs::read_to_string(&target_path).unwrap(), "OLD");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-12 hostile review: the unix build must compile with the 3-arg
+    /// signature and IGNORE the capability flag — atomic rename semantics
+    /// are preserved even when a caller requests the Windows-only fallback.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_capability_flag_keeps_atomic_rename() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        // Explicit capability request — must be a no-op on unix.
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
+        assert!(res.is_ok(), "unix replace must succeed: {res:?}");
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "NEW");
+        assert!(!temp_path.exists(), "temp consumed by the rename");
+        assert!(!backup_path.exists(), "backup removed on success");
         let _ = fs::remove_dir_all(&dir);
     }
 
