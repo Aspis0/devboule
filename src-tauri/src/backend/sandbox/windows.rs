@@ -23,8 +23,8 @@ use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME,
+    JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 const SECURITY_RESTRICTED_CODE_RID: u32 = 12;
 use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_ALL_ACCESS};
@@ -626,23 +626,44 @@ fn apply_restricted_sid_acl(
 /// Deduplicates canonical paths.
 /// Rollback on failures.
 /// Returns snapshots for restoration.
+///
+/// `package_sid` is the per-spawn AppContainer package SID (C5) — the same SID
+/// the broker put into the token's SidsToRestrict. Grants target that SID, so
+/// only this spawn's child can use the granted paths.
 fn apply_restricted_sid_policy(
     policy: &SandboxPolicy,
     cwd: &Path,
     program: &str,
+    package_sid: PSID,
 ) -> Result<Vec<PathSecuritySnapshot>, String> {
     let mut snapshots = Vec::new();
     let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
-    // Create the restricted SID once and keep it alive through the full ACL transaction.
-    let restricted_sid = RestrictedSidGuard::new(create_restricted_code_sid()?);
-
-    // Collect read roots: readonly_root, cwd, and the executable parent.
+    // Collect read roots: readonly_root, cwd, the executable parent.
     // Canonicalization failures roll back every ACL already applied in this
     // transaction; they never return through `?` with host ACLs left changed.
     let mut read_roots = Vec::new();
+    // C5: paths under SystemRoot (C:\Windows...) are NEVER granted. Stock
+    // Windows ships ALL APPLICATION PACKAGES:(RX) on them, so the AppContainer
+    // already has read+exec there; writing a package-SID ACE would need
+    // elevation and would re-introduce the §10.5 blocker.
+    let system_root = std::env::var("SystemRoot")
+        .ok()
+        .map(PathBuf::from)
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    let under_system_root = |p: &Path| -> bool {
+        if let Some(root) = &system_root {
+            p.starts_with(root)
+        } else {
+            false
+        }
+    };
     let mut collect_read_root = |candidate: &Path| -> Result<(), String> {
         let canonical = canonicalize_path(candidate)?;
+        if under_system_root(&canonical) {
+            // Skip: already covered by ALL APPLICATION PACKAGES ACEs.
+            return Ok(());
+        }
         if !read_roots.contains(&canonical) {
             read_roots.push(canonical);
         }
@@ -668,21 +689,19 @@ fn apply_restricted_sid_policy(
             }
         }
     }
-    // Normal Windows executables load system DLLs even when the executable
-    // itself lives in a project/temp directory. Grant the restricted SID
-    // read+execute on the system roots required for process startup; this is
-    // not a user-home grant and remains read-only.
-    if let Ok(system_root) = std::env::var("SystemRoot") {
-        let system_root = PathBuf::from(system_root);
-        for system_path in [system_root.clone(), system_root.join("System32")] {
-            if system_path.is_dir() {
-                if let Err(e) = collect_read_root(&system_path) {
-                    let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
-                    return Err(e);
-                }
-            }
-        }
-    }
+    // C5: NO user-home grant. AppContainers are deny-by-default, so the child
+    // CANNOT read ~/.ssh, ~/.npmrc, ~/.gitconfig unless the policy explicitly
+    // lists them (readonly_root / writable_paths). This is stricter than macOS
+    // seatbelt's broad reads and removes the .ssh-exposure concern reviewers
+    // flagged on 840d142. Tools needing user config must have those paths
+    // granted per-project (documented trade-off, spec §10.6).
+    // NOTE: granting the whole home is also a performance trap — setting an
+    // inheritable ACE on the user's Known Folder triggers a long Windows
+    // propagation pass over every file (observed: multi-minute hang).
+    // SystemRoot/System32 are NOT granted either (C5): stock Windows ships
+    // ALL APPLICATION PACKAGES:(RX) on the system roots, so the AppContainer
+    // reads system DLLs with zero ACL writes on this host — this is what
+    // removes the §10.5 elevation blocker.
 
     // Apply read+execute on read roots.
     for root in read_roots {
@@ -694,7 +713,7 @@ fn apply_restricted_sid_policy(
                     return Err(e);
                 }
             };
-            if let Err(e) = apply_restricted_sid_acl(&root, restricted_sid.sid(), GRANT_ACCESS, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0, root.is_dir()) {
+            if let Err(e) = apply_restricted_sid_acl(&root, package_sid, GRANT_ACCESS, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0, root.is_dir()) {
                 let _ = restore_security_descriptor(&root, &sd_backup);
                 let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
                 return Err(e);
@@ -714,6 +733,10 @@ fn apply_restricted_sid_policy(
                     return Err(e);
                 }
             };
+            // C5: never grant write ACEs under SystemRoot either.
+            if under_system_root(&canon) {
+                continue;
+            }
             // If already processed as read root, we need to upgrade the ACL.
             // We restore the original first, then apply the more permissive ACL.
             let is_upgrade = processed.contains(&canon);
@@ -738,7 +761,7 @@ fn apply_restricted_sid_policy(
                     }
                 };
                 let access = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
-                if let Err(e) = apply_restricted_sid_acl(&canon, restricted_sid.sid(), GRANT_ACCESS, access, canon.is_dir()) {
+                if let Err(e) = apply_restricted_sid_acl(&canon, package_sid, GRANT_ACCESS, access, canon.is_dir()) {
                     let _ = restore_security_descriptor(&canon, &sd_backup);
                     let _ = restore_restricted_sid_policy(std::mem::take(&mut snapshots));
                     return Err(e);
@@ -797,7 +820,7 @@ fn apply_restricted_sid_policy(
                 let deny_mask = FILE_GENERIC_WRITE.0 | FILE_DELETE_CHILD.0 | 0x0001_0000;
                 if let Err(e) = apply_restricted_sid_acl(
                     &path,
-                    restricted_sid.sid(),
+                    package_sid,
                     DENY_ACCESS,
                     deny_mask,
                     is_directory,
@@ -834,8 +857,7 @@ fn apply_restricted_sid_policy(
         }
     }
 
-    // Success: release the SID after all ACLs have been set.
-    restricted_sid.disarm();
+    // Success: the caller (broker) owns the package SID lifecycle.
     Ok(snapshots)
 }
 
@@ -877,193 +899,46 @@ fn restore_restricted_sid_policy(snapshots: Vec<PathSecuritySnapshot>) -> Result
 /// Saved firewall rule name for restore after child exit.
 #[derive(Clone, Default)]
 pub struct NetPolicySnapshot {
+    // C5: always empty — network blocking is token-capability-based, there is
+    // no firewall rule to track. Kept for API shape (restore is a no-op).
     rule_name: String,
 }
 
-/// Path to this process's firewall-rule journal (one rule name per line).
-/// Used by [`cleanup_orphaned_firewall_rules`] to recover from crashes.
-fn firewall_journal_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "devboule_firewall_journal_{}.txt",
-        std::process::id()
-    ))
-}
-
-/// Append a rule name to this process's journal.
-fn firewall_journal_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-fn journal_add(rule: &str) {
-    use std::io::Write;
-    let _guard = firewall_journal_lock().lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(firewall_journal_path())
-    {
-        let _ = writeln!(f, "{rule}");
-    }
-}
-
-/// Remove a rule name from this process's journal (rewrite without it).
-fn journal_remove(rule: &str) {
-    let _guard = firewall_journal_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let path = firewall_journal_path();
-    if let Ok(lines) = std::fs::read_to_string(&path) {
-        let kept: Vec<&str> = lines.lines().filter(|l| *l != rule).collect();
-        if kept.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else {
-            let _ = std::fs::write(&path, kept.join("\n") + "\n");
-        }
-    }
-}
-
 /// M-10: remove firewall rules left behind by crashed devboule instances.
-/// Scan temp dir for `devboule_firewall_journal_*.txt`, and for each whose
-/// owning PID is no longer alive, delete the listed rules and the journal.
-/// Safe to call at app startup.
-pub fn cleanup_orphaned_firewall_rules() {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    let tmp = std::env::temp_dir();
-    let Ok(entries) = std::fs::read_dir(&tmp) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(pid_str) = name
-            .strip_prefix("devboule_firewall_journal_")
-            .and_then(|s| s.strip_suffix(".txt"))
-        else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        // Skip journals of still-running processes.
-        // MEDIUM fix: close the OpenProcess handle — previously .is_ok() leaked it.
-        let alive = unsafe {
-            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                Ok(h) => {
-                    let _ = CloseHandle(h);
-                    true
-                }
-                Err(_) => false,
-            }
-        };
-        if alive {
-            continue;
-        }
-        // Orphan: serialize journal read/delete against add/remove in this process.
-        let _guard = firewall_journal_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let journal = entry.path();
-        if let Ok(lines) = std::fs::read_to_string(&journal) {
-            for rule in lines.lines() {
-                let _ = std::process::Command::new("netsh")
-                    .args([
-                        "advfirewall",
-                        "firewall",
-                        "delete",
-                        "rule",
-                        &format!("name={rule}"),
-                    ])
-                    .output();
-            }
-        }
-        let _ = std::fs::remove_file(&journal);
-    }
-}
+/// C5: no-op — the netsh rule layer is gone (AppContainer capability SIDs are
+/// per-token and die with the token); kept so lib.rs startup call stays valid.
+pub fn cleanup_orphaned_firewall_rules() {}
 
-/// Add a firewall rule blocking outbound network for `program` (C4).
-/// Only applies when `policy.net == NetPolicy::None`.
+/// Network policy enforcement (C4, C5 rewrite).
 ///
-/// H-1: `netsh advfirewall` requires administrator privileges. If the calling
-/// process is not elevated, this returns an error directing the user to run as
-/// admin. A v2 alternative (WFP filter via a broker service) would remove the
-/// elevation requirement but is out of scope for v1.
+/// C5: the AppContainer token carries NO network capability unless
+/// `NetPolicy::Enabled` (internetClient). With no capability the kernel
+/// denies ALL outbound sockets — including raw AFD access — via WFP ALE
+/// (Project Zero's analysis). This replaced the netsh advfirewall rule, which
+/// required an elevated shell (H-1) and is now gone: network blocking is
+/// per-token, dies with the token, needs no journal, no admin.
+///
+/// The returned snapshot is always empty; retained for API shape.
 pub fn apply_net_policy(
     policy: &SandboxPolicy,
-    program: &str,
+    _program: &str,
 ) -> Result<NetPolicySnapshot, String> {
     use super::NetPolicy;
     match policy.net {
-        NetPolicy::None => {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static RULE_SEQ: AtomicU64 = AtomicU64::new(1);
-            let rule_name = format!(
-                "devboule_sandbox_block_{}_{}",
-                std::process::id(),
-                RULE_SEQ.fetch_add(1, Ordering::Relaxed)
-            );
-            let out = std::process::Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    &format!("name={rule_name}"),
-                    "dir=out",
-                    "action=block",
-                    &format!("program=\"{program}\""),
-                ])
-                .output()
-                .map_err(|e| format!("netsh add rule spawn failed: {e}"))?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let combined = format!("{stderr} {stdout}");
-                // H-1: detect access-denied (admin required) and give a clear message.
-                if combined.to_ascii_lowercase().contains("administrator")
-                    || combined.to_ascii_lowercase().contains("access is denied")
-                    || combined.to_ascii_lowercase().contains("elevation")
-                {
-                    return Err("network blocking requires administrator privileges \
-                         (netsh advfirewall). Run devboule as administrator. \
-                         See H-1 in specs/PORT_MACOS_TO_WINDOWS_FINAL.md."
-                        .into());
-                }
-                return Err(format!("netsh add rule failed: {combined}"));
-            }
-            // M-10: record the rule so a crash can be recovered.
-            journal_add(&rule_name);
-            Ok(NetPolicySnapshot { rule_name })
-        }
+        NetPolicy::None | NetPolicy::Enabled => Ok(NetPolicySnapshot {
+            rule_name: String::new(),
+        }),
         NetPolicy::Loopback => Err(
             "Windows loopback-only network policy is not implemented; refusing an unrestricted spawn"
                 .into(),
         ),
-        NetPolicy::Enabled => Ok(NetPolicySnapshot {
-            rule_name: String::new(),
-        })
     }
 }
 
 /// Remove the firewall rule saved by [`apply_net_policy`].
-pub fn restore_net_policy(snapshot: NetPolicySnapshot) -> Result<(), String> {
-    if snapshot.rule_name.is_empty() {
-        return Ok(());
-    }
-    let rule = snapshot.rule_name.clone();
-    let out = std::process::Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            &format!("name={rule}"),
-        ])
-        .output()
-        .map_err(|e| format!("netsh delete rule spawn failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "netsh delete rule failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    // M-10: drop the rule from the journal (recovered). Ignore errors.
-    journal_remove(&rule);
+/// C5: no-op — capability SIDs live in the token and die with it; there is no
+/// firewall rule to remove and no journal to update.
+pub fn restore_net_policy(_snapshot: NetPolicySnapshot) -> Result<(), String> {
     Ok(())
 }
 
@@ -1091,6 +966,10 @@ pub struct SandboxedChild {
     restricted_snapshots: Vec<PathSecuritySnapshot>,
     net_snapshot: NetPolicySnapshot,
     job: HANDLE,
+    /// Spawn sequence number of the AppContainer profile (C5), used to delete
+    /// the profile once the child has exited. None on error paths that never
+    /// created one.
+    appcontainer_seq: Option<u64>,
     restored: bool, // true after wait_and_restore has restored ACLs + net
 }
 
@@ -1370,6 +1249,14 @@ impl SandboxedChild {
             return Err(e);
         }
 
+        // C5: the child is dead and all host state is restored — delete the
+        // per-spawn AppContainer profile so %LOCALAPPDATA%\Packages does not
+        // accumulate one entry per spawned command. Best-effort: a leftover
+        // profile is inert (only an orphaned empty folder + registry entry).
+        if let Some(seq) = self.appcontainer_seq.take() {
+            delete_appcontainer_profile(seq);
+        }
+
         Ok(exit_code)
         // Drop closes ALL handles (child is dead, safe to close job too).
     }
@@ -1575,83 +1462,159 @@ fn open_null_handle() -> Result<HANDLE, String> {
     }
 }
 
-/// Open the current process token and create a restricted version
-/// with DISABLE_MAX_PRIVILEGE (strips all privileges from the token).
-/// Also adds the well-known WinRestrictedCodeSid (S-1-5-12) as a restricted SID,
-/// so the second access check evaluates against this SID instead of the user's groups.
-fn create_restricted_token() -> Result<HANDLE, String> {
-    use windows::Win32::Security::{
-        CreateRestrictedToken, CREATE_RESTRICTED_TOKEN_FLAGS, TOKEN_ACCESS_MASK,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+/// Create a per-spawn AppContainer profile and return its package SID.
+///
+/// C5: the MS "Launch an AppContainer" flow requires a REGISTERED profile —
+/// a bare derived SID makes CreateProcess* fail with ERROR_FILE_NOT_FOUND
+/// (verified 2026-07-31). CreateAppContainerProfile registers it (no admin
+/// needed; the profile lands under %LOCALAPPDATA%\Packages). Every spawn gets
+/// a unique moniker (pid+seq), so each child has its OWN package SID and ACL
+/// grants from concurrent spawns never collide. The profile is deleted in
+/// `wait_and_restore` via [`delete_appcontainer_profile`].
+/// The caller owns the returned PSID (free with FreeSid); the seq is needed
+/// later to delete the profile in `wait_and_restore`.
+fn create_appcontainer_profile() -> Result<(PSID, u64), String> {
+    use windows::Win32::Security::Isolation::CreateAppContainerProfile;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let moniker = format!("devboule.sandbox.{}.{}", std::process::id(), seq);
+    let moniker_wide: Vec<u16> =
+        moniker.encode_utf16().chain(std::iter::once(0)).collect();
+    let display_wide: Vec<u16> =
+        "devboule agent sandbox".encode_utf16().chain(std::iter::once(0)).collect();
+    let desc_wide: Vec<u16> =
+        "Per-spawn AppContainer for devboule agent commands".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        CreateAppContainerProfile(
+            windows::core::PCWSTR(moniker_wide.as_ptr()),
+            windows::core::PCWSTR(display_wide.as_ptr()),
+            windows::core::PCWSTR(desc_wide.as_ptr()),
+            None,
+        )
+        .map(|sid| (sid, seq))
+        .map_err(|e| format!("CreateAppContainerProfile({moniker}) failed: {e}"))
+    }
+}
 
-    let mut primary_token = HANDLE::default();
+/// Delete the AppContainer profile created by [`create_appcontainer_profile`].
+/// Called from `wait_and_restore` after the child exited, so profiles do not
+/// accumulate in %LOCALAPPDATA%\Packages across spawns. `seq` is the spawn
+/// sequence number that was embedded in the moniker at creation time.
+fn delete_appcontainer_profile(seq: u64) {
+    use windows::Win32::Security::Isolation::DeleteAppContainerProfile;
+    let moniker = format!("devboule.sandbox.{}.{}", std::process::id(), seq);
+    let moniker_wide: Vec<u16> =
+        moniker.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = DeleteAppContainerProfile(windows::core::PCWSTR(moniker_wide.as_ptr()));
+    }
+}
+
+/// Resolve the AppContainer profile folder (the "AC" dir created by
+/// CreateAppContainerProfile) and ensure its Temp subdir exists. The child's
+/// LOCALAPPDATA/TEMP/TMP must point here — with an explicit env block, Windows
+/// fails the spawn with ERROR_ENVVAR_NOT_FOUND otherwise (verified 2026-07-31,
+/// error 0x800700CB).
+fn appcontainer_env_paths(package_sid: PSID) -> Result<(String, String), String> {
+    use windows::Win32::Security::Isolation::GetAppContainerFolderPath;
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Foundation::LocalFree;
+    unsafe {
+        // GetAppContainerFolderPath takes the SID as a string, not a PSID.
+        let mut sid_string = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(package_sid, &mut sid_string)
+            .map_err(|e| format!("ConvertSidToStringSidW failed: {e}"))?;
+        let sid_str = sid_string.to_string().unwrap_or_default();
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(sid_string.as_ptr() as *mut _));
+        let folder_wide: Vec<u16> =
+            sid_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let folder = GetAppContainerFolderPath(windows::core::PCWSTR(folder_wide.as_ptr()))
+            .map_err(|e| format!("GetAppContainerFolderPath failed: {e}"))?;
+        let folder_str = folder.to_string().unwrap_or_default();
+        // Free the returned PWSTR (LocalAlloc per MS docs).
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(folder.as_ptr() as *mut _));
+        if folder_str.is_empty() {
+            return Err("GetAppContainerFolderPath returned empty path".to_string());
+        }
+        let temp_dir = format!(r"{}\Temp", folder_str);
+        std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("create AppContainer Temp dir {temp_dir}: {e}"))?;
+        Ok((folder_str, temp_dir))
+    }
+}
+
+/// Open the current process's primary token (TOKEN_ASSIGN_PRIMARY) for
+/// CreateProcessAsUserW. Windows derives the AppContainer token from this one
+/// plus SECURITY_CAPABILITIES.
+fn open_process_token() -> Result<HANDLE, String> {
+    use windows::Win32::Security::TOKEN_ACCESS_MASK;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
     unsafe {
         OpenProcessToken(
             GetCurrentProcess(),
-            TOKEN_ACCESS_MASK(TOKEN_DUPLICATE.0 | TOKEN_QUERY.0 | TOKEN_ASSIGN_PRIMARY.0),
-            &mut primary_token,
+            TOKEN_ACCESS_MASK(
+                windows::Win32::Security::TOKEN_DUPLICATE.0
+                    | windows::Win32::Security::TOKEN_QUERY.0
+                    | windows::Win32::Security::TOKEN_ASSIGN_PRIMARY.0,
+            ),
+            &mut token,
         )
         .map_err(|e| format!("OpenProcessToken failed: {e}"))?;
     }
+    Ok(token)
+}
 
-    // Create the well-known WinRestrictedCodeSid (S-1-5-12) in a stack buffer.
-    // This SID is used for the second access check on securable objects.
-    // The buffer must stay alive through the CreateRestrictedToken call.
-    let mut restricted_sid: PSID = PSID::default();
-    let mut sid_authority = SID_IDENTIFIER_AUTHORITY {
-        Value: [0, 0, 0, 0, 0, 5], // SECURITY_NT_AUTHORITY
-    };
+/// Build the capability SID array for the AppContainer's SECURITY_CAPABILITIES.
+/// `NetPolicy::Enabled` adds internetClient (SE_GROUP_ENABLED, per the MS
+/// "Launch an AppContainer" sample); `None` adds nothing — kernel-enforced
+/// deny-by-default network. The returned Vec owns LocalAlloc'd PSIDs; free
+/// each with LocalFree after CreateProcessAsUserW.
+fn build_capability_sids(policy: &SandboxPolicy) -> Result<Vec<SID_AND_ATTRIBUTES>, String> {
+    use windows::Win32::Security::DeriveCapabilitySidsFromName;
+    use windows::Win32::System::SystemServices::SE_GROUP_ENABLED;
+    if policy.net != crate::backend::sandbox::NetPolicy::Enabled {
+        return Ok(Vec::new());
+    }
+    let mut cap_groups: *mut PSID = std::ptr::null_mut();
+    let mut cap_group_count: u32 = 0;
+    let mut cap_sids_ptr: *mut PSID = std::ptr::null_mut();
+    let mut cap_sid_count: u32 = 0;
+    let cap_name: Vec<u16> = "internetClient".encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        AllocateAndInitializeSid(
-            &mut sid_authority,
-            1,
-            SECURITY_RESTRICTED_CODE_RID, // 12
-            0, 0, 0, 0, 0, 0, 0,
-            &mut restricted_sid,
+        DeriveCapabilitySidsFromName(
+            windows::core::PCWSTR(cap_name.as_ptr()),
+            &mut cap_groups,
+            &mut cap_group_count,
+            &mut cap_sids_ptr,
+            &mut cap_sid_count,
         )
-        .map_err(|e| format!("AllocateAndInitializeSid(WinRestrictedCodeSid) failed: {e}"))?;
+        .map_err(|e| format!("DeriveCapabilitySidsFromName(internetClient) failed: {e}"))?;
     }
-
-    // Wrap the SID in a SID_AND_ATTRIBUTES array for SidsToRestrict.
-    // We use a stack-allocated array to keep the buffer alive through the call.
-    let sid_and_attr = [windows::Win32::Security::SID_AND_ATTRIBUTES {
-        Sid: restricted_sid,
-        // For SidsToRestrict, Windows requires zero or integrity/logon
-        // attributes; SE_GROUP_ENABLED is not valid for this parameter.
-        Attributes: 0,
-    }];
-
-    let mut restricted_token = HANDLE::default();
+    let mut caps = Vec::new();
     unsafe {
-        // DISABLE_MAX_PRIVILEGE (0x1) strips privileges;
-        // LUA_TOKEN (0x4) produces a filtered token like UAC does.
-        // Pass the restricted SID array as SidsToRestrict.
-        if let Err(e) = CreateRestrictedToken(
-            primary_token,
-            CREATE_RESTRICTED_TOKEN_FLAGS(0x1 | 0x4), // DISABLE_MAX_PRIVILEGE | LUA_TOKEN
-            None,
-            None,
-            Some(&sid_and_attr),
-            &mut restricted_token,
-        ) {
-            let _ = CloseHandle(primary_token);
-            let _ = FreeSid(restricted_sid);
-            return Err(format!("CreateRestrictedToken failed: {e}"));
+        for i in 0..cap_sid_count {
+            let sid = *cap_sids_ptr.add(i as usize);
+            caps.push(SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: SE_GROUP_ENABLED as u32,
+            });
         }
+        // Group SIDs are only used for services; the MS sample frees them.
+        for i in 0..cap_group_count {
+            let g = *cap_groups.add(i as usize);
+            let _ = LocalFree(windows::Win32::Foundation::HLOCAL(g.0 as *mut _));
+        }
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(cap_groups as *mut _));
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(cap_sids_ptr as *mut _));
     }
-
-    unsafe {
-        let _ = CloseHandle(primary_token);
-        let _ = FreeSid(restricted_sid);
-    }
-    Ok(restricted_token)
+    Ok(caps)
 }
 
 /// Create a Job Object with kill-on-close + optional memory limit, CPU time limit, and process count limit.
 ///
-/// When cpu_secs > 0: sets JOB_OBJECT_LIMIT_PROCESS_TIME with PerJobUserTimeLimit in 100ns units.
+/// When cpu_secs > 0: sets JOB_OBJECT_LIMIT_JOB_TIME with PerJobUserTimeLimit in 100ns units.
 /// When max_procs > 0: sets JOB_OBJECT_LIMIT_ACTIVE_PROCESS with ActiveProcessLimit.
 fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
     let memory_limit: usize = rlimits
@@ -1668,12 +1631,15 @@ fn create_job_object(rlimits: &ResourceLimits) -> Result<HANDLE, String> {
         if rlimits.addr_space_bytes.is_some() {
             basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         }
-        // CPU time limit: JOB_OBJECT_LIMIT_PROCESS_TIME with PerJobUserTimeLimit in 100ns units.
+        // CPU time limit: JOB_OBJECT_LIMIT_JOB_TIME with PerJobUserTimeLimit in 100ns units.
+        // (NOT JOB_OBJECT_LIMIT_PROCESS_TIME — that flag pairs with
+        // PerProcessUserTimeLimit and SetInformationJobObject rejects the
+        // mismatch with ERROR_INVALID_PARAMETER, verified 2026-07-31.)
         // Set the limit fields on `basic` FIRST, then copy into info: assigning a zeroed
         // struct over info.BasicLimitInformation afterwards would clobber them (reviewer
         // finding, 2026-07-31 — the fields must not be written after the copy).
         if rlimits.cpu_secs > 0 {
-            basic.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+            basic.LimitFlags |= JOB_OBJECT_LIMIT_JOB_TIME;
             // cpu_secs is seconds; convert to 100-nanosecond units (1 sec = 10,000,000 100ns units).
             basic.PerJobUserTimeLimit = (rlimits.cpu_secs as i64) * 10_000_000;
         }
@@ -1750,19 +1716,73 @@ fn spawn_sandboxed_internal(
         PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
+    // C5: derive the per-spawn AppContainer package SID once — the SAME SID
+    // goes into the token's SidsToRestrict AND the filesystem ACL grants, so
+    // only this spawn's child can use the granted paths. Freed after the
+    // token+ACL transaction (both copy the SID into their own structures).
+    let (package_sid, appcontainer_seq) = match create_appcontainer_profile() {
+        Ok(pair) => pair,
+        Err(e) => return Err(e),
+    };
+    let free_package_sid = || unsafe {
+        let _ = FreeSid(package_sid);
+    };
+
     // C3+C4: apply filesystem ACLs + net policy before spawn.
     // SandboxGuard ensures both are restored even if spawn fails.
-    let restricted_snapshots = apply_restricted_sid_policy(policy, cwd, program)?;
+    let restricted_snapshots = match apply_restricted_sid_policy(policy, cwd, program, package_sid) {
+        Ok(snaps) => snaps,
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    };
     let mut guard = RestrictedSandboxGuard::new(restricted_snapshots);
-    guard.set_net(apply_net_policy(policy, program)?);
+    match apply_net_policy(policy, program) {
+        Ok(net) => guard.set_net(net),
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    }
 
     let mut cleanup = SpawnHandleCleanup::new();
 
     // C1: create Job Object.
-    let job = cleanup.track(create_job_object(&policy.rlimits)?);
+    let job = match create_job_object(&policy.rlimits) {
+        Ok(j) => cleanup.track(j),
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    };
 
-    // C2: create restricted token.
-    let restricted_token = cleanup.track(create_restricted_token()?);
+    // C2: create the AppContainer restricted token (package SID + optional
+    // internetClient capability; net enforcement is kernel-side, no firewall).
+    // C2 (C5): per the MS "Launch an AppContainer" pattern, we do NOT build a
+    // restricted token ourselves. We pass the caller's primary token to
+    // CreateProcessAsUserW and hand Windows a SECURITY_CAPABILITIES
+    // (package SID + capability SIDs) via PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES;
+    // Windows derives the AppContainer token at process creation.
+    let primary_token = match open_process_token() {
+        Ok(t) => cleanup.track(t),
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    };
+    // Capability SIDs (internetClient only when Enabled). Freed after spawn.
+    let caps = match build_capability_sids(policy) {
+        Ok(c) => c,
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    };
+    // NOTE: package_sid is NOT freed here — SECURITY_CAPABILITIES (built later)
+    // references it by pointer and UpdateProcThreadAttribute only shallow-copies
+    // the struct. Freed after CreateProcessAsUserW succeeds (or on each error
+    // path after this point).
 
     // Create pipes for stdout/stderr.
     let (stdout_read, stdout_write) = create_pipe()?;
@@ -1788,7 +1808,26 @@ fn spawn_sandboxed_internal(
     let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
 
     // Build env block.
-    let env_block = make_env_block(env_vars);
+    // C5: AppContainers REQUIRE LOCALAPPDATA/TEMP/TMP pointing at the profile
+    // AC folder (spawn fails with ERROR_ENVVAR_NOT_FOUND otherwise). Override
+    // whatever the caller passed — these MUST be the container's own paths.
+    let (localappdata, temp_dir) = match appcontainer_env_paths(package_sid) {
+        Ok(p) => p,
+        Err(e) => {
+            free_package_sid();
+            return Err(e);
+        }
+    };
+    let mut broker_env: Vec<(String, String)> = env_vars.to_vec();
+    broker_env.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case("LOCALAPPDATA")
+            && !k.eq_ignore_ascii_case("TEMP")
+            && !k.eq_ignore_ascii_case("TMP")
+    });
+    broker_env.push(("LOCALAPPDATA".to_string(), localappdata));
+    broker_env.push(("TEMP".to_string(), temp_dir.clone()));
+    broker_env.push(("TMP".to_string(), temp_dir));
+    let env_block = make_env_block(&broker_env);
 
     // Build cwd wide string.
     let cwd_wide: Vec<u16> = cwd
@@ -1806,7 +1845,20 @@ fn spawn_sandboxed_internal(
     // handle inheritance to ONLY stdout/stderr/stdin. With bInheritHandles=TRUE
     // but a constrained attribute list, the child cannot inherit arbitrary parent
     // handles (e.g. other pipe ends, token handles).
+    // C5: a second attribute (PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES) makes
+    // Windows create an AppContainer token for the child.
     let inherit_handles: [HANDLE; 3] = [stdout_write, stderr_write, child_stdin];
+    const ATTR_COUNT: usize = 2;
+
+    // SECURITY_CAPABILITIES: package SID + capability SIDs. Must stay alive
+    // through CreateProcessAsUserW (the attribute list copies the struct, but
+    // the SIDs are referenced, not copied).
+    let mut security_capabilities = windows::Win32::Security::SECURITY_CAPABILITIES {
+        AppContainerSid: package_sid,
+        Capabilities: caps.as_ptr() as *mut _,
+        CapabilityCount: caps.len() as u32,
+        Reserved: 0,
+    };
 
     // Step 1: query the required attribute-list buffer size. The sizing call
     // normally returns FALSE with ERROR_INSUFFICIENT_BUFFER; any other error
@@ -1816,7 +1868,7 @@ fn spawn_sandboxed_internal(
     let sizing_error = unsafe {
         let ok = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-            1,
+            ATTR_COUNT as u32,
             0,
             &mut attr_size,
         )
@@ -1835,9 +1887,11 @@ fn spawn_sandboxed_internal(
         }
     };
     if let Some(error) = sizing_error {
+        free_package_sid();
         return Err(error);
     }
     if attr_size == 0 {
+        free_package_sid();
         return Err("InitializeProcThreadAttributeList sizing returned zero bytes".to_string());
     }
 
@@ -1845,11 +1899,18 @@ fn spawn_sandboxed_internal(
     let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
     let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut std::ffi::c_void);
 
-    // Step 3: initialize + populate the single HANDLE_LIST attribute.
+    // Step 3: initialize + populate the HANDLE_LIST and SECURITY_CAPABILITIES
+    // attributes.
     let handle_list = inherit_handles;
     unsafe {
         let mut initialized_size = attr_size;
-        if let Err(e) = InitializeProcThreadAttributeList(attr_list, 1, 0, &mut initialized_size) {
+        if let Err(e) = InitializeProcThreadAttributeList(
+            attr_list,
+            ATTR_COUNT as u32,
+            0,
+            &mut initialized_size,
+        ) {
+            free_package_sid();
             return Err(format!("InitializeProcThreadAttributeList failed: {e}"));
         }
         if let Err(e) = UpdateProcThreadAttribute(
@@ -1865,7 +1926,25 @@ fn spawn_sandboxed_internal(
             None,
         ) {
             DeleteProcThreadAttributeList(attr_list);
+            free_package_sid();
             return Err(format!("UpdateProcThreadAttribute failed: {e}"));
+        }
+        // C5: SECURITY_CAPABILITIES (0x00020009) — the AppContainer identity.
+        if let Err(e) = UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            // PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
+            0x00020009usize,
+            Some((&mut security_capabilities as *mut _) as *const std::ffi::c_void),
+            std::mem::size_of::<windows::Win32::Security::SECURITY_CAPABILITIES>() as usize,
+            None,
+            None,
+        ) {
+            DeleteProcThreadAttributeList(attr_list);
+            free_package_sid();
+            return Err(format!(
+                "UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {e}"
+            ));
         }
     }
 
@@ -1888,7 +1967,7 @@ fn spawn_sandboxed_internal(
 
     unsafe {
         if let Err(e) = CreateProcessAsUserW(
-            restricted_token,
+            primary_token,
             PCWSTR::null(),
             PWSTR(cmdline_wide.as_mut_ptr()),
             None,
@@ -1903,6 +1982,7 @@ fn spawn_sandboxed_internal(
             // LOW fix: clean up ALL intermediate handles + attr list before returning.
             // SandboxGuard (Drop) restores ACLs/net.
             DeleteProcThreadAttributeList(attr_list);
+            free_package_sid();
             return Err(format!("CreateProcessAsUserW failed: {e}"));
         }
     }
@@ -1915,7 +1995,16 @@ fn spawn_sandboxed_internal(
     cleanup.close(stdout_write);
     cleanup.close(stderr_write);
     cleanup.close(child_stdin);
-    cleanup.close(restricted_token);
+    cleanup.close(primary_token);
+    free_package_sid();
+    // C5: the capability SIDs were LocalAlloc'd by DeriveCapabilitySidsFromName
+    // (the struct itself lives on our stack); free each SID now that the child
+    // token exists.
+    for cap in &caps {
+        unsafe {
+            let _ = LocalFree(windows::Win32::Foundation::HLOCAL(cap.Sid.0 as *mut _));
+        }
+    }
     cleanup.track(pi.hProcess);
     cleanup.track(pi.hThread);
 
@@ -1965,6 +2054,7 @@ fn spawn_sandboxed_internal(
         restricted_snapshots,
         net_snapshot,
         job,
+        appcontainer_seq: Some(appcontainer_seq),
         restored: false,
     })
 }
@@ -2081,18 +2171,14 @@ mod tests {
         );
     }
 
-    /// Broker integration: create a restricted child with a parent-owned stdin
-    /// pipe, then wait for normal exit and restore the broker state. All paths
-    /// are confined to a temporary directory, but the broker's restricted-SID
-    /// grant on `C:\Windows` (system DLL loading for the S-1-5-12 token) still
-    /// requires an elevated shell, so this test skips when the host is not
-    /// elevated instead of failing on a normal dev machine.
+    /// Broker integration: create an AppContainer child with a parent-owned
+    /// stdin pipe, then wait for normal exit and restore the broker state.
+    /// C5: the package-SID grants now cover only user paths (cwd, exe parent,
+    /// home read-only) and system DLL access comes from the stock
+    /// ALL APPLICATION PACKAGES ACEs — NO C:\Windows ACL writes, so this test
+    /// runs on a non-elevated shell (the §10.5 blocker is gone).
     #[test]
     fn broker_spawn_with_stdin_exits_and_restores_cleanly() {
-        if !process_is_elevated() {
-            eprintln!("skipping: restricted-SID grant on C:\\Windows requires elevation");
-            return;
-        }
         use std::io::{Read, Write};
         use std::os::windows::io::FromRawHandle;
 
@@ -2130,6 +2216,45 @@ mod tests {
             &[("SystemRoot".to_string(), "C:\\Windows".to_string())],
         )
         .expect("broker should spawn cmd.exe");
+
+        // C5 assertion: the child must be running as an AppContainer — verify
+        // TokenIsAppContainer on its process token (the load-bearing property
+        // of this milestone: kernel-enforced net deny + package-SID ACLs).
+        {
+            use windows::Win32::Security::TokenIsAppContainer;
+            use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+            let proc = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, child.pid)
+                    .expect("open child process")
+            };
+            let mut token = HANDLE::default();
+            unsafe {
+                OpenProcessToken(
+                    proc,
+                    windows::Win32::Security::TOKEN_QUERY,
+                    &mut token,
+                )
+                .expect("open child token");
+            }
+            let mut is_appcontainer: u32 = 0;
+            let mut len = 0u32;
+            unsafe {
+                windows::Win32::Security::GetTokenInformation(
+                    token,
+                    TokenIsAppContainer,
+                    Some(&mut is_appcontainer as *mut _ as *mut _),
+                    std::mem::size_of::<u32>() as u32,
+                    &mut len,
+                )
+                .expect("query TokenIsAppContainer");
+                let _ = CloseHandle(token);
+                let _ = CloseHandle(proc);
+            }
+            assert_eq!(
+                is_appcontainer, 1,
+                "broker child must run as an AppContainer (TokenIsAppContainer=1)"
+            );
+        }
 
         let stdout = unsafe { std::fs::File::from_raw_handle(child.take_stdout_handle().0) };
         let stderr = unsafe { std::fs::File::from_raw_handle(child.take_stderr_handle().0) };

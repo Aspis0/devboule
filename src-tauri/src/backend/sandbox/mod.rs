@@ -227,14 +227,15 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // BLOCKED (2026-07-31): C1..C4 are shipped and wired (all spawn paths route
-        // through spawn_sandboxed + CREATE_SUSPENDED + Job assignment), but the broker's
-        // restricted-SID ACL grant on C:\Windows requires elevation, while devboule must
-        // run unprivileged (tauri#13926). Must stay false until the elevation conflict is
-        // resolved — see specs/PORT_MACOS_TO_WINDOWS_FINAL.md §10.5 (options: broker
-        // service, AppContainer LPAC, or admin-required UX wall). Fail-closed: Unattended
-        // silently degrades to Ask via broker::effective_sandbox_mode.
-        false
+        // TRUE since 2026-07-31 (C5, AppContainer): the broker now spawns every
+        // sandboxed child as a per-spawn AppContainer (derived package SID +
+        // SECURITY_CAPABILITIES + Job Object + restricted-SID ACL grants). The
+        // §10.5 elevation blocker is gone: system DLL access comes from the
+        // stock ALL APPLICATION PACKAGES ACEs, network deny-by-default comes
+        // from the missing internetClient capability — no C:\Windows ACL
+        // writes, no netsh, no admin. Verified by the broker integration test
+        // (TokenIsAppContainer=1) on a non-elevated host.
+        true
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -313,12 +314,13 @@ mod tests {
         assert!(is_enforced());
     }
 
-    /// Windows: is_enforced() is false until ALL unattended paths route through the broker
-    /// (hostile review C-1 found pi_sidecar + mini_coder bypass the broker).
+    /// Windows: is_enforced() is true since C5 — the broker spawns every
+    /// sandboxed child as an AppContainer (verified TokenIsAppContainer=1 on a
+    /// non-elevated host). This is what unlocks Unattended autonomy on Windows.
     #[cfg(target_os = "windows")]
     #[test]
-    fn is_enforced_false_on_windows() {
-        assert!(!is_enforced());
+    fn is_enforced_true_on_windows() {
+        assert!(is_enforced());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

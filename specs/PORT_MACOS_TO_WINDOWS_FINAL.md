@@ -411,6 +411,11 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 
 ## 10.5 Implementation status (2026-07-31, post-execution pass)
 
+> **UPDATE (2026-07-31, C5 landed): the elevation blocker below is RESOLVED** —
+> the sandbox now uses AppContainers (§10.6). `is_enforced()` is `true` on
+> Windows, verified by the broker integration test on a non-elevated host.
+
+
 | item | status | evidence |
 |---|---|---|
 | M0 — windows=0.58 features | ✅ shipped | commit `c1144fd` |
@@ -422,7 +427,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
 | ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
 | G — memory backpressure | ⏸ deferred | per plan (optional) |
-| **Flip `is_enforced()` → true** | ⛔ **BLOCKED** | see below |
+| **Flip `is_enforced()` → true** | ✅ **DONE (C5)** | `mod.rs` windows arm = `true`, test `is_enforced_true_on_windows` |
 
 ### Why the flip is still BLOCKED (new evidence, not plan-anticipated)
 
@@ -449,6 +454,87 @@ confinement that the shipped broker cannot deliver in the supported run mode.
 
 Until one lands, `is_enforced()` stays `false` on Windows (fail-closed: Unattended
 silently degrades to Ask, per `broker::effective_sandbox_mode`).
+
+---
+
+## 10.6 RESOLUTION — AppContainer (LPAC-style) replaces the S-1-5-12 restricted token
+
+**Decision (2026-07-31, follow-on pass):** option 2 from §10.5 — replace the
+`CreateRestrictedToken` S-1-5-12 path with a **per-spawn AppContainer profile**.
+This removes the elevation requirement entirely and strengthens the sandbox.
+
+**IMPLEMENTED and VERIFIED 2026-07-31.** The broker now: creates a per-spawn
+profile via `CreateAppContainerProfile` (pid+seq moniker), passes
+`SECURITY_CAPABILITIES` (package SID + `internetClient` capability when
+`NetPolicy::Enabled`) via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` to
+`CreateProcessAsUserW`, grants the package SID read/exec on
+readonly_root/cwd/exe-parent and modify on writable_paths, reroutes
+LOCALAPPDATA/TEMP/TMP to the profile AC folder (required — spawn fails with
+0x800700CB otherwise), deletes the profile in `wait_and_restore`. Verified
+end-to-end on a non-elevated host: `TokenIsAppContainer=1`, stdin pipe works,
+exit 0, host ACLs restored. Three API pitfalls found and fixed on the way:
+(i) `CreateRestrictedToken` with a package SID fails ERROR_INVALID_PARAMETER —
+the MS pattern is SECURITY_CAPABILITIES, not a restricted token; (ii) a bare
+derived SID without a registered profile fails CreateProcess* with
+ERROR_FILE_NOT_FOUND; (iii) JOB_OBJECT_LIMIT_PROCESS_TIME pairs with
+PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLimit).
+
+### Why it works unprivileged
+
+- System roots (`C:\Windows`, `System32`) already carry `ALL APPLICATION PACKAGES:(RX)`
+  ACEs on a stock Windows install — an AppContainer token reads system DLLs **without
+  any ACL modification**. The broker's system-root grant (the elevation blocker) is
+  deleted, not made conditional.
+- Network is deny-by-default for AppContainers: no `internetClient` capability → no
+  outbound sockets (kernel-enforced via WFP ALE, see Project Zero's analysis). The
+  `netsh advfirewall` rule (admin-required) is deleted; `NetPolicy::None` = no
+  capability SIDs, `NetPolicy::Enabled` = `internetClient` capability
+  (`DeriveCapabilitySidsFromName`). Loopback stays rejected for v1 (needs
+  `NetworkIsolationSetAppContainerConfig`, deferred).
+- Package SID is **derived per spawn** (`DeriveAppContainerSidFromAppContainerName`
+  with a pid+seq moniker, no `CreateAppContainerProfile`) — same pattern Chromium's
+  sandbox uses (`app_container_base.cc`). No profile registration, no admin.
+- File ACL layer (C3) keeps its exact snapshot/restore machinery but targets the
+  **package SID** instead of S-1-5-12. Grants are now required for EVERY path the
+  child needs (deny-by-default), which is stricter than the S-1-5-12 double-check.
+
+### Concrete changes (all in `src-tauri`, milestone "C5")
+
+1. `Cargo.toml`: add `"Win32_Security_Isolation"` to the `windows 0.58` features.
+2. `sandbox/windows.rs`:
+   - `create_restricted_token` → `create_appcontainer_token(policy)`: derive package
+     SID (moniker `devboule.sandbox.<pid>.<seq>`), `CreateRestrictedToken` with
+     `SidsToRestrict = [package_sid]` + (only when `NetPolicy::Enabled`)
+     `internetClient` capability SID with `SE_GROUP_ENABLED`.
+   - `apply_restricted_sid_policy` → package-SID grants; **delete the SystemRoot/
+     System32 grant block**; add the user home as a READ-ONLY root (npm/git/python
+     read `~/.npmrc`, `~/.gitconfig`, `~/.config`; matches macOS seatbelt broad reads).
+   - `apply_net_policy`/`restore_net_policy`: delete netsh rule + journal + orphan
+     cleanup (no longer needed; capability SIDs are per-token and die with the token).
+   - Broker spawn: unchanged flow (CREATE_SUSPENDED → AssignProcessToJobObject →
+     ResumeThread), token is the AppContainer token.
+3. Tests: the broker integration test can now run **non-elevated** — remove the
+   `process_is_elevated()` skip and assert the child really is in an AppContainer
+   (check `TokenIsAppContainer` on the child token, or verify a blocked-outbound
+   socket). icacls roundtrip tests keep their skip (icacls /restore still needs
+   SeRestorePrivilege — they cover the legacy path, not the broker).
+4. Final gate: flip `is_enforced()` → `true` on Windows AFTER reviewer + oracle
+   sign-off on the C5 diff.
+
+### Known trade-offs (accepted for v1)
+
+- AppContainer children CANNOT reach any user path without an explicit ACE.
+  v1 grants only `readonly_root` + `cwd` + exe parent + `writable_paths` — the
+  user home (~/.ssh, ~/.npmrc, ~/.gitconfig) is NOT granted, so the child is
+  **more locked down than macOS seatbelt** (broad reads). Tools that need user
+  config must have those paths added per-project. (A home-wide read grant was
+  tried and dropped: setting an inheritable ACE on the user Known Folder
+  triggers a long Windows propagation pass over every file — multi-minute
+  hang.)
+- Some tools that write to `AppData` (npm cache) need their cache dir in
+  `writable_paths`; pi-sidecar already passes a writable home for now (reviewer
+  CONCERN on 840d142 — tracked, same policy on macOS).
+- Loopback-only policy remains unsupported on Windows (v1 None/Enabled only).
 
 ---
 
