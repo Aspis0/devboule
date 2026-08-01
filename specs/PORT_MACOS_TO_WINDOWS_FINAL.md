@@ -409,6 +409,49 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 
 ---
 
+## 10.5 Implementation status (2026-07-31, post-execution pass)
+
+| item | status | evidence |
+|---|---|---|
+| M0 — windows=0.58 features | ✅ shipped | commit `c1144fd` |
+| A — `bundle.windows` block | ✅ shipped | `tauri.conf.json` (wix/nsis perMachine, downloadBootstrapper) |
+| H — 3-OS CI matrix | ✅ shipped | `.github/workflows/ci.yml` |
+| C1 — Job Object | ✅ shipped | `sandbox/windows.rs` `create_job_object` (KILL_ON_JOB_CLOSE, PROCESS_MEMORY, ACTIVE_PROCESS, PROCESS_TIME) |
+| C2 — Restricted Token + broker spawn | ✅ shipped | commit `840d142` — `spawn_sandboxed`/`spawn_sandboxed_with_stdin` (CreateRestrictedToken DISABLE_MAX_PRIVILEGE+LUA_TOKEN, CreateProcessAsUserW, CREATE_SUSPENDED, proc-thread-attr list, ResumeThread) |
+| C3 — filesystem ACL layer | ✅ shipped | commit `840d142` — restricted-SID DACL grants via SetNamedSecurityInfoW, SD save/restore, .git/.devboule deny-write, rollback guards |
+| C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
+| ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
+| G — memory backpressure | ⏸ deferred | per plan (optional) |
+| **Flip `is_enforced()` → true** | ⛔ **BLOCKED** | see below |
+
+### Why the flip is still BLOCKED (new evidence, not plan-anticipated)
+
+All 18 sandbox tests pass on a real Windows host (`cargo test --lib backend::sandbox`),
+but the suite exposed a hard conflict:
+
+- The broker's C2/C3 path **must** grant the restricted SID (S-1-5-12) read/execute on
+  `C:\Windows` and `C:\Windows\System32` — system DLLs are otherwise unreachable for a
+  restricted token (system roots carry no S-1-5-12 ACE). `SetNamedSecurityInfoW` on those
+  roots requires **SeRestorePrivilege / elevation**.
+- devboule must run **unprivileged** (tauri#13926 — WebView2 fails under elevation; §6).
+
+So on a normal (non-elevated) dev machine every broker spawn fails with
+`WIN32_ERROR(5)` on the system-root ACE grant. `is_enforced() -> true` would claim OS
+confinement that the shipped broker cannot deliver in the supported run mode.
+
+**Options (out of this plan's scope, pick one for a follow-on plan):**
+1. Elevate a thin broker *service* once (install-time), children spawned via the service
+   token; app stays unprivileged. Matches srt-win's sandbox-user pattern.
+2. Replace the restricted-token path with an AppContainer (LPAC) whose system access is
+   granted by package SID ACLs instead of touching `C:\Windows` — plan §C4 pattern 2,
+   previously deferred.
+3. Accept admin-required sandboxing (documented UX wall; contradicts §6).
+
+Until one lands, `is_enforced()` stays `false` on Windows (fail-closed: Unattended
+silently degrades to Ask, per `broker::effective_sandbox_mode`).
+
+---
+
 ## 10. Audit trail (pointers)
 
 - `PORT_MACOS_TO_WINDOWS.md` — original plan (kept for diff visibility)

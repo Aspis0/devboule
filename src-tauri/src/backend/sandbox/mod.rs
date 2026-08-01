@@ -227,9 +227,13 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Reverted to false after hostile review found unsandboxed execution paths
-        // (pi_sidecar, mini_coder) that bypass the broker. Must stay false until ALL
-        // unattended paths route through spawn_sandboxed + CREATE_SUSPENDED + Job assignment.
+        // BLOCKED (2026-07-31): C1..C4 are shipped and wired (all spawn paths route
+        // through spawn_sandboxed + CREATE_SUSPENDED + Job assignment), but the broker's
+        // restricted-SID ACL grant on C:\Windows requires elevation, while devboule must
+        // run unprivileged (tauri#13926). Must stay false until the elevation conflict is
+        // resolved — see specs/PORT_MACOS_TO_WINDOWS_FINAL.md §10.5 (options: broker
+        // service, AppContainer LPAC, or admin-required UX wall). Fail-closed: Unattended
+        // silently degrades to Ask via broker::effective_sandbox_mode.
         false
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
