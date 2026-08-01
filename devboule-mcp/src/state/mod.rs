@@ -437,6 +437,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
         .unwrap_or_else(|| "file".into());
     let temp_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.tmp"));
     let backup_path = path.with_file_name(format!("{file_name}.{pid}-{ns}.bak"));
+    let had_backup = path.exists();
     let write_result = (|| -> std::io::Result<()> {
         {
             use std::io::Write;
@@ -460,7 +461,7 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        if path.exists() {
+        if had_backup {
             let _ = std::fs::copy(path, &backup_path);
         }
         replace_existing(&temp_path, path)?;
@@ -476,11 +477,27 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
     })();
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&temp_path);
-        if backup_path.exists() && !path.exists() {
-            let _ = std::fs::copy(&backup_path, path);
+        if had_backup {
+            // Round-15 hostile review: restore UNCONDITIONALLY — a failed
+            // fallback copy can leave the target truncated but still present,
+            // and `!path.exists()` would skip the restore and delete the only
+            // good copy. Keep the .bak if the restore itself fails.
+            match std::fs::copy(&backup_path, path) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&backup_path);
+                }
+                Err(restore_err) => {
+                    return Err(ToolError::new(format!(
+                        "Could not save {label}: {e}; backup restoration ALSO failed                          ({restore_err}) — keeping {label} backup at {}",
+                        backup_path.display()
+                    )));
+                }
+            }
+        } else if path.exists() {
+            // First write with no backup: a partially-created target must not
+            // survive a failed save.
+            let _ = std::fs::remove_file(path);
         }
-        // Best-effort: drop leftover bak after restore attempt.
-        let _ = std::fs::remove_file(&backup_path);
         return Err(ToolError::new(format!("Could not save {label}: {e}")));
     }
     Ok(())
@@ -488,8 +505,23 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
 
 /// Atomic replace of `target` with `temp` (Python `os.replace` / app MoveFileExW).
 #[cfg(windows)]
+thread_local! {
+    /// Test seam: simulate the AppContainer double-check ACCESS_DENIED from
+    /// MoveFileExW (cannot be reproduced with ACLs on a plain host — icacls
+    /// deny-DELETE is bypassed by DELETE_CHILD on the parent).
+    static MOVE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: make the fallback copy truncate the target then fail
+    /// (observed damage mode of a mid-copy I/O failure).
+    static COPY_FALLBACK_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
 fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    #[cfg(test)]
+    if MOVE_FAULT.with(|c| c.replace(false)) {
+        return Err(std::io::Error::from_raw_os_error(5)); // ERROR_ACCESS_DENIED
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -539,6 +571,18 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()>
     // ERROR_ACCESS_DENIED (0x5); any other error keeps original semantics.
     if err.raw_os_error() != Some(5) {
         return Err(err);
+    }
+    #[cfg(test)]
+    if COPY_FALLBACK_FAULT.with(|c| c.replace(false)) {
+        // Simulate CopyFileW failing mid-copy: destination truncated, then error.
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).open(target_path) {
+            use std::io::Write;
+            let _ = f.set_len(0);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "simulated mid-copy failure",
+        ));
     }
     match std::fs::copy(temp_path, target_path) {
         Ok(_) => {
@@ -1156,6 +1200,78 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    /// C6 round-15 hostile review: if the fallback copy fails AFTER
+    /// truncating the target (still present), the backup must be restored
+    /// UNCONDITIONALLY — the old `!path.exists()` guard would have skipped
+    /// restoration and deleted the only good copy.
+    #[cfg(windows)]
+    #[test]
+    fn fallback_copy_failure_restores_backup_unconditionally() {
+        use std::cell::Cell;
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-fallback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(&path, "GOOD-OLD").unwrap();
+
+        // Arm the seam: the fallback copy truncates the target then fails
+        // (observed damage mode of a mid-copy I/O failure).
+        COPY_FALLBACK_FAULT.with(|c| c.set(true));
+        // Simulate the AppContainer double-check denying the atomic replace:
+        // we can't inject into MoveFileExW directly, so arm the move fault —
+        // replace_existing returns ACCESS_DENIED when armed.
+        MOVE_FAULT.with(|c| c.set(true));
+
+        let res = write_text_crash_safe(&path, "NEW", "test file");
+        assert!(res.is_err(), "save must fail");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "GOOD-OLD",
+            "backup must be restored over the truncated target"
+        );
+        // No .bak left behind by a successful restore.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        assert!(leftovers.is_empty(), "backup consumed by restore: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6 round-15: first write with no pre-existing target — on failure the
+    /// partially-created target must be removed, not left behind.
+    #[cfg(windows)]
+    #[test]
+    fn fallback_first_write_failure_cleans_partial_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mcp-fallback2-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        // No pre-existing target.
+
+        COPY_FALLBACK_FAULT.with(|c| c.set(true));
+        MOVE_FAULT.with(|c| c.set(true));
+
+        let res = write_text_crash_safe(&path, "NEW", "test file");
+        assert!(res.is_err(), "save must fail");
+        assert!(!path.exists(), "partial target must be removed on first-write failure");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn write_text_crash_safe_overwrites_existing() {

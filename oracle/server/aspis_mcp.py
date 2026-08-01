@@ -1759,12 +1759,17 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
     suffix = f"{os.getpid()}-{time.time_ns()}"
     temp_path = path.with_suffix(path.suffix + f".{suffix}.tmp")
     backup_path = path.with_suffix(path.suffix + f".{suffix}.bak")
+    # Round-15 hostile review: track whether a backup was taken BEFORE the
+    # replace, so a failed fallback copy (target truncated but still present)
+    # can be rolled back UNCONDITIONALLY — the handler must not rely on
+    # `path.exists()`.
+    had_backup = path.exists()
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        if path.exists():
+        if had_backup:
             shutil.copy2(path, backup_path)
         try:
             os.replace(temp_path, path)
@@ -1796,10 +1801,26 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
             if temp_path.exists():
                 temp_path.unlink()
         finally:
-            if backup_path.exists() and not path.exists():
+            if had_backup:
+                # Round-15: restore UNCONDITIONALLY — a failed fallback copy
+                # can leave the target truncated but still present, and the
+                # old `not path.exists()` guard would skip the restore and
+                # delete the only good copy. If the restore itself fails,
+                # KEEP the .bak (a stale backup beats a corrupted file).
                 try:
                     shutil.copy2(backup_path, path)
+                    try:
+                        backup_path.unlink()
+                    except OSError:
+                        pass
                 except Exception:
+                    pass
+            elif path.exists():
+                # First write with no backup: a partially-created target must
+                # not survive a failed save.
+                try:
+                    path.unlink()
+                except OSError:
                     pass
         raise McpError(f"Could not save {label}: {exc}") from exc
 

@@ -629,7 +629,13 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   registration/heartbeat/claim writes would fail closed and Unattended cloud
   could not function (round-14 review). Both now fall back to copy+delete on
   ERROR_ACCESS_DENIED (winerror 5) only; other errors keep original
-  semantics.
+  semantics. Round 15 hardened the MCP rollback the same way as fs_replace:
+  had_backup is tracked BEFORE the replace, a failed fallback copy (target
+  truncated but still present) restores the backup UNCONDITIONALLY (keeping
+  the .bak if the restore itself fails), and first-write failures remove the
+  partially-created target. New Windows tests (fault seams MOVE_FAULT /
+  COPY_FALLBACK_FAULT) prove both paths; the Python backend mirrors the same
+  logic.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job
