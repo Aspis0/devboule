@@ -660,7 +660,12 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   (cfg(all(test, target_os = "windows"))) — uniform by audit (round 21). The
   polis meta_store / augure ledger writers use strict rename but are HOST-side
   only (never inside an AppContainer child), so they stay atomic and are
-  outside the sandbox-writer scope.
+  outside the sandbox-writer scope. Round 26: the MCP fallbacks are now
+  context-gated like fs_replace — devboule-mcp checks TokenIsAppContainer via
+  raw FFI (OpenProcessToken/GetTokenInformation class 29) and aspis_mcp.py
+  via ctypes, so a HOST-side MCP server hitting an ordinary ACL ACCESS_DENIED
+  keeps strictly atomic semantics (new host-denial tests in both backends;
+  sandboxed-writer tests simulate the AppContainer context).
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job
