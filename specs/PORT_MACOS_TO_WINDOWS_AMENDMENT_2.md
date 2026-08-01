@@ -1,5 +1,10 @@
 # Plan amendment: `PORT_MACOS_TO_WINDOWS_AMENDMENT_2.md`
 
+> **SUPERSEDED (2026-07-31)**: the Windows-sandbox status below is
+> historical. The shipped broker is the C5 AppContainer implementation — see
+> `PORT_MACOS_TO_WINDOWS_FINAL.md` §10.6 — `is_enforced()` == true since C6.
+> The 'not done' / 'Do NOT flip' statements below no longer apply.
+
 > **Status**: Supersedes / amends `specs/PORT_MACOS_TO_WINDOWS.md` after the hostile review at oracle run `29c6691c`. Read `AMENDMENT_1.md` first, then this.
 
 > **Headline finding of this amendment**: **5 of 8 milestones in the original plan describe work already shipped in devboule**. The remaining real work is the `bundle.windows` block (A), the Windows sandbox stack (C with 4 sub-stories per amendment 1), CI matrix (H), and the `ort` rc.10 → rc.12 unify in `oracle-core`. Everything else is "verify existing" or a destructive plan that must NOT be applied.
@@ -119,7 +124,10 @@ The plan's appendix cited `mod.rs:217` for `is_enforced()` — actually at `:207
 
 ## E. Out-of-scope items (unchanged from AMENDMENT_1 §F)
 
-- `is_enforced() -> true` on Windows: requires C1 + C2 + C3 + C4 + reviewer + oracle sign-off. Do NOT flip until all five conditions hold.
+- `is_enforced() -> true` on Windows: **DONE (C6, 2026-07-31)** — AppContainer
+  broker (C5) covers every app-hosted spawn path; external conhost rejects
+  Unattended. The historical gate (C1+C2+C3+C4 + sign-offs) is closed; see
+  FINAL plan §10.6.
 - ARM64 Windows port: still out of scope per your earlier decision (`wry#1665` deadlock).
 - Apple FM (Censor on-device LLM) deferral: still in place.
 - Aion 1.0 Windows AI Foundry: deferred (no Rust SDK at plan time).
@@ -147,6 +155,8 @@ The plan's appendix cited `mod.rs:217` for `is_enforced()` — actually at `:207
 7. **C4** — Network-egress layer (WFP filter or ACL-denied network for `NetPolicy::None`, loopback-PERMIT for `Loopback`)
 8. **ort rc.10 → rc.12 unify** in `oracle-core` per AMENDMENT_1 §A
 9. **G (optional)** — `GlobalMemoryStatusEx` mem-pressure backpressure
-10. **flip `is_enforced() -> true` on Windows** — only after C1+C2+C3+C4 reviewed + oracle-signed
+10. **flip `is_enforced() -> true` on Windows** — **DONE (C6, 2026-07-31)**;
+    the historical requirement (C1+C2+C3+C4 reviewed + oracle-signed) is
+    closed by the C5 AppContainer broker — see FINAL plan §10.6
 
 Plus `verify-only` for the already-shipped milestones (B, D, E, F2, keyring).
