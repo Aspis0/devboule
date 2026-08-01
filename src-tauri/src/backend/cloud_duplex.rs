@@ -331,6 +331,12 @@ pub fn spawn_cloud_duplex(
     resume_context: Option<&str>,
     project_id: &str,
     model: Option<&str>,
+    // C6 (review rounds 4-5): per-launch read roots (Claude consent-hook binary)
+    // and writable roots (projects_dir for the .aspis-agents.json ledger the hook
+    // must update). Without these the AppContainer child cannot spawn the hook —
+    // Unattended would run bypassPermissions with NO tool-consent gate.
+    extra_read_roots: Vec<std::path::PathBuf>,
+    extra_writable_roots: Vec<std::path::PathBuf>,
     codex_policy: Option<crate::backend::broker::CodexThreadPolicy>,
 ) -> Result<(), String> {
     // Clean relaunch: kill any prior session for this id first.
@@ -400,21 +406,35 @@ pub fn spawn_cloud_duplex(
             for root in crate::backend::agent_spawn::agent_sandbox_read_roots(None) {
                 policy = policy.readonly(root);
             }
-            // --settings <path> (Claude) / --settings=<path> forms.
+            // C6 round 5: the Claude consent-hook BINARY must be readable AND
+            // executable by the child or the PreToolUse gate silently vanishes.
+            for root in &extra_read_roots {
+                if root.is_absolute() {
+                    policy = policy.readonly(root.clone());
+                }
+            }
+            for root in &extra_writable_roots {
+                if root.is_absolute() {
+                    policy = policy.writable(root.clone());
+                }
+            }
+            // --settings <path> (Claude) / --settings=<path> forms. Restricted to
+            // the app-generated %TEMP% settings file: never grant an arbitrary
+            // absolute path (reviewer round 5 — argv is backend-built today, but
+            // a future user-controlled arg must not self-grant reads).
+            let temp_prefix = std::env::temp_dir();
             let mut i = 0;
             while i < args.len() {
                 let a = &args[i];
-                if a == "--settings" && i + 1 < args.len() {
-                    let p = PathBuf::from(&args[i + 1]);
-                    if p.is_absolute() {
-                        policy = policy.readonly(p);
-                    }
-                    i += 2;
-                    continue;
-                }
-                if let Some(rest) = a.strip_prefix("--settings=") {
-                    let p = PathBuf::from(rest);
-                    if p.is_absolute() {
+                let candidate: Option<&str> = if a == "--settings" && i + 1 < args.len() {
+                    i += 1;
+                    Some(args[i].as_str())
+                } else {
+                    a.strip_prefix("--settings=")
+                };
+                if let Some(path_str) = candidate {
+                    let p = PathBuf::from(path_str);
+                    if p.is_absolute() && p.starts_with(&temp_prefix) {
                         policy = policy.readonly(p);
                     }
                 }

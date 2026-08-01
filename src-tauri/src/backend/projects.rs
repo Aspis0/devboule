@@ -2480,6 +2480,13 @@ fn prepare_or_launch_project_agent(
         // receives its brief. Orchestrator without a goal → None (the planner chat's
         // first user message arrives later by design).
         let first_turn = duplex_first_turn(&role, input.initial_goal.as_deref(), &prompt);
+        // C6 round 5: the consent-hook binary must be readable+executable by the
+        // sandboxed child (else PreToolUse gate silently vanishes), and the hook
+        // writes the .aspis-agents.json ledger in projects_path — grant both.
+        let mut hook_read_roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(hook) = resolve_claude_consent_hook_path() {
+            hook_read_roots.push(std::path::PathBuf::from(hook));
+        }
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -2495,6 +2502,8 @@ fn prepare_or_launch_project_agent(
             resume_context.as_deref(),
             &input.project_id,
             input.model.as_deref(),
+            hook_read_roots,
+            vec![projects_path.clone()],
             codex_policy,
         )?;
         if let Err(record_err) = record_agent_launch(
