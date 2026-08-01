@@ -1760,7 +1760,24 @@ pub fn spawn_sandboxed(
     cwd: &Path,
     env_vars: &[(String, String)],
 ) -> Result<SandboxedChild, String> {
-    spawn_sandboxed_internal(policy, program, args, cwd, env_vars, None)
+    spawn_sandboxed_internal(policy, program, args, cwd, env_vars, StdioMode::Pipes, None)
+}
+
+/// Spawn a sandboxed child whose stdio is a ConPTY (interactive agent terminal).
+/// `hpc` is the pseudoconsole handle (HPCON) created by the caller; the broker
+/// passes it via PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE. The returned
+/// SandboxedChild has NO pipe handles — the master side (read/write/resize)
+/// lives in the caller's ConPTY handles. All sandbox layers (AppContainer,
+/// Job Object, ACLs, net capability) apply identically.
+pub fn spawn_sandboxed_pty(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_vars: &[(String, String)],
+    hpc: windows::Win32::System::Console::HPCON,
+) -> Result<SandboxedChild, String> {
+    spawn_sandboxed_internal(policy, program, args, cwd, env_vars, StdioMode::ConPty(hpc), None)
 }
 
 /// Spawn a sandboxed child with an OPTIONAL parent-owned stdin pipe.
@@ -1778,17 +1795,29 @@ pub fn spawn_sandboxed_with_stdin(
     cwd: &Path,
     env_vars: &[(String, String)],
 ) -> Result<SandboxedChild, String> {
-    spawn_sandboxed_internal(policy, program, args, cwd, env_vars, Some(true))
+    spawn_sandboxed_internal(policy, program, args, cwd, env_vars, StdioMode::Pipes, Some(true))
 }
 
 /// Internal implementation shared by both spawn functions.
 /// `stdin_pipe`: None = NUL (agentic), Some(true) = pipe (interactive sidecar).
+/// How the sandboxed child's stdio is wired (C6).
+pub enum StdioMode {
+    /// Standard pipes: NUL stdin (agentic runs) or a parent-owned stdin pipe
+    /// (interactive sidecars). stdout/stderr are always pipes.
+    Pipes,
+    /// ConPTY (HPCON): the child's stdio is the pseudoconsole. Used by the
+    /// interactive agent terminal path (agent_pty.rs) so agents get a real
+    /// console (keystrokes, resize, DSR) inside the AppContainer.
+    ConPty(windows::Win32::System::Console::HPCON),
+}
+
 fn spawn_sandboxed_internal(
     policy: &SandboxPolicy,
     program: &str,
     args: &[String],
     cwd: &Path,
     env_vars: &[(String, String)],
+    stdio: StdioMode,
     stdin_pipe: Option<bool>,
 ) -> Result<SandboxedChild, String> {
     use windows::core::{PCWSTR, PWSTR};
@@ -1871,6 +1900,14 @@ fn spawn_sandboxed_internal(
     // the struct. Freed after CreateProcessAsUserW succeeds (or on each error
     // path after this point).
 
+    // C6: ConPTY mode wires the pseudoconsole as the child's stdio; the pipes
+    // below exist only in Pipes mode. In ConPty mode the SandboxedChild carries
+    // no pipe handles (the caller owns the ConPTY master side).
+    let conpty_handle: Option<windows::Win32::System::Console::HPCON> = match stdio {
+        StdioMode::ConPty(hpc) => Some(hpc),
+        StdioMode::Pipes => None,
+    };
+
     // Create pipes for stdout/stderr.
     let (stdout_read, stdout_write) = create_pipe()?;
     cleanup.track(stdout_read);
@@ -1880,7 +1917,10 @@ fn spawn_sandboxed_internal(
     cleanup.track(stderr_write);
 
     // Handle stdin: either NUL (agentic) or a pipe (interactive sidecar).
-    let (stdin_write, child_stdin) = if stdin_pipe == Some(true) {
+    // Unused in ConPty mode (the pseudoconsole owns stdio).
+    let (stdin_write, child_stdin) = if conpty_handle.is_some() {
+        (None, HANDLE::default())
+    } else if stdin_pipe == Some(true) {
         let (read, write) = create_stdin_pipe()?;
         // The child reads from the pipe; the parent keeps the write end.
         (Some(cleanup.track(write)), cleanup.track(read))
@@ -1931,10 +1971,12 @@ fn spawn_sandboxed_internal(
     // handle inheritance to ONLY stdout/stderr/stdin. With bInheritHandles=TRUE
     // but a constrained attribute list, the child cannot inherit arbitrary parent
     // handles (e.g. other pipe ends, token handles).
-    // C5: a second attribute (PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES) makes
-    // Windows create an AppContainer token for the child.
+    // C5: SECURITY_CAPABILITIES makes Windows create an AppContainer token.
+    // C6: in ConPty mode, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE wires the
+    // pseudoconsole; stdio handles are INVALID_HANDLE_VALUE per portable-pty.
+    let conpty_mode = conpty_handle.is_some();
     let inherit_handles: [HANDLE; 3] = [stdout_write, stderr_write, child_stdin];
-    const ATTR_COUNT: usize = 2;
+    let attr_count: usize = if conpty_mode { 3 } else { 2 };
 
     // SECURITY_CAPABILITIES: package SID + capability SIDs. Must stay alive
     // through CreateProcessAsUserW (the attribute list copies the struct, but
@@ -1961,7 +2003,7 @@ fn spawn_sandboxed_internal(
     let sizing_error = unsafe {
         let ok = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
-            ATTR_COUNT as u32,
+            attr_count as u32,
             0,
             &mut attr_size,
         )
@@ -1997,26 +2039,53 @@ fn spawn_sandboxed_internal(
         let mut initialized_size = attr_size;
         if let Err(e) = InitializeProcThreadAttributeList(
             attr_list,
-            ATTR_COUNT as u32,
+            attr_count as u32,
             0,
             &mut initialized_size,
         ) {
             return Err(format!("InitializeProcThreadAttributeList failed: {e}"));
         }
-        if let Err(e) = UpdateProcThreadAttribute(
-            attr_list,
-            0,
-            // PROC_THREAD_ATTRIBUTE_HANDLE_LIST. Do not use the nearby
-            // PARENT_PROCESS value (0x00020000): a wrong value silently
-            // defeats the inherited-handle containment boundary.
-            0x00020002usize,
-            Some(handle_list.as_ptr() as *const std::ffi::c_void),
-            std::mem::size_of_val(&handle_list),
-            None,
-            None,
-        ) {
-            DeleteProcThreadAttributeList(attr_list);
-            return Err(format!("UpdateProcThreadAttribute failed: {e}"));
+        // In ConPty mode the pseudoconsole replaces the handle list: the child
+        // inherits NO handles and stdio comes from the HPCON.
+        if !conpty_mode {
+            if let Err(e) = UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                // PROC_THREAD_ATTRIBUTE_HANDLE_LIST. Do not use the nearby
+                // PARENT_PROCESS value (0x00020000): a wrong value silently
+                // defeats the inherited-handle containment boundary.
+                0x00020002usize,
+                Some(handle_list.as_ptr() as *const std::ffi::c_void),
+                std::mem::size_of_val(&handle_list),
+                None,
+                None,
+            ) {
+                DeleteProcThreadAttributeList(attr_list);
+                return Err(format!("UpdateProcThreadAttribute failed: {e}"));
+            }
+        } else {
+            // C6: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE (0x20016). The HPCON must
+            // stay alive through CreateProcessAsUserW (referenced, not copied);
+            // the caller closes it after the child is reaped.
+            let hpc = conpty_handle.expect("conpty mode implies handle");
+            if let Err(e) = UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                0x00020016usize,
+                // NOTE: PSEUDOCONSOLE takes the HPCON VALUE itself as lpValue
+                // (like a scalar), NOT a pointer to it — unlike
+                // SECURITY_CAPABILITIES which is passed by address. portable-pty
+                // does the same (`UpdateProcThreadAttribute(..., con, ...)`).
+                Some(hpc.0 as *const std::ffi::c_void),
+                std::mem::size_of::<windows::Win32::System::Console::HPCON>() as usize,
+                None,
+                None,
+            ) {
+                DeleteProcThreadAttributeList(attr_list);
+                return Err(format!(
+                    "UpdateProcThreadAttribute(PSEUDOCONSOLE) failed: {e}"
+                ));
+            }
         }
         // C5: SECURITY_CAPABILITIES (0x00020009) — the AppContainer identity.
         if let Err(e) = UpdateProcThreadAttribute(
@@ -2039,19 +2108,33 @@ fn spawn_sandboxed_internal(
     // STARTUPINFOEXW (superset of STARTUPINFOW, with lpAttributeList).
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdOutput = stdout_write;
-    si.StartupInfo.hStdError = stderr_write;
-    si.StartupInfo.hStdInput = child_stdin;
+    // C6: ConPty mode sets stdio handles to INVALID_HANDLE_VALUE (portable-pty
+    // pattern) so the child never inherits the parent's redirected stdio.
+    if conpty_mode {
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdOutput = HANDLE(u32::MAX as *mut _);
+        si.StartupInfo.hStdError = HANDLE(u32::MAX as *mut _);
+        si.StartupInfo.hStdInput = HANDLE(u32::MAX as *mut _);
+    } else {
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdOutput = stdout_write;
+        si.StartupInfo.hStdError = stderr_write;
+        si.StartupInfo.hStdInput = child_stdin;
+    }
     si.StartupInfo.lpDesktop = windows::core::PWSTR::null();
     si.lpAttributeList = attr_list;
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // H-9: EXTENDED_STARTUPINFO_PRESENT (0x00080000) tells the loader this is a STARTUPINFOEXW.
-    let flags = CREATE_SUSPENDED
-        | CREATE_NO_WINDOW
-        | CREATE_UNICODE_ENVIRONMENT
-        | PROCESS_CREATION_FLAGS(0x00080000);
+    // C6: CREATE_NO_WINDOW is NOT set in ConPty mode — it breaks ConPTY output
+    // (verified 2026-07-31: with it, the child never renders into the
+    // pseudoconsole and the master reads nothing; without it, the ConPTY init
+    // sequences + child output flow normally). In Pipes mode it stays, keeping
+    // agentic/one-shot runs console-free.
+    let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | PROCESS_CREATION_FLAGS(0x00080000);
+    if !conpty_mode {
+        flags |= CREATE_NO_WINDOW;
+    }
 
     unsafe {
         if let Err(e) = CreateProcessAsUserW(
@@ -2060,7 +2143,12 @@ fn spawn_sandboxed_internal(
             PWSTR(cmdline_wide.as_mut_ptr()),
             None,
             None,
-            BOOL(1),
+            // C6: in ConPty mode there is no HANDLE_LIST — the pseudoconsole is
+            // wired via attribute. bInheritHandles must be FALSE or the child
+            // inherits EVERY parent handle (and the ConPTY host setup can stall).
+            // In Pipes mode the HANDLE_LIST restricts inheritance, so TRUE + the
+            // attribute list is the safe combo there.
+            BOOL(if conpty_mode { 0 } else { 1 }),
             flags,
             Some(env_block.as_ptr() as *const _),
             PCWSTR(cwd_wide.as_ptr()),
@@ -2082,6 +2170,19 @@ fn spawn_sandboxed_internal(
     cleanup.close(stdout_write);
     cleanup.close(stderr_write);
     cleanup.close(child_stdin);
+    // C6: in ConPty mode the child's stdio is the pseudoconsole — the pipes we
+    // created above were never handed to it. Close the read ends so no handle
+    // is leaked and the child carries default handles.
+    let (stdout_read, stderr_read, stdin_write) = if conpty_mode {
+        cleanup.close(stdout_read);
+        cleanup.close(stderr_read);
+        if let Some(w) = stdin_write {
+            cleanup.close(w);
+        }
+        (HANDLE::default(), HANDLE::default(), None)
+    } else {
+        (stdout_read, stderr_read, stdin_write)
+    };
     cleanup.close(primary_token);
     // C5: the child token exists; package SID + capability SIDs are no longer
     // referenced by SECURITY_CAPABILITIES. Disarm both guards.
@@ -2174,6 +2275,279 @@ fn process_is_elevated() -> bool {
         let _ = CloseHandle(token);
     }
     res.is_ok() && elevation.TokenIsElevated != 0
+}
+
+// ─── C6: ConPTY master + portable_pty trait impls ─────────────────────────────
+//
+// The interactive agent terminal (agent_pty.rs) needs a real console inside the
+// AppContainer. portable_pty's own ConPTY spawn cannot be pointed at our broker,
+// so we create the pseudoconsole here and expose it through portable_pty's
+// traits: SandboxedChild becomes a portable_pty::Child, and WindowsConPtyMaster
+// implements MasterPty over a caller-created HPCON + the two pipes.
+
+/// Create a ConPTY (HPCON) plus the two pipes that form its host side.
+/// Returns (master, hpc):
+/// - master: read/write/resize endpoints for the app (agent_pty uses them).
+/// - hpc: the pseudoconsole handle to pass to [`spawn_sandboxed_pty`]; the
+///   caller must keep it alive until the child is reaped (it is referenced by
+///   the child's stdio, not copied), then close it with ClosePseudoConsole.
+pub fn create_conpty(
+    rows: u16,
+    cols: u16,
+) -> Result<(WindowsConPtyMaster, windows::Win32::System::Console::HPCON), String> {
+    use windows::Win32::System::Console::{
+        CreatePseudoConsole, COORD, HPCON,
+    };
+    // Same pipe wiring as portable-pty's PsuedoCon::new: hInput = read end of
+    // the host→child pipe, hOutput = write end of the child→host pipe.
+    let (input_read, input_write) = create_pipe()?;
+    let (output_read, output_write) = create_pipe()?;
+    let hpc = unsafe {
+        CreatePseudoConsole(
+            COORD { X: cols as i16, Y: rows as i16 },
+            input_read,
+            output_write,
+            0,
+        )
+        .map_err(|e| format!("CreatePseudoConsole failed: {e}"))?
+    };
+    let master = WindowsConPtyMaster {
+        hpc,
+        input_write,
+        output_read,
+        // The read end of the host pipe and write end of the child pipe are
+        // owned by the OS now; close our copies on drop.
+        _input_read: input_read,
+        _output_write: output_write,
+        rows,
+        cols,
+    };
+    Ok((master, hpc))
+}
+
+/// Host side of a ConPTY: writing to `input_write` feeds the child's stdin,
+/// reading from `output_read` consumes the child's stdout/stderr, and resize
+/// resizes the pseudoconsole. Implements portable_pty::MasterPty so
+/// agent_pty.rs can keep its trait-based plumbing.
+pub struct WindowsConPtyMaster {
+    hpc: windows::Win32::System::Console::HPCON,
+    input_write: HANDLE,
+    output_read: HANDLE,
+    _input_read: HANDLE,
+    _output_write: HANDLE,
+    rows: u16,
+    cols: u16,
+}
+
+impl Drop for WindowsConPtyMaster {
+    fn drop(&mut self) {
+        unsafe {
+            // ClosePseudoConsole is async: it signals the conhost to exit but
+            // does not block. portable-pty calls it in PsuedoCon::drop too.
+            let _ = windows::Win32::System::Console::ClosePseudoConsole(self.hpc);
+            let _ = CloseHandle(self.input_write);
+            let _ = CloseHandle(self.output_read);
+            let _ = CloseHandle(self._input_read);
+            let _ = CloseHandle(self._output_write);
+        }
+    }
+}
+
+impl WindowsConPtyMaster {
+    /// Duplicate `output_read` for the reader thread (each reader gets its own
+    /// handle; the master keeps the original for its lifetime).
+    pub fn duplicate_reader(&self) -> Result<HANDLE, String> {
+        unsafe {
+            let mut dup = HANDLE::default();
+            windows::Win32::Foundation::DuplicateHandle(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                self.output_read,
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                &mut dup,
+                0,
+                false,
+                windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            )
+            .map_err(|e| format!("DuplicateHandle(reader) failed: {e}"))?;
+            Ok(dup)
+        }
+    }
+
+    /// Duplicate `input_write` for the writer (the master keeps the original).
+    pub fn duplicate_writer(&self) -> Result<HANDLE, String> {
+        unsafe {
+            let mut dup = HANDLE::default();
+            windows::Win32::Foundation::DuplicateHandle(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                self.input_write,
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                &mut dup,
+                0,
+                false,
+                windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            )
+            .map_err(|e| format!("DuplicateHandle(writer) failed: {e}"))?;
+            Ok(dup)
+        }
+    }
+}
+
+// SAFETY: the master owns raw handles; all access is through &self methods that
+// are internally synchronized by the OS (pipe I/O is thread-safe per handle),
+// and each duplicated handle is owned by exactly one thread. Matches the
+// existing unsafe impl for SandboxedChild.
+unsafe impl Send for WindowsConPtyMaster {}
+unsafe impl Sync for WindowsConPtyMaster {}
+
+impl std::fmt::Debug for WindowsConPtyMaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsConPtyMaster")
+            .field("hpc", &self.hpc.0)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
+}
+
+impl portable_pty::MasterPty for WindowsConPtyMaster {
+    fn resize(&self, size: portable_pty::PtySize) -> anyhow::Result<()> {
+        use windows::Win32::System::Console::ResizePseudoConsole;
+        unsafe {
+            ResizePseudoConsole(
+                self.hpc,
+                windows::Win32::System::Console::COORD {
+                    X: size.cols as i16,
+                    Y: size.rows as i16,
+                },
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("ResizePseudoConsole failed: {e}")
+            })
+        }
+    }
+
+    fn get_size(&self) -> anyhow::Result<portable_pty::PtySize> {
+        Ok(portable_pty::PtySize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+
+    fn try_clone_reader(
+        &self,
+    ) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+        use std::os::windows::io::FromRawHandle;
+        let dup = self
+            .duplicate_reader()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Safety: dup is a fresh handle owned by us.
+        let file = unsafe { std::fs::File::from_raw_handle(dup.0 as _) };
+        Ok(Box::new(file))
+    }
+
+    fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+        use std::os::windows::io::FromRawHandle;
+        let dup = self
+            .duplicate_writer()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Safety: dup is a fresh handle owned by us.
+        let file = unsafe { std::fs::File::from_raw_handle(dup.0 as _) };
+        Ok(Box::new(file))
+    }
+}
+
+/// SandboxedChild as a portable_pty::Child. `wait` maps to wait_and_restore
+/// (child reaped + ACLs/AppContainer profile restored); `kill` terminates the
+/// whole job (descendants included).
+impl std::fmt::Debug for SandboxedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxedChild")
+            .field("pid", &self.pid)
+            .field("restored", &self.restored)
+            .finish()
+    }
+}
+
+impl portable_pty::ChildKiller for SandboxedChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        SandboxedChild::kill(self).map_err(std::io::Error::other)
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(SandboxedChildKiller {
+            pid: self.pid,
+            process_handle: self.process_handle,
+            job: self.job,
+        })
+    }
+}
+
+impl portable_pty::Child for SandboxedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        SandboxedChild::try_wait(self)
+            .map(|opt| opt.map(|code| portable_pty::ExitStatus::with_exit_code(code as u32)))
+            .map_err(std::io::Error::other)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        // wait_and_restore reaps the child AND restores ACLs + AppContainer
+        // profile — the PTY teardown path relies on this.
+        let code = self.wait_and_restore().map_err(std::io::Error::other)?;
+        Ok(portable_pty::ExitStatus::with_exit_code(code as u32))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        Some(self.process_handle.0 as _)
+    }
+}
+
+/// Standalone killer for a sandboxed child (what clone_killer returns): holds
+/// the raw handles WITHOUT the ACL/profile restore responsibility, so it can
+/// be shared across threads (Send+Sync) and used after the child object moved
+/// into the reap path. Terminating the job kills all descendants.
+#[derive(Clone)]
+struct SandboxedChildKiller {
+    pid: u32,
+    process_handle: HANDLE,
+    job: HANDLE,
+}
+
+impl std::fmt::Debug for SandboxedChildKiller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxedChildKiller")
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
+
+// SAFETY: raw handles are only used for TerminateJobObject/TerminateProcess
+// which are thread-safe; the killer is Clone + shared across reader threads.
+unsafe impl Send for SandboxedChildKiller {}
+unsafe impl Sync for SandboxedChildKiller {}
+
+impl portable_pty::ChildKiller for SandboxedChildKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        unsafe {
+            if !self.job.0.is_null() {
+                TerminateJobObject(self.job, 1).map_err(std::io::Error::other)?;
+            } else if !self.process_handle.0.is_null() {
+                windows::Win32::System::Threading::TerminateProcess(self.process_handle, 1)
+                    .map_err(std::io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
 }
 
 mod tests {

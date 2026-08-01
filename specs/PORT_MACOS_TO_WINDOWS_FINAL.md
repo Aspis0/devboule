@@ -431,7 +431,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
 | ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
 | G — memory backpressure | ⏸ deferred | per plan (optional) |
-| **Flip `is_enforced()` → true** | ⏸ **C6-gated** | broker C5 verified; PTY paths unsandboxed → flip deferred (hostile review 479e355) |
+| **Flip `is_enforced()` → true** | ✅ **DONE (C6)** | `mod.rs` = `true`; PTY + one-shot paths sandboxed via ConPTY broker; `is_enforced_true_on_windows` |
 
 ### Why the flip is still BLOCKED (new evidence, not plan-anticipated)
 
@@ -531,16 +531,35 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
 4. Final gate: flip `is_enforced()` → `true` on Windows AFTER reviewer + oracle
    sign-off on the C5 diff.
 
-### C6 (next milestone) — sandbox the PTY paths
+### C6 (DONE 2026-07-31) — sandbox the PTY paths
 
-Hostile review on `479e355` (blocker): `agent_pty.rs:192` spawns interactive
-agent terminals via `portable_pty` and the one-shot mini path uses the same
-PTY — on Windows these bypass the broker entirely (full user token, no Job
-Object, no AppContainer). `is_enforced()` stays `false` until both route
-through `spawn_sandboxed`. Open question: `portable_pty` on Windows uses
-ConPTY — the broker needs a ConPTY-compatible spawn (pass ConPTY handles as
-stdin/stdout in `STARTUPINFOEXW` while keeping CREATE_SUSPENDED +
-SECURITY_CAPABILITIES). Spike required.
+Hostile review on `479e355` (blocker) is resolved: `agent_pty.rs` now routes
+the interactive agent terminal AND the one-shot mini path through the broker
+on Windows. Implementation:
+
+- `PtyCommand { program, args, cwd, env }` replaces the opaque
+  portable_pty::CommandBuilder in `spawn_agent_pty` (builder is converted via
+  `from_command_builder`, which reads get_argv/get_cwd/iter_extra_env_as_str).
+- `create_conpty()` (sandbox/windows.rs) creates the pseudoconsole + the two
+  host pipes; `spawn_sandboxed_pty` passes HPCON via
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` (0x20016) alongside SECURITY_CAPABILITIES.
+- `SandboxedChild` implements portable_pty `Child`/`ChildKiller`;
+  `WindowsConPtyMaster` implements `MasterPty` (resize via ResizePseudoConsole,
+  duplicate_reader/duplicate_writer for the app's reader/writer threads).
+- `is_enforced()` → `true` on Windows: every unattended spawn path (agentic,
+  sidecar, cloud duplex, censor, PTY, one-shot mini) now runs in an
+  AppContainer with Job Object + ACL grants.
+
+Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
+(PTY echo roundtrip inside the AppContainer, TokenIsAppContainer=1) and
+`fast_exit_child_does_not_orphan_session_in_map` both pass.
+
+API pitfalls found and fixed (documented for the next engineer):
+- `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as
+  lpValue (like a scalar), NOT a pointer to it — unlike SECURITY_CAPABILITIES.
+- `CREATE_NO_WINDOW` **breaks ConPTY output** (child never renders into the
+  pseudoconsole; master reads nothing). Removed in ConPty mode only.
+- `bInheritHandles` must be FALSE in ConPty mode (no HANDLE_LIST attribute).
 
 ### Known trade-offs (accepted for v1)
 

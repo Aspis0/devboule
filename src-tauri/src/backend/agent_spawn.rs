@@ -235,7 +235,7 @@ fn spawn_agent_terminal_app_impl(
     orchestrator: Option<&OrchestratorLaunchConfig>,
     user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
-    use portable_pty::CommandBuilder;
+    use crate::backend::agent_pty::PtyCommand;
 
     let (prompt_file, script) = build_windows_agent_script(
         agent_id,
@@ -254,12 +254,17 @@ fn spawn_agent_terminal_app_impl(
 
     // PTY host: run powershell directly (NO conhost — the PTY IS the console). Same
     // -NoExit/-ExecutionPolicy Bypass/-Command script the external path runs.
-    let mut cmd = CommandBuilder::new("powershell.exe");
-    cmd.args(["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", &script]);
-    cmd.cwd(root_path);
-    for env in provider_env_for_launch(custom_command, provider_env) {
-        cmd.env(&env.name, &env.value);
-    }
+    // C6: PtyCommand keeps the components inspectable so the Windows broker can
+    // spawn the child inside the AppContainer sandbox with a ConPTY.
+    let cmd = PtyCommand::new(
+        "powershell.exe",
+        vec!["-NoExit".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-Command".into(), script],
+        root_path.to_path_buf(),
+        provider_env_for_launch(custom_command, provider_env)
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect(),
+    );
 
     let sessions = app
         .try_state::<crate::backend::agent_pty::AgentPtySessions>()
@@ -296,7 +301,7 @@ fn spawn_agent_terminal_app_impl(
     orchestrator: Option<&OrchestratorLaunchConfig>,
     user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
-    use portable_pty::CommandBuilder;
+    use crate::backend::agent_pty::PtyCommand;
 
     let (prompt_file, script) = build_macos_agent_script(
         agent_id,
@@ -321,12 +326,15 @@ fn spawn_agent_terminal_app_impl(
     // Prefer the user's login shell; fall back to /bin/zsh (macOS default), then
     // /bin/bash. The script itself is POSIX-sh compatible.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.args(["-ic", &script]);
-    cmd.cwd(root_path);
-    for env in provider_env_for_launch(custom_command, provider_env) {
-        cmd.env(&env.name, &env.value);
-    }
+    let cmd = PtyCommand::new(
+        shell,
+        vec!["-ic".into(), script],
+        root_path.to_path_buf(),
+        provider_env_for_launch(custom_command, provider_env)
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect(),
+    );
 
     let sessions = app
         .try_state::<crate::backend::agent_pty::AgentPtySessions>()

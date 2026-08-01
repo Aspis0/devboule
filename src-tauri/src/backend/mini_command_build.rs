@@ -103,7 +103,9 @@ pub(crate) struct MiniCommandBuild {
     /// SPAWN caller removes it (via `remove_mini_temp_files`) on a spawn failure (where the
     /// script never ran). `None` on every unsandboxed path (codex/api/non-loopback/Windows).
     pub(crate) profile_file: Option<PathBuf>,
-    pub(crate) command: CommandBuilder,
+    /// C6: inspectable launch components (the PTY path on Windows spawns through
+    /// the AppContainer broker, which cannot read a portable_pty CommandBuilder).
+    pub(crate) command: crate::backend::agent_pty::PtyCommand,
 }
 
 pub(crate) fn build_mini_command(
@@ -135,7 +137,7 @@ pub(crate) fn build_mini_command(
         Ok((command, profile_file)) => Ok(MiniCommandBuild {
             prompt_file: Some(prompt_file),
             profile_file,
-            command,
+            command: crate::backend::agent_pty::PtyCommand::from_command_builder(&command),
         }),
         Err(e) => {
             super::projects::remove_restricted_temp_file(&prompt_file);

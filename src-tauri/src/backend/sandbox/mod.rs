@@ -227,16 +227,13 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // FALSE (reverted 2026-07-31, hostile review on 479e355): the C5
-        // AppContainer broker works and is verified (TokenIsAppContainer=1 on a
-        // non-elevated host), but NOT every unattended path routes through it
-        // yet — agent_pty.rs spawns interactive agent terminals and the
-        // one-shot mini path via portable_pty WITHOUT the broker on Windows
-        // (mini_command_build.rs "P5: Windows is NOT sandboxed this phase").
-        // is_enforced() must stay false until those PTY paths route through
-        // spawn_sandboxed (milestone C6). Fail-closed: Unattended silently
-        // degrades to Ask via broker::effective_sandbox_mode.
-        false
+        // TRUE since 2026-07-31 (C6): the AppContainer broker (C5) now covers
+        // EVERY unattended spawn path. C6 routed the last bypass — the
+        // interactive agent PTY and the one-shot mini path — through the broker
+        // via a ConPTY (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE + SECURITY_CAPABILITIES
+        // + Job Object; verified TokenIsAppContainer=1 + echo roundtrip on a
+        // non-elevated host). This unlocks Unattended autonomy on Windows.
+        true
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -315,14 +312,14 @@ mod tests {
         assert!(is_enforced());
     }
 
-    /// Windows: is_enforced() is false until the PTY paths (agent_pty,
-    /// one-shot mini) also route through the AppContainer broker (C6). The C5
-    /// broker itself is verified, but partial coverage must not unlock
-    /// Unattended autonomy (hostile review on 479e355).
+    /// Windows: is_enforced() is true since C6 — every unattended spawn path
+    /// (agentic runs, sidecars, cloud duplex, censor, interactive agent PTY,
+    /// one-shot mini) routes through the AppContainer broker. Verified on a
+    /// non-elevated host (TokenIsAppContainer=1, PTY echo roundtrip).
     #[cfg(target_os = "windows")]
     #[test]
-    fn is_enforced_false_on_windows() {
-        assert!(!is_enforced());
+    fn is_enforced_true_on_windows() {
+        assert!(is_enforced());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

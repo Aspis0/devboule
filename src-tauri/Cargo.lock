@@ -2707,8 +2707,10 @@ name = "devboule"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "block2 0.5.1",
  "chrono",
+ "downcast-rs",
  "ed25519-dalek",
  "fs2",
  "futures-util",

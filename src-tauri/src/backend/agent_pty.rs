@@ -148,6 +148,65 @@ fn terminal_event_name(agent_id: &str) -> String {
     format!("agent-terminal://{agent_id}")
 }
 
+/// Everything needed to launch a PTY child, platform-agnostic. On macOS this is
+/// turned into a portable_pty::CommandBuilder; on Windows the broker spawns the
+/// child with a ConPTY (C6 — previously the PTY path was NOT sandboxed).
+#[derive(Debug, Clone)]
+pub struct PtyCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: std::path::PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+impl PtyCommand {
+    pub fn new(
+        program: impl Into<String>,
+        args: Vec<String>,
+        cwd: std::path::PathBuf,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self { program: program.into(), args, cwd, env }
+    }
+
+    /// Build a portable_pty CommandBuilder (macOS path).
+    #[cfg(not(target_os = "windows"))]
+    fn to_command_builder(&self) -> portable_pty::CommandBuilder {
+        let mut cmd = portable_pty::CommandBuilder::new(&self.program);
+        cmd.args(&self.args);
+        cmd.cwd(&self.cwd);
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Convert a portable_pty CommandBuilder into inspectable components.
+    /// `env` carries the EXTRA env entries (portable-pty's builder snapshots
+    /// the host env as its base; the extras are the overrides callers set).
+    pub fn from_command_builder(cmd: &portable_pty::CommandBuilder) -> Self {
+        let argv = cmd.get_argv();
+        let program = argv
+            .first()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let args: Vec<String> = argv
+            .iter()
+            .skip(1)
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let cwd = cmd
+            .get_cwd()
+            .map(|c| std::path::PathBuf::from(c.to_os_string()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let env: Vec<(String, String)> = cmd
+            .iter_extra_env_as_str()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self { program, args, cwd, env }
+    }
+}
+
 /// Spawn an app-hosted PTY for `agent_id` running `command` and start streaming
 /// its output. The session is inserted into `sessions` keyed by `agent_id`; an
 /// existing session for the same id is killed+replaced so a relaunch is clean.
@@ -163,7 +222,7 @@ pub fn spawn_agent_pty(
     app: &tauri::AppHandle,
     sessions: &AgentPtySessions,
     agent_id: &str,
-    command: CommandBuilder,
+    command: PtyCommand,
 ) -> Result<(), String> {
     // FRONT-END CONTRACT (Phase 6): on Windows, ConPTY emits a Device Status
     // Report query (`ESC [ 6 n`, cursor position) at startup and STALLS its render
@@ -176,52 +235,140 @@ pub fn spawn_agent_pty(
     // Replace any prior session for this id (clean relaunch). Best-effort kill.
     kill_session_in_map(sessions, agent_id);
 
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: INITIAL_ROWS,
-            cols: INITIAL_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| {
-            log_pty_detail("openpty failed", &e.to_string());
+    #[cfg(target_os = "windows")]
+    let (mut child, master, writer, reader) = {
+        use crate::backend::sandbox::windows::{create_conpty, spawn_sandboxed_pty};
+        use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
+
+        // C6: the interactive agent terminal runs INSIDE the AppContainer
+        // sandbox. Create the ConPTY first, then hand the pseudoconsole handle
+        // to the broker; all sandbox layers apply (AppContainer token, Job
+        // Object, ACL grants, network capability).
+        let (master, hpc) = create_conpty(INITIAL_ROWS, INITIAL_COLS).map_err(|e| {
+            log_pty_detail("create_conpty failed", &e.to_string());
             "Could not open the agent terminal.".to_string()
         })?;
 
-    let mut child = pair.slave.spawn_command(command).map_err(|e| {
-        log_pty_detail("spawn_command failed", &e.to_string());
-        "Could not start the agent in the app terminal.".to_string()
-    })?;
+        // Agents need outbound network (LLM API calls) — same policy the
+        // external-terminal path gets: full sandbox, network enabled.
+        let policy = SandboxPolicy::deny(command.cwd.clone())
+            .writable(command.cwd.clone())
+            .net(NetPolicy::Enabled)
+            .rlimits(ResourceLimits::default());
 
-    // From here on a failure must not leak the live child: capture a killer first.
+        // C6: the broker builds the child env from scratch (make_env_block), so
+        // it must receive the FULL environment — host base + PtyCommand extras.
+        let mut full_env: Vec<(String, String)> = std::env::vars().collect();
+        for (k, v) in &command.env {
+            full_env.retain(|(ek, _)| !ek.eq_ignore_ascii_case(k));
+            full_env.push((k.clone(), v.clone()));
+        }
+
+        let mut child = spawn_sandboxed_pty(
+            &policy,
+            &command.program,
+            &command.args,
+            &command.cwd,
+            &full_env,
+            hpc,
+        )
+        .map_err(|e| {
+            log_pty_detail("spawn_sandboxed_pty failed", &e.to_string());
+            "Could not start the agent in the app terminal.".to_string()
+        })?;
+
+        let writer = master
+            .duplicate_writer()
+            .map_err(|e| {
+                let _ = child.kill();
+                log_pty_detail("duplicate_writer failed", &e.to_string());
+                "Could not attach to the agent terminal.".to_string()
+            })
+            .map(|h| -> Box<dyn std::io::Write + Send> {
+                use std::os::windows::io::FromRawHandle;
+                Box::new(unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+            })?;
+        let reader = master
+            .duplicate_reader()
+            .map_err(|e| {
+                let _ = child.kill();
+                log_pty_detail("duplicate_reader failed", &e.to_string());
+                "Could not read from the agent terminal.".to_string()
+            })
+            .map(|h| -> Box<dyn std::io::Read + Send> {
+                use std::os::windows::io::FromRawHandle;
+                Box::new(unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+            })?;
+
+        (
+            Box::new(child) as Box<dyn Child + Send + Sync>,
+            Box::new(master) as Box<dyn MasterPty + Send>,
+            Box::new(writer) as Box<dyn Write + Send>,
+            Box::new(reader) as Box<dyn Read + Send>,
+        )
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let (mut child, master, writer, reader) = {
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: INITIAL_ROWS,
+                cols: INITIAL_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| {
+                log_pty_detail("openpty failed", &e.to_string());
+                "Could not open the agent terminal.".to_string()
+            })?;
+
+        let mut child = pair
+            .slave
+            .spawn_command(command.to_command_builder())
+            .map_err(|e| {
+                log_pty_detail("spawn_command failed", &e.to_string());
+                "Could not start the agent in the app terminal.".to_string()
+            })?;
+
+        // From here on a failure must not leak the live child: capture a killer first.
+        let killer = child.clone_killer();
+
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                let mut killer = killer;
+                let _ = killer.kill();
+                let _ = child.wait();
+                log_pty_detail("take_writer failed", &e.to_string());
+                return Err("Could not attach to the agent terminal.".to_string());
+            }
+        };
+
+        let reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                let mut killer = killer;
+                let _ = killer.kill();
+                let _ = child.wait();
+                log_pty_detail("try_clone_reader failed", &e.to_string());
+                return Err("Could not read from the agent terminal.".to_string());
+            }
+        };
+
+        (
+            child,
+            pair.master,
+            Box::new(writer) as Box<dyn Write + Send>,
+            Box::new(reader) as Box<dyn Read + Send>,
+        )
+    };
+    // From here on a failure must not leak the live child.
     let killer = child.clone_killer();
-
-    let writer = match pair.master.take_writer() {
-        Ok(writer) => writer,
-        Err(e) => {
-            let mut killer = killer;
-            let _ = killer.kill();
-            let _ = child.wait();
-            log_pty_detail("take_writer failed", &e.to_string());
-            return Err("Could not attach to the agent terminal.".to_string());
-        }
-    };
-
-    let reader = match pair.master.try_clone_reader() {
-        Ok(reader) => reader,
-        Err(e) => {
-            let mut killer = killer;
-            let _ = killer.kill();
-            let _ = child.wait();
-            log_pty_detail("try_clone_reader failed", &e.to_string());
-            return Err("Could not read from the agent terminal.".to_string());
-        }
-    };
 
     let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     let exited = Arc::new(AtomicBool::new(false));
-    let master = Arc::new(Mutex::new(pair.master));
+    let master = Arc::new(Mutex::new(master));
     let writer = Arc::new(Mutex::new(writer));
 
     // FIX 2 (insert-before-read): insert the session into the map BEFORE spawning
@@ -916,38 +1063,89 @@ mod tests {
     #[ignore = "spawns a real PTY child; run locally with --ignored"]
     fn real_pty_echo_is_captured_and_child_reaped() {
         use std::time::Instant;
+        use std::os::windows::io::FromRawHandle;
+        use crate::backend::sandbox::windows::{create_conpty, spawn_sandboxed_pty};
+        use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
 
-        let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: INITIAL_ROWS,
-                cols: INITIAL_COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
+        // C6: the ConPTY is created here and handed to the AppContainer broker —
+        // the sandboxed path is what the test now exercises.
+        let (master, hpc) = create_conpty(INITIAL_ROWS, INITIAL_COLS).expect("create_conpty");
+        // NOTE: a SMALL dir — the broker grants the package-SID ACE on the cwd,
+        // and %TEMP% on this host has ~58k files (ACL propagation would take
+        // minutes). Real project roots are small; this mirrors production.
+        let cwd = std::env::temp_dir().join(format!("devboule_pty_test_{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let policy = SandboxPolicy::deny(cwd.clone())
+            .writable(cwd.clone())
+            .net(NetPolicy::Enabled)
+            .rlimits(ResourceLimits::default());
+        let full_env: Vec<(String, String)> = std::env::vars().collect();
 
         // A unique marker printed via PowerShell Write-Host, invoked directly (no
         // nested `cmd /c` quoting). Write-Host writes straight to the console
         // buffer ConPTY streams out, so the marker is reliably captured. The marker
         // is unusual enough not to collide with the ConPTY init escape sequences.
-        let mut cmd = CommandBuilder::new("powershell.exe");
-        cmd.args(["-NoProfile", "-Command", "Write-Host ASPISPTYMARKER"]);
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
-        // Drop our slave copy so only the child holds the write end.
-        drop(pair.slave);
+        let mut child = spawn_sandboxed_pty(
+            &policy,
+            "cmd.exe",
+            &["/c".to_string(), "echo".to_string(), "ASPISPTYMARKER".to_string()],
+            &cwd,
+            &full_env,
+            hpc,
+        )
+        .expect("spawn_sandboxed_pty");
+
+        // C6 load-bearing assertion: the interactive agent terminal runs inside
+        // the AppContainer, exactly like the non-PTY broker path.
+        {
+            use windows::Win32::Security::TokenIsAppContainer;
+            use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+            use windows::Win32::Foundation::CloseHandle;
+            let proc = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, child.pid).expect("open child")
+            };
+            let mut token = windows::Win32::Foundation::HANDLE::default();
+            unsafe {
+                OpenProcessToken(proc, windows::Win32::Security::TOKEN_QUERY, &mut token)
+                    .expect("open token");
+            }
+            let mut is_ac: u32 = 0;
+            let mut len = 0u32;
+            unsafe {
+                windows::Win32::Security::GetTokenInformation(
+                    token,
+                    TokenIsAppContainer,
+                    Some(&mut is_ac as *mut _ as *mut _),
+                    4,
+                    &mut len,
+                )
+                .expect("query TokenIsAppContainer");
+                let _ = CloseHandle(token);
+                let _ = CloseHandle(proc);
+            }
+            assert_eq!(
+                is_ac, 1,
+                "PTY child must run as an AppContainer (TokenIsAppContainer=1)"
+            );
+        }
 
         // ConPTY emits a Device Status Report (`ESC [ 6 n`, cursor-position query)
         // at startup and STALLS its render pipeline until the controlling terminal
         // replies. A real terminal (and the app's xterm front-end) answers it; in
         // this headless test we must answer it ourselves or no child output is ever
         // streamed. Write a cursor-position report back on the master writer.
-        let mut writer = pair.master.take_writer().expect("writer");
+        let mut writer = master
+            .duplicate_writer()
+            .map(|h| unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+            .expect("writer");
         let _ = writer.write_all(b"\x1b[1;1R");
         let _ = writer.flush();
 
         // Reader thread on a cloned reader (its own handle), exactly as production.
-        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut reader = master
+            .duplicate_reader()
+            .map(|h| unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+            .expect("reader");
         let ring = Arc::new(Mutex::new(VecDeque::new()));
         let ring_for_thread = Arc::clone(&ring);
         let handle = std::thread::spawn(move || {
@@ -987,7 +1185,7 @@ mod tests {
         }
 
         // Close the master so the reader drains and EOFs, then join it.
-        drop(pair.master);
+        drop(master);
         let join_deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_finished() && Instant::now() < join_deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -1025,28 +1223,40 @@ mod tests {
     #[test]
     #[ignore = "spawns a real PTY child; run locally with --ignored"]
     fn fast_exit_child_does_not_orphan_session_in_map() {
-        let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: INITIAL_ROWS,
-                cols: INITIAL_COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
+        use std::os::windows::io::FromRawHandle;
+        use crate::backend::sandbox::windows::{create_conpty, spawn_sandboxed_pty};
+        use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
 
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.args(["/c", "exit", "0"]);
-        let child = pair.slave.spawn_command(cmd).expect("spawn");
-        drop(pair.slave);
+        let (master, hpc) = create_conpty(INITIAL_ROWS, INITIAL_COLS).expect("create_conpty");
+        // small cwd (see real_pty test note — %TEMP% ACL propagation is slow)
+        let cwd = std::env::temp_dir().join(format!("devboule_pty_fast_{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let policy = SandboxPolicy::deny(cwd.clone())
+            .writable(cwd.clone())
+            .net(NetPolicy::Enabled)
+            .rlimits(ResourceLimits::default());
+        let full_env: Vec<(String, String)> = std::env::vars().collect();
+
+        let child = spawn_sandboxed_pty(
+            &policy,
+            "cmd.exe",
+            &["/c".to_string(), "exit".to_string(), "0".to_string()],
+            &cwd,
+            &full_env,
+            hpc,
+        )
+        .expect("spawn_sandboxed_pty");
 
         let killer = child.clone_killer();
-        let writer = pair.master.take_writer().expect("writer");
+        let writer = master
+            .duplicate_writer()
+            .map(|h| unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+            .expect("writer");
         let session = PtySession {
-            master: Arc::new(Mutex::new(pair.master)),
+            master: Arc::new(Mutex::new(Box::new(master))),
             killer,
-            child: Some(child),
-            writer: Arc::new(Mutex::new(writer)),
+            child: Some(Box::new(child)),
+            writer: Arc::new(Mutex::new(Box::new(writer) as Box<dyn Write + Send>)),
             // No reader thread in this test — we exercise the map insert/remove +
             // teardown ordering, not the reader EOF path (which needs an AppHandle).
             reader_handle: None,

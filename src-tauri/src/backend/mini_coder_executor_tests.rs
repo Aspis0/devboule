@@ -2518,6 +2518,13 @@ fn argv_strings(cmd: &portable_pty::CommandBuilder) -> Vec<String> {
         .collect()
 }
 
+/// Same shape for the C6 inspectable command (used by the broker path).
+fn pty_argv_strings(cmd: &crate::backend::agent_pty::PtyCommand) -> Vec<String> {
+    let mut v = vec![cmd.program.clone()];
+    v.extend(cmd.args.iter().cloned());
+    v
+}
+
 #[cfg(windows)]
 #[test]
 fn build_command_applefm_windows_returns_clean_macos_only_error() {
@@ -2928,7 +2935,7 @@ fn build_mini_command_wires_mcp_when_roots_present_windows() {
     };
     let build =
         build_mini_command(&b, &root, &result_target, &prompt, Some(&roots), false).unwrap();
-    let script = argv_strings(&build.command).pop().unwrap();
+    let script = pty_argv_strings(&build.command).pop().unwrap();
     assert!(
         script.contains("mcp_servers.devboule.command"),
         "granted mini must wire the MCP flags: {script}"
@@ -2936,7 +2943,7 @@ fn build_mini_command_wires_mcp_when_roots_present_windows() {
     super::super::projects::remove_restricted_temp_file(&build.prompt_file.unwrap());
 
     let build = build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
-    let script = argv_strings(&build.command).pop().unwrap();
+    let script = pty_argv_strings(&build.command).pop().unwrap();
     assert!(
         !script.contains("mcp_servers"),
         "ungranted mini must carry no MCP flags: {script}"
@@ -3320,7 +3327,7 @@ fn build_command_full_writes_prompt_file_off_argv() {
     let prompt = build_mini_prompt(&b, &directive, &root, &result_target, None);
     let build = build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
     let prompt_file = build.prompt_file.expect("a prompt file is created");
-    let joined = argv_strings(&build.command).join(" ");
+    let joined = pty_argv_strings(&build.command).join(" ");
     // The full prompt body (the task text) must NOT be on argv.
     assert!(
         !joined.contains("add a docstring to foo()"),
