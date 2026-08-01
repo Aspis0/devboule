@@ -275,17 +275,8 @@ fn spawn_agent_terminal_app_impl(
     // contains commit identity + safe.directory, no credentials by design).
     #[cfg(target_os = "windows")]
     {
-        if let Some(parent) = prompt_file.parent() {
-            cmd = cmd.read_root(parent.to_path_buf());
-        }
-        let session_gitconfig = write_session_gitconfig();
-        if let Ok(gitconfig) = &session_gitconfig {
-            if let Some(parent) = gitconfig.parent() {
-                cmd = cmd.read_root(parent.to_path_buf());
-            }
-        }
-        for real in real_global_gitconfig_paths() {
-            cmd = cmd.read_root(real);
+        for root in agent_sandbox_read_roots(Some(&prompt_file)) {
+            cmd = cmd.read_root(root);
         }
     }
 
@@ -1093,6 +1084,36 @@ fn spawn_agent_terminal_impl(
 /// resolves correctly.
 fn gitconfig_include_path(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
+}
+
+/// C6: compute the read roots an agent child needs beyond its project cwd:
+/// the per-launch prompt dir (if given), the session gitconfig dir, and the
+/// REAL global gitconfig file(s) the session config [include]s (level-1 only;
+/// includeIf targets are NOT covered — documented limitation). On Windows the
+/// deny-by-default AppContainer cannot read user-only %TEMP% or home files
+/// without these grants; every sandboxed agent spawn builder (app-hosted PTY,
+/// one-shot mini, cloud duplex) must apply them.
+///
+/// NOTE: the real gitconfig may contain http.extraHeader/credential sections
+/// (users store PATs there) — granting it is a deliberate, documented widening
+/// vs the C5 no-home policy; copying only identity keys is a follow-up.
+#[cfg(target_os = "windows")]
+pub(crate) fn agent_sandbox_read_roots(prompt_file: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(prompt_file) = prompt_file {
+        if let Some(parent) = prompt_file.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(gitconfig) = write_session_gitconfig() {
+        if let Some(parent) = gitconfig.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    for real in real_global_gitconfig_paths() {
+        roots.push(real);
+    }
+    roots
 }
 
 /// GH-P5 (F1/F2): the absolute paths of the user's REAL global git config(s) that

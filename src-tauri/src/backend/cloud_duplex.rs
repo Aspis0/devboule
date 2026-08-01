@@ -388,6 +388,14 @@ pub fn spawn_cloud_duplex(
                 }
             }
         }
+        // C6 (reviewer round 3): the cloud CLI's env points GIT_CONFIG_GLOBAL at
+        // the user-only session gitconfig dir, and that config [include]s the
+        // real ~/.gitconfig — the AppContainer child must read all of these or
+        // every git subprocess dies with 'unable to read config file'.
+        #[cfg(target_os = "windows")]
+        for root in crate::backend::agent_spawn::agent_sandbox_read_roots(None) {
+            policy = policy.readonly(root);
+        }
         let mut broker_env = envs.to_vec();
         for key in [
             "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC",

@@ -570,6 +570,12 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
 - Known limitation: `writable(cwd)` ACL propagation is O(files in cwd) — a
   node_modules-heavy repo can take seconds at spawn+restore. Accepted for v1;
   a file-count guard is a follow-up.
+- **Centralized read roots (review round 3)**: `agent_sandbox_read_roots()`
+  (agent_spawn.rs) computes prompt dir + session gitconfig dir + real
+  gitconfig file(s) and is applied by ALL sandboxed agent builders — app-hosted
+  PTY, one-shot mini, cloud duplex. The real gitconfig grant is level-1 only
+  (includeIf targets not covered) and is a documented widening (users may store
+  PATs in http.extraHeader; copying identity keys only is a follow-up).
 
 API pitfalls found and fixed (documented for the next engineer):
 - `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` takes the **HPCON value itself** as

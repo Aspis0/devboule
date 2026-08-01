@@ -136,12 +136,13 @@ pub(crate) fn build_mini_command(
     match cmd {
         Ok((command, profile_file)) => {
             let mut pty_cmd = crate::backend::agent_pty::PtyCommand::from_command_builder(&command);
-            // C6: the mini script reads the prompt from a user-only %TEMP% dir;
-            // the AppContainer child needs it as a read root (Windows). macOS
-            // seatbelt allows broad reads, so this is a no-op there.
+            // C6: the mini script reads the prompt from a user-only %TEMP% dir
+            // and may run git (session gitconfig + real config includes) — the
+            // AppContainer child needs all of these as read roots (Windows).
+            // macOS seatbelt allows broad reads, so this is a no-op there.
             #[cfg(target_os = "windows")]
-            if let Some(parent) = prompt_file.parent() {
-                pty_cmd = pty_cmd.read_root(parent.to_path_buf());
+            for root in super::agent_spawn::agent_sandbox_read_roots(Some(&prompt_file)) {
+                pty_cmd = pty_cmd.read_root(root);
             }
             Ok(MiniCommandBuild {
                 prompt_file: Some(prompt_file),
