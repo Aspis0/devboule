@@ -640,9 +640,15 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   (`backup_copy_failure_reports_no_valid_backup` test); restore failure keeps
   the .bak and names it in the error (`restore_failure_keeps_backup` test).
   The Python backend mirrors the same logic and reads the winerror via
-  getattr (Windows-only attribute, round-16 review). New Windows tests use
-  fault seams MOVE_FAULT / COPY_FALLBACK_FAULT / BACKUP_COPY_FAULT /
-  RESTORE_FAULT; all discriminating.
+  getattr (Windows-only attribute, round-16 review). Round 17-18: restore
+  failure in Python now RAISES with the retained .bak path (no silent
+  swallow); the MCP test seams compile under cfg(all(test, windows)) so
+  `cargo test` works on Linux/macOS; new Python parity tests
+  (oracle/server/tests/test_write_crash_safe_fallback.py — 4 tests, mocks
+  os.replace winerror=5) cover fallback success, unconditional restore,
+  first-write cleanup and .bak retention on restore failure. New Windows
+  tests use fault seams MOVE_FAULT / COPY_FALLBACK_FAULT / BACKUP_COPY_FAULT
+  / RESTORE_FAULT; all discriminating.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job

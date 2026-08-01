@@ -1819,14 +1819,26 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
                 # can leave the target truncated but still present, and the
                 # old `not path.exists()` guard would skip the restore and
                 # delete the only good copy. If the restore itself fails,
-                # KEEP the .bak (a stale backup beats a corrupted file).
+                # KEEP the .bak (a stale backup beats a corrupted file) and
+                # REPORT it with its path (round-16/17 reviews: swallowing
+                # the restore failure hides the only good copy's location).
                 try:
                     shutil.copy2(backup_path, path)
                     try:
                         backup_path.unlink()
                     except OSError:
                         pass
-                except Exception:
+                except Exception as restore_exc:
+                    raise McpError(
+                        f"Could not save {label}: {exc}; backup restoration ALSO "
+                        f"failed ({restore_exc}) — keeping {label} backup at "
+                        f"{backup_path}"
+                    ) from restore_exc
+                finally:
+                    # Ensure the .bak survives even when an assertion-level
+                    # re-raise happens; the raise above already exits, but a
+                    # defensive unlink after a SUCCESSFUL restore is intended.
+                    # (No-op here: the raise path never reaches this.)
                     pass
             elif had_backup:
                 # Round-16: the target existed but we hold NO valid backup

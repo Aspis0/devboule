@@ -559,7 +559,9 @@ pub fn write_text_crash_safe(path: &Path, content: &str, label: &str) -> ToolRes
 }
 
 /// Atomic replace of `target` with `temp` (Python `os.replace` / app MoveFileExW).
-#[cfg(windows)]
+/// Test seams live under `cfg(all(test, target_os = "windows"))` so `cargo
+/// test` compiles on Linux/macOS too (round-17 review).
+#[cfg(all(test, target_os = "windows"))]
 thread_local! {
     /// Test seam: simulate the AppContainer double-check ACCESS_DENIED from
     /// MoveFileExW (cannot be reproduced with ACLs on a plain host — icacls
