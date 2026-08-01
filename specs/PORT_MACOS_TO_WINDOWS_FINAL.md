@@ -39,7 +39,11 @@
 - **ort unify** — `rc.10 → rc.12` in `oracle-core`
 - (optional) **G** — `GlobalMemoryStatusEx` mem-pressure backpressure
 
-**`is_enforced() -> true` on Windows is gated on**: C1 + C2 + C3 + C4 + reviewer sign-off + oracle sign-off. Do NOT flip until all six hold.
+**`is_enforced() -> true` on Windows: DONE (C6, 2026-07-31)** — the C5
+AppContainer broker shipped (per-spawn profiles, SECURITY_CAPABILITIES, Job
+Object, package-SID ACLs, capability net deny) and the flip landed; the
+historical six-condition gate (C1..C4 + reviewer + oracle sign-off) is
+closed.
 
 ---
 
@@ -427,7 +431,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | A — `bundle.windows` block | ✅ shipped | `tauri.conf.json` (wix/nsis perMachine, downloadBootstrapper) |
 | H — 3-OS CI matrix | ✅ shipped | `.github/workflows/ci.yml` |
 | C1 — Job Object | ✅ shipped | `sandbox/windows.rs` `create_job_object` (KILL_ON_JOB_CLOSE, PROCESS_MEMORY, ACTIVE_PROCESS, PROCESS_TIME) |
-| C2 — Restricted Token + broker spawn | ✅ shipped | commit `840d142` — `spawn_sandboxed`/`spawn_sandboxed_with_stdin` (CreateRestrictedToken DISABLE_MAX_PRIVILEGE+LUA_TOKEN, CreateProcessAsUserW, CREATE_SUSPENDED, proc-thread-attr list, ResumeThread) |
+| C2 — Restricted Token + broker spawn | ✅ shipped, **SUPERSEDED by C5** | commit `840d142` (historical restricted-token path) replaced by per-spawn AppContainer profiles (C5, §10.6): `create_appcontainer_profile` + SECURITY_CAPABILITIES via PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, CreateProcessAsUserW, CREATE_SUSPENDED, proc-thread-attr list, ResumeThread |
 | C3 — filesystem ACL layer | ✅ shipped | commit `840d142` — restricted-SID DACL grants via SetNamedSecurityInfoW, SD save/restore, .git/.devboule deny-write, rollback guards |
 | C4 — network egress layer | ✅ shipped (None-only) | commit `840d142` — netsh advfirewall block rule + journal + orphan cleanup; Loopback/Enabled rejected (plan decision #5) |
 | ort unify rc.12 + api-24 | ✅ shipped | `oracle-core/Cargo.toml:50,57,61`; vendored esaxx-rs `/MD` CRT |
