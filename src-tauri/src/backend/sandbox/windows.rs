@@ -160,10 +160,15 @@ pub fn attach_to_child(child_pid: u32) -> Result<(), String> {
 
 /// Apply a restricted token to the child process (C2).
 ///
-/// **v1 STATUS: STUB — documented gap, NOT enforced.**
+/// **SUPERSEDED (C5, 2026-07-31): legacy stub — the restricted-token path was
+/// REPLACED by per-spawn AppContainer profiles (create_appcontainer_profile +
+/// SECURITY_CAPABILITIES via PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES in
+/// spawn_sandboxed_internal). Retained as a no-op for pre-broker callers.
+/// is_enforced() is TRUE since C6.**
 ///
-/// Windows does NOT allow token re-attachment after `CreateProcess`. The
-/// `std::process::Command::spawn()` path creates the process without a custom
+/// Historical note: Windows does NOT allow token re-attachment after
+/// `CreateProcess`. The `std::process::Command::spawn()` path creates the
+/// process without a custom
 /// token, so we cannot apply `CreateRestrictedToken` post-spawn.
 ///
 /// The real implementation requires spawning via `CreateProcessAsUserW` in a
@@ -991,16 +996,14 @@ pub fn restore_net_policy(_snapshot: NetPolicySnapshot) -> Result<(), String> {
     Ok(())
 }
 
-// ─── C2 broker: restricted token + sandboxed spawn ─────────────────────────────
+// ─── C2 superseded by C5 AppContainer broker ──────────────────────────────────
 //
-// The real Windows sandbox spawn path. Replaces std::process::Command::spawn()
-// for sandboxed runs. Creates a restricted token (DISABLE_MAX_PRIVILEGE), spawns
-// via CreateProcessAsUserW, and assigns to the C1 Job Object. Also calls C3's
-// apply_path_policy before spawn and restore_path_policy after child exit.
-//
-// Pattern adapted from OpenAI Codex windows-sandbox-rs (token.rs + process.rs).
-// Simplified for devboule v1: no AppContainer capabilities, no dedicated sandbox
-// user, no private desktop. Just DISABLE_MAX_PRIVILEGE + Job Object + ACLs.
+// The historical C2 plan (restricted token DISABLE_MAX_PRIVILEGE +
+// CreateProcessAsUserW, adapted from OpenAI Codex windows-sandbox-rs) was
+// REPLACED in C5 by per-spawn AppContainer profiles: package SID via
+// SECURITY_CAPABILITIES, net deny-by-default via capability SIDs (not netsh),
+// Job Object + ACL layer unchanged. See spawn_sandboxed_internal /
+// create_appcontainer_profile. is_enforced() is TRUE since C6.
 
 /// A sandboxed child process spawned with a restricted token.
 pub struct SandboxedChild {

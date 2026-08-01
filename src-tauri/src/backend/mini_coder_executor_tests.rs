@@ -2613,9 +2613,11 @@ fn build_command_codex_uses_codex_exec_and_pipes_prompt_via_stdin() {
         !script.contains("$env:OMLX_KEY_FILE"),
         "non-keyed codex script must not carry the oMLX key cleanup: {script}"
     );
-    // P5 test 9 (windows_mini_command_unchanged): Windows is NOT sandboxed this phase.
-    // The program is powershell.exe (NOT sandbox-exec), no `.sb` profile is emitted,
-    // and the script carries none of the macOS-only sandbox/rlimit collateral.
+    // P5 test 9 (windows_mini_command_unchanged): no Seatbelt profile on
+    // Windows (the AppContainer broker sandboxes at spawn time, is_enforced()
+    // == true since C6). The program is powershell.exe (NOT sandbox-exec), no
+    // `.sb` profile is emitted, and the script carries none of the macOS-only
+    // sandbox/rlimit collateral.
     assert_eq!(
         argv[0], "powershell.exe",
         "Windows must spawn powershell directly"
@@ -3865,7 +3867,8 @@ fn macos_wrapper_prefers_done_over_an_earlier_failed() {
 // ======================================================================
 // P5 — Seatbelt sandbox + rlimits (macOS). Tests 1-4 exercise the PURE,
 // uncfg'd profile/loopback builders (run on the Windows dev host too); 5-8
-// exercise the macOS spawn arm; 9 asserts the Windows arm stays unsandboxed.
+// exercise the macOS spawn arm; 9 asserts the Windows arm emits no Seatbelt
+// profile (broker-sandboxed at spawn time since C6, not via a profile).
 // ======================================================================
 
 /// argv[0] (the spawned program) of a built command — for the sandbox-wrap tests.

@@ -413,11 +413,12 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 
 > **UPDATE (2026-07-31, C5 landed): the elevation blocker below is RESOLVED** —
 > the sandbox now uses AppContainers (§10.6), verified by the broker
-> integration test on a non-elevated host. **The flip is still `false`**:
-> hostile review on 479e355 found the interactive-agent PTY paths
-> (agent_pty.rs, one-shot mini via portable_pty) are NOT routed through the
-> broker on Windows yet — milestone **C6** must sandbox those before
-> `is_enforced()` flips (fail-closed: Unattended degrades to Ask meanwhile).
+> integration test on a non-elevated host. **FINAL UPDATE (C6 landed): the
+> flip is DONE** — `is_enforced()` is `true` on Windows; the interactive-agent
+> PTY and one-shot mini paths are sandboxed via the ConPTY broker. The
+> historical note below (flip still false, hostile review on 479e355) is
+> preserved as the C5-era status; Unattended is now honoured app-hosted and
+> rejected on the external conhost path.
 
 
 | item | status | evidence |
@@ -433,7 +434,7 @@ If npm reinstall of `pi-coding-agent` runs again, **line 6 of `pi.ps1` will be r
 | G — memory backpressure | ⏸ deferred | per plan (optional) |
 | **Flip `is_enforced()` → true** | ✅ **DONE (C6)** | `mod.rs` = `true`; PTY + one-shot paths sandboxed via ConPTY broker; `is_enforced_true_on_windows` |
 
-### Why the flip is still BLOCKED (new evidence, not plan-anticipated)
+### Why the flip was BLOCKED at C5 (historical; resolved by C6)
 
 All 18 sandbox tests pass on a real Windows host (`cargo test --lib backend::sandbox`),
 but the suite exposed a hard conflict:
