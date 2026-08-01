@@ -241,12 +241,14 @@ pub fn is_enforced() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // TRUE since 2026-07-31 (C6): the AppContainer broker (C5) now covers
-        // EVERY unattended spawn path. C6 routed the last bypass — the
-        // interactive agent PTY and the one-shot mini path — through the broker
-        // via a ConPTY (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE + SECURITY_CAPABILITIES
-        // + Job Object; verified TokenIsAppContainer=1 + echo roundtrip on a
-        // non-elevated host). This unlocks Unattended autonomy on Windows.
+        // TRUE since 2026-07-31 (C6): the AppContainer broker (C5) covers every
+        // APP-HOSTED spawn path — agentic runs, sidecars, cloud duplex, censor,
+        // interactive agent PTY and one-shot mini (ConPTY via
+        // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE + SECURITY_CAPABILITIES + Job
+        // Object; verified TokenIsAppContainer=1 + prompt-read roundtrip on a
+        // non-elevated host). The legacy EXTERNAL conhost terminal is excluded
+        // by design (attended path, parity with macOS Terminal.app). This
+        // unlocks Unattended autonomy for app-hosted agents on Windows.
         true
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

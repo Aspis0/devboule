@@ -388,13 +388,38 @@ pub fn spawn_cloud_duplex(
                 }
             }
         }
-        // C6 (reviewer round 3): the cloud CLI's env points GIT_CONFIG_GLOBAL at
-        // the user-only session gitconfig dir, and that config [include]s the
+        // C6 (reviewer rounds 3-4): the cloud CLI's env points GIT_CONFIG_GLOBAL
+        // at the user-only session gitconfig dir, and that config [include]s the
         // real ~/.gitconfig — the AppContainer child must read all of these or
-        // every git subprocess dies with 'unable to read config file'.
+        // every git subprocess dies with 'unable to read config file'. Also
+        // grant per-launch --settings <file> args (Claude consent hook): if the
+        // file were unreadable the CLI would silently lose the hook + net-deny
+        // rules — fail-open on the tool-consent gate (reviewer round 4 blocker).
         #[cfg(target_os = "windows")]
-        for root in crate::backend::agent_spawn::agent_sandbox_read_roots(None) {
-            policy = policy.readonly(root);
+        {
+            for root in crate::backend::agent_spawn::agent_sandbox_read_roots(None) {
+                policy = policy.readonly(root);
+            }
+            // --settings <path> (Claude) / --settings=<path> forms.
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--settings" && i + 1 < args.len() {
+                    let p = PathBuf::from(&args[i + 1]);
+                    if p.is_absolute() {
+                        policy = policy.readonly(p);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(rest) = a.strip_prefix("--settings=") {
+                    let p = PathBuf::from(rest);
+                    if p.is_absolute() {
+                        policy = policy.readonly(p);
+                    }
+                }
+                i += 1;
+            }
         }
         let mut broker_env = envs.to_vec();
         for key in [
