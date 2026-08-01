@@ -1810,6 +1810,17 @@ fn spawn_sandboxed_internal(
     };
     let mut package_sid_guard = PackageSidGuard::new(package_sid, appcontainer_seq);
 
+    // C5 oracle sentinel (2026-07-31): the AppContainer child inherits the
+    // caller's token identity — kernel-enforced Low IL + package-SID filtering
+    // bound it, but an ELEVATED devboule would hand the child an elevated
+    // identity. The plan requires unprivileged operation (tauri#13926); log
+    // loudly if that invariant is ever violated so it cannot go unnoticed.
+    if process_is_elevated() {
+        eprintln!(
+            "[sandbox/windows] WARNING: devboule is running ELEVATED; AppContainer              children inherit the elevated identity. Run devboule unprivileged              (spec invariant, tauri#13926)."
+        );
+    }
+
     // C3+C4: apply filesystem ACLs + net policy before spawn.
     // SandboxGuard ensures both are restored even if spawn fails.
     let restricted_snapshots = match apply_restricted_sid_policy(policy, cwd, program, package_sid) {
@@ -2130,46 +2141,44 @@ fn spawn_sandboxed_internal(
     })
 }
 
-#[cfg(test)]
+/// True when the current process runs with an elevated (administrator) token.
+/// Used by the broker as a sentinel (C5 oracle finding: an elevated parent
+/// hands the AppContainer child an elevated identity) and by tests that mutate
+/// real system ACLs/firewall rules, which skip on a non-elevated host.
+fn process_is_elevated() -> bool {
+    use windows::Win32::Security::TOKEN_ELEVATION;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            windows::Win32::Security::TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if ok.is_err() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    let res = unsafe {
+        windows::Win32::Security::GetTokenInformation(
+            token,
+            windows::Win32::Security::TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    res.is_ok() && elevation.TokenIsElevated != 0
+}
+
 mod tests {
     use super::*;
     use crate::backend::sandbox::{ResourceLimits, SandboxPolicy};
-
-    /// True when the current process runs with an elevated (administrator) token.
-    /// The ACL layer needs it: `icacls /restore` requires SeRestorePrivilege and
-    /// the broker's restricted-SID grant on `C:\Windows` requires SeRestorePrivilege
-    /// or owner rights the sandbox cannot assume. Tests that mutate real system
-    /// ACLs/firewall rules skip on a non-elevated host instead of failing.
-    fn process_is_elevated() -> bool {
-        use windows::Win32::Security::TOKEN_ELEVATION;
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        let mut token = HANDLE::default();
-        let ok = unsafe {
-            OpenProcessToken(
-                GetCurrentProcess(),
-                windows::Win32::Security::TOKEN_QUERY,
-                &mut token,
-            )
-        };
-        if ok.is_err() {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        let res = unsafe {
-            windows::Win32::Security::GetTokenInformation(
-                token,
-                windows::Win32::Security::TokenElevation,
-                Some(&mut elevation as *mut _ as *mut _),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut len,
-            )
-        };
-        unsafe {
-            let _ = CloseHandle(token);
-        }
-        res.is_ok() && elevation.TokenIsElevated != 0
-    }
 
     #[test]
     fn apply_restricted_token_stub_returns_ok() {
