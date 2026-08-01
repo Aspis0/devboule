@@ -1755,6 +1755,15 @@ def replace_frontmatter(content: str, metadata: dict[str, Any]) -> str:
     return f"{frontmatter}{content[frontmatter_end:]}"
 
 
+# The kernel32/advapi32 DLL handles used by _process_is_appcontainer, kept at
+# module level so tests can assert the exact prototypes (round-26 review:
+# ctypes.WinDLL does NOT cache across call sites — each call returns a fresh
+# object, so a prototype set inside the function would be invisible to tests
+# creating their own WinDLL handle).
+_APP_CTX_KERNEL32 = None
+_APP_CTX_ADVAPI32 = None
+
+
 def _process_is_appcontainer() -> bool:
     """True when the current process runs inside an AppContainer.
 
@@ -1770,11 +1779,36 @@ def _process_is_appcontainer() -> bool:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        global _APP_CTX_KERNEL32, _APP_CTX_ADVAPI32
+        if _APP_CTX_KERNEL32 is None:
+            _APP_CTX_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if _APP_CTX_ADVAPI32 is None:
+            _APP_CTX_ADVAPI32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = _APP_CTX_KERNEL32
+        advapi32 = _APP_CTX_ADVAPI32
 
-        class _TOKEN_ELEVATION(ctypes.Structure):
-            _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+        # Round-26 hostile review: ctypes defaults unknown signatures to c_int
+        # — on 64-bit Windows GetCurrentProcess()'s HANDLE would be truncated
+        # and the check would always fail (even inside an AppContainer), so
+        # the Python MCP fallback would never fire. Declare exact prototypes
+        # BEFORE calling (idempotent).
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,  # ProcessHandle
+            wintypes.DWORD,  # DesiredAccess
+            ctypes.POINTER(wintypes.HANDLE),  # TokenHandle
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,  # TokenHandle
+            ctypes.c_int,  # TokenInformationClass
+            ctypes.c_void_p,  # TokenInformation
+            wintypes.DWORD,  # TokenInformationLength
+            ctypes.POINTER(wintypes.DWORD),  # ReturnLength
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
 
         h_process = kernel32.GetCurrentProcess()
         token = wintypes.HANDLE()

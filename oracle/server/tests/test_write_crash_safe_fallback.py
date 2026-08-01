@@ -20,6 +20,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import oracle.server.aspis_mcp as mcp  # noqa: E402
 
+# The REAL implementation, captured before any test patches it — the
+# round-26 prototype test needs it unmocked.
+_REAL_IS_APPCONTAINER = mcp._process_is_appcontainer
+
 
 def _fake_replace_denied(*args, **kwargs):
     raise OSError(13, "Permission denied", None, 5)  # winerror=5 ACCESS_DENIED
@@ -125,6 +129,45 @@ class WriteTextCrashSafeFallbackTests(unittest.TestCase):
         self.assertEqual(
             self.path.read_text(encoding="utf-8"), "GOOD-OLD",
             "host-side save must restore the old content atomically",
+        )
+
+    def test_process_is_appcontainer_uses_64bit_safe_prototypes(self):
+        # Round-26 hostile review: ctypes defaults unknown signatures to c_int
+        # — on 64-bit Windows the HANDLE from GetCurrentProcess() would be
+        # truncated. This test pins the exact prototypes so a regression
+        # cannot silently disable the Python fallback inside AppContainers.
+        import ctypes
+        from ctypes import wintypes
+
+        # Call the REAL implementation (bypass the class-level mock from
+        # setUp — the fallback tests patch _process_is_appcontainer=True).
+        result = _REAL_IS_APPCONTAINER()
+        # This test host is NOT an AppContainer (verified empirically); the
+        # real check must not crash and must return the truthful value.
+        self.assertIs(result, False)
+
+        # Assert the exact prototypes on the SAME handles the implementation
+        # uses (ctypes.WinDLL does not cache across call sites — a fresh
+        # WinDLL here would be a different object with default signatures).
+        kernel32 = mcp._APP_CTX_KERNEL32
+        advapi32 = mcp._APP_CTX_ADVAPI32
+        self.assertIsNotNone(kernel32)
+        self.assertIsNotNone(advapi32)
+        self.assertEqual(kernel32.GetCurrentProcess.restype, wintypes.HANDLE)
+        self.assertEqual(kernel32.CloseHandle.argtypes, [wintypes.HANDLE])
+        self.assertEqual(kernel32.CloseHandle.restype, wintypes.BOOL)
+        self.assertEqual(
+            advapi32.OpenProcessToken.argtypes,
+            [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.HANDLE),
+            ],
+        )
+        self.assertEqual(advapi32.OpenProcessToken.restype, wintypes.BOOL)
+        self.assertEqual(
+            advapi32.GetTokenInformation.argtypes[1:3],
+            [ctypes.c_int, ctypes.c_void_p],
         )
 
     def test_restore_failure_keeps_backup_and_reports_path(self):
