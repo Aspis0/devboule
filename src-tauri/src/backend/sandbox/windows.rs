@@ -1836,19 +1836,22 @@ fn revoke_loopback_exemption(package_sid: PSID) -> Result<(), String> {
         Some(b) => b,
         None => return Ok(()), // nothing to revoke for an unusable SID
     };
-    revoke_loopback_exemption_bytes(&bytes)
-}
-
-/// Bytes-based revoke (used by SandboxedChild after the profile SID is freed).
-/// On API failure the SID goes into PENDING_REVOKES so ownership is NOT lost
-/// (round-34 review): the next grant/revoke drains the list and retries.
-fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
-    // Also drain pending entries first (round-35 review: the spec promises
-    // 'next grant/revoke' drains; a direct revoke must too, else pending
-    // records can linger indefinitely when no further grant happens).
+    // PUBLIC entry: drain pending first (spec §10.6 'next grant/revoke
+    // drains'), then revoke this SID one-shot.
     if !PENDING_REVOKES.lock().map(|p| p.is_empty()).unwrap_or(true) {
         let _ = drain_pending_revokes();
     }
+    revoke_loopback_exemption_bytes(&bytes)
+}
+
+/// Bytes-based one-shot revoke (NON-draining — round-36 hostile review: the
+/// round-35 drain inside this helper re-entered itself through
+/// drain_pending_revokes -> revoke_loopback_exemption_bytes -> drain... and
+/// would stack-overflow whenever PENDING_REVOKES was nonempty). Only the
+/// PUBLIC entry points (apply/revoke PSID wrappers) drain; internal callers
+/// (drain itself, Drop) use this non-recursive core. On API failure the SID
+/// goes into PENDING_REVOKES so ownership is NOT lost (round-34).
+fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
     let mut guard = LOOPBACK_SIDS.lock().map_err(|e| e.to_string())?;
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
     let removed = set.remove(bytes);
@@ -1869,10 +1872,10 @@ fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Retry every SID recorded in PENDING_REVOKES; RETAIN those whose retry
-/// still failed (round-35 review: unconditional clear lost ownership again
-/// after the first retry). Note: revoke_loopback_exemption_bytes itself
-/// re-adds the SID to PENDING_REVOKES on failure, so this only needs to
-/// remove the entries that succeeded.
+/// still failed. Concurrency-safe reconciliation: MERGE against entries
+/// appended while the drain ran, never overwrite the list blindly
+/// (round-36 review — `*p = still_pending` could erase a SID that another
+/// thread pushed during the drain).
 fn drain_pending_revokes() -> Result<(), String> {
     let pending = match PENDING_REVOKES.lock() {
         Ok(p) => p.clone(),
@@ -1885,9 +1888,15 @@ fn drain_pending_revokes() -> Result<(), String> {
         }
     }
     if let Ok(mut p) = PENDING_REVOKES.lock() {
-        // Reconcile: keep only the entries that failed this round (the
-        // revoke helper re-adds failures, so rebuild from the successes).
-        *p = still_pending;
+        // Keep the ones that failed this round, PLUS any concurrently added
+        // entries (they were not part of `pending` and were not retried).
+        let mut merged: Vec<Vec<u8>> = still_pending;
+        for b in p.iter() {
+            if !merged.contains(b) {
+                merged.push(b.clone());
+            }
+        }
+        *p = merged;
     }
     Ok(())
 }
@@ -3293,6 +3302,18 @@ mod tests {
         // keep child2's exemption.
         let _ = child1.wait_and_restore();
         drop(child1);
+        // Round-36 review: assert the revocation actually took effect — the
+        // registry must no longer hold child1's SID (wait_and_restore clears
+        // the ownership flag only on a SUCCESSFUL revoke, and Drop retries).
+        if let Ok(reg) = LOOPBACK_SIDS.lock() {
+            if let Some(set) = reg.as_ref() {
+                assert!(
+                    set.len() <= 1,
+                    "after child1's revoke at most child2's SID may remain, got {}",
+                    set.len()
+                );
+            }
+        }
 
         // NOW signal child2 to run its second probe (causally after the revoke).
         std::fs::write(temp.join("go.marker"), b"go").expect("write go.marker");
