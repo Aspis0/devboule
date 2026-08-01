@@ -29,8 +29,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 
 use crate::cluster;
@@ -103,6 +104,22 @@ pub struct JobState {
     pub gpu_temp_c: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_gb: Option<f64>,
+    // O0 diagnostics: these fields are deliberately optional so older clients
+    // can continue to consume the status payload unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_batch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_forward: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_forward: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_reason: Option<String>,
 }
 
 impl Default for JobState {
@@ -120,6 +137,13 @@ impl Default for JobState {
             phase_message: None,
             gpu_temp_c: None,
             free_gb: None,
+            last_progress_at: None,
+            current_batch: None,
+            current_file: None,
+            current_forward: None,
+            elapsed_ms: None,
+            last_successful_forward: None,
+            stall_reason: None,
         }
     }
 }
@@ -139,6 +163,83 @@ pub struct StatusResponse {
 pub fn utc_now() -> String {
     let now: DateTime<Utc> = Utc::now();
     now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// UTC timestamp with millisecond precision for live progress heartbeats.
+/// The string is ISO-8601 and therefore remains lexically sortable.
+fn utc_now_millis() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn event_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_whitespace().find_map(|part| part.strip_prefix(key))
+}
+
+/// Apply the non-invasive O0 telemetry carried by indexer progress lines.
+/// Values are labels/counts only; file paths are relative and already sanitized
+/// by the indexer before they reach this parser.
+fn record_progress_telemetry(job: &mut JobState, line: &str, elapsed_ms: u64) {
+    let now = utc_now_millis();
+    if job
+        .last_progress_at
+        .as_deref()
+        .map(|previous| now.as_str() > previous)
+        .unwrap_or(true)
+    {
+        job.last_progress_at = Some(now);
+    }
+    job.elapsed_ms = Some(job.elapsed_ms.unwrap_or(0).max(elapsed_ms));
+
+    if line.starts_with("chunk-index batch begin") {
+        let batch = [
+            event_value(line, "batch_index=").map(|v| format!("batch={v}")),
+            event_value(line, "files=").map(|v| format!("files={v}")),
+            event_value(line, "chunks=").map(|v| format!("chunks={v}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        if !batch.is_empty() {
+            job.current_batch = Some(batch);
+        }
+        job.current_file = event_value(line, "first_file=")
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        job.current_forward = None;
+        job.stall_reason = Some("embedding_pending".to_string());
+    } else if line.starts_with("chunk-index embed begin") {
+        let forward = [
+            event_value(line, "chunks=").map(|v| format!("chunks={v}")),
+            event_value(line, "chars=").map(|v| format!("chars={v}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        job.current_forward = Some(forward);
+        job.stall_reason = Some("embedding".to_string());
+    } else if line.starts_with("chunk-index embed end") {
+        let duration = event_value(line, "duration_ms=").unwrap_or("0");
+        let chunks = event_value(line, "chunks=").unwrap_or("?");
+        job.last_successful_forward = Some(format!("chunks={chunks} duration_ms={duration}"));
+        job.current_forward = None;
+        job.stall_reason = None;
+    } else if line.starts_with("chunk-index embed error") {
+        job.current_forward = None;
+        job.stall_reason = Some("embed_error".to_string());
+    } else if line.starts_with("chunk-index batch committed") {
+        job.current_forward = None;
+        job.stall_reason = None;
+    } else if line.starts_with("chunk-index low-memory retry")
+        || line.starts_with("chunk-index paused_low_memory")
+    {
+        job.stall_reason = Some("waiting_memory".to_string());
+    } else if line.starts_with("chunk-index low-memory proceeding") {
+        job.stall_reason = None;
+    } else if line.starts_with("chunk-index gpu cooldown") {
+        job.stall_reason = Some("cooling_gpu".to_string());
+    }
 }
 
 /// Normalize index-run parameters for manual vs auto/watch.
@@ -369,6 +470,7 @@ impl OracleIndexJobManager {
                 .unwrap_or_else(|| resolve_min_free_gb(detect_device(), idle));
 
             let inner_for_progress = std::sync::Arc::clone(&self.inner);
+            let progress_started = Instant::now();
             let progress = move |line: &str| {
                 // Map the indexer's progress lines to a live job phase. Pause lines
                 // (memory / GPU cooldown) must override "embedding" so the UI stops
@@ -410,8 +512,13 @@ impl OracleIndexJobManager {
                     } else {
                         None
                     };
+                let mut inner = inner_for_progress.lock().unwrap_or_else(|e| e.into_inner());
+                record_progress_telemetry(
+                    &mut inner.job,
+                    line,
+                    progress_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                );
                 if let Some((phase, msg)) = update {
-                    let mut inner = inner_for_progress.lock().unwrap_or_else(|e| e.into_inner());
                     inner.job.phase = Some(phase.to_string());
                     inner.job.phase_message = msg;
                 }
@@ -527,6 +634,13 @@ impl OracleIndexJobManager {
                     phase_message: None,
                     gpu_temp_c: index_result.gpu_temp_c,
                     free_gb: index_result.free_gb,
+                    last_progress_at: None,
+                    current_batch: None,
+                    current_file: None,
+                    current_forward: None,
+                    elapsed_ms: None,
+                    last_successful_forward: None,
+                    stall_reason: None,
                 };
                 self._finish_job(result_job.clone());
                 // No cluster refresh, no CKG rebuild — dense index is empty.
@@ -553,6 +667,13 @@ impl OracleIndexJobManager {
                 phase_message: None,
                 gpu_temp_c: index_result.gpu_temp_c,
                 free_gb: index_result.free_gb,
+                last_progress_at: None,
+                current_batch: None,
+                current_file: None,
+                current_forward: None,
+                elapsed_ms: None,
+                last_successful_forward: None,
+                stall_reason: None,
             };
 
             self._finish_job(result_job.clone());
@@ -826,11 +947,36 @@ impl OracleIndexJobManager {
             phase_message: None,
             gpu_temp_c: None,
             free_gb: None,
+            last_progress_at: None,
+            current_batch: None,
+            current_file: None,
+            current_forward: None,
+            elapsed_ms: None,
+            last_successful_forward: None,
+            stall_reason: None,
         };
     }
 
-    fn _finish_job(&self, job: JobState) {
+    fn _finish_job(&self, mut job: JobState) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Preserve the live O0 diagnostics when a terminal result is built
+        // from the indexer's summary. The terminal result intentionally keeps
+        // the existing public fields, while telemetry comes from the last
+        // progress event observed by the manager.
+        macro_rules! preserve_telemetry {
+            ($field:ident) => {
+                if job.$field.is_none() {
+                    job.$field = inner.job.$field.clone();
+                }
+            };
+        }
+        preserve_telemetry!(last_progress_at);
+        preserve_telemetry!(current_batch);
+        preserve_telemetry!(current_file);
+        preserve_telemetry!(current_forward);
+        preserve_telemetry!(elapsed_ms);
+        preserve_telemetry!(last_successful_forward);
+        preserve_telemetry!(stall_reason);
         inner.job = job;
         // Do NOT join the worker handle here: _finish_job runs ON the worker
         // thread — self-join is EDEADLK and poisons the mutex. The finished
@@ -968,10 +1114,110 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// Drive `_refresh_ckg_best_effort` directly with an injected hook that
-    /// records the root it was called with. Verifies:
-    ///   - the hook fires with the right root
-    ///   - `wait_for_ckg_refresh` joins it
+    /// Feed representative indexer progress events into the telemetry state
+    /// and verify the optional fields serialize without changing old fields.
+    #[test]
+    fn test_progress_telemetry_updates_and_serializes() {
+        let mut job = JobState::default();
+        record_progress_telemetry(
+            &mut job,
+            "chunk-index batch begin batch_index=3 files=4 chunks=12 remaining_before=8 free_gb=9.0 first_file=src/lib.rs",
+            10,
+        );
+        assert_eq!(job.current_batch.as_deref(), Some("batch=3 files=4 chunks=12"));
+        assert_eq!(job.current_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(job.stall_reason.as_deref(), Some("embedding_pending"));
+        assert_eq!(job.elapsed_ms, Some(10));
+        assert!(job.last_progress_at.is_some());
+
+        record_progress_telemetry(
+            &mut job,
+            "chunk-index embed begin files=4 chunks=12 chars=6400",
+            25,
+        );
+        assert_eq!(job.current_forward.as_deref(), Some("chunks=12 chars=6400"));
+        assert_eq!(job.stall_reason.as_deref(), Some("embedding"));
+
+        record_progress_telemetry(
+            &mut job,
+            "chunk-index embed end chunks=12 duration_ms=87",
+            112,
+        );
+        assert!(job.current_forward.is_none());
+        assert_eq!(
+            job.last_successful_forward.as_deref(),
+            Some("chunks=12 duration_ms=87")
+        );
+        assert!(job.stall_reason.is_none());
+        assert_eq!(job.elapsed_ms, Some(112));
+
+        let json = serde_json::to_value(&job).expect("JobState should serialize");
+        assert_eq!(json["current_batch"], "batch=3 files=4 chunks=12");
+        assert_eq!(json["current_file"], "src/lib.rs");
+        assert_eq!(json["last_successful_forward"], "chunks=12 duration_ms=87");
+    }
+
+    #[test]
+    fn test_progress_elapsed_is_non_decreasing() {
+        let mut job = JobState::default();
+        record_progress_telemetry(&mut job, "chunk-index start scanned=4", 30);
+        record_progress_telemetry(&mut job, "chunk-index embed begin chunks=1 chars=5", 12);
+        assert_eq!(job.elapsed_ms, Some(30));
+    }
+
+    #[test]
+    fn test_progress_telemetry_stall_transitions() {
+        let mut job = JobState::default();
+
+        record_progress_telemetry(&mut job, "chunk-index low-memory retry free_gb=1.2", 1);
+        assert_eq!(job.stall_reason.as_deref(), Some("waiting_memory"));
+        record_progress_telemetry(&mut job, "chunk-index low-memory proceeding free_gb=6.0", 2);
+        assert!(job.stall_reason.is_none());
+
+        record_progress_telemetry(&mut job, "chunk-index gpu cooldown temp_c=90", 3);
+        assert_eq!(job.stall_reason.as_deref(), Some("cooling_gpu"));
+        record_progress_telemetry(&mut job, "chunk-index embed begin chunks=2 chars=20", 4);
+        assert_eq!(job.stall_reason.as_deref(), Some("embedding"));
+        record_progress_telemetry(&mut job, "chunk-index embed error chunks=2 duration_ms=5", 5);
+        assert_eq!(job.stall_reason.as_deref(), Some("embed_error"));
+        assert!(job.current_forward.is_none());
+
+        record_progress_telemetry(&mut job, "chunk-index batch committed processed_files=2", 6);
+        assert!(job.stall_reason.is_none());
+    }
+
+    #[test]
+    fn test_finish_preserves_live_telemetry() {
+        let mgr = OracleIndexJobManager::new();
+        {
+            let mut inner = mgr.inner.lock().unwrap();
+            record_progress_telemetry(
+                &mut inner.job,
+                "chunk-index batch begin batch_index=2 files=1 chunks=3 first_file=src/lib.rs",
+                42,
+            );
+            record_progress_telemetry(
+                &mut inner.job,
+                "chunk-index embed end chunks=3 duration_ms=17",
+                59,
+            );
+        }
+
+        let terminal = JobState {
+            status: JobStatus::Complete,
+            root: "workspace".to_string(),
+            finished_at: Some("now".to_string()),
+            ..Default::default()
+        };
+        mgr._finish_job(terminal);
+        let job = mgr.status(None).job;
+        assert_eq!(job.status, JobStatus::Complete);
+        assert_eq!(job.current_file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(job.last_successful_forward.as_deref(), Some("chunks=3 duration_ms=17"));
+        assert_eq!(job.elapsed_ms, Some(59));
+        assert!(job.stall_reason.is_none());
+    }
+
     #[test]
     fn test_ckg_refresh_hook_fires_and_joins() {
         let mgr = OracleIndexJobManager::new();

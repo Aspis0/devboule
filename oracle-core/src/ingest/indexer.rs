@@ -35,7 +35,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -1185,6 +1185,7 @@ pub async fn index_file_chunks(
     let chunk_char_budget = config.batch_chars.max(1);
 
     let mut pending_index = 0usize;
+    let mut batch_index = 0usize;
 
     while pending_index < pending.len() {
         if cancel.is_cancelled() {
@@ -1272,14 +1273,17 @@ pub async fn index_file_chunks(
         }
 
         let old_ids = sqlite.chunk_ids_for_files(&batch_file_ids)?;
+        batch_index += 1;
         log_progress(
             progress,
             &format!(
-                "chunk-index batch begin files={} chunks={} remaining_before={} free_gb={}",
+                "chunk-index batch begin batch_index={} files={} chunks={} remaining_before={} free_gb={} first_file={}",
+                batch_index,
                 batch_paths.len(),
                 batch_chunks_all.len(),
                 pending.len().saturating_sub(processed_files),
                 free_memory_gb(),
+                batch_file_ids.first().map(String::as_str).unwrap_or(""),
             ),
         );
 
@@ -1390,14 +1394,40 @@ pub async fn index_file_chunks(
             log_progress(
                 progress,
                 &format!(
-                    "chunk-index embed files={} chunks={} chars={total_chars}",
+                    "chunk-index embed begin files={} chunks={} chars={total_chars}",
                     batch_paths.len(),
                     texts.len(),
                 ),
             );
 
-            // Embed (sync call — see module docs)
-            let vectors = embedder.embed(&texts, chunk_batch_size, cancel)?;
+            // Embed (sync call — see module docs). O0 measures this trait call
+            // without changing batching or the cancellation contract; ONNX
+            // session.run remains an internal detail of the concrete backend.
+            let embed_started = Instant::now();
+            let vectors = match embedder.embed(&texts, chunk_batch_size, cancel) {
+                Ok(vectors) => {
+                    log_progress(
+                        progress,
+                        &format!(
+                            "chunk-index embed end chunks={} duration_ms={}",
+                            texts.len(),
+                            embed_started.elapsed().as_millis(),
+                        ),
+                    );
+                    vectors
+                }
+                Err(error) => {
+                    log_progress(
+                        progress,
+                        &format!(
+                            "chunk-index embed error chunks={} duration_ms={}",
+                            texts.len(),
+                            embed_started.elapsed().as_millis(),
+                        ),
+                    );
+                    return Err(error);
+                }
+            };
             if cancel.is_cancelled() {
                 // Cancellation fired during this embed: DROP the batch. A
                 // partial commit would write sqlite chunks for every file in
