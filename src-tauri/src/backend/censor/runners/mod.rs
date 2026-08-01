@@ -1608,7 +1608,15 @@ mod tests {
         #[cfg(windows)]
         let (prog, args): (&str, Vec<&str>) = (
             "cmd",
-            vec!["/c", "for /L %i in (1,1,9999999) do ver >nul"],
+            vec![
+                "/c",
+                // Round-11 hostile review: the child FIRST writes a start
+                // marker into its writable cwd, THEN loops forever. The test
+                // asserts the marker afterwards so `out.is_none()` cannot be
+                // satisfied vacuously by a spawn failure or an immediate
+                // child exit — None is meaningful only if the child started.
+                "echo started > started.marker & for /L %i in (1,1,9999999) do ver >nul",
+            ],
         );
         #[cfg(not(windows))]
         let (prog, args): (&str, Vec<&str>) = ("sleep", vec!["30"]);
@@ -1626,10 +1634,16 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("started.marker");
         let start = std::time::Instant::now();
         let out = run_capture_with_timeout(prog, &args, root.as_path(), Duration::from_millis(300));
+        let marker_exists = marker.exists();
         let _ = std::fs::remove_dir_all(&root);
         // Timed out → None, and we did NOT wait the full 30s (killed promptly).
+        assert!(
+            marker_exists,
+            "child never started (spawn failure or wrong command?) — assertion would be vacuous"
+        );
         assert!(out.is_none());
         assert!(
             start.elapsed() < Duration::from_secs(10),

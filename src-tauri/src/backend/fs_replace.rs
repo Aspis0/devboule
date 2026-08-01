@@ -197,11 +197,55 @@ fn arm_move_fault() {
 /// Failure of the replace step. `target_committed` distinguishes the
 /// round-10 case: the fallback copy landed the new content and only the temp
 /// cleanup failed (target MUST be preserved) from a genuine copy failure
-/// (target unreliable, restore required).
-#[cfg(target_os = "windows")]
+/// (target unreliable, restore required). Platform-neutral because the
+/// wrapper and the unix replace_existing share it.
 struct ReplaceFailure {
     message: String,
     target_committed: bool,
+}
+
+/// True when the CURRENT process runs inside an AppContainer. The fallback
+/// capability is enforced by execution context (round-11 hostile review):
+/// a bare boolean passed by a host-side caller must not be able to degrade
+/// atomic saves — only a process that is ACTUALLY sandboxed (the double-check
+/// that motivates the fallback) may use it.
+#[cfg(target_os = "windows")]
+fn process_is_appcontainer() -> bool {
+    #[cfg(test)]
+    if APPCONTAINER_SIM.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    unsafe {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{GetTokenInformation, TokenIsAppContainer};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token: HANDLE = HANDLE::default();
+        if !OpenProcessToken(GetCurrentProcess(), windows::Win32::Security::TOKEN_QUERY, &mut token)
+            .is_ok()
+        {
+            return false;
+        }
+        let mut is_app_container = 0u32;
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            Some(&mut is_app_container as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && is_app_container != 0
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+static APPCONTAINER_SIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "windows"))]
+fn arm_appcontainer_sim() {
+    APPCONTAINER_SIM.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(target_os = "windows")]
@@ -229,13 +273,16 @@ fn replace_existing(
     match replace {
         Ok(()) => Ok(()),
         Err(e) => {
-            if !allow_copy_fallback {
-                // Round-10 hostile review: the copy+delete fallback is a
-                // non-atomic capability reserved for sandboxed ledger writers.
-                // Host-side callers never degrade: 0x80070005 from a plain
-                // host (e.g. broken ACLs) is indistinguishable from the
-                // AppContainer double-check, so without the explicit
-                // capability we keep the original error semantics.
+            if !allow_copy_fallback || !process_is_appcontainer() {
+                // Round-11 hostile review: the copy+delete fallback is a
+                // non-atomic capability reserved for ACTUAL sandboxed writers.
+                // Two independent gates: the explicit capability flag AND the
+                // execution context (this process must itself be inside an
+                // AppContainer). A host-side caller that passes the flag by
+                // mistake still cannot degrade: 0x80070005 from a plain host
+                // (e.g. broken ACLs) is indistinguishable from the
+                // AppContainer double-check, so without BOTH gates we keep
+                // the original error semantics.
                 return Err(ReplaceFailure {
                     message: e.to_string(),
                     target_committed: false,
@@ -287,8 +334,17 @@ fn replace_existing(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn replace_existing(temp_path: &Path, target_path: &Path) -> Result<(), String> {
-    fs::rename(temp_path, target_path).map_err(|e| e.to_string())
+fn replace_existing(
+    temp_path: &Path,
+    target_path: &Path,
+    _allow_copy_fallback: bool,
+) -> Result<(), ReplaceFailure> {
+    // Unix rename is atomic and never hits the AppContainer double-check;
+    // the copy+delete fallback capability is a Windows-only concern.
+    fs::rename(temp_path, target_path).map_err(|e| ReplaceFailure {
+        message: e.to_string(),
+        target_committed: false,
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +404,7 @@ mod tests {
         fs::write(&target_path, b"OLD").unwrap();
         fs::write(&temp_path, b"NEW").unwrap();
 
+        arm_appcontainer_sim(); // fallback requires AppContainer context
         arm_move_fault(); // emulated ERROR_ACCESS_DENIED from the move
 
         let res = replace_file_with_backup_with_fallback(
@@ -380,6 +437,7 @@ mod tests {
         fs::write(&target_path, b"GOOD-OLD").unwrap();
         fs::write(&temp_path, b"NEW").unwrap();
 
+        arm_appcontainer_sim(); // fallback requires AppContainer context
         arm_move_fault(); // move -> ACCESS_DENIED
         arm_copy_fault(); // copy fallback truncates target then fails
 
@@ -411,6 +469,7 @@ mod tests {
         fs::write(&target_path, b"OLD").unwrap();
         fs::write(&temp_path, b"NEW").unwrap();
 
+        arm_appcontainer_sim(); // fallback requires AppContainer context
         arm_move_fault(); // move -> ACCESS_DENIED
         arm_copy_fault(); // copy fallback fails
         arm_restore_fault(); // restore copy fails -> .bak kept
@@ -473,6 +532,7 @@ mod tests {
         // NO pre-existing target.
         fs::write(&temp_path, b"NEW").unwrap();
 
+        arm_appcontainer_sim(); // fallback requires AppContainer context
         arm_move_fault(); // move -> ACCESS_DENIED
         arm_copy_fault(); // copy fallback creates+truncates target then fails
 
@@ -501,6 +561,7 @@ mod tests {
         fs::write(&target_path, b"OLD").unwrap();
         fs::write(&temp_path, b"NEW").unwrap();
 
+        arm_appcontainer_sim(); // fallback requires AppContainer context
         arm_move_fault(); // move -> ACCESS_DENIED (emulated double-check)
         // Lock the temp with READ|WRITE but NO DELETE: the fallback copy reads
         // it fine, but the temp cleanup (DELETE) fails -> committed + leak.
@@ -549,6 +610,37 @@ mod tests {
         // Old content restored from backup (had_backup=true).
         assert_eq!(fs::read_to_string(&target_path).unwrap(), "OLD");
         assert!(!backup_path.exists(), "backup consumed by successful restore");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-12 hostile review: even WITH the fallback capability requested, a
+    /// host-side process (NOT inside an AppContainer) must NOT fall back —
+    /// execution context is the load-bearing gate. A host caller that passes
+    /// the flag by mistake still gets strictly atomic semantics.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn capability_without_appcontainer_context_does_not_fall_back() {
+        let dir = tmp_dir();
+        let backup_path = dir.join("payload.bak");
+        let target_path = dir.join("target.json");
+        let temp_path = dir.join("payload.tmp");
+        fs::write(&target_path, b"OLD").unwrap();
+        fs::write(&temp_path, b"NEW").unwrap();
+
+        arm_move_fault(); // ACCESS_DENIED emulated
+        // NOTE: no arm_appcontainer_sim() — this process is a plain host.
+
+        let res = replace_file_with_backup_with_fallback(
+            &temp_path, &target_path, &backup_path, "thing",
+        );
+        assert!(res.is_err(), "host context must not fall back");
+        let msg = res.unwrap_err();
+        assert!(
+            !msg.contains("copy fallback"),
+            "fallback must not run outside an AppContainer, got: {msg}"
+        );
+        // Old content restored from backup (had_backup=true).
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "OLD");
         let _ = fs::remove_dir_all(&dir);
     }
 

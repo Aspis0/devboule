@@ -602,13 +602,18 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   double-check rejects the atomic-replace access path; the ACE grant alone
   cannot fix it). `fs_replace::replace_existing` tries the atomic move first
   and falls back to copy+delete, but ONLY (a) for ERROR_ACCESS_DENIED
-  (FACILITY_WIN32 validated) and (b) through the explicit
-  `replace_file_with_backup_with_fallback` capability — used only by the
-  sandboxed ledger writers (agent client ledger, agent state file, censor
-  shard). Host-side shared callers (design/projects/config/oracle saves)
+  (FACILITY_WIN32 validated), (b) through the explicit
+  `replace_file_with_backup_with_fallback` capability AND (c) when the
+  calling process is ITSELF inside an AppContainer (TokenIsAppContainer
+  checked — round-12 hostile review: a bare boolean is not enough, the
+  execution context is load-bearing). Host-side shared callers
+  (design/projects/config/oracle saves, and today ALL production call sites
+  of fs_replace — agent ledger/state, censor shard are host-process writers)
   keep strictly atomic semantics: 0x80070005 from a plain host (broken ACLs)
-  is indistinguishable from the AppContainer double-check, so without the
-  capability the original error is returned (round-11 review). Rollback
+  is indistinguishable from the AppContainer double-check, so without BOTH
+  gates the original error is returned. The fallback capability exists for a
+  FUTURE genuinely-sandboxed writer; unit tests simulate the AppContainer
+  context to exercise it. Rollback
   semantics: on copy failure the backup is restored UNCONDITIONALLY (even if
   the target still exists — round-8 bug), the .bak is KEPT if restoration
   itself fails, a committed target with a leaked temp is preserved and only

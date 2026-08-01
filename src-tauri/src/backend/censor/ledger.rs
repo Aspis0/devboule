@@ -20,7 +20,7 @@
 
 use super::schema::{CensorShard, Finding};
 use super::CENSOR_DIR;
-use crate::backend::fs_replace::{replace_file_with_backup, replace_file_with_backup_with_fallback};
+use crate::backend::fs_replace::replace_file_with_backup;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -319,7 +319,7 @@ fn write_shard_locked(path: &Path, shard: &CensorShard) -> io::Result<()> {
         let _ = fs::remove_file(&temp_path);
         return Err(e);
     }
-    replace_file_with_backup_with_fallback(&temp_path, path, &backup_path, "censor shard")
+    replace_file_with_backup(&temp_path, path, &backup_path, "censor shard")
         .map_err(io::Error::other)
 }
 
