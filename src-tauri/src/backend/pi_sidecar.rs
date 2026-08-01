@@ -20,7 +20,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(not(target_os = "windows"))]
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -29,9 +31,86 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::mini_activity::{push_coder_note, ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry};
+use super::mini_activity::{
+    push_coder_note, ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry,
+};
 use super::mini_coder::MiniCoderBackendKind;
 use super::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
+
+// The sidecar uses ordinary stdio pipes on Unix and the Windows broker's
+// HANDLE-backed pipes on Windows. These aliases keep one lifecycle/reader path.
+#[cfg(not(target_os = "windows"))]
+type SidecarChild = Child;
+#[cfg(target_os = "windows")]
+type SidecarChild = crate::backend::sandbox::windows::SandboxedChild;
+#[cfg(not(target_os = "windows"))]
+type SidecarStdin = ChildStdin;
+#[cfg(target_os = "windows")]
+type SidecarStdin = std::fs::File;
+#[cfg(not(target_os = "windows"))]
+type SidecarStdout = ChildStdout;
+#[cfg(target_os = "windows")]
+type SidecarStdout = std::fs::File;
+#[cfg(not(target_os = "windows"))]
+type SidecarStderr = ChildStderr;
+#[cfg(target_os = "windows")]
+type SidecarStderr = std::fs::File;
+
+#[cfg(not(target_os = "windows"))]
+type SidecarExitStatus = std::process::ExitStatus;
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+struct SidecarExitStatus {
+    code: i32,
+}
+
+#[cfg(not(target_os = "windows"))]
+fn child_try_wait(child: &mut SidecarChild) -> Result<Option<SidecarExitStatus>, String> {
+    child.try_wait().map_err(|e| e.to_string())
+}
+#[cfg(target_os = "windows")]
+fn child_try_wait(child: &mut SidecarChild) -> Result<Option<SidecarExitStatus>, String> {
+    child
+        .try_wait()
+        .map(|status| status.map(|code| SidecarExitStatus { code }))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn child_kill(child: &mut SidecarChild) -> Result<(), String> {
+    child.kill().map_err(|e| e.to_string())
+}
+#[cfg(target_os = "windows")]
+fn child_kill(child: &mut SidecarChild) -> Result<(), String> {
+    child.kill()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn child_wait(child: &mut SidecarChild) -> Result<SidecarExitStatus, String> {
+    child.wait().map_err(|e| e.to_string())
+}
+#[cfg(target_os = "windows")]
+fn child_wait(child: &mut SidecarChild) -> Result<SidecarExitStatus, String> {
+    child
+        .wait_and_restore()
+        .map(|code| SidecarExitStatus { code })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn status_success(status: &SidecarExitStatus) -> bool {
+    status.success()
+}
+#[cfg(target_os = "windows")]
+fn status_success(status: &SidecarExitStatus) -> bool {
+    status.code == 0
+}
+#[cfg(not(target_os = "windows"))]
+fn status_code(status: &SidecarExitStatus) -> i32 {
+    status.code().unwrap_or(-1)
+}
+#[cfg(target_os = "windows")]
+fn status_code(status: &SidecarExitStatus) -> i32 {
+    status.code
+}
 
 // ---- per-session state (decision #7) --------------------------------------
 
@@ -44,13 +123,14 @@ struct SessionSlot {
     inner: Option<PiSession>,
 }
 
-/// Owns a just-spawned `Child` until pipes are taken and the session is built.
-/// Drop kills+waits so a failed post-spawn setup never orphans a process that
-/// holds vault API keys in its env (CRIT-11).
+/// Owns a just-spawned std child until pipes are taken and the session is built.
+/// The Windows broker owns its own RAII cleanup, so this guard is Unix-only.
+#[cfg(not(target_os = "windows"))]
 struct KillOnDrop {
     child: Option<Child>,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl KillOnDrop {
     fn new(child: Child) -> Self {
         Self { child: Some(child) }
@@ -60,12 +140,12 @@ impl KillOnDrop {
         self.child.as_mut().expect("KillOnDrop already disarmed")
     }
 
-    /// Release ownership without killing (caller now owns the Child).
     fn disarm(mut self) -> Child {
         self.child.take().expect("KillOnDrop already disarmed")
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
@@ -103,11 +183,11 @@ struct PiSession {
     /// thread (which calls `try_wait()` on EOF) and the control path
     /// (`stop_pi_session`, `spike_pi_prompt`) can inspect/kill the child without
     /// a second exclusive owner.
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<SidecarChild>>,
     /// Shared stdin writer. Also written by the reader thread (which sends
     /// `classified` responses back to the sidecar), so it is reference-counted
     /// and mutex-guarded to keep JSONL lines from interleaving.
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<SidecarStdin>>,
     /// Per-session generation counter — bumped ONLY when THIS session respawns.
     /// The reader thread compares against this, NOT a global counter.
     generation: Arc<AtomicU64>,
@@ -163,9 +243,15 @@ impl PiSidecarState {
 
     /// Frontend banner text for restored sessions, if any were restored.
     pub fn restored_session_banner(&self) -> Option<String> {
-        let n = self.restored.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let n = self
+            .restored
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         if n > 0 {
-            Some(format!("Restored {n} active pi sessions from previous session."))
+            Some(format!(
+                "Restored {n} active pi sessions from previous session."
+            ))
         } else {
             None
         }
@@ -206,6 +292,7 @@ pub(crate) fn live_pi_sessions(app: &AppHandle) -> Vec<LivePiSession> {
         Some(s) => s,
         None => return Vec::new(),
     };
+    let state: &PiSidecarState = &state;
     // ITEM 3: use try_lock to avoid stalling the agent-state file lock when the
     // sidecar mutex is contended (e.g. send_prompt_to_session holds it across a
     // synchronous stdin write). Degrade to no overlay this poll rather than
@@ -228,10 +315,10 @@ pub(crate) fn live_pi_sessions(app: &AppHandle) -> Vec<LivePiSession> {
                 // treat as alive (someone is actively using it — it exists); on
                 // Poisoned recover like the rest of this file and evaluate normally.
                 match session.child.try_lock() {
-                    Ok(mut c) => matches!(c.try_wait(), Ok(None)),
+                    Ok(mut c) => matches!(child_try_wait(&mut c), Ok(None)),
                     Err(std::sync::TryLockError::Poisoned(e)) => {
                         let mut c = e.into_inner();
-                        matches!(c.try_wait(), Ok(None))
+                        matches!(child_try_wait(&mut c), Ok(None))
                     }
                     Err(std::sync::TryLockError::WouldBlock) => true,
                 }
@@ -362,7 +449,6 @@ pub enum SessionStatus {
     Crashed,
 }
 
-
 /// A serializable record of a single pi sidecar session, persisted to
 /// `{project_root}/.devboule/pi-sessions.json` so sessions survive app restarts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -399,7 +485,10 @@ fn now_ms() -> u64 {
 /// (default: `true`). Set to `0`/`false`/`no`/`off` to disable file writes.
 fn persist_enabled() -> bool {
     match std::env::var("DEVBOULE_PI_PERSIST") {
-        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -445,7 +534,9 @@ pub fn save_pi_sessions(state: &PiSidecarState, project_root: &Path) {
     // callers interleave and lose each other's writes (and corrupt the file).
     let mut g = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
     let collected: Vec<PersistedSession> = g.values().cloned().collect();
-    let file = apply_cleanup(SessionFile { sessions: collected });
+    let file = apply_cleanup(SessionFile {
+        sessions: collected,
+    });
 
     let dir = project_root.join(".devboule");
     let path = dir.join("pi-sessions.json");
@@ -645,7 +736,10 @@ pub fn pi_sidecar_enabled() -> bool {
 /// unrecognized-but-enabled values do so at their own call site.
 fn env_flag_default_on(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => true,
     }
 }
@@ -755,10 +849,7 @@ pub(crate) fn websearch_env_pairs(
 ///
 /// Falls back to a non-Claude default (openrouter/tencent/hy3:free) if nothing
 /// is configured. Decision #10: do NOT default to Claude.
-pub(crate) fn resolve_coder_env_for_sidecar(
-    app: &AppHandle,
-    role: Option<&str>,
-) -> SidecarEnvVars {
+pub(crate) fn resolve_coder_env_for_sidecar(app: &AppHandle, role: Option<&str>) -> SidecarEnvVars {
     // PER-ROLE lookup first. None / parse error / kind the pi engine cannot
     // drive ⇒ fall back to read_local_coder_backend (the historical default).
     let per_role_backend: Option<super::mini_coder::MiniCoderBackend> = match role {
@@ -806,8 +897,9 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                 // are both surfaced as a user-visible Banner (via vault_key_warning).
                 // F50: per-role key first, shared fallback. Role aliases canonicalize in vault.
                 let vault_role = role.unwrap_or("coder");
-                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(vault_role)
-                {
+                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(
+                    vault_role,
+                ) {
                     Ok(Some(key)) => (Some(key), None),
                     Ok(None) => {
                         eprintln!(
@@ -815,11 +907,15 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                              The session may fail to authenticate. \
                              Save a key in Settings -> Roles -> Cloud API."
                         );
-                        (None, Some(
-                            "Cloud model configured but no API key is saved. \
+                        (
+                            None,
+                            Some(
+                                "Cloud model configured but no API key is saved. \
                              The session may fail to authenticate. \
-                             Save a key in Settings \u{2192} Roles \u{2192} Cloud API.".to_string()
-                        ))
+                             Save a key in Settings \u{2192} Roles \u{2192} Cloud API."
+                                    .to_string(),
+                            ),
+                        )
                     }
                     Err(e) => {
                         eprintln!(
@@ -913,8 +1009,9 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                 // are both surfaced as a user-visible Banner (via vault_key_warning).
                 // F50: cross-role localCoderBackend Cloud uses role if known, else "coder".
                 let vault_role = role.unwrap_or("coder");
-                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(vault_role)
-                {
+                let (api_key, vault_warning) = match super::vault::read_cloud_llm_key_for_role(
+                    vault_role,
+                ) {
                     Ok(Some(key)) => (Some(key), None),
                     Ok(None) => {
                         eprintln!(
@@ -922,11 +1019,15 @@ pub(crate) fn resolve_coder_env_for_sidecar(
                              The session may fail to authenticate. \
                              Save a key in Settings -> Roles -> Cloud API."
                         );
-                        (None, Some(
-                            "Cloud model configured but no API key is saved. \
+                        (
+                            None,
+                            Some(
+                                "Cloud model configured but no API key is saved. \
                              The session may fail to authenticate. \
-                             Save a key in Settings \u{2192} Roles \u{2192} Cloud API.".to_string()
-                        ))
+                             Save a key in Settings \u{2192} Roles \u{2192} Cloud API."
+                                    .to_string(),
+                            ),
+                        )
                     }
                     Err(e) => {
                         eprintln!(
@@ -984,33 +1085,39 @@ pub(crate) fn resolve_coder_env_for_sidecar(
 /// (Api/Codex/Openai/AppleFm) the primary resolves from `localCoderBackend` in
 /// `resolve_coder_env_for_sidecar`, so the fallback chain MUST do the same —
 /// otherwise fallbacks attach from a DIFFERENT config row than the primary.
-pub(crate) fn role_fallbacks(app: &AppHandle, role: Option<&str>) -> Vec<super::mini_coder::FallbackModel> {
-    let mini_if_capable = |b: Option<super::mini_coder::MiniCoderBackend>| -> Vec<super::mini_coder::FallbackModel> {
-        match b {
-            Some(be) if matches!(
-                be.kind,
-                super::mini_coder::MiniCoderBackendKind::Cloud
-                    | super::mini_coder::MiniCoderBackendKind::Ollama
-                    | super::mini_coder::MiniCoderBackendKind::Omlx
-            ) => be.fallbacks.unwrap_or_default(),
-            _ => super::projects::read_local_coder_backend(app)
-                .and_then(|lb| lb.fallbacks)
-                .unwrap_or_default(),
-        }
-    };
+pub(crate) fn role_fallbacks(
+    app: &AppHandle,
+    role: Option<&str>,
+) -> Vec<super::mini_coder::FallbackModel> {
+    let mini_if_capable =
+        |b: Option<super::mini_coder::MiniCoderBackend>| -> Vec<super::mini_coder::FallbackModel> {
+            match b {
+                Some(be)
+                    if matches!(
+                        be.kind,
+                        super::mini_coder::MiniCoderBackendKind::Cloud
+                            | super::mini_coder::MiniCoderBackendKind::Ollama
+                            | super::mini_coder::MiniCoderBackendKind::Omlx
+                    ) =>
+                {
+                    be.fallbacks.unwrap_or_default()
+                }
+                _ => super::projects::read_local_coder_backend(app)
+                    .and_then(|lb| lb.fallbacks)
+                    .unwrap_or_default(),
+            }
+        };
     match role {
         None | Some("orchestrator") => super::projects::read_local_coder_backend(app)
             .and_then(|b| b.fallbacks)
             .unwrap_or_default(),
-        Some("coder") | Some("main-coder") => {
-            mini_if_capable(super::roles_config::read_main_coder_backend_no_fallback(app))
-        }
+        Some("coder") | Some("main-coder") => mini_if_capable(
+            super::roles_config::read_main_coder_backend_no_fallback(app),
+        ),
         Some("mini") | Some("mini-coder") => {
             mini_if_capable(super::projects::read_mini_coder_backend(app))
         }
-        Some("verifier") => {
-            mini_if_capable(super::roles_config::read_verifier_backend(app))
-        }
+        Some("verifier") => mini_if_capable(super::roles_config::read_verifier_backend(app)),
         Some(_) => super::projects::read_local_coder_backend(app)
             .and_then(|b| b.fallbacks)
             .unwrap_or_default(),
@@ -1164,15 +1271,11 @@ pub(crate) fn map_mini_coder_backend_to_sidecar_env(
                 .filter(|m| !m.is_empty())
                 .unwrap_or("tencent/hy3:free")
                 .to_string();
-            let base_url = backend
-                .base_url
-                .clone()
-                .filter(|b| !b.trim().is_empty());
+            let base_url = backend.base_url.clone().filter(|b| !b.trim().is_empty());
             SidecarEnvVars {
                 provider: "openrouter".to_string(),
                 model,
-                api_key_env: cloud_api_key
-                    .map(|k| ("OPENROUTER_API_KEY".to_string(), k)),
+                api_key_env: cloud_api_key.map(|k| ("OPENROUTER_API_KEY".to_string(), k)),
                 base_url,
                 vault_key_warning: None,
             }
@@ -1213,10 +1316,7 @@ pub(crate) fn map_mini_coder_backend_to_sidecar_env(
 /// If a candidate has the script but is missing node_modules, it is skipped
 /// (and remembered) so later candidates can still win. Returns the first
 /// fully-valid candidate, or an error listing every path tried.
-fn resolve_sidecar_candidates(
-    candidates: &[PathBuf],
-    target: &str,
-) -> Result<PathBuf, String> {
+fn resolve_sidecar_candidates(candidates: &[PathBuf], target: &str) -> Result<PathBuf, String> {
     let mut tried = Vec::new();
     let mut script_without_modules: Option<PathBuf> = None;
 
@@ -1359,7 +1459,17 @@ fn pi_sandbox_policy(
         .unwrap_or_else(std::env::temp_dir);
     let home = std::env::var_os("HOME").map(PathBuf::from);
 
-    let mut policy = SandboxPolicy::deny(project_root.to_path_buf())
+    // Windows ACLs cannot express the Seatbelt-style "readonly root plus
+    // writable exception" safely with the current icacls implementation: the
+    // deny ACE would win over the writable grant. The broker therefore uses an
+    // empty readonly root on Windows and grants the explicit writable paths;
+    // macOS keeps the stricter deny-root policy.
+    let readonly_root = if cfg!(target_os = "windows") {
+        PathBuf::new()
+    } else {
+        project_root.to_path_buf()
+    };
+    let mut policy = SandboxPolicy::deny(readonly_root)
         .writable(project_root.to_path_buf())
         .writable(tmpdir)
         // F3: aspis_mcp python child writes plans/tasks into projects_dir.
@@ -1404,7 +1514,11 @@ fn pi_sandbox_policy(
 /// The sidecar treats ONLY the literal "true" as enabled (see sidecar.mjs
 /// `DEVBOULE_PIGEON_ENABLED === "true"`); everything else is OFF.
 fn pigeon_enabled_env_value(enabled: bool) -> &'static str {
-    if enabled { "true" } else { "false" }
+    if enabled {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 /// Spawn a new pi sidecar session with the given session id. Reads the coder
@@ -1435,21 +1549,22 @@ fn spawn_pi_session_inner(
     // backward compatibility). The tail (candidates 1..N) is emitted as the
     // `DEVBOULE_PI_MODEL_CHAIN` env var (JSON); the sidecar ignores it until B2.2.
     let chain = resolve_coder_chain_for_sidecar(app, role);
-    let mut env_vars = chain.first().cloned().unwrap_or_else(|| resolve_coder_env_for_sidecar(app, role));
+    let mut env_vars = chain
+        .first()
+        .cloned()
+        .unwrap_or_else(|| resolve_coder_env_for_sidecar(app, role));
 
     // --- macOS Seatbelt sandbox (decision #11) -------------------------------
     // Confine pi's edit/write/bash tools to the project directory. Default ON for
     // safety; toggle with DEVBOULE_PI_SANDBOX=false for debugging. On non-macOS
     // wrap/apply_rlimits are no-ops (passthrough), so we only wrap on macOS.
     // F1: prefer the explicit project_root over the sidecar-parent fallback.
-    let effective_project_root = project_root
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| {
-            sidecar_dir
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| sidecar_dir.clone())
-        });
+    let effective_project_root = project_root.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        sidecar_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| sidecar_dir.clone())
+    });
 
     // F3: resolve projects_dir and management_root for the sandbox policy and
     // the MCP config. These use the same resolution chain as claude/codex MCP
@@ -1473,7 +1588,10 @@ fn spawn_pi_session_inner(
         .unwrap_or_else(|| {
             // Fallback: use effective_project_root as both (sandbox stays
             // correct for the common case; MCP config is skipped).
-            (effective_project_root.clone(), effective_project_root.clone())
+            (
+                effective_project_root.clone(),
+                effective_project_root.clone(),
+            )
         });
     // Fix 3: use the tolerant opt-out parser (default ON). Previously this did
     // `.map(|v| v == "true").unwrap_or(true)`, which silently DISABLED the macOS
@@ -1487,16 +1605,17 @@ fn spawn_pi_session_inner(
     // for python imports) to the sandbox policy.
     // Cloud/OpenRouter needs full egress (LLM API + web tools). Local oMLX/Ollama
     // stay loopback-only so a local session cannot call the public internet.
-    let net = if pi_session_needs_egress(
-        &env_vars.provider,
-        env_vars.base_url.as_deref(),
-    ) {
+    let net = if pi_session_needs_egress(&env_vars.provider, env_vars.base_url.as_deref()) {
         NetPolicy::Enabled
     } else {
         NetPolicy::Loopback
     };
-    let policy =
-        pi_sandbox_policy(&effective_project_root, &projects_dir, &management_root, net);
+    let policy = pi_sandbox_policy(
+        &effective_project_root,
+        &projects_dir,
+        &management_root,
+        net,
+    );
     let script_arg = script.to_string_lossy().into_owned();
     // Audit F-04-012: never spawn bare `node` (GUI apps often lack Homebrew PATH).
     // Resolve an absolute path via the same augmented_path scan as provider_detect.
@@ -1505,12 +1624,8 @@ fn spawn_pi_session_inner(
     })?;
     let node_s = node.to_string_lossy().into_owned();
     let (program, args): (String, Vec<String>) = if sandboxed {
-        let wrapped = crate::backend::sandbox::wrap(
-            &policy,
-            &node_s,
-            &[script_arg],
-            &effective_project_root,
-        );
+        let wrapped =
+            crate::backend::sandbox::wrap(&policy, &node_s, &[script_arg], &effective_project_root);
         eprintln!(
             "[pi-sidecar] sandbox: enabled (macOS Seatbelt, net={:?}); node={node_s}",
             policy.net
@@ -1558,10 +1673,16 @@ fn spawn_pi_session_inner(
             .iter()
             .map(|c| {
                 let mut obj = serde_json::Map::new();
-                obj.insert("provider".into(), serde_json::Value::String(c.provider.clone()));
+                obj.insert(
+                    "provider".into(),
+                    serde_json::Value::String(c.provider.clone()),
+                );
                 obj.insert("model".into(), serde_json::Value::String(c.model.clone()));
                 if let Some(ref base_url) = c.base_url {
-                    obj.insert("baseUrl".into(), serde_json::Value::String(base_url.clone()));
+                    obj.insert(
+                        "baseUrl".into(),
+                        serde_json::Value::String(base_url.clone()),
+                    );
                 }
                 serde_json::Value::Object(obj)
             })
@@ -1690,132 +1811,351 @@ fn spawn_pi_session_inner(
         }
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;
-    // Kill+wait on any early return after spawn (stdin/stdout take failure, …)
-    // so a child with vault keys in env is never orphaned untracked (CRIT-11).
-    let mut guard = KillOnDrop::new(child);
+    // Platform-specific spawn:
+    // - Windows: use the sandbox broker (spawn_sandboxed_with_stdin) for interactive sidecars.
+    // - Unix/macOS: use std::process::Command (existing behavior).
+    #[cfg(target_os = "windows")]
+    {
+        use crate::backend::sandbox::windows::spawn_sandboxed_with_stdin;
+        use std::collections::HashSet;
+        use std::os::windows::io::FromRawHandle;
 
-    let raw_stdin = guard
-        .child_mut()
-        .stdin
-        .take()
-        .ok_or_else(|| "pi sidecar stdin not captured".to_string())?;
-    let stdout = guard
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| "pi sidecar stdout not captured".to_string())?;
-    // #4: capture stderr only when we piped it (release build), so the forwarder
-    // thread has a stream to read.
-    let stderr = if stderr_piped {
-        guard.child_mut().stderr.take()
-    } else {
-        None
-    };
+        // Build the curated environment block for the broker.
+        // Include explicit sidecar env + required Windows system vars.
+        let mut broker_env: Vec<(String, String)> = Vec::new();
 
-    // Shared, mutex-guarded stdin: both `spike_pi_prompt` (prompt commands) and
-    // the reader thread (`classified` responses) write here. The Arc lets the
-    // reader own a clone; the Mutex serializes their JSONL lines.
-    let stdin = Arc::new(Mutex::new(raw_stdin));
-
-    // Per-session generation: reuse existing Arc if respawning the same session,
-    // or create a new one for a fresh session.
-    let generation = prev_generation.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-    // Bump THIS session's generation so any old reader for this session exits.
-    let _gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-
-    // Wrap the child so the reader thread can call `try_wait()` on EOF without
-    // owning the only handle (#1). Disarm KillOnDrop — session now owns the child.
-    let child = Arc::new(Mutex::new(guard.disarm()));
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let spawned_at = Instant::now();
-
-    // Injection queue: control paths push ConsoleEntry items here; the reader
-    // thread's EventMapper drains them at the top of every handle_event call.
-    let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
-
-    // Push the F2 failure banner (if any) directly into the queue. We are still
-    // mid-spawn and the session slot's `inner` is not populated yet, so
-    // inject_console_entry would fail; we own the queue here, so pushing directly
-    // is correct. The reader thread drains the queue on its first handle_event,
-    // so the banner lands as soon as the session produces an event.
-    if let Some(text) = mcp_config_banner.take() {
-        if let Ok(mut q) = injections.lock() {
-            q.push(super::mini_activity::ConsoleEntry::Banner {
-                text,
-                time: super::mini_activity::console_now_str(),
-            });
+        // Explicit sidecar env vars (same as cmd.env above).
+        broker_env.push(("DEVBOULE_PI_PROVIDER".into(), env_vars.provider.clone()));
+        broker_env.push(("DEVBOULE_PI_MODEL".into(), env_vars.model.clone()));
+        if chain.len() > 1 {
+            let chain_out: Vec<serde_json::Value> = chain
+                .iter()
+                .map(|c| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(
+                        "provider".into(),
+                        serde_json::Value::String(c.provider.clone()),
+                    );
+                    obj.insert("model".into(), serde_json::Value::String(c.model.clone()));
+                    if let Some(ref base_url) = c.base_url {
+                        obj.insert(
+                            "baseUrl".into(),
+                            serde_json::Value::String(base_url.clone()),
+                        );
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            if let Ok(json) = serde_json::to_string(&chain_out) {
+                broker_env.push(("DEVBOULE_PI_MODEL_CHAIN".into(), json));
+            }
         }
-    }
-    // B4 (BLOCKER): push the vault key warning (if any) into the SAME injection
-    // queue, using the SAME mechanism as the MCP config banner above. The warning
-    // is set by resolve_coder_env_for_sidecar when read_cloud_llm_key returns
-    // Err (vault locked/error) or Ok(None) (no key saved).
-    if let Some(text) = env_vars.vault_key_warning.take() {
-        if let Ok(mut q) = injections.lock() {
-            q.push(super::mini_activity::ConsoleEntry::Banner {
-                text,
-                time: super::mini_activity::console_now_str(),
-            });
+        broker_env.push(("DEVBOULE_SESSION_ID".into(), session_id.to_string()));
+        if let Some(ref root) = project_root {
+            broker_env.push((
+                "DEVBOULE_PROJECT_ROOT".into(),
+                root.to_string_lossy().into_owned(),
+            ));
         }
-    }
+        broker_env.push((
+            "DEVBOULE_PIGEON_ENABLED".into(),
+            pigeon_enabled_env_value(pigeon_enabled).to_string(),
+        ));
+        if let Some(role) = role {
+            broker_env.push(("DEVBOULE_AGENT_ROLE".into(), role.to_string()));
+        }
+        if let Some(pid) = project_id {
+            broker_env.push(("DEVBOULE_PROJECT_ID".into(), pid.to_string()));
+        }
+        if let Some((ref key_name, ref key_value)) = env_vars.api_key_env {
+            broker_env.push((key_name.clone(), key_value.clone()));
+        }
+        if let Some(ref base_url) = env_vars.base_url {
+            broker_env.push(("DEVBOULE_PI_BASE_URL".into(), base_url.clone()));
+        }
+        if let Ok(dir) = crate::backend::pi_extensions::resolve_pi_agent_dir(app) {
+            broker_env.push((
+                "PI_CODING_AGENT_DIR".into(),
+                dir.path.to_string_lossy().into_owned(),
+            ));
+        }
+        for (env_var, key_value) in websearch_env_pairs(super::vault::read_websearch_key) {
+            broker_env.push((env_var.to_string(), key_value));
+        }
 
-    // Console durability: resolve the bridge-file path for write-through
-    // persistence so the console survives app restart. `None` when the
-    // agent id is unsanitizable or the holding dir cannot be created —
-    // observability never blocks a launch.
-    let bridge_path: Option<PathBuf> =
-        super::mini_activity::activity_file_path(&projects_dir, session_id);
+        // Required Windows system environment variables (curated, not inheriting arbitrary secrets).
+        for var in [
+            "PATH",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "COMSPEC",
+            "PATHEXT",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "WINDIR",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                broker_env.push((var.to_string(), val));
+            }
+        }
 
-    let app_clone = app.clone();
-    let sid = session_id.to_string();
-    let gen_clone = generation.clone();
-    let stdin_clone = stdin.clone();
-    let child_clone = child.clone();
-    let timed_out_clone = timed_out.clone();
-    let injections_clone = injections.clone();
-    let reader_handle = std::thread::spawn(move || {
-        read_sidecar_events(
-            app_clone,
-            stdout,
-            stdin_clone,
-            gen_clone,
-            child_clone,
-            timed_out_clone,
-            &sid,
-            pigeon_enabled,
-            injections_clone,
-            bridge_path,
+        // Deduplicate by key (case-insensitive on Windows).
+        let mut seen = HashSet::new();
+        broker_env.retain(|(k, _)| {
+            let upper = k.to_ascii_uppercase();
+            seen.insert(upper)
+        });
+
+        // Spawn via the broker with a stdin pipe for interactive sidecar.
+        let mut sandboxed_child =
+            spawn_sandboxed_with_stdin(&policy, &program, &args, &sidecar_dir, &broker_env)?;
+
+        // Convert HANDLEs to std::fs::File for the reader thread.
+        let stdout_handle = sandboxed_child.take_stdout_handle();
+        let stderr_handle = sandboxed_child.take_stderr_handle();
+        let stdout_file = unsafe { std::fs::File::from_raw_handle(stdout_handle.0) };
+        let stderr_file = unsafe { std::fs::File::from_raw_handle(stderr_handle.0) };
+        let stdin_write = sandboxed_child.take_stdin_write_handle();
+        if stdin_write.0.is_null() {
+            return Err("pi sidecar broker returned no stdin pipe".to_string());
+        }
+
+        // Shared, mutex-guarded stdin writer (from the broker's pipe).
+        let stdin = Arc::new(Mutex::new(unsafe {
+            std::fs::File::from_raw_handle(stdin_write.0)
+        }));
+
+        // Per-session generation: reuse existing Arc if respawning the same session,
+        // or create a new one for a fresh session.
+        let generation = prev_generation.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        // Bump THIS session's generation so any old reader for this session exits.
+        let _gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Wrap the SandboxedChild in Arc<Mutex> so the reader thread can call try_wait().
+        let child = Arc::new(Mutex::new(sandboxed_child));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let spawned_at = Instant::now();
+
+        // Injection queue: control paths push ConsoleEntry items here; the reader
+        // thread's EventMapper drains them at the top of every handle_event call.
+        let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
+
+        // Push the F2 failure banner (if any) directly into the queue.
+        if let Some(text) = mcp_config_banner.take() {
+            if let Ok(mut q) = injections.lock() {
+                q.push(super::mini_activity::ConsoleEntry::Banner {
+                    text,
+                    time: super::mini_activity::console_now_str(),
+                });
+            }
+        }
+        // B4 (BLOCKER): push the vault key warning (if any) into the SAME injection
+        // queue, using the SAME mechanism as the MCP config banner above.
+        if let Some(text) = env_vars.vault_key_warning.take() {
+            if let Ok(mut q) = injections.lock() {
+                q.push(super::mini_activity::ConsoleEntry::Banner {
+                    text,
+                    time: super::mini_activity::console_now_str(),
+                });
+            }
+        }
+
+        // Console durability: resolve the bridge-file path for write-through
+        // persistence so the console survives app restart. `None` when the
+        // agent id is unsanitizable or the holding dir cannot be created —
+        // observability never blocks a launch.
+        let bridge_path: Option<PathBuf> =
+            super::mini_activity::activity_file_path(&projects_dir, session_id);
+
+        let app_clone = app.clone();
+        let sid = session_id.to_string();
+        let gen_clone = generation.clone();
+        let stdin_clone = stdin.clone();
+        let child_clone = child.clone();
+        let timed_out_clone = timed_out.clone();
+        let injections_clone = injections.clone();
+        let reader_handle = std::thread::spawn(move || {
+            read_sidecar_events(
+                app_clone,
+                stdout_file,
+                stdin_clone,
+                gen_clone,
+                child_clone,
+                timed_out_clone,
+                &sid,
+                pigeon_enabled,
+                injections_clone,
+                bridge_path,
+            );
+        });
+
+        // The broker always supplies a pipe on Windows. Keep a reader active
+        // even in debug builds; otherwise a verbose sidecar could fill the
+        // pipe buffer and block while `stderr_piped == false`.
+        if stderr_piped || cfg!(target_os = "windows") {
+            spawn_stderr_forwarder(stderr_file);
+        }
+
+        // #5: session-timeout watchdog (DEVBOULE_PI_SESSION_TIMEOUT_SECS; 0 disables).
+        spawn_session_timeout_watchdog(
+            app.clone(),
+            session_id.to_string(),
+            generation.clone(),
+            child.clone(),
+            timed_out.clone(),
+            spawned_at,
+            read_session_timeout_secs(),
         );
-    });
 
-    // #4: release-build stderr forwarder (terminal-less packaged app).
-    if let Some(stderr_stream) = stderr {
-        spawn_stderr_forwarder(stderr_stream);
+        return Ok((
+            PiSession {
+                child,
+                stdin,
+                generation,
+                timed_out,
+                spawned_at,
+                injections,
+                reader_handle: Some(reader_handle),
+            },
+            env_vars.model,
+        ));
     }
 
-    // #5: session-timeout watchdog (DEVBOULE_PI_SESSION_TIMEOUT_SECS; 0 disables).
-    spawn_session_timeout_watchdog(
-        app.clone(),
-        session_id.to_string(),
-        generation.clone(),
-        child.clone(),
-        timed_out.clone(),
-        spawned_at,
-        read_session_timeout_secs(),
-    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;
+        // Kill+wait on any early return after spawn (stdin/stdout take failure, …)
+        // so a child with vault keys in env is never orphaned untracked (CRIT-11).
+        let mut guard = KillOnDrop::new(child);
 
-    Ok((PiSession {
-        child,
-        stdin,
-        generation,
-        timed_out,
-        spawned_at,
-        injections,
-        reader_handle: Some(reader_handle),
-    }, env_vars.model))
+        let raw_stdin = guard
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| "pi sidecar stdin not captured".to_string())?;
+        let stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or_else(|| "pi sidecar stdout not captured".to_string())?;
+        // #4: capture stderr only when we piped it (release build), so the forwarder
+        // thread has a stream to read.
+        let stderr = if stderr_piped {
+            guard.child_mut().stderr.take()
+        } else {
+            None
+        };
+
+        // Shared, mutex-guarded stdin: both `spike_pi_prompt` (prompt commands) and
+        // the reader thread (`classified` responses) write here. The Arc lets the
+        // reader own a clone; the Mutex serializes their JSONL lines.
+        let stdin = Arc::new(Mutex::new(raw_stdin));
+
+        // Per-session generation: reuse existing Arc if respawning the same session,
+        // or create a new one for a fresh session.
+        let generation = prev_generation.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        // Bump THIS session's generation so any old reader for this session exits.
+        let _gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Wrap the child so the reader thread can call `try_wait()` on EOF without
+        // owning the only handle (#1). Disarm KillOnDrop — session now owns the child.
+        let child = Arc::new(Mutex::new(guard.disarm()));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let spawned_at = Instant::now();
+
+        // Injection queue: control paths push ConsoleEntry items here; the reader
+        // thread's EventMapper drains them at the top of every handle_event call.
+        let injections: ConsoleInjections = Arc::new(Mutex::new(Vec::new()));
+
+        // Push the F2 failure banner (if any) directly into the queue. We are still
+        // mid-spawn and the session slot's `inner` is not populated yet, so
+        // inject_console_entry would fail; we own the queue here, so pushing directly
+        // is correct. The reader thread drains the queue on its first handle_event,
+        // so the banner lands as soon as the session produces an event.
+        if let Some(text) = mcp_config_banner.take() {
+            if let Ok(mut q) = injections.lock() {
+                q.push(super::mini_activity::ConsoleEntry::Banner {
+                    text,
+                    time: super::mini_activity::console_now_str(),
+                });
+            }
+        }
+        // B4 (BLOCKER): push the vault key warning (if any) into the SAME injection
+        // queue, using the SAME mechanism as the MCP config banner above. The warning
+        // is set by resolve_coder_env_for_sidecar when read_cloud_llm_key returns
+        // Err (vault locked/error) or Ok(None) (no key saved).
+        if let Some(text) = env_vars.vault_key_warning.take() {
+            if let Ok(mut q) = injections.lock() {
+                q.push(super::mini_activity::ConsoleEntry::Banner {
+                    text,
+                    time: super::mini_activity::console_now_str(),
+                });
+            }
+        }
+
+        // Console durability: resolve the bridge-file path for write-through
+        // persistence so the console survives app restart. `None` when the
+        // agent id is unsanitizable or the holding dir cannot be created —
+        // observability never blocks a launch.
+        let bridge_path: Option<PathBuf> =
+            super::mini_activity::activity_file_path(&projects_dir, session_id);
+
+        let app_clone = app.clone();
+        let sid = session_id.to_string();
+        let gen_clone = generation.clone();
+        let stdin_clone = stdin.clone();
+        let child_clone = child.clone();
+        let timed_out_clone = timed_out.clone();
+        let injections_clone = injections.clone();
+        let reader_handle = std::thread::spawn(move || {
+            read_sidecar_events(
+                app_clone,
+                stdout,
+                stdin_clone,
+                gen_clone,
+                child_clone,
+                timed_out_clone,
+                &sid,
+                pigeon_enabled,
+                injections_clone,
+                bridge_path,
+            );
+        });
+
+        // #4: release-build stderr forwarder (terminal-less packaged app).
+        if let Some(stderr_stream) = stderr {
+            spawn_stderr_forwarder(stderr_stream);
+        }
+
+        // #5: session-timeout watchdog (DEVBOULE_PI_SESSION_TIMEOUT_SECS; 0 disables).
+        spawn_session_timeout_watchdog(
+            app.clone(),
+            session_id.to_string(),
+            generation.clone(),
+            child.clone(),
+            timed_out.clone(),
+            spawned_at,
+            read_session_timeout_secs(),
+        );
+
+        Ok((
+            PiSession {
+                child,
+                stdin,
+                generation,
+                timed_out,
+                spawned_at,
+                injections,
+                reader_handle: Some(reader_handle),
+            },
+            env_vars.model,
+        ))
+    }
 }
 
 /// Stop a specific pi sidecar session: kill the child, join reader, remove from state.
@@ -1920,7 +2260,7 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
         let mut exited = false;
         while Instant::now() < deadline {
             if let Ok(mut c) = session.child.lock() {
-                if matches!(c.try_wait(), Ok(Some(_))) {
+                if matches!(child_try_wait(&mut c), Ok(Some(_))) {
                     exited = true;
                     break;
                 }
@@ -1929,11 +2269,11 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
         }
         if !exited {
             if let Ok(mut c) = session.child.lock() {
-                let _ = c.kill();
+                let _ = child_kill(&mut c);
             }
         }
         if let Ok(mut c) = session.child.lock() {
-            let _ = c.wait();
+            let _ = child_wait(&mut c);
         }
         if let Some(handle) = session.reader_handle.take() {
             let _ = handle.join();
@@ -1989,7 +2329,7 @@ fn get_or_spawn_session(
                         // on `session`/`guard` (the child lock must be dropped before
                         // we mutate `guard` below, #1).
                         let dead = match session.child.lock() {
-                            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+                            Ok(mut c) => matches!(child_try_wait(&mut c), Ok(Some(_))),
                             Err(_) => false, // lock poisoned — assume alive.
                         };
                         if dead {
@@ -2000,10 +2340,12 @@ fn get_or_spawn_session(
                             guard.insert(id.clone(), SessionSlot { inner: None });
                             (id, false, Some(old_gen))
                         } else {
-                            return Ok((id, false)) // Alive (or assume alive on error).
+                            return Ok((id, false)); // Alive (or assume alive on error).
                         }
                     } else {
-                        return Err(format!("Session {id} is currently spawning — try again in a moment."));
+                        return Err(format!(
+                            "Session {id} is currently spawning — try again in a moment."
+                        ));
                     }
                 } else {
                     // F6: session count check (live sessions only).
@@ -2065,10 +2407,12 @@ fn get_or_spawn_session(
         let mut s = new_session;
         s.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut c) = s.child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
+            let _ = child_kill(&mut c);
+            let _ = child_wait(&mut c);
         }
-        if let Some(h) = s.reader_handle.take() { let _ = h.join(); }
+        if let Some(h) = s.reader_handle.take() {
+            let _ = h.join();
+        }
         return Err(format!("pi session {id} was stopped during spawn"));
     }
     drop(guard);
@@ -2077,7 +2421,11 @@ fn get_or_spawn_session(
     // survives an app restart. Decoupled from the live `inner` map.
     // F3: use the model already resolved by spawn_pi_session_inner (avoids a
     // redundant config read). Empty model => None for the overlay.
-    let model_for_persisted = if resolved_model.is_empty() { None } else { Some(resolved_model) };
+    let model_for_persisted = if resolved_model.is_empty() {
+        None
+    } else {
+        Some(resolved_model)
+    };
     {
         let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
         pg.insert(
@@ -2144,14 +2492,15 @@ pub(crate) fn send_prompt_to_session(
         // `session`/`guard` — the child lock must be dropped before we mutate
         // `guard` below (#1).
         let exit_status = match session.child.lock() {
-            Ok(mut c) => c.try_wait(),
+            Ok(mut c) => child_try_wait(&mut c),
             Err(_) => return Err(format!("pi session {sid} child lock poisoned")),
         };
         match exit_status {
             Ok(Some(status)) => {
                 guard.remove(&sid);
                 return Err(format!(
-                    "pi session {sid} exited with status {status}. Start a new session."
+                    "pi session {sid} exited with status {}. Start a new session.",
+                    status_code(&status)
                 ));
             }
             Ok(None) => {} // Alive — proceed.
@@ -2173,8 +2522,7 @@ pub(crate) fn send_prompt_to_session(
             "type": "prompt",
             "message": text,
         });
-        let line =
-            serde_json::to_string(&cmd).map_err(|e| format!("JSON serialize error: {e}"))?;
+        let line = serde_json::to_string(&cmd).map_err(|e| format!("JSON serialize error: {e}"))?;
         // Phase 2: stdin is shared with the reader thread (which writes
         // `classified` responses back to the sidecar). Lock it so the JSONL
         // prompt line never interleaves with a `classified` line.
@@ -2186,8 +2534,11 @@ pub(crate) fn send_prompt_to_session(
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|e| {
                 // F4: on write failure, flag for zombie cleanup after we release session borrow.
-                if let Some(Some(_)) =
-                    session.child.lock().ok().and_then(|mut c| c.try_wait().ok())
+                if let Some(Some(_)) = session
+                    .child
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| child_try_wait(&mut c).ok())
                 {
                     write_failed_zombie = true;
                 }
@@ -2593,13 +2944,11 @@ impl EventMapper {
         // `push_entry` — so it does not duplicate lines in the file.
         if let Some(ref p) = mapper.bridge_path {
             if p.exists() {
-                if let Some((activity, _)) =
-                    super::mini_activity::hydrate_from_bridge_file(
-                        p,
-                        super::mini_activity::HYDRATE_WINDOW_BYTES,
-                        false,
-                    )
-                {
+                if let Some((activity, _)) = super::mini_activity::hydrate_from_bridge_file(
+                    p,
+                    super::mini_activity::HYDRATE_WINDOW_BYTES,
+                    false,
+                ) {
                     if let Some(entries) = activity.entries {
                         mapper.entries = entries;
                         // evicted_count stays 0: we re-read the tail, so no
@@ -2770,9 +3119,7 @@ impl EventMapper {
         if let Some(store) = app.try_state::<super::mini_activity::MiniActivityStore>() {
             store.update(app, &self.agent_id, |a| *a = snapshot);
         } else {
-            let event = MiniActivityEvent::Snapshot {
-                activity: snapshot,
-            };
+            let event = MiniActivityEvent::Snapshot { activity: snapshot };
             let channel = super::mini_activity::mini_activity_channel(&self.agent_id);
             let _ = app.emit(&channel, event);
         }
@@ -3185,14 +3532,12 @@ impl EventMapper {
                 // #2: the `ready` event carries whether the Oracle MCP was reachable
                 // at startup. If not, surface a banner so the user knows
                 // `oracle_ask` will silently fail.
-                if event.event_type == "ready"
-                    && event.oracle_mcp == Some(false) {
-                        self.push_entry(ConsoleEntry::Banner {
-                            text: "Oracle MCP not available — oracle_ask will not work."
-                                .to_string(),
-                            time: Self::now_str(),
-                        });
-                    }
+                if event.event_type == "ready" && event.oracle_mcp == Some(false) {
+                    self.push_entry(ConsoleEntry::Banner {
+                        text: "Oracle MCP not available — oracle_ask will not work.".to_string(),
+                        time: Self::now_str(),
+                    });
+                }
                 // Fix D: a `response` with success==Some(false) means a provider/
                 // turn error — surface the failure so the user sees it instead of a
                 // silent stall.
@@ -3274,19 +3619,13 @@ impl EventMapper {
                 // The sidecar emits this on tool_execution_end for web_search;
                 // the old sendMessage path never surfaced in the event stream.
                 let query = event.query.as_deref().unwrap_or("");
-                let results = event
-                    .results
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
+                let results = event.results.clone().unwrap_or(serde_json::Value::Null);
                 self.handle_devboule_websearch(query, &results);
                 self.emit_snapshot(app);
             }
             "devboule_plan" => {
                 // First-class plan event (replaces the dead sendMessage echo).
-                let plan = event
-                    .plan
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
+                let plan = event.plan.clone().unwrap_or(serde_json::Value::Null);
                 self.handle_devboule_plan(&plan);
                 self.emit_snapshot(app);
             }
@@ -3301,7 +3640,9 @@ impl EventMapper {
                 let text = if event.resolved.unwrap_or(false) {
                     format!("Model fallback: {from} failed ({reason}) \u{2192} switched to {to}")
                 } else {
-                    format!("Model fallback exhausted: could not switch from {from} to {to} ({reason})")
+                    format!(
+                        "Model fallback exhausted: could not switch from {from} to {to} ({reason})"
+                    )
                 };
                 self.push_entry(ConsoleEntry::Banner {
                     text,
@@ -3309,8 +3650,8 @@ impl EventMapper {
                 });
                 self.emit_snapshot(app);
             }
-            "compaction_start" | "compaction_end" | "auto_retry_start"
-            | "auto_retry_end" | "error" | "queue_dropped" => {
+            "compaction_start" | "compaction_end" | "auto_retry_start" | "auto_retry_end"
+            | "error" | "queue_dropped" => {
                 // Part C: banners for compaction / retry / sidecar error / queue
                 // drops. These are turn boundaries, so flush pending text + thinking
                 // first, then push the (pure-built) banner text and re-emit.
@@ -3334,11 +3675,7 @@ impl EventMapper {
     /// stamps `_devboule` onto every event, so this is an idempotent refresh that
     /// keeps `current_role` correct for the whole session.
     fn apply_devboule_role(&mut self, event: &PiEvent) {
-        if let Some(role) = event
-            .devboule
-            .as_ref()
-            .and_then(|d| d.agent_role.clone())
-        {
+        if let Some(role) = event.devboule.as_ref().and_then(|d| d.agent_role.clone()) {
             self.current_role = Some(role);
         }
     }
@@ -3367,7 +3704,10 @@ impl EventMapper {
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("devboule.websearch") => {
                 let query = obj.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                let results = obj.get("results").cloned().unwrap_or(serde_json::Value::Null);
+                let results = obj
+                    .get("results")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 self.handle_devboule_websearch(query, &results);
                 true
             }
@@ -3530,7 +3870,6 @@ fn censor_loop_bump(session_id: &str) {
     censor_loop_bump_in(&mut map, session_id);
 }
 
-
 // ---- Fix 4: per-session delivered-finding ids (dedup across rounds) -------
 //
 // `wait_for_censor_findings` returns ALL Open findings in the shard, not just
@@ -3538,8 +3877,7 @@ fn censor_loop_bump(session_id: &str) {
 // 2 rounds forever. We keep, per session, the set of finding ids we have already
 // delivered and drop them before re-prompting. Lazily initialized like the loop
 // counters above.
-static CENSOR_DELIVERED_IDS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> =
-    OnceLock::new();
+static CENSOR_DELIVERED_IDS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
 
 fn censor_delivered_ids() -> &'static Mutex<HashMap<String, HashSet<String>>> {
     CENSOR_DELIVERED_IDS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3634,9 +3972,7 @@ fn truncate_to_chars(s: &str, max: usize) -> String {
 /// Compose the compact message delivered back into the session when the Censor
 /// review surfaces confirmed findings. Capped to [`CENSOR_REVIEW_MSG_MAX_CHARS`]
 /// so a chatty review can't flood the agent's context.
-fn compose_censor_review_message(
-    findings: &[crate::backend::censor::schema::Finding],
-) -> String {
+fn compose_censor_review_message(findings: &[crate::backend::censor::schema::Finding]) -> String {
     let n = findings.len();
     let mut body = format!("Automated Censor review found {n} issue(s):\n");
     for f in findings {
@@ -3705,7 +4041,12 @@ fn run_pi_censor_review(
     let _guard = match crate::backend::censor_review::try_begin_censor_review() {
         Some(g) => g,
         None => {
-            push_censor_note(app, agent_id, "Censor review skipped (busy)", Some(NodeStyle::Sage));
+            push_censor_note(
+                app,
+                agent_id,
+                "Censor review skipped (busy)",
+                Some(NodeStyle::Sage),
+            );
             return;
         }
     };
@@ -3929,7 +4270,11 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
             if title.is_empty() && url.is_empty() {
                 return None;
             }
-            Some(PageEntry { url, title, summary })
+            Some(PageEntry {
+                url,
+                title,
+                summary,
+            })
         })
         .collect();
 
@@ -3976,7 +4321,10 @@ fn extract_pages_from_text(text: &str) -> Vec<PageEntry> {
     let bare = regex::Regex::new(r#"https?://[^\s\)\]\>"']+"#).ok();
     if let Some(re) = bare.as_ref() {
         for m in re.find_iter(text) {
-            let url = m.as_str().trim_end_matches(['.', ',', ';', ':']).to_string();
+            let url = m
+                .as_str()
+                .trim_end_matches(['.', ',', ';', ':'])
+                .to_string();
             if url.is_empty() || !seen.insert(url.clone()) {
                 continue;
             }
@@ -3998,11 +4346,7 @@ fn extract_pages_from_text(text: &str) -> Vec<PageEntry> {
 /// (`classify_prompt`) before it is mistaken for a pi SDK event. Returns `true`
 /// if the line was a control command (and consumed); `false` lets the caller
 /// fall through to normal pi event parsing.
-fn handle_control_line(
-    line: &str,
-    stdin: &Arc<Mutex<ChildStdin>>,
-    pigeon_enabled: bool,
-) -> bool {
+fn handle_control_line(line: &str, stdin: &Arc<Mutex<SidecarStdin>>, pigeon_enabled: bool) -> bool {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return false,
@@ -4042,7 +4386,7 @@ fn handle_control_line(
 /// (`let _ =`). A dropped `classified` line would otherwise leave the sidecar's
 /// `requestClassification()` awaiting forever (#7). The sidecar additionally
 /// guards with a 5s timeout, but surfacing the error here aids diagnosis.
-fn write_jsonl_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
+fn write_jsonl_to_stdin(stdin: &Arc<Mutex<SidecarStdin>>, value: &serde_json::Value) {
     if let Ok(mut s) = stdin.lock() {
         if let Ok(line) = serde_json::to_string(value) {
             if let Err(e) = s.write_all(format!("{line}\n").as_bytes()) {
@@ -4067,14 +4411,14 @@ enum SidecarTermination {
 }
 
 fn classify_sidecar_termination(
-    exit_status: Option<std::process::ExitStatus>,
+    exit_status: Option<SidecarExitStatus>,
     timed_out: bool,
 ) -> SidecarTermination {
     if timed_out {
         return SidecarTermination::Timeout;
     }
     match exit_status {
-        Some(status) if !status.success() => SidecarTermination::Crash(status.code().unwrap_or(-1)),
+        Some(status) if !status_success(&status) => SidecarTermination::Crash(status_code(&status)),
         _ => SidecarTermination::Clean,
     }
 }
@@ -4084,10 +4428,7 @@ fn classify_sidecar_termination(
 /// (`try_wait` returned `Ok(None)`). `classify_sidecar_termination(None, ..)`
 /// would otherwise report `Clean` and leave the session in the map forever —
 /// an orphaned child with no stdin/stdout that never gets reaped.
-fn is_zombie_stdout_close(
-    exit_status: Option<std::process::ExitStatus>,
-    child_alive: bool,
-) -> bool {
+fn is_zombie_stdout_close(exit_status: Option<SidecarExitStatus>, child_alive: bool) -> bool {
     child_alive && exit_status.is_none()
 }
 
@@ -4144,7 +4485,7 @@ pub fn kill_all_pi_sessions(app: &AppHandle) {
     // a reader thread of a DIFFERENT session can hit EOF and block on
     // state.inner inside remove_session_if_same_generation — holding the lock
     // while joining would deadlock.
-    let to_kill: Vec<(Arc<Mutex<Child>>, Option<JoinHandle<()>>, String)> = {
+    let to_kill: Vec<(Arc<Mutex<SidecarChild>>, Option<JoinHandle<()>>, String)> = {
         let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut collected = Vec::new();
         for (id, slot) in guard.iter_mut() {
@@ -4159,11 +4500,11 @@ pub fn kill_all_pi_sessions(app: &AppHandle) {
         }
         collected
     }; // lock dropped here
-    // Phase 2: kill children, join readers, persist status — all outside the lock.
+       // Phase 2: kill children, join readers, persist status — all outside the lock.
     for (child, reader, id) in to_kill {
         if let Ok(mut c) = child.lock() {
-            let _ = c.kill();
-            let _ = c.wait();
+            let _ = child_kill(&mut c);
+            let _ = child_wait(&mut c);
         }
         if let Some(handle) = reader {
             let _ = handle.join();
@@ -4183,7 +4524,7 @@ pub fn kill_all_pi_sessions(app: &AppHandle) {
 /// each line via `eprintln!` so packaged (terminal-less) builds still surface
 /// logs through Tauri's logger. (The release-build gate is applied at the spawn
 /// site; this function is always callable but only wired up there.)
-fn spawn_stderr_forwarder(stderr: std::process::ChildStderr) {
+fn spawn_stderr_forwarder(stderr: SidecarStderr) {
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -4215,7 +4556,7 @@ fn spawn_session_timeout_watchdog(
     app: AppHandle,
     session_id: String,
     generation: Arc<AtomicU64>,
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<SidecarChild>>,
     timed_out: Arc<AtomicBool>,
     spawned_at: Instant,
     timeout_secs: u64,
@@ -4236,12 +4577,13 @@ fn spawn_session_timeout_watchdog(
         let still_alive = child
             .lock()
             .ok()
-            .and_then(|mut c| c.try_wait().ok().flatten())
+            .and_then(|mut c| child_try_wait(&mut c).ok().flatten())
             .is_none();
         if still_alive {
             timed_out.store(true, Ordering::SeqCst);
             if let Ok(mut c) = child.lock() {
-                let _ = c.kill();
+                let _ = child_kill(&mut c);
+                let _ = child_wait(&mut c);
             }
             // Self-sufficient cleanup (#3): even if the reader thread is
             // dead/stuck when the timeout fires, evict the session and persist
@@ -4259,10 +4601,10 @@ fn spawn_session_timeout_watchdog(
 /// NOT when sibling sessions spawn or stop (fixes BLOCKER #1).
 fn read_sidecar_events(
     app: AppHandle,
-    stdout: std::process::ChildStdout,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdout: SidecarStdout,
+    stdin: Arc<Mutex<SidecarStdin>>,
     generation: Arc<AtomicU64>,
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<SidecarChild>>,
     timed_out: Arc<AtomicBool>,
     agent_id: &str,
     pigeon_enabled: bool,
@@ -4311,12 +4653,24 @@ fn read_sidecar_events(
         let try_wait = child
             .lock()
             .ok()
-            .and_then(|mut c| c.try_wait().ok());
+            .and_then(|mut c| child_try_wait(&mut c).ok());
         let exit_status = try_wait.flatten();
         // Zombie-leak guard (#1): stdout closed but the child is still alive
         // (`try_wait` returned `Ok(None)`) — otherwise classified as `Clean`
         // and the session leaks in the map forever.
         let child_alive = try_wait.map(|s| s.is_none()).unwrap_or(false);
+        // The Windows broker must restore ACLs/network policy explicitly on
+        // every EOF path, including ordinary clean exit. Do this before the
+        // session is evicted; Drop remains a retry fallback if restoration
+        // reports an error. Unix keeps its existing Child lifecycle.
+        #[cfg(target_os = "windows")]
+        if !is_zombie_stdout_close(exit_status, child_alive) {
+            if let Ok(mut c) = child.lock() {
+                if let Err(error) = child_wait(&mut c) {
+                    eprintln!("[pi-sidecar] broker cleanup after stdout EOF failed: {error}");
+                }
+            }
+        }
         // A death mid-stream (crash/timeout/kill) means text_end/thinking_end
         // never arrived — flush the accumulators into real entries so the
         // partial reply reaches BOTH the final snapshot and the bridge file
@@ -4346,9 +4700,7 @@ fn read_sidecar_events(
             SidecarTermination::Crash(code) => {
                 mapper.running = false;
                 mapper.push_entry(ConsoleEntry::Banner {
-                    text: format!(
-                        "pi sidecar crashed (exit code {code}). Spawn a new session."
-                    ),
+                    text: format!("pi sidecar crashed (exit code {code}). Spawn a new session."),
                     time: EventMapper::now_str(),
                 });
                 mapper.emit_snapshot(&app);
@@ -4364,7 +4716,8 @@ fn read_sidecar_events(
                     // Child orphaned (no stdin/stdout) → kill it and evict the
                     // session so it cannot become a zombie after restart.
                     if let Ok(mut c) = child.lock() {
-                        let _ = c.kill();
+                        let _ = child_kill(&mut c);
+                        let _ = child_wait(&mut c);
                     }
                     eprintln!(
                         "[pi-sidecar] pi sidecar stdout closed but child still alive — removing session {agent_id}"
@@ -4452,7 +4805,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for v in [
-            "0", "false", "no", "off", "FALSE", "No", "OFF", "  no  ", "\tFalse\n",
+            "0",
+            "false",
+            "no",
+            "off",
+            "FALSE",
+            "No",
+            "OFF",
+            "  no  ",
+            "\tFalse\n",
         ] {
             std::env::set_var("DEVBOULE_PI_ENABLED", v);
             assert!(
@@ -4468,7 +4829,9 @@ mod tests {
         let _guard = PI_SIDECAR_ENABLED_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for v in ["1", "true", "yes", "on", "TRUE", "Yes", "ON", "  yes ", "On"] {
+        for v in [
+            "1", "true", "yes", "on", "TRUE", "Yes", "ON", "  yes ", "On",
+        ] {
             std::env::set_var("DEVBOULE_PI_ENABLED", v);
             assert!(
                 pi_sidecar_enabled(),
@@ -4555,14 +4918,20 @@ mod tests {
     fn agent_id_orchestrator_uses_stable_project_id() {
         let id = generate_agent_id("orchestrator", Some("my-proj"));
         assert_eq!(id, "orchestrator-my-proj");
-        assert_eq!(id, super::super::projects::stable_orchestrator_agent_id("my-proj"));
+        assert_eq!(
+            id,
+            super::super::projects::stable_orchestrator_agent_id("my-proj")
+        );
     }
 
     #[test]
     fn agent_id_orchestrator_sanitizes_hostile_project_id() {
         let id = generate_agent_id("orchestrator", Some("proj/../evil name!"));
         assert!(id.starts_with("orchestrator-"), "id: {id}");
-        assert!(!id.contains('/'), "id must not contain path separators: {id}");
+        assert!(
+            !id.contains('/'),
+            "id must not contain path separators: {id}"
+        );
         assert!(!id.contains(' '), "id must not contain spaces: {id}");
     }
 
@@ -4595,7 +4964,10 @@ mod tests {
         // legacy `pi-<counter>` fallback), so the frontend console subscribes to
         // `mini-activity://main-<ts>`.
         let id = generate_agent_id("main-coder", None);
-        assert!(id.starts_with("main-"), "main id must use main- namespace: {id}");
+        assert!(
+            id.starts_with("main-"),
+            "main id must use main- namespace: {id}"
+        );
         let ts: u128 = id["main-".len()..id.rfind('-').unwrap()]
             .parse()
             .expect("main- suffix must start with a numeric timestamp");
@@ -4607,7 +4979,10 @@ mod tests {
         // A "mini-coder" role must produce `mini-<numeric timestamp>` (NOT the
         // legacy `pi-<counter>` fallback).
         let id = generate_agent_id("mini-coder", None);
-        assert!(id.starts_with("mini-"), "mini id must use mini- namespace: {id}");
+        assert!(
+            id.starts_with("mini-"),
+            "mini id must use mini- namespace: {id}"
+        );
         let ts: u128 = id["mini-".len()..id.rfind('-').unwrap()]
             .parse()
             .expect("mini- suffix must start with a numeric timestamp");
@@ -4638,8 +5013,14 @@ mod tests {
         // (the override threads the minted id via explicit_id, not regeneration).
         let coder_id = generate_agent_id("main-coder", Some("my-proj"));
         let mini_id = generate_agent_id("mini-coder", Some("my-proj"));
-        assert!(coder_id.starts_with("main-"), "coder must be main-*: {coder_id}");
-        assert!(mini_id.starts_with("mini-"), "mini must be mini-*: {mini_id}");
+        assert!(
+            coder_id.starts_with("main-"),
+            "coder must be main-*: {coder_id}"
+        );
+        assert!(
+            mini_id.starts_with("mini-"),
+            "mini must be mini-*: {mini_id}"
+        );
         // Each call appends a global monotonic counter, so every call is unique
         // BY DESIGN (uniqueness is the property; determinism is not).
         let coder_id2 = generate_agent_id("main-coder", Some("my-proj"));
@@ -4650,14 +5031,20 @@ mod tests {
     fn pi_override_agent_id_coder_yields_main_namespace() {
         let result = pi_override_agent_id("coder", "my-proj");
         let id = result.expect("coder must override");
-        assert!(id.starts_with("main-"), "coder override must be main-*: {id}");
+        assert!(
+            id.starts_with("main-"),
+            "coder override must be main-*: {id}"
+        );
     }
 
     #[test]
     fn pi_override_agent_id_mini_yields_mini_namespace() {
         let result = pi_override_agent_id("mini", "my-proj");
         let id = result.expect("mini must override");
-        assert!(id.starts_with("mini-"), "mini override must be mini-*: {id}");
+        assert!(
+            id.starts_with("mini-"),
+            "mini override must be mini-*: {id}"
+        );
     }
 
     #[test]
@@ -4712,12 +5099,20 @@ mod tests {
         // Bump gen_b too.
         let gen_b_val = gen_b.fetch_add(1, Ordering::SeqCst) + 1;
         assert_eq!(gen_b_val, 1);
-        assert_eq!(gen_a.load(Ordering::SeqCst), 1, "gen_a must be unaffected by gen_b bump");
+        assert_eq!(
+            gen_a.load(Ordering::SeqCst),
+            1,
+            "gen_a must be unaffected by gen_b bump"
+        );
 
         // Bump gen_a again (respawn session A).
         let gen_a_val2 = gen_a.fetch_add(1, Ordering::SeqCst) + 1;
         assert_eq!(gen_a_val2, 2);
-        assert_eq!(gen_b.load(Ordering::SeqCst), 1, "gen_b must still be unaffected");
+        assert_eq!(
+            gen_b.load(Ordering::SeqCst),
+            1,
+            "gen_b must still be unaffected"
+        );
     }
 
     #[test]
@@ -4728,7 +5123,11 @@ mod tests {
         assert_eq!(initial, 1);
 
         // Reader checks: still our generation?
-        assert_eq!(gen.load(Ordering::SeqCst), initial, "reader should continue");
+        assert_eq!(
+            gen.load(Ordering::SeqCst),
+            initial,
+            "reader should continue"
+        );
 
         // Session respawns — bumps THIS session's generation.
         gen.fetch_add(1, Ordering::SeqCst); // gen=2
@@ -4845,10 +5244,7 @@ mod tests {
             "sidecar.mjs",
         );
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            good.join("pi-sidecar").join("sidecar.mjs")
-        );
+        assert_eq!(result.unwrap(), good.join("pi-sidecar").join("sidecar.mjs"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4900,8 +5296,14 @@ mod tests {
         let err = result.unwrap_err();
         let expected_a = a.join("sidecar.mjs").display().to_string();
         let expected_b = b.join("sidecar.mjs").display().to_string();
-        assert!(err.contains(&expected_a), "must list first tried path: {err}");
-        assert!(err.contains(&expected_b), "must list second tried path: {err}");
+        assert!(
+            err.contains(&expected_a),
+            "must list first tried path: {err}"
+        );
+        assert!(
+            err.contains(&expected_b),
+            "must list second tried path: {err}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4913,15 +5315,17 @@ mod tests {
         // (map_mini_coder_backend_to_sidecar_env with a Cloud backend that has
         // empty model) and assert on the RETURNED values, not local string
         // literals. This verifies the actual code path, not a tautology.
-        let backend = mini_backend(
-            MiniCoderBackendKind::Cloud,
-            Some("tencent/hy3:free"),
-            None,
-        );
+        let backend = mini_backend(MiniCoderBackendKind::Cloud, Some("tencent/hy3:free"), None);
         let env = map_mini_coder_backend_to_sidecar_env(&backend, None, None);
         assert_ne!(env.provider, "anthropic", "must NOT default to Claude");
-        assert_eq!(env.provider, "openrouter", "fallback provider must be openrouter");
-        assert_eq!(env.model, "tencent/hy3:free", "fallback model must be hy3:free");
+        assert_eq!(
+            env.provider, "openrouter",
+            "fallback provider must be openrouter"
+        );
+        assert_eq!(
+            env.model, "tencent/hy3:free",
+            "fallback model must be hy3:free"
+        );
     }
 
     // -- A2: MiniCoderBackend -> SidecarEnvVars pure mapping ------------------
@@ -4955,7 +5359,11 @@ mod tests {
             Some("anthropic/claude-3.5-sonnet"),
             Some("https://openrouter.ai/api/v1"),
         );
-        let env = map_mini_coder_backend_to_sidecar_env(&backend, Some("sk-test".into()), Some("main-coder"));
+        let env = map_mini_coder_backend_to_sidecar_env(
+            &backend,
+            Some("sk-test".into()),
+            Some("main-coder"),
+        );
         assert_eq!(env.provider, "openrouter");
         assert_eq!(env.model, "anthropic/claude-3.5-sonnet");
         assert_eq!(
@@ -4963,7 +5371,10 @@ mod tests {
             Some(("OPENROUTER_API_KEY".to_string(), "sk-test".to_string())),
             "vault key must ride as OPENROUTER_API_KEY (env, never argv)"
         );
-        assert_eq!(env.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(
+            env.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
     }
 
     #[test]
@@ -5004,11 +5415,7 @@ mod tests {
         // produces (provider "openai", OPENAI_API_KEY=ollama, base_url
         // passthrough or OLLAMA_OPENAI_BASE_URL default). This is the
         // single-source-of-truth guarantee.
-        let backend = mini_backend(
-            MiniCoderBackendKind::Ollama,
-            Some("qwen2.5-coder:7b"),
-            None,
-        );
+        let backend = mini_backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder:7b"), None);
         let env = map_mini_coder_backend_to_sidecar_env(&backend, None, Some("main-coder"));
         assert_eq!(env.provider, "openai");
         assert_eq!(env.model, "qwen2.5-coder:7b");
@@ -5064,9 +5471,15 @@ mod tests {
         );
         let env = map_mini_coder_backend_to_sidecar_env(&backend, None, Some("mini"));
         // The env reflects the omlx backend's own config, NOT a fallback.
-        assert_eq!(env.provider, "openai", "omlx must map to provider openai, not fall back");
-        assert_eq!(env.base_url.as_deref(), Some("http://localhost:8000/v1"),
-            "omlx base_url must be preserved from the backend, not a localCoderBackend fallback");
+        assert_eq!(
+            env.provider, "openai",
+            "omlx must map to provider openai, not fall back"
+        );
+        assert_eq!(
+            env.base_url.as_deref(),
+            Some("http://localhost:8000/v1"),
+            "omlx base_url must be preserved from the backend, not a localCoderBackend fallback"
+        );
         assert_eq!(
             env.api_key_env,
             Some(("OPENAI_API_KEY".to_string(), "mlx".to_string())),
@@ -5091,8 +5504,7 @@ mod tests {
             let backend = mini_backend(kind, Some("m"), Some("http://x/v1"));
             let env = map_mini_coder_backend_to_sidecar_env(&backend, None, Some("main-coder"));
             assert_eq!(
-                env.provider,
-                "openrouter",
+                env.provider, "openrouter",
                 "non-sidecar kind {kind:?} must fall back to openrouter"
             );
             assert_eq!(
@@ -5145,7 +5557,7 @@ mod tests {
         let slot = SessionSlot { inner: None };
         assert!(slot.inner.is_none(), "placeholder slot must be None");
     }
-    
+
     #[test]
     fn session_slot_inner_is_some_when_live() {
         // Can't construct a real PiSession without a Child, but we can
@@ -5178,11 +5590,15 @@ mod tests {
         release_spawn_reservation(&state, "pi-stuck");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn kill_on_drop_reaps_child_when_not_disarmed() {
         // CRIT-11: post-spawn early return must kill the child (vault keys in env).
         #[cfg(unix)]
-        let child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         #[cfg(windows)]
         let child = {
             use std::os::windows::process::CommandExt;
@@ -5220,6 +5636,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn kill_on_drop_disarm_releases_without_double_reap() {
         #[cfg(unix)]
@@ -5301,7 +5718,8 @@ mod tests {
         // as a first-class event (replaces the dead sendMessage echo). Parse it
         // and verify handle_event maps it to a WebSearch console entry.
         let line = r#"{"type":"devboule_websearch","query":"anthropic claude","results":{"queries":["anthropic claude"],"totalResults":5,"successfulQueries":1},"timestamp":1234567890}"#;
-        let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_websearch event");
+        let event: PiEvent =
+            serde_json::from_str(line).expect("must parse devboule_websearch event");
         assert_eq!(event.event_type, "devboule_websearch");
         assert_eq!(event.query.as_deref(), Some("anthropic claude"));
         assert!(event.results.is_some());
@@ -5322,7 +5740,8 @@ mod tests {
     #[test]
     fn parses_devboule_model_switch_event() {
         let line = r#"{"type":"devboule_model_switch","from":"tencent/hy3","to":"kwaipilot/kat-coder-air-v2.5","reason":"rate limited","resolved":true}"#;
-        let event: PiEvent = serde_json::from_str(line).expect("must parse devboule_model_switch event");
+        let event: PiEvent =
+            serde_json::from_str(line).expect("must parse devboule_model_switch event");
         assert_eq!(event.event_type, "devboule_model_switch");
         assert_eq!(event.from.as_deref(), Some("tencent/hy3"));
         assert_eq!(event.to.as_deref(), Some("kwaipilot/kat-coder-air-v2.5"));
@@ -5705,7 +6124,8 @@ mod tests {
             ref other => panic!("expected Thinking at shifted idx, got {other:?}"),
         }
         assert_eq!(
-            mapper.live_thinking_idx, Some(497),
+            mapper.live_thinking_idx,
+            Some(497),
             "tracker still points at shifted live entry"
         );
 
@@ -5720,7 +6140,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
             .count();
-        assert_eq!(thinking_count, 1, "exactly one Thinking entry after finalize");
+        assert_eq!(
+            thinking_count, 1,
+            "exactly one Thinking entry after finalize"
+        );
         match mapper.entries[497] {
             ConsoleEntry::Thinking { ref text, .. } => assert_eq!(text, "AB"),
             ref other => panic!("expected finalized Thinking at idx 497, got {other:?}"),
@@ -5784,7 +6207,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
             .count();
-        assert_eq!(thinking_count, 0, "live thinking entry evicted, none remain");
+        assert_eq!(
+            thinking_count, 0,
+            "live thinking entry evicted, none remain"
+        );
 
         // A later delta re-pushes a fresh live entry at the tail. Note: FIFO
         // eviction drops the *visual* entry but does NOT reset `accumulated_thinking`
@@ -5888,7 +6314,11 @@ mod tests {
             delta: Some("B".to_string()),
             content_index: Some(0),
         });
-        assert_eq!(mapper.live_thinking_idx, Some(1), "'B' pushed as a new entry");
+        assert_eq!(
+            mapper.live_thinking_idx,
+            Some(1),
+            "'B' pushed as a new entry"
+        );
 
         // Finalize "B".
         mapper.apply_message_delta(&AssistantMessageEvent {
@@ -5908,7 +6338,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            final_thinking, vec!["A".to_string(), "B".to_string()],
+            final_thinking,
+            vec!["A".to_string(), "B".to_string()],
             "'A' and 'B' finalized as separate entries, no stale-merge"
         );
         assert!(mapper.accumulated_thinking.is_empty());
@@ -5922,14 +6353,20 @@ mod tests {
         let partial = serde_json::json!({
             "content": [{"type": "text", "text": "child agent: searching files"}]
         });
-        assert_eq!(extract_partial_snippet(&partial), "child agent: searching files");
+        assert_eq!(
+            extract_partial_snippet(&partial),
+            "child agent: searching files"
+        );
     }
 
     #[test]
     fn partial_snippet_falls_back_to_json() {
         let partial = serde_json::json!({ "progress": 0.5, "step": "compile" });
         let s = extract_partial_snippet(&partial);
-        assert!(s.contains("compile"), "json fallback must surface the data: {s}");
+        assert!(
+            s.contains("compile"),
+            "json fallback must surface the data: {s}"
+        );
     }
 
     #[test]
@@ -5937,7 +6374,11 @@ mod tests {
         let long = "a".repeat(300);
         let partial = serde_json::json!({ "content": [{ "type": "text", "text": long }] });
         let s = extract_partial_snippet(&partial);
-        assert!(s.chars().count() <= 201, "capped at 200 + ellipsis, got {}", s.chars().count());
+        assert!(
+            s.chars().count() <= 201,
+            "capped at 200 + ellipsis, got {}",
+            s.chars().count()
+        );
         assert!(!s.contains('\n'), "must be single-line");
     }
 
@@ -5947,7 +6388,10 @@ mod tests {
             "content": [{ "type": "text", "text": "line one\nline two\rline three" }]
         });
         let s = extract_partial_snippet(&partial);
-        assert!(!s.contains('\n') && !s.contains('\r'), "newlines replaced: {s}");
+        assert!(
+            !s.contains('\n') && !s.contains('\r'),
+            "newlines replaced: {s}"
+        );
         assert!(s.contains('␤'), "newline symbol present");
     }
 
@@ -5956,7 +6400,9 @@ mod tests {
     #[test]
     fn tool_progress_rewrites_args_row_in_place() {
         let mut mapper = EventMapper::new("pi-prog", Arc::new(Mutex::new(Vec::new())));
-        mapper.active_tool_progress.insert("t1".to_string(), (0, "  args: {}".to_string()));
+        mapper
+            .active_tool_progress
+            .insert("t1".to_string(), (0, "  args: {}".to_string()));
         mapper.push_entry(ConsoleEntry::Coder {
             node: None,
             text: "  args: {}".to_string(),
@@ -5992,7 +6438,9 @@ mod tests {
             });
         }
         // The tracked entry originally sits at index 250.
-        mapper.active_tool_progress.insert("t".to_string(), (250, "turn-250".to_string()));
+        mapper
+            .active_tool_progress
+            .insert("t".to_string(), (250, "turn-250".to_string()));
         for _ in 0..100 {
             mapper.push_entry(ConsoleEntry::Chat {
                 role: "user".to_string(),
@@ -6029,7 +6477,9 @@ mod tests {
                 msg_id: None,
             });
         }
-        mapper.active_tool_progress.insert("t".to_string(), (5, "turn-5".to_string()));
+        mapper
+            .active_tool_progress
+            .insert("t".to_string(), (5, "turn-5".to_string()));
         for _ in 0..6 {
             mapper.push_entry(ConsoleEntry::Chat {
                 role: "user".to_string(),
@@ -6058,8 +6508,11 @@ mod tests {
             text: args_text.clone(),
             time: String::new(),
         });
-        mapper.active_tool_progress.insert("t1".to_string(), (1, args_text.clone()));
-        let partial = serde_json::json!({ "content": [{ "type": "text", "text": "halfway there" }] });
+        mapper
+            .active_tool_progress
+            .insert("t1".to_string(), (1, args_text.clone()));
+        let partial =
+            serde_json::json!({ "content": [{ "type": "text", "text": "halfway there" }] });
         mapper.rewrite_tool_progress("t1", &partial);
         match mapper.entries[1] {
             ConsoleEntry::Coder { ref text, .. } => assert_eq!(text, "  ⋯ halfway there"),
@@ -6111,17 +6564,25 @@ mod tests {
         mapper
             .active_tool_progress
             .insert("B".to_string(), (mapper.entries.len() - 1, args_b.clone()));
-        assert_eq!(mapper.active_tool_progress.len(), 2, "both trackers present");
+        assert_eq!(
+            mapper.active_tool_progress.len(),
+            2,
+            "both trackers present"
+        );
 
         let partial = serde_json::json!({ "content": [{ "type": "text", "text": "B progress" }] });
         // B update rewrites ONLY B's row (index 3).
         mapper.rewrite_tool_progress("B", &partial);
         match &mapper.entries[1] {
-            ConsoleEntry::Coder { text, .. } => assert_eq!(text, &args_a, "A row untouched by B update"),
+            ConsoleEntry::Coder { text, .. } => {
+                assert_eq!(text, &args_a, "A row untouched by B update")
+            }
             _ => panic!("entry 1 must be the A args row"),
         }
         match &mapper.entries[3] {
-            ConsoleEntry::Coder { text, .. } => assert!(text.contains("B progress"), "B row shows progress"),
+            ConsoleEntry::Coder { text, .. } => {
+                assert!(text.contains("B progress"), "B row shows progress")
+            }
             _ => panic!("entry 3 must be the B args row"),
         }
         // A end: restore A's row, remove A only — B's tracker must survive.
@@ -6131,7 +6592,9 @@ mod tests {
             _ => panic!("entry 1 must be the A args row"),
         }
         match &mapper.entries[3] {
-            ConsoleEntry::Coder { text, .. } => assert!(text.contains("B progress"), "B row still in progress"),
+            ConsoleEntry::Coder { text, .. } => {
+                assert!(text.contains("B progress"), "B row still in progress")
+            }
             _ => panic!("entry 3 must be the B args row"),
         }
         assert_eq!(mapper.active_tool_progress.len(), 1, "A removed, B remains");
@@ -6139,10 +6602,15 @@ mod tests {
         mapper.rewrite_tool_progress("B", &partial);
         mapper.restore_tool_progress("B");
         match &mapper.entries[3] {
-            ConsoleEntry::Coder { text, .. } => assert_eq!(text, &args_b, "B row restored to original"),
+            ConsoleEntry::Coder { text, .. } => {
+                assert_eq!(text, &args_b, "B row restored to original")
+            }
             _ => panic!("entry 3 must be the B args row"),
         }
-        assert!(mapper.active_tool_progress.is_empty(), "all trackers removed");
+        assert!(
+            mapper.active_tool_progress.is_empty(),
+            "all trackers removed"
+        );
     }
 
     #[test]
@@ -6171,7 +6639,10 @@ mod tests {
             !pi_session_existed(&state, "pi-does-not-exist"),
             "unknown id => no live session"
         );
-        assert!(!pi_session_existed(&state, ""), "empty id => no live session");
+        assert!(
+            !pi_session_existed(&state, ""),
+            "empty id => no live session"
+        );
         // A present slot WITHOUT a live inner session must also report false.
         state
             .inner
@@ -6324,7 +6795,8 @@ mod tests {
         assert!(roles.contains("orchestrator"));
 
         // File on disk must contain both sessions.
-        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        let data =
+            std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
         assert!(data.contains("pi-1") && data.contains("pi-2"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6372,7 +6844,8 @@ mod tests {
         ));
         save_pi_sessions(&state, &root);
 
-        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        let data =
+            std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
         let file: SessionFile = serde_json::from_str(&data).unwrap();
         let ids: Vec<String> = file.sessions.iter().map(|s| s.id.clone()).collect();
         assert!(
@@ -6467,7 +6940,8 @@ mod tests {
         }
 
         // Every thread's session must survive — no lost writes under the race.
-        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        let data =
+            std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
         let file: SessionFile = serde_json::from_str(&data).unwrap();
         assert_eq!(
             file.sessions.len(),
@@ -6640,7 +7114,9 @@ mod tests {
         let _guard = PI_SIDECAR_SANDBOX_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for v in ["true", "1", "yes", "on", "TRUE", "Yes", "  yes ", "garbage", "ENABLED"] {
+        for v in [
+            "true", "1", "yes", "on", "TRUE", "Yes", "  yes ", "garbage", "ENABLED",
+        ] {
             std::env::set_var("DEVBOULE_PI_SANDBOX", v);
             assert!(
                 env_flag_default_on("DEVBOULE_PI_SANDBOX"),
@@ -6774,12 +7250,24 @@ mod tests {
     fn censor_loop_allows_up_to_cap_then_blocks() {
         let mut map: HashMap<String, u8> = HashMap::new();
         // Rounds 1 and 2 are allowed (cap = 2 consecutive sent rounds).
-        assert!(censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+        assert!(censor_loop_allow_in(
+            &map,
+            "pi-1",
+            CENSOR_LOOP_MAX_CONSECUTIVE
+        ));
         censor_loop_bump_in(&mut map, "pi-1");
-        assert!(censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+        assert!(censor_loop_allow_in(
+            &map,
+            "pi-1",
+            CENSOR_LOOP_MAX_CONSECUTIVE
+        ));
         censor_loop_bump_in(&mut map, "pi-1");
         // Round 3 must be blocked.
-        assert!(!censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+        assert!(!censor_loop_allow_in(
+            &map,
+            "pi-1",
+            CENSOR_LOOP_MAX_CONSECUTIVE
+        ));
     }
 
     #[test]
@@ -6787,9 +7275,17 @@ mod tests {
         let mut map: HashMap<String, u8> = HashMap::new();
         censor_loop_bump_in(&mut map, "pi-9");
         censor_loop_bump_in(&mut map, "pi-9");
-        assert!(!censor_loop_allow_in(&map, "pi-9", CENSOR_LOOP_MAX_CONSECUTIVE));
+        assert!(!censor_loop_allow_in(
+            &map,
+            "pi-9",
+            CENSOR_LOOP_MAX_CONSECUTIVE
+        ));
         censor_loop_reset_in(&mut map, "pi-9");
-        assert!(censor_loop_allow_in(&map, "pi-9", CENSOR_LOOP_MAX_CONSECUTIVE));
+        assert!(censor_loop_allow_in(
+            &map,
+            "pi-9",
+            CENSOR_LOOP_MAX_CONSECUTIVE
+        ));
     }
 
     // -- Fix 4: delivered-id dedup (pure) ------------------------------------
@@ -6810,7 +7306,11 @@ mod tests {
         use std::collections::HashSet;
         let _ = (Finding::default(), Verdict::Confirmed); // ensure schema types in scope
         let mut delivered: HashSet<String> = HashSet::new();
-        let findings = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let findings = vec![
+            finding_with_id("a"),
+            finding_with_id("b"),
+            finding_with_id("c"),
+        ];
         let (new_findings, already) = censor_dedup_in(&mut delivered, &findings);
         assert_eq!(already, 0, "first pass: nothing previously delivered");
         assert_eq!(new_findings.len(), 3, "first pass: all three are new");
@@ -6827,13 +7327,21 @@ mod tests {
         assert_eq!(new1.len(), 2);
         // A later review of the SAME files returns both findings again — dedup
         // must suppress them so the agent isn't nagged every 2 rounds.
-        let second = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let second = vec![
+            finding_with_id("a"),
+            finding_with_id("b"),
+            finding_with_id("c"),
+        ];
         let (new2, already2) = censor_dedup_in(&mut delivered, &second);
         assert_eq!(already2, 2, "two were already delivered");
         assert_eq!(new2.len(), 1, "only the new id (c) survives");
         assert_eq!(new2[0].id, "c");
         // A third pass with nothing new reports all-already and zero new.
-        let third = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let third = vec![
+            finding_with_id("a"),
+            finding_with_id("b"),
+            finding_with_id("c"),
+        ];
         let (new3, already3) = censor_dedup_in(&mut delivered, &third);
         assert_eq!(already3, 3);
         assert_eq!(new3.len(), 0, "no new findings on third pass");
@@ -6888,27 +7396,48 @@ mod tests {
 
     #[test]
     fn pi_route_disabled_always_none() {
-        assert_eq!(pi_route_for_launch(true, "orchestrator", "orchestrator", false), None);
-        assert_eq!(pi_route_for_launch(true, "coder", "orchestrator", false), None);
-        assert_eq!(pi_route_for_launch(true, "mini", "orchestrator", false), None);
+        assert_eq!(
+            pi_route_for_launch(true, "orchestrator", "orchestrator", false),
+            None
+        );
+        assert_eq!(
+            pi_route_for_launch(true, "coder", "orchestrator", false),
+            None
+        );
+        assert_eq!(
+            pi_route_for_launch(true, "mini", "orchestrator", false),
+            None
+        );
     }
 
     #[test]
     fn pi_route_prepare_only_always_none() {
         // launch_terminal=false means prepare-only path (Copy prompt) ⇒ no pi route
-        assert_eq!(pi_route_for_launch(false, "orchestrator", "orchestrator", true), None);
-        assert_eq!(pi_route_for_launch(false, "coder", "orchestrator", true), None);
+        assert_eq!(
+            pi_route_for_launch(false, "orchestrator", "orchestrator", true),
+            None
+        );
+        assert_eq!(
+            pi_route_for_launch(false, "coder", "orchestrator", true),
+            None
+        );
     }
 
     #[test]
     fn pi_route_unknown_role_is_none() {
-        assert_eq!(pi_route_for_launch(true, "verifier", "orchestrator", true), None);
+        assert_eq!(
+            pi_route_for_launch(true, "verifier", "orchestrator", true),
+            None
+        );
         assert_eq!(pi_route_for_launch(true, "", "orchestrator", true), None);
     }
 
     #[test]
     fn pi_route_codex_and_openai_clients_are_none() {
-        assert_eq!(pi_route_for_launch(true, "orchestrator", "codex", true), None);
+        assert_eq!(
+            pi_route_for_launch(true, "orchestrator", "codex", true),
+            None
+        );
         assert_eq!(pi_route_for_launch(true, "coder", "openai", true), None);
     }
 
@@ -6952,7 +7481,15 @@ mod tests {
 
     #[test]
     fn websearch_env_pairs_all_7_providers_have_env_var() {
-        for provider in ["exa", "brave", "tavily", "perplexity", "gemini_search", "openai_search", "parallel"] {
+        for provider in [
+            "exa",
+            "brave",
+            "tavily",
+            "perplexity",
+            "gemini_search",
+            "openai_search",
+            "parallel",
+        ] {
             let pairs = websearch_env_pairs(|p| {
                 if p == provider {
                     Ok(Some("test-key-12345678".into()))
@@ -6960,7 +7497,11 @@ mod tests {
                     Ok(None)
                 }
             });
-            assert_eq!(pairs.len(), 1, "provider {provider} must produce exactly one env pair");
+            assert_eq!(
+                pairs.len(),
+                1,
+                "provider {provider} must produce exactly one env pair"
+            );
         }
     }
 
@@ -7153,7 +7694,12 @@ mod tests {
         }
     }
 
-    fn make_live(agent_id: &str, project_id: &str, role: &str, model: Option<&str>) -> LivePiSession {
+    fn make_live(
+        agent_id: &str,
+        project_id: &str,
+        role: &str,
+        model: Option<&str>,
+    ) -> LivePiSession {
         LivePiSession {
             agent_id: agent_id.to_string(),
             project_id: project_id.to_string(),
@@ -7165,10 +7711,18 @@ mod tests {
     #[test]
     fn overlay_pi_sessions_orchestrator_synthetic_row() {
         let mut sessions = vec![make_session("coder-1", "running")];
-        let live = vec![make_live("orchestrator-proj1", "proj1", "orchestrator", None)];
+        let live = vec![make_live(
+            "orchestrator-proj1",
+            "proj1",
+            "orchestrator",
+            None,
+        )];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 2);
-        let orch = sessions.iter().find(|s| s.agent_id == "orchestrator-proj1").unwrap();
+        let orch = sessions
+            .iter()
+            .find(|s| s.agent_id == "orchestrator-proj1")
+            .unwrap();
         assert_eq!(orch.status, "running");
         assert_eq!(orch.client.as_deref(), Some("orchestrator"));
         assert_eq!(orch.current_project_id.as_deref(), Some("proj1"));
@@ -7178,7 +7732,12 @@ mod tests {
     #[test]
     fn overlay_pi_sessions_refreshes_terminal_status() {
         let mut sessions = vec![make_session("orchestrator-proj1", "closed")];
-        let live = vec![make_live("orchestrator-proj1", "proj1", "orchestrator", None)];
+        let live = vec![make_live(
+            "orchestrator-proj1",
+            "proj1",
+            "orchestrator",
+            None,
+        )];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 1);
         let orch = &sessions[0];
@@ -7199,7 +7758,12 @@ mod tests {
     #[test]
     fn overlay_pi_sessions_main_coder_gets_role_coder_client_pi() {
         let mut sessions = vec![];
-        let live = vec![make_live("main-123", "proj1", "main-coder", Some("claude-sonnet"))];
+        let live = vec![make_live(
+            "main-123",
+            "proj1",
+            "main-coder",
+            Some("claude-sonnet"),
+        )];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
@@ -7224,7 +7788,12 @@ mod tests {
     #[test]
     fn overlay_pi_sessions_model_threaded_from_persisted() {
         let mut sessions = vec![];
-        let live = vec![make_live("main-789", "proj1", "main-coder", Some("qwen2.5-coder:7b"))];
+        let live = vec![make_live(
+            "main-789",
+            "proj1",
+            "main-coder",
+            Some("qwen2.5-coder:7b"),
+        )];
         overlay_pi_sessions(&mut sessions, &live, "2025-01-01T00:00:00Z");
         assert_eq!(sessions[0].model.as_deref(), Some("qwen2.5-coder:7b"));
     }
@@ -7271,7 +7840,10 @@ mod tests {
     fn response_failure_banner_orchestrator_label() {
         let event = make_response_event(Some(false), Some("rate limit exceeded".to_string()));
         let banner = response_failure_banner(&event, Some("orchestrator"));
-        assert_eq!(banner.as_deref(), Some("Orchestrator turn failed: rate limit exceeded"));
+        assert_eq!(
+            banner.as_deref(),
+            Some("Orchestrator turn failed: rate limit exceeded")
+        );
     }
 
     #[test]
@@ -7283,7 +7855,10 @@ mod tests {
     #[test]
     fn response_failure_banner_no_error_uses_fallback() {
         let event = make_response_event(Some(false), None);
-        assert_eq!(response_failure_banner(&event, Some("orchestrator")).as_deref(), Some("Orchestrator turn failed"));
+        assert_eq!(
+            response_failure_banner(&event, Some("orchestrator")).as_deref(),
+            Some("Orchestrator turn failed")
+        );
     }
 
     #[test]
@@ -7347,14 +7922,12 @@ mod tests {
     fn drain_injections_survives_build_snapshot() {
         use std::sync::{Arc, Mutex};
 
-        let injections: ConsoleInjections = Arc::new(Mutex::new(vec![
-            ConsoleEntry::Chat {
-                role: "user".to_string(),
-                text: "steer msg".to_string(),
-                time: "11:00:00".to_string(),
-                msg_id: Some("m1".to_string()),
-            },
-        ]));
+        let injections: ConsoleInjections = Arc::new(Mutex::new(vec![ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "steer msg".to_string(),
+            time: "11:00:00".to_string(),
+            msg_id: Some("m1".to_string()),
+        }]));
 
         let mut mapper = EventMapper::new("test", injections);
         mapper.drain_injections();
@@ -7363,7 +7936,9 @@ mod tests {
         let entries = snapshot.entries.expect("entries should be present");
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            ConsoleEntry::Chat { role, text, msg_id, .. } => {
+            ConsoleEntry::Chat {
+                role, text, msg_id, ..
+            } => {
                 assert_eq!(role, "user");
                 assert_eq!(text, "steer msg");
                 assert_eq!(msg_id.as_deref(), Some("m1"));
@@ -7426,20 +8001,21 @@ mod tests {
         // fn sets it. We test the mapping fn's contract (always None) and then
         // verify the resolve fn would set it by checking the SidecarEnvVars
         // struct has the field.
-        let backend = mini_backend(
-            MiniCoderBackendKind::Cloud,
-            Some("m"),
-            Some("https://x/v1"),
-        );
+        let backend = mini_backend(MiniCoderBackendKind::Cloud, Some("m"), Some("https://x/v1"));
         let env = map_mini_coder_backend_to_sidecar_env(&backend, None, Some("main-coder"));
         // The mapping fn itself does NOT set the warning — that's the caller's job.
-        assert!(env.vault_key_warning.is_none(),
-            "mapping fn must not set vault_key_warning (caller's responsibility)");
+        assert!(
+            env.vault_key_warning.is_none(),
+            "mapping fn must not set vault_key_warning (caller's responsibility)"
+        );
         // But the SidecarEnvVars struct carries the field so the caller CAN set it.
         // This test pins that the field exists and is writable.
         let mut env_with_warning = env;
         env_with_warning.vault_key_warning = Some("test warning".to_string());
-        assert_eq!(env_with_warning.vault_key_warning.as_deref(), Some("test warning"));
+        assert_eq!(
+            env_with_warning.vault_key_warning.as_deref(),
+            Some("test warning")
+        );
     }
 
     // -- bridge write-through durability tests ---------------------------------
@@ -7450,10 +8026,8 @@ mod tests {
     /// pid-only dir would be shared — colliding on the file and letting one
     /// test's remove_dir_all delete another's live file.
     fn temp_bridge_dir(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "pi-bridge-test-{}-{label}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pi-bridge-test-{}-{label}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("test-agent.jsonl");
         (path, dir)
@@ -7486,7 +8060,8 @@ mod tests {
         let chat = crate::backend::mini_activity::parse_chat_line(lines[0]).expect("chat parses");
         assert_eq!(chat.role, "assistant");
         assert_eq!(chat.text, "hello");
-        let banner = crate::backend::mini_activity::parse_banner_line(lines[1]).expect("banner parses");
+        let banner =
+            crate::backend::mini_activity::parse_banner_line(lines[1]).expect("banner parses");
         assert_eq!(banner, "done");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7578,10 +8153,7 @@ mod tests {
     fn event_mapper_new_writes_no_file() {
         let (path, dir) = temp_bridge_dir("new_none");
         // `new` (no bridge) must NOT create/write the path.
-        let mut mapper = EventMapper::new(
-            "pi-bridge-4",
-            Arc::new(Mutex::new(Vec::new())),
-        );
+        let mut mapper = EventMapper::new("pi-bridge-4", Arc::new(Mutex::new(Vec::new())));
         mapper.push_entry(ConsoleEntry::Chat {
             role: "assistant".to_string(),
             text: "ephemeral".to_string(),
@@ -7623,9 +8195,7 @@ mod tests {
         // agent_end flushes the accumulated text into the assistant Chat entry.
         mapper.flush_text_block();
         let chat = mapper.entries.iter().find_map(|e| match e {
-            ConsoleEntry::Chat { role, text, .. } if role == "assistant" => {
-                Some(text.clone())
-            }
+            ConsoleEntry::Chat { role, text, .. } if role == "assistant" => Some(text.clone()),
             _ => None,
         });
         assert_eq!(
@@ -7665,7 +8235,11 @@ mod tests {
             },
         });
         let contents = std::fs::read_to_string(&path).expect("read bridge file");
-        assert_eq!(contents.lines().count(), 1, "still one line (Spawn => None)");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "still one line (Spawn => None)"
+        );
         assert!(contents.contains("only"), "only the chat line persisted");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7741,7 +8315,11 @@ mod tests {
         // `handle_event` needs an AppHandle; drive the same internal steps directly.
         mapper.flush_text_block();
         mapper.flush_thinking_block();
-        let args_str = event.args.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default()).unwrap_or_default();
+        let args_str = event
+            .args
+            .as_ref()
+            .map(|a| serde_json::to_string(a).unwrap_or_default())
+            .unwrap_or_default();
         mapper.push_entry(ConsoleEntry::Coder {
             node: Some(NodeStyle::Dot),
             text: format!("🔧 Calling `write`"),
@@ -7754,7 +8332,9 @@ mod tests {
         });
         if let Some(ref id) = event.tool_call_id {
             let args_idx = mapper.entries.len() - 1;
-            mapper.active_tool_progress.insert(id.clone(), (args_idx, format!("  args: {args_str}")));
+            mapper
+                .active_tool_progress
+                .insert(id.clone(), (args_idx, format!("  args: {args_str}")));
         }
 
         // tool_execution_end (✅ + result summary).
@@ -7762,7 +8342,8 @@ mod tests {
         let event: PiEvent = serde_json::from_str(tool_end).unwrap();
         mapper.flush_text_block();
         mapper.flush_thinking_block();
-        let result_summary = event.result
+        let result_summary = event
+            .result
             .as_ref()
             .and_then(|r| r.get("content"))
             .and_then(|c| c.as_array())
@@ -7849,11 +8430,8 @@ mod tests {
             .join("fixtures");
         std::fs::create_dir_all(&fixtures_dir).expect("create fixtures dir");
         let path = fixtures_dir.join("console-activity.json");
-        let json = serde_json::to_string_pretty(&snapshot)
-            .expect("snapshot must serialize")
-            + "\n";
-        std::fs::write(&path, json)
-            .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+        let json = serde_json::to_string_pretty(&snapshot).expect("snapshot must serialize") + "\n";
+        std::fs::write(&path, json).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
     }
 
     /// Recursively zero out every `time` field on a `ConsoleActivity` so the
@@ -7863,7 +8441,8 @@ mod tests {
         if let Some(ref mut entries) = activity.entries {
             for entry in entries.iter_mut() {
                 match entry {
-                    ConsoleEntry::Coder { time, .. } | ConsoleEntry::Spawn { time, .. }
+                    ConsoleEntry::Coder { time, .. }
+                    | ConsoleEntry::Spawn { time, .. }
                     | ConsoleEntry::WebSearch { time, .. }
                     | ConsoleEntry::Banner { time, .. }
                     | ConsoleEntry::Thinking { time, .. }
@@ -7892,12 +8471,17 @@ mod tests {
             delta: Some("live fragment".to_string()),
             content_index: Some(0),
         });
-        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
-            "live thinking push must NOT persist");
+        assert!(
+            !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
+            "live thinking push must NOT persist"
+        );
         // Now flush — the FINAL thinking entry must be persisted.
         mapper.flush_thinking_block();
         let contents = std::fs::read_to_string(&path).expect("read bridge file");
-        assert!(!contents.is_empty(), "flush must persist the thinking entry");
+        assert!(
+            !contents.is_empty(),
+            "flush must persist the thinking entry"
+        );
         let thinking_text =
             crate::backend::mini_activity::parse_thinking_line(contents.lines().next().unwrap())
                 .expect("parses as thinking");
@@ -7939,7 +8523,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ConsoleEntry::Chat { .. }))
             .count();
-        assert_eq!(chat_count, 0, "whitespace-only block must NOT become a Chat entry");
+        assert_eq!(
+            chat_count, 0,
+            "whitespace-only block must NOT become a Chat entry"
+        );
         assert!(
             mapper.accumulated_text.is_empty(),
             "accumulator must be cleared on the dropped path so the next delta starts fresh"
@@ -7967,7 +8554,11 @@ mod tests {
             ConsoleEntry::Chat { role, text, .. } if role == "assistant" => Some(text.clone()),
             _ => None,
         });
-        assert_eq!(chat.as_deref(), Some("Hello"), "non-empty text flushes as Chat");
+        assert_eq!(
+            chat.as_deref(),
+            Some("Hello"),
+            "non-empty text flushes as Chat"
+        );
     }
 
     #[test]
@@ -8007,7 +8598,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
             .count();
-        assert_eq!(thinking_count, 1, "real delta must surface a live Thinking entry");
+        assert_eq!(
+            thinking_count, 1,
+            "real delta must surface a live Thinking entry"
+        );
         match mapper.entries.last() {
             Some(ConsoleEntry::Thinking { text, .. }) => assert_eq!(text, "reasoning"),
             other => panic!("expected live Thinking entry, got {other:?}"),
@@ -8096,7 +8690,10 @@ mod fallback_chain_tests {
         let chain = expand_chain(primary(), vec![fb]);
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[1].provider, "openrouter"); // inherited
-        assert_eq!(chain[1].api_key_env, Some(("OPENROUTER_API_KEY".into(), "sk-abc".into()))); // inherited
+        assert_eq!(
+            chain[1].api_key_env,
+            Some(("OPENROUTER_API_KEY".into(), "sk-abc".into()))
+        ); // inherited
     }
 
     #[test]
@@ -8129,8 +8726,16 @@ mod fallback_chain_tests {
         let chain = expand_chain(
             primary(),
             vec![
-                FallbackModel { model: "claude".into(), provider: Some("anthropic".into()), base_url: None },
-                FallbackModel { model: "gpt-4o".into(), provider: Some("openrouter".into()), base_url: None },
+                FallbackModel {
+                    model: "claude".into(),
+                    provider: Some("anthropic".into()),
+                    base_url: None,
+                },
+                FallbackModel {
+                    model: "gpt-4o".into(),
+                    provider: Some("openrouter".into()),
+                    base_url: None,
+                },
             ],
         );
         assert_eq!(chain.len(), 3);
@@ -8174,4 +8779,3 @@ mod fallback_chain_tests {
         assert_eq!(chain.len(), 1); // whitespace model skipped
     }
 }
-

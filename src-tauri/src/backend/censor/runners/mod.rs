@@ -792,6 +792,7 @@ pub fn run_capture_stderr_with_timeout(
 /// capped reader; the OTHER pipe is drained to a sink (full-pipe deadlock
 /// guard). Variable names below keep the historical stdout-centric names —
 /// "stdout_handle" is "the captured stream's handle".
+#[cfg(not(target_os = "windows"))]
 fn run_capture_stream_with_timeout(
     program: &str,
     args: &[&str],
@@ -936,6 +937,99 @@ fn run_capture_stream_with_timeout(
     } else {
         Some(stdout)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn run_capture_stream_with_timeout(
+    program: &str,
+    args: &[&str],
+    root: &Path,
+    timeout: Duration,
+    capture_stderr: bool,
+) -> Option<String> {
+    use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
+    use crate::backend::sandbox::windows::spawn_sandboxed;
+    use std::collections::HashSet;
+    use std::os::windows::io::FromRawHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let policy = SandboxPolicy::deny(root.to_path_buf())
+        .writable(root.to_path_buf())
+        .net(NetPolicy::None)
+        .rlimits(ResourceLimits::default());
+    let env_vars: Vec<(String, String)> = [
+        "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC",
+        "PATHEXT", "APPDATA", "LOCALAPPDATA", "ProgramData", "WINDIR",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+    .collect();
+    let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let mut child = match spawn_sandboxed(&policy, program, &args_owned, root, &env_vars) {
+        Ok(child) => child,
+        Err(_) => {
+            eprintln!("censor: runner '{program}' failed to spawn in Windows sandbox at {}", root.display());
+            return None;
+        }
+    };
+
+    let stdout = unsafe { std::fs::File::from_raw_handle(child.take_stdout_handle().0) };
+    let stderr = unsafe { std::fs::File::from_raw_handle(child.take_stderr_handle().0) };
+    let overran_flag = Arc::new(AtomicBool::new(false));
+    let (capture_reader, drain_reader) = if capture_stderr {
+        (stderr, stdout)
+    } else {
+        (stdout, stderr)
+    };
+    let reader_flag = Arc::clone(&overran_flag);
+    let reader = std::thread::spawn(move || {
+        let mut source = capture_reader;
+        read_capped(&mut source, MAX_STDOUT_BYTES, &reader_flag)
+    });
+    let drainer = std::thread::spawn(move || {
+        let mut source = drain_reader;
+        let _ = std::io::copy(&mut source, &mut std::io::sink());
+    });
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait_and_restore();
+                let _ = reader.join();
+                let _ = drainer.join();
+                return None;
+            }
+        }
+        if overran_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait_and_restore();
+            break;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait_and_restore();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.wait_and_restore();
+    let _ = drainer.join();
+    let (bytes, overran) = reader.join().ok().unwrap_or_default();
+    if timed_out || overran || overran_flag.load(Ordering::Relaxed) {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&bytes).into_owned();
+    if output.is_empty() {
+        return None;
+    }
+    Some(output)
 }
 
 /// Read from `pipe` into a buffer capped at `max` bytes. Returns the bytes read and

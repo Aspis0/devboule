@@ -159,9 +159,16 @@ mod tests {
 
     #[test]
     fn writable_paths_appear_under_file_write() {
+        // The writable path must be absolute on every host platform: on Windows
+        // a POSIX-style "/tmp/..." is relative and would be skipped by the
+        // builder, breaking this test on Windows CI hosts.
+        #[cfg(target_os = "windows")]
+        let writable = PathBuf::from(r"C:\tmp\scratch-xyz");
+        #[cfg(not(target_os = "windows"))]
+        let writable = PathBuf::from("/tmp/scratch-xyz");
         let policy = SandboxPolicy {
             readonly_root: PathBuf::from("/readonly"),
-            writable_paths: vec![PathBuf::from("/tmp/scratch-xyz")],
+            writable_paths: vec![writable],
             net: NetPolicy::None,
             rlimits: ResourceLimits::default(),
         };

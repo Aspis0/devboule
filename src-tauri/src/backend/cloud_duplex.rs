@@ -19,9 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ChildStdin;
+#[cfg(not(target_os = "windows"))]
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -33,6 +35,16 @@ use super::state::BackendState;
 
 use super::cloud_claude::ClaudeNormalizer;
 use super::cloud_codex::CodexNormalizer;
+
+#[cfg(target_os = "windows")]
+type DuplexChild = crate::backend::sandbox::windows::SandboxedChild;
+#[cfg(not(target_os = "windows"))]
+type DuplexChild = Child;
+
+#[cfg(target_os = "windows")]
+type DuplexStdin = std::fs::File;
+#[cfg(not(target_os = "windows"))]
+type DuplexStdin = ChildStdin;
 
 /// Which cloud CLI + protocol this session speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -116,8 +128,8 @@ pub fn encode_user_turn(provider: Provider, msg: &str) -> String {
 /// Registered into the session map as soon as the child is spawned (before handshake/reader
 /// setup) so `kill_cloud_duplex` can reap a keyed child during the TOCTOU window.
 struct DuplexSession {
-    child: Arc<Mutex<Option<Child>>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    child: Arc<Mutex<Option<DuplexChild>>>,
+    stdin: Arc<Mutex<DuplexStdin>>,
     /// Bridge path, so live sends can echo the USER turn into the transcript
     /// (see `append_user_echo`). Empty when the launch had no bridge.
     activity_file: PathBuf,
@@ -141,24 +153,26 @@ struct DuplexSession {
 /// released). Drop kills+waits so a failed post-spawn setup never orphans a process that holds
 /// API keys in its env.
 struct KillOnDrop {
-    child: Option<Child>,
+    child: Option<DuplexChild>,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl KillOnDrop {
-    fn new(child: Child) -> Self {
+    fn new(child: DuplexChild) -> Self {
         Self { child: Some(child) }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
+    fn child_mut(&mut self) -> &mut DuplexChild {
         self.child.as_mut().expect("KillOnDrop already disarmed")
     }
 
     /// Release ownership without killing (caller now owns the Child).
-    fn disarm(mut self) -> Child {
+    fn disarm(mut self) -> DuplexChild {
         self.child.take().expect("KillOnDrop already disarmed")
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
@@ -244,13 +258,23 @@ fn append_bridge_line(path: &std::path::Path, line: &str) {
 }
 
 /// Reap (kill + wait) the shared child exactly once, taking it out of the `Option`. Idempotent.
-fn reap_child(child: &Arc<Mutex<Option<Child>>>, kill: bool) {
+fn reap_child(child: &Arc<Mutex<Option<DuplexChild>>>, kill: bool) {
     if let Ok(mut guard) = child.lock() {
         if let Some(mut c) = guard.take() {
-            if kill {
-                let _ = c.kill();
+            #[cfg(target_os = "windows")]
+            {
+                if kill {
+                    let _ = c.kill();
+                }
+                let _ = c.wait_and_restore();
             }
-            let _ = c.wait(); // reap — no zombie
+            #[cfg(not(target_os = "windows"))]
+            {
+                if kill {
+                    let _ = c.kill();
+                }
+                let _ = c.wait(); // reap — no zombie
+            }
         }
     }
 }
@@ -312,36 +336,79 @@ pub fn spawn_cloud_duplex(
     // Clean relaunch: kill any prior session for this id first.
     kill_cloud_duplex(app, sessions, agent_id);
 
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // stderr → a milestone line via a side reader (so a launch failure is visible, not silent).
-        .stderr(Stdio::piped());
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
-    // Kill+wait on any early return after spawn (stdin/stdout take failure, lock poison, …)
-    // so a keyed child with vault API keys in its env is never orphaned untracked.
-    let mut guard = KillOnDrop::new(child);
+    #[cfg(not(target_os = "windows"))]
+    let (child, child_stdin, child_stdout, child_stderr) = {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // stderr → a milestone line via a side reader (so a launch failure is visible, not silent).
+            .stderr(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+        let mut guard = KillOnDrop::new(child);
+        let child_stdin = guard
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| "child stdin unavailable".to_string())?;
+        let child_stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or_else(|| "child stdout unavailable".to_string())?;
+        let child_stderr = guard.child_mut().stderr.take();
+        (guard.disarm(), child_stdin, child_stdout, child_stderr)
+    };
 
-    let child_stdin = guard
-        .child_mut()
-        .stdin
-        .take()
-        .ok_or_else(|| "child stdin unavailable".to_string())?;
-    let child_stdout = guard
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout unavailable".to_string())?;
-    let child_stderr = guard.child_mut().stderr.take();
+    #[cfg(target_os = "windows")]
+    let (child, child_stdin, child_stdout, child_stderr) = {
+        use std::collections::HashSet;
+        use std::os::windows::io::FromRawHandle;
+        use crate::backend::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
+        use crate::backend::sandbox::windows::spawn_sandboxed_with_stdin;
+
+        // Cloud duplex is an interactive pipe path. It receives the same broker
+        // as pi sidecar, with the project root and Codex writable roots granted.
+        // Cloud providers require egress; local callers must not reach this path.
+        let mut policy = SandboxPolicy::deny(cwd.to_path_buf())
+            .writable(cwd.to_path_buf())
+            .net(NetPolicy::Enabled)
+            .rlimits(ResourceLimits::default());
+        if let Some(codex) = codex_policy.as_ref() {
+            for root in &codex.writable_roots {
+                let path = PathBuf::from(root);
+                if path.is_absolute() {
+                    policy = policy.writable(path);
+                }
+            }
+        }
+        let mut broker_env = envs.to_vec();
+        for key in [
+            "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC",
+            "PATHEXT", "APPDATA", "LOCALAPPDATA", "ProgramData", "WINDIR",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                broker_env.push((key.to_string(), value));
+            }
+        }
+        let mut seen = HashSet::new();
+        broker_env.retain(|(key, _)| seen.insert(key.to_ascii_uppercase()));
+        let mut child = spawn_sandboxed_with_stdin(&policy, program, args, cwd, &broker_env)
+            .map_err(|e| format!("failed to spawn sandboxed {program}: {e}"))?;
+        let stdin = unsafe { std::fs::File::from_raw_handle(child.take_stdin_write_handle().0) };
+        let stdout = unsafe { std::fs::File::from_raw_handle(child.take_stdout_handle().0) };
+        let stderr = unsafe { std::fs::File::from_raw_handle(child.take_stderr_handle().0) };
+        (child, stdin, stdout, Some(stderr))
+    };
+
     let stdin = Arc::new(Mutex::new(child_stdin));
-    let child = Arc::new(Mutex::new(Some(guard.disarm())));
+    let child = Arc::new(Mutex::new(Some(child)));
 
     // Codex sessions get a JSON-RPC correlator shared between the handshake driver, the reader
     // dispatcher, and the steering path. Claude sessions keep `None` (NDJSON, no correlation).
@@ -965,7 +1032,7 @@ fn append_codex_milestone(activity_file: &std::path::Path, text: &str) {
 
 /// Write one encoded JSON-RPC line to the shared stdin under its lock. Best-effort: a dead child
 /// makes the write fail harmlessly. Returns `false` if the stdin lock could not be acquired.
-fn write_codex_line(stdin: &Arc<Mutex<ChildStdin>>, line: &str) -> bool {
+fn write_codex_line(stdin: &Arc<Mutex<DuplexStdin>>, line: &str) -> bool {
     if let Ok(mut w) = stdin.lock() {
         let _ = w.write_all(line.as_bytes());
         let _ = w.flush();
@@ -1008,7 +1075,7 @@ fn wait_codex_response(
 #[allow(clippy::too_many_arguments)]
 fn codex_handshake_driver(
     codex: Arc<CodexClient>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<DuplexStdin>>,
     activity_file: PathBuf,
     cwd: String,
     model: Option<String>,
@@ -1179,7 +1246,7 @@ fn handle_codex_approval(
     codex: &Arc<CodexClient>,
     agent_id: &str,
     project_id: &str,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &Arc<Mutex<DuplexStdin>>,
     activity_file: &std::path::Path,
     v: &serde_json::Value,
 ) {
@@ -1614,6 +1681,7 @@ impl Default for CodexClient {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn user_echo_carries_the_msg_id_and_omits_it_when_absent() {
@@ -1940,6 +2008,7 @@ mod tests {
         assert!(!client.complete_response(5, serde_json::json!({"ok": false})));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn kill_on_drop_reaps_child_when_not_disarmed() {
         // Short-lived sleep; drop must kill+wait so the pid is gone (CRIT-11).
@@ -1983,6 +2052,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn kill_on_drop_disarm_releases_without_kill_on_drop() {
         // Child already exited: disarm then wait ourselves; Drop must be a no-op (no double-wait panic).
@@ -2031,6 +2101,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn handshake_driver_pre_cancelled_writes_no_timeout_milestone() {
         // FIX-1: reader EOF sets handshake_cancel before dropping response waiters. The
