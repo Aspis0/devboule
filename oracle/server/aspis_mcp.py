@@ -1766,7 +1766,26 @@ def write_text_crash_safe(path: Path, content: str, label: str) -> None:
             os.fsync(handle.fileno())
         if path.exists():
             shutil.copy2(path, backup_path)
-        os.replace(temp_path, path)
+        try:
+            os.replace(temp_path, path)
+        except OSError as exc:
+            # C6 round-14 hostile review: inside the cloud-duplex AppContainer
+            # the sandbox double-check rejects the atomic replace
+            # (MoveFileExW REPLACE_EXISTING -> ERROR_ACCESS_DENIED, e2e-proven
+            # in the app sandbox suite) even with DELETE+DELETE_CHILD granted.
+            # aspis_mcp runs INSIDE that AppContainer (Python MCP backend) and
+            # writes .aspis-agents.json (write_agents_state) plus project
+            # files — without this fallback every write fails closed and
+            # Unattended cloud runs cannot function. Fall back to copy+delete
+            # ONLY on ERROR_ACCESS_DENIED (winerror 5); any other error keeps
+            # original semantics.
+            if exc.winerror != 5:
+                raise
+            shutil.copy2(temp_path, path)
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
         if backup_path.exists():
             try:
                 backup_path.unlink()

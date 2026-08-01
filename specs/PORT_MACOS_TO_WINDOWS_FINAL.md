@@ -620,7 +620,16 @@ Verified on a non-elevated host: `real_pty_echo_is_captured_and_child_reaped`
   so without the fallback the hook's ledger update fails closed and Unattended
   cloud cannot function — round-13 review). The TokenIsAppContainer gate keeps
   the host-side launch-time callers strictly atomic. Unit tests simulate the
-  AppContainer context to exercise the fallback.
+  AppContainer context to exercise the fallback. The SAME gap existed in the
+  MCP servers that run INSIDE the AppContainer (mcpServers entries of the
+  sandboxed codex/claude child): `devboule-mcp` (Rust, default backend) and
+  `oracle/server/aspis_mcp.py` (Python, packaged fallback) both wrote
+  `.aspis-agents.json`/project files with a strict atomic replace
+  (MoveFileExW / os.replace) that fails ACCESS_DENIED in the double-check —
+  registration/heartbeat/claim writes would fail closed and Unattended cloud
+  could not function (round-14 review). Both now fall back to copy+delete on
+  ERROR_ACCESS_DENIED (winerror 5) only; other errors keep original
+  semantics.
 - **UNATTENDED MUST BE APP-HOSTED (review round 12, enforced in code)**: with
   `is_enforced()=true`, Unattended autonomy is unlocked — but the legacy
   EXTERNAL conhost path launches raw `conhost.exe` OUTSIDE the broker (no Job

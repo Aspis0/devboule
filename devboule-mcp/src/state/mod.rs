@@ -522,10 +522,33 @@ fn replace_existing(temp_path: &Path, target_path: &Path) -> std::io::Result<()>
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    if ok != 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    // C6 round-14 hostile review: inside the cloud-duplex AppContainer the
+    // sandbox double-check rejects the atomic replace access path with
+    // ERROR_ACCESS_DENIED even when DELETE+DELETE_CHILD are granted
+    // (e2e-proven in the app sandbox suite: cmd move /y, Move-Item -Force,
+    // [IO.File]::Replace all fail; copy+delete succeed). The devboule-mcp
+    // server runs INSIDE that AppContainer (mcpServers entry of the
+    // sandboxed codex/claude child) and writes .aspis-agents.json
+    // (write_agents_state) plus project files — without this fallback every
+    // registration/heartbeat/claim write fails closed and Unattended cloud
+    // runs cannot function. Fall back to copy+delete ONLY on
+    // ERROR_ACCESS_DENIED (0x5); any other error keeps original semantics.
+    if err.raw_os_error() != Some(5) {
+        return Err(err);
+    }
+    match std::fs::copy(temp_path, target_path) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(copy_err) => Err(std::io::Error::new(
+            err.kind(),
+            format!("MoveFileExW replace failed ({err}); copy fallback also failed: {copy_err}"),
+        )),
     }
 }
 
