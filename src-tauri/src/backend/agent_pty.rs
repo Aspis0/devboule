@@ -1236,6 +1236,7 @@ mod tests {
             "ring buffer should contain the prompt file contents, got: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&prompt_dir);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     // INTEGRATION (FIX 2): a child that exits immediately must NOT orphan its

@@ -311,6 +311,20 @@ mod tests {
     }
 
     #[test]
+    fn builder_adds_readonly_paths() {
+        let policy = SandboxPolicy::deny("/proj".into())
+            .readonly("/tmp/prompt.d".into())
+            .readonly("/tmp/gitconfig".into());
+
+        assert_eq!(
+            policy.readonly_paths,
+            vec![PathBuf::from("/tmp/prompt.d"), PathBuf::from("/tmp/gitconfig")]
+        );
+        // readonly_paths must NOT grant write access (deny-by-default otherwise).
+        assert!(policy.writable_paths.is_empty());
+    }
+
+    #[test]
     fn default_rlimits_are_conservative() {
         let limits = ResourceLimits::default();
         assert_eq!(limits.cpu_secs, 600);

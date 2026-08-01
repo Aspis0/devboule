@@ -268,15 +268,24 @@ fn spawn_agent_terminal_app_impl(
     // C6: the AppContainer child cannot read user-only %TEMP% files — grant the
     // prompt dir + session gitconfig dir as read roots (Windows only; on macOS
     // the seatbelt profile allows broad reads so these are no-ops there).
+    // Reviewer follow-up (1113782): the session gitconfig [include]s the user's
+    // REAL global git config (~/.gitconfig / XDG) — that file must be readable
+    // too or every git call in the sandbox dies with "unable to read config
+    // file". Grant the real config FILE(S) directly (single-file ACEs, cheap;
+    // contains commit identity + safe.directory, no credentials by design).
     #[cfg(target_os = "windows")]
     {
         if let Some(parent) = prompt_file.parent() {
             cmd = cmd.read_root(parent.to_path_buf());
         }
-        if let Ok(gitconfig) = write_session_gitconfig() {
+        let session_gitconfig = write_session_gitconfig();
+        if let Ok(gitconfig) = &session_gitconfig {
             if let Some(parent) = gitconfig.parent() {
                 cmd = cmd.read_root(parent.to_path_buf());
             }
+        }
+        for real in real_global_gitconfig_paths() {
+            cmd = cmd.read_root(real);
         }
     }
 
