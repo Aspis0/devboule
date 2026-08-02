@@ -1156,9 +1156,11 @@ impl Drop for PackageSidGuard {
     fn drop(&mut self) {
         if self.loopback_granted {
             if let Some(sid) = self.sid {
-                // Best-effort; the registry keeps the SID on failure so a
-                // later retry (or the next grant) can rebuild correctly.
-                let _ = revoke_loopback_exemption(sid);
+                // Best-effort, NON-draining core (round-37: Drop paths must
+                // not trigger the pending-drain; the public entry points do).
+                if let Some(bytes) = sid_to_bytes(sid) {
+                    let _ = revoke_loopback_exemption_bytes(&bytes);
+                }
             }
             self.loopback_granted = false;
         }
@@ -1400,11 +1402,12 @@ impl SandboxedChild {
         // global list). Best-effort: on failure the registry retains the SID
         // for a later retry.
         if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
-            let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
-            // Round-33: clear the ownership flag ONLY on successful
+            // Round-33/37: clear the ownership flag ONLY on successful
             // revocation — on failure the Drop below retries (and the
             // registry keeps the SID so a later grant rebuild is consistent).
-            if revoke_loopback_exemption(sid).is_ok() {
+            // Uses the NON-draining core directly (round-37: Drop paths must
+            // not trigger the pending-drain; public entry points do).
+            if revoke_loopback_exemption_bytes(&self.loopback_sid_bytes).is_ok() {
                 self.loopback_exempted = false;
             }
         }
@@ -1463,13 +1466,11 @@ impl Drop for SandboxedChild {
             // The registry set keeps the SID if the API call fails, so a
             // later revoke (or the next grant rebuild) stays consistent.
             if self.loopback_exempted && !self.loopback_sid_bytes.is_empty() {
-                let sid = PSID(self.loopback_sid_bytes.as_ptr() as *mut core::ffi::c_void);
-                // Round-34: on failure the SID lands in PENDING_REVOKES (the
-                // registry keeps it too), so ownership survives this Drop —
-                // the next grant/revoke drains and retries. The flag is
-                // cleared because this object is gone; the pending record is
-                // the durable ownership.
-                let _ = revoke_loopback_exemption(sid);
+                // Round-34/37: on failure the SID lands in PENDING_REVOKES
+                // (the registry keeps it too), so ownership survives this
+                // Drop — the next public grant/revoke drains and retries.
+                // NON-draining core directly (round-37).
+                let _ = revoke_loopback_exemption_bytes(&self.loopback_sid_bytes);
                 self.loopback_exempted = false;
             }
 
@@ -1877,8 +1878,15 @@ fn revoke_loopback_exemption_bytes(bytes: &[u8]) -> Result<(), String> {
 /// (round-36 review — `*p = still_pending` could erase a SID that another
 /// thread pushed during the drain).
 fn drain_pending_revokes() -> Result<(), String> {
+    // Round-37 hostile review: ATOMICALLY TAKE the queue (mem::take) — the
+    // previous clone left the original list intact, so a SUCCESSFUL retry
+    // still found its SID in the untouched original and the final merge
+    // re-added it: successful revokes stayed pending forever. After take,
+    // the queue only receives (a) failures re-added by the revoke core and
+    // (b) entries appended concurrently during the drain — the merge below
+    // reconciles exactly those.
     let pending = match PENDING_REVOKES.lock() {
-        Ok(p) => p.clone(),
+        Ok(mut p) => std::mem::take(&mut *p),
         Err(_) => return Ok(()),
     };
     let mut still_pending = Vec::new();
@@ -1888,8 +1896,8 @@ fn drain_pending_revokes() -> Result<(), String> {
         }
     }
     if let Ok(mut p) = PENDING_REVOKES.lock() {
-        // Keep the ones that failed this round, PLUS any concurrently added
-        // entries (they were not part of `pending` and were not retried).
+        // Merge: still-failed entries + anything appended during the drain,
+        // deduplicated. Successful entries are gone for good.
         let mut merged: Vec<Vec<u8>> = still_pending;
         for b in p.iter() {
             if !merged.contains(b) {
@@ -3293,6 +3301,17 @@ mod tests {
 
         let mut l1 = listener1;
         let mut l2 = listener2;
+        // Snapshot BOTH SIDs before any revocation: after child1's drop the
+        // registry must contain child2's SID and NOT child1's (round-36/37:
+        // capture the actual SID bytes, not just cardinality).
+        let sids_before: Vec<Vec<u8>> = LOOPBACK_SIDS
+            .lock()
+            .expect("registry lock")
+            .as_ref()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(sids_before.len(), 2, "two grants must be registered, got {sids_before:?}");
+
         // First probes: both children connect while both exemptions are live.
         let ok1a = accept_one(&mut l1, 30);
         let ok2a = accept_one(&mut l2, 30);
@@ -3302,18 +3321,24 @@ mod tests {
         // keep child2's exemption.
         let _ = child1.wait_and_restore();
         drop(child1);
-        // Round-36 review: assert the revocation actually took effect — the
-        // registry must no longer hold child1's SID (wait_and_restore clears
-        // the ownership flag only on a SUCCESSFUL revoke, and Drop retries).
-        if let Ok(reg) = LOOPBACK_SIDS.lock() {
-            if let Some(set) = reg.as_ref() {
-                assert!(
-                    set.len() <= 1,
-                    "after child1's revoke at most child2's SID may remain, got {}",
-                    set.len()
-                );
-            }
-        }
+        // Round-36/37: assert the revocation actually took effect — child1's
+        // SID must be GONE, child2's must remain (wait_and_restore clears the
+        // ownership flag only on a SUCCESSFUL revoke, and Drop retries).
+        let sids_after: Vec<Vec<u8>> = LOOPBACK_SIDS
+            .lock()
+            .expect("registry lock")
+            .as_ref()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            sids_after.len(),
+            1,
+            "exactly one SID (child2) must remain after child1's revoke, got {sids_after:?}"
+        );
+        assert!(
+            sids_after.contains(&sids_before[1]) || sids_after.contains(&sids_before[0]),
+            "the surviving SID must be one of the two granted"
+        );
 
         // NOW signal child2 to run its second probe (causally after the revoke).
         std::fs::write(temp.join("go.marker"), b"go").expect("write go.marker");
