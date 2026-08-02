@@ -3124,6 +3124,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    /// Serializes the Loopback e2e tests (round-38): they share the global
+    /// LOOPBACK_SIDS registry and the per-process instance mutex, so
+    /// parallel `cargo test` runs would race on exact-count assertions.
+    static LOOPBACK_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// C6 round-30: NetPolicy::Loopback grants the per-package loopback
     /// exemption — a sandboxed child can reach a 127.0.0.1 listener. Without
     /// the exemption the AppContainer blocks loopback and this fails.
@@ -3131,6 +3136,7 @@ mod tests {
     fn loopback_policy_allows_localhost_connection() {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
+        let _serial = LOOPBACK_TEST_SERIAL.lock().unwrap();
 
         let temp = std::env::temp_dir().join(format!(
             "aspis-loopback-{}-{}",
@@ -3215,6 +3221,7 @@ mod tests {
     fn concurrent_loopback_children_keep_each_others_exemption() {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
+        let _serial = LOOPBACK_TEST_SERIAL.lock().unwrap();
 
         let temp = std::env::temp_dir().join(format!(
             "aspis-loopback-2-{}-{}",
@@ -3301,16 +3308,13 @@ mod tests {
 
         let mut l1 = listener1;
         let mut l2 = listener2;
-        // Snapshot BOTH SIDs before any revocation: after child1's drop the
-        // registry must contain child2's SID and NOT child1's (round-36/37:
-        // capture the actual SID bytes, not just cardinality).
-        let sids_before: Vec<Vec<u8>> = LOOPBACK_SIDS
-            .lock()
-            .expect("registry lock")
-            .as_ref()
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
-        assert_eq!(sids_before.len(), 2, "two grants must be registered, got {sids_before:?}");
+        // Snapshot each child's OWN SID bytes (round-38 review: the old
+        // HashSet-order sids_before[0]/[1] check accepted either SID and
+        // proved nothing about WHICH child survived).
+        let child1_sid = child1.loopback_sid_bytes.clone();
+        let child2_sid = child2.loopback_sid_bytes.clone();
+        assert!(!child1_sid.is_empty() && !child2_sid.is_empty());
+        assert_ne!(child1_sid, child2_sid, "per-spawn profiles must differ");
 
         // First probes: both children connect while both exemptions are live.
         let ok1a = accept_one(&mut l1, 30);
@@ -3321,23 +3325,23 @@ mod tests {
         // keep child2's exemption.
         let _ = child1.wait_and_restore();
         drop(child1);
-        // Round-36/37: assert the revocation actually took effect — child1's
-        // SID must be GONE, child2's must remain (wait_and_restore clears the
-        // ownership flag only on a SUCCESSFUL revoke, and Drop retries).
+        // Round-36/37/38: assert the revocation actually took effect —
+        // child1's OWN SID must be GONE, child2's OWN SID must remain
+        // (wait_and_restore clears the ownership flag only on a SUCCESSFUL
+        // revoke, and Drop retries).
         let sids_after: Vec<Vec<u8>> = LOOPBACK_SIDS
             .lock()
             .expect("registry lock")
             .as_ref()
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        assert_eq!(
-            sids_after.len(),
-            1,
-            "exactly one SID (child2) must remain after child1's revoke, got {sids_after:?}"
+        assert!(
+            !sids_after.contains(&child1_sid),
+            "child1's SID must be revoked, still present: {sids_after:?}"
         );
         assert!(
-            sids_after.contains(&sids_before[1]) || sids_after.contains(&sids_before[0]),
-            "the surviving SID must be one of the two granted"
+            sids_after.contains(&child2_sid),
+            "child2's SID must survive child1's revoke, got {sids_after:?}"
         );
 
         // NOW signal child2 to run its second probe (causally after the revoke).

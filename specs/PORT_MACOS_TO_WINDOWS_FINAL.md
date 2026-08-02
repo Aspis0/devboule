@@ -529,6 +529,15 @@ PerProcessUserTimeLimit (per-job is JOB_OBJECT_LIMIT_JOB_TIME + PerJobUserTimeLi
   first Loopback grant, and a second instance FAILS CLOSED on Loopback with
   an actionable error. Revoke ownership is durable: a failed revoke lands
   the SID in PENDING_REVOKES and the next grant/revoke drains and retries.
+  **FOLLOW-UP (accepted at port close, round 38 — theoretical, not
+  reachable in practice)**: (a) overlapping concurrent drains are not
+  serialized — two simultaneous drains can re-add a SID that the other
+  already revoked successfully; requires two concurrent API-failure
+  scenarios at once, documented with a drain-mutex as the fix; (b) a
+  poisoned LOOPBACK_SIDS/PENDING_REVOKES mutex (a panic while holding it)
+  skips retry ownership silently — fail-closed reporting is the fix. The
+  Loopback e2e tests are serialized via a test mutex so exact-count
+  assertions cannot race under parallel `cargo test`.
 - Package SID comes from a **per-spawn registered profile**
   (`CreateAppContainerProfile` with a pid+seq moniker — no admin needed, lands
   under `%LOCALAPPDATA%\Packages`). NOTE: a bare derived SID
