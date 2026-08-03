@@ -17,11 +17,17 @@
 //! ## RAM / GPU guards
 //!
 //! - **Low-RAM guard** (binding constraint on Apple Silicon): reads free system
-//!   RAM via `sysinfo`; when below `min_free_gb` the pipeline sleeps-and-retries
-//!   for a bounded number of cycles, then returns `paused_low_memory` if RAM
-//!   does not recover. The floor **fails closed**: unusable/near-zero readings
-//!   pause indexing rather than silently proceeding (Metal buffers are wired
-//!   and not swappable — low free RAM freezes the machine).
+//!   RAM two ways. On macOS the kernel's own `kern.memorystatus_*` sysctls are
+//!   authoritative when readable — the same signals jetsam acts on, which
+//!   `sysinfo` cannot match (it both over-reported ~8 GB free during the
+//!   2026-07-25 freeze and under-reported 0.3 GB on a healthy machine on
+//!   2026-08-02). When the probe is unreadable (or on other OSes) the
+//!   `sysinfo` floor below `min_free_gb` is the fail-closed fallback:
+//!   unusable/near-zero readings pause indexing rather than silently
+//!   proceeding (Metal buffers are wired and not swappable — low free RAM
+//!   freezes the machine). Either signal pausing → the pipeline
+//!   sleeps-and-retries for a bounded number of cycles, then returns
+//!   `paused_low_memory` if it does not recover.
 //! - **GPU thermal guard**: polls `nvidia-smi` only. On macOS / Apple Silicon
 //!   there is **no thermal guard** (`nvidia-smi` is absent; we do not probe
 //!   powermetrics). Memory, not temperature, is the binding constraint there.
@@ -648,15 +654,41 @@ fn read_macos_memory_pressure() -> Option<(u32, u32)> {
     None
 }
 
-/// Combined memory guard: GB floor **and** (on macOS) kernel pressure.
-/// Always takes the more conservative outcome. A failed macOS probe returns
-/// no pressure-based pause (GB floor still applies) — never unlocks indexing.
+/// Pure decision core of the combined memory guard.
 ///
-/// `min_free_gb <= 0` disables the entire memory guard (GB + pressure), matching
-/// the existing master switch for the free-RAM floor.
-fn memory_pause_reason(free_gb: f64, min_free_gb: f64) -> Option<MemoryPauseReason> {
+/// Precedence: when the macOS kernel probe is readable (`kernel = Some`), it is
+/// **authoritative** in both directions — its memorystatus signals are what
+/// jetsam itself acts on, while `sysinfo::available_memory()` lies on macOS in
+/// BOTH directions (2026-07-25: reported ~8 GB "free" while the machine froze
+/// at 87 MB real free; 2026-08-02: reported 0.3 GB on a healthy machine at
+/// kernel level 57%, pausing indexing constantly). A healthy kernel reading
+/// therefore overrides the sysinfo GB floor; an elevated one pauses regardless
+/// of what sysinfo claims.
+///
+/// Fail-closed is preserved where it matters: a failed/absent probe
+/// (`kernel = None` — also every non-macOS host) falls back to the GB floor,
+/// and a broken probe can never *unlock* indexing that the floor would pause.
+///
+/// `min_free_gb <= 0` disables the entire memory guard (kernel + floor),
+/// matching the existing master switch for the free-RAM floor.
+fn combined_pause_reason(
+    kernel: Option<(u32, u32)>,
+    min_level: u32,
+    free_gb: f64,
+    min_free_gb: f64,
+) -> Option<MemoryPauseReason> {
     if min_free_gb <= 0.0 {
         return None;
+    }
+    if let Some((pressure, level)) = kernel {
+        if !macos_pressure_says_pause(Some(pressure), Some(level), min_level) {
+            return None;
+        }
+        // Prefer naming the pressure signal when elevated; otherwise level.
+        if pressure > 1 {
+            return Some(MemoryPauseReason::MacosVmPressure { pressure });
+        }
+        return Some(MemoryPauseReason::MacosMemorystatusLevel { level, min_level });
     }
     if should_enforce_memory_floor(free_gb, min_free_gb) {
         return Some(MemoryPauseReason::FreeGbFloor {
@@ -664,25 +696,27 @@ fn memory_pause_reason(free_gb: f64, min_free_gb: f64) -> Option<MemoryPauseReas
             min_free_gb,
         });
     }
-    if !macos_memory_pressure_probe_enabled() {
-        return None;
-    }
-    match read_macos_memory_pressure() {
-        Some((pressure, level)) => {
-            let min_level = resolve_macos_min_memorystatus_level();
-            if !macos_pressure_says_pause(Some(pressure), Some(level), min_level) {
-                return None;
-            }
-            // Prefer naming the pressure signal when elevated; otherwise level.
-            if pressure > 1 {
-                Some(MemoryPauseReason::MacosVmPressure { pressure })
-            } else {
-                Some(MemoryPauseReason::MacosMemorystatusLevel { level, min_level })
-            }
-        }
-        // Probe failed: do not invent a pause; GB floor already checked above.
-        None => None,
-    }
+    None
+}
+
+/// Combined memory guard: kernel memorystatus (authoritative when readable,
+/// macOS only) with the sysinfo GB floor as the fallback. See
+/// [`combined_pause_reason`] for the precedence rationale.
+fn memory_pause_reason(free_gb: f64, min_free_gb: f64) -> Option<MemoryPauseReason> {
+    let kernel = if macos_memory_pressure_probe_enabled() {
+        read_macos_memory_pressure()
+    } else {
+        // Probe explicitly disabled via env: behave like an unreadable probe
+        // (GB floor still applies — the escape hatch debugs the sysctl, it
+        // must not disarm the guard entirely).
+        None
+    };
+    combined_pause_reason(
+        kernel,
+        resolve_macos_min_memorystatus_level(),
+        free_gb,
+        min_free_gb,
+    )
 }
 
 /// GPU temperature in °C via `nvidia-smi`.
@@ -707,41 +741,43 @@ pub fn gpu_temperature_c() -> Option<i32> {
     first_line.trim().parse::<f32>().ok().map(|v| v as i32)
 }
 
-/// Sleep-and-retry while free RAM is below `min_free_gb`.
-/// Returns the final observed free-RAM reading (never faked above the floor).
+/// Sleep-and-retry while the combined memory guard ([`memory_pause_reason`])
+/// wants a pause. Returns the final observed free-RAM reading (never faked
+/// above the floor).
 ///
-/// Exits only when free RAM genuinely recovers above `min_free_gb`, or when the
-/// bounded retry count is exhausted. Callers must re-check
-/// [`memory_pause_reason`] after return (GB floor **and** macOS pressure) and
-/// treat a still-blocking result as [`IndexStatus::PausedLowMemory`].
+/// Exits only when the combined guard genuinely clears (kernel signals healthy
+/// / GB floor recovered, per the [`combined_pause_reason`] precedence), or when
+/// the bounded retry count is exhausted. Callers must re-check
+/// [`memory_pause_reason`] after return and treat a still-blocking result as
+/// [`IndexStatus::PausedLowMemory`].
 fn wait_for_memory_recovery(min_free_gb: f64, progress: Option<&dyn Fn(&str)>) -> f64 {
     wait_for_memory_recovery_with(
         min_free_gb,
         progress,
         free_memory_gb,
+        |free_gb| memory_pause_reason(free_gb, min_free_gb).is_some(),
         LOW_MEMORY_RETRY_SECONDS,
         LOW_MEMORY_RETRY_CYCLES,
     )
 }
 
-/// Testable core of [`wait_for_memory_recovery`]: inject free-RAM reader and
-/// retry timing (use `retry_seconds = 0` in unit tests to avoid sleeping).
-///
-/// This loop only clears the **GB floor**. Callers always re-check the combined
-/// guard ([`memory_pause_reason`]) after return so macOS pressure still pauses
-/// even when free-GB looks healthy.
-fn wait_for_memory_recovery_with<F>(
+/// Testable core of [`wait_for_memory_recovery`]: inject the free-RAM reader,
+/// the blocking predicate (the combined guard in production), and retry timing
+/// (use `retry_seconds = 0` in unit tests to avoid sleeping).
+fn wait_for_memory_recovery_with<F, G>(
     min_free_gb: f64,
     progress: Option<&dyn Fn(&str)>,
     mut free_reader: F,
+    mut still_blocked: G,
     retry_seconds: u64,
     retry_cycles: usize,
 ) -> f64
 where
     F: FnMut() -> f64,
+    G: FnMut(f64) -> bool,
 {
     let mut free_gb = free_reader();
-    if free_gb.is_finite() && free_gb >= min_free_gb {
+    if !still_blocked(free_gb) {
         return free_gb;
     }
     for cycle in 0..retry_cycles {
@@ -758,7 +794,7 @@ where
             std::thread::sleep(Duration::from_secs(retry_seconds));
         }
         free_gb = free_reader();
-        if free_gb.is_finite() && free_gb >= min_free_gb {
+        if !still_blocked(free_gb) {
             return free_gb;
         }
     }
@@ -1850,6 +1886,7 @@ mod tests {
                     v.remove(0)
                 }
             },
+            |free| should_enforce_memory_floor(free, 10.0),
             0, // no sleep
             3, // three retry cycles after the initial reading
         );
@@ -1873,10 +1910,93 @@ mod tests {
                 let mut v = readings.borrow_mut();
                 v.remove(0)
             },
+            |free| should_enforce_memory_floor(free, 10.0),
             0,
             5,
         );
         assert!(last >= 10.0, "expected recovery above floor, got {last}");
+    }
+
+    #[test]
+    fn wait_for_memory_recovery_releases_when_guard_clears_despite_low_free() {
+        // 2026-08-02 regression shape: the injected guard (kernel-authoritative
+        // in production) clears on the second poll even though the free-GB
+        // reading stays far below the floor — the wait must release on the
+        // GUARD, not on the raw reading.
+        let readings = std::cell::RefCell::new(vec![0.3, 0.3]);
+        let polls = std::cell::Cell::new(0u32);
+        let last = wait_for_memory_recovery_with(
+            10.0,
+            None,
+            || {
+                let mut v = readings.borrow_mut();
+                if v.is_empty() { 0.3 } else { v.remove(0) }
+            },
+            |_free| {
+                polls.set(polls.get() + 1);
+                polls.get() < 2 // blocked on first poll, clear on second
+            },
+            0,
+            5,
+        );
+        assert!(
+            last < 10.0,
+            "reading stays low — the release must come from the guard, got {last}"
+        );
+        assert_eq!(polls.get(), 2, "must exit on the poll where the guard clears");
+    }
+
+    /// The 2026-08-02 figlyph run: machine healthy (kernel pressure 1, level 57)
+    /// while sysinfo reported 0.3 GB "free" — the kernel reading must OVERRIDE
+    /// the sysinfo floor, or indexing pauses constantly on every healthy Mac.
+    #[test]
+    fn combined_guard_kernel_healthy_overrides_lying_sysinfo_floor() {
+        assert_eq!(
+            combined_pause_reason(Some((1, 57)), 25, 0.3, 10.0),
+            None,
+            "healthy kernel (pressure=1 level=57) must override free_gb=0.3 (2026-08-02)"
+        );
+    }
+
+    #[test]
+    fn combined_guard_kernel_pressure_pauses_despite_healthy_free() {
+        // The 2026-07-25 incident direction: sysinfo says ~8 GB free while the
+        // kernel is at critical pressure — the kernel must win here too.
+        assert_eq!(
+            combined_pause_reason(Some((4, 1)), 25, 8.0, 5.0),
+            Some(MemoryPauseReason::MacosVmPressure { pressure: 4 }),
+            "critical kernel pressure must pause regardless of sysinfo (2026-07-25)"
+        );
+        // Warn level, same rule.
+        assert_eq!(
+            combined_pause_reason(Some((2, 96)), 25, 20.0, 10.0),
+            Some(MemoryPauseReason::MacosVmPressure { pressure: 2 }),
+        );
+        // Normal pressure but kernel level below threshold → level reason.
+        assert_eq!(
+            combined_pause_reason(Some((1, 10)), 25, 20.0, 10.0),
+            Some(MemoryPauseReason::MacosMemorystatusLevel { level: 10, min_level: 25 }),
+        );
+    }
+
+    #[test]
+    fn combined_guard_probe_unreadable_falls_back_to_floor_fail_closed() {
+        // No kernel reading (probe failed / non-macOS): the sysinfo floor is
+        // the fallback and keeps its fail-closed semantics.
+        assert_eq!(
+            combined_pause_reason(None, 25, 0.3, 10.0),
+            Some(MemoryPauseReason::FreeGbFloor { free_gb: 0.3, min_free_gb: 10.0 }),
+        );
+        assert!(combined_pause_reason(None, 25, f64::NAN, 10.0).is_some());
+        assert_eq!(combined_pause_reason(None, 25, 20.0, 10.0), None);
+    }
+
+    #[test]
+    fn combined_guard_master_switch_disables_everything() {
+        // min_free_gb <= 0 is the documented master switch — it disables the
+        // kernel guard too (unchanged semantics vs the pre-existing floor switch).
+        assert_eq!(combined_pause_reason(Some((4, 1)), 25, 0.01, 0.0), None);
+        assert_eq!(combined_pause_reason(None, 25, 0.01, 0.0), None);
     }
 
     #[test]
