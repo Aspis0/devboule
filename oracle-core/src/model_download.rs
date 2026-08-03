@@ -33,6 +33,12 @@ const FP32_FILES: &[&str] = &["onnx/model.onnx", "onnx/model.onnx_data", "tokeni
 /// Repo-relative files for the int8 bundle (single graph, no external data).
 const INT8_FILES: &[&str] = &["onnx/model_int8.onnx", "tokenizer.json"];
 
+/// Hard ceiling on a single downloaded file. The largest legitimate artifact
+/// (the Qwen3 ONNX model) is well under this; anything bigger means a wrong
+/// or hostile server, and we must not fill the disk. Restores the bound lost
+/// when the Content-Length requirement was relaxed for HF's HEAD quirk.
+const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+
 /// Progress for a single file within the bundle.
 #[derive(Debug, Clone)]
 pub struct FileProgress {
@@ -83,6 +89,19 @@ pub fn model_present_at(model_dir: &Path, int8: bool) -> bool {
 /// Equivalent to `model_present_at(&model_dir(root), int8)`.
 pub fn model_present(oracle_data_root: &Path, int8: bool) -> bool {
     model_present_at(&model_dir(oracle_data_root), int8)
+}
+
+/// Effective per-file byte cap for a download. When the remote length IS
+/// known (and non-zero) it is honored only up to the hard
+/// [`MAX_DOWNLOAD_BYTES`] ceiling — an announced length above the ceiling is
+/// clamped, so a hostile server announcing a huge Content-Length can never
+/// raise the cap above the disk-safety bound. When the length is unknown
+/// (HF's HEAD quirk) the cap is the hard [`MAX_DOWNLOAD_BYTES`] ceiling.
+fn effective_download_cap(bytes_total: Option<u64>) -> u64 {
+    bytes_total
+        .filter(|&t| t > 0)
+        .map(|t| t.min(MAX_DOWNLOAD_BYTES))
+        .unwrap_or(MAX_DOWNLOAD_BYTES)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client> {
@@ -149,6 +168,7 @@ fn download_file(
         .with_context(|| format!("creating {}", part.display()))?;
     let mut buf = vec![0u8; 1 << 20]; // 1 MiB
     let mut done: u64 = 0;
+    let cap = effective_download_cap(bytes_total);
     loop {
         let n = resp.read(&mut buf).context("reading download stream")?;
         if n == 0 {
@@ -156,6 +176,14 @@ fn download_file(
         }
         file.write_all(&buf[..n]).context("writing model file")?;
         done += n as u64;
+        if done > cap {
+            let _ = std::fs::remove_file(&part);
+            bail!(
+                "download of {} exceeded the {} byte cap (got {done} bytes) — refusing to write more",
+                dest.display(),
+                cap
+            );
+        }
         progress(done);
     }
     file.flush().ok();
@@ -384,6 +412,15 @@ mod tests {
                 "copied {rel} must match source bytes"
             );
         }
+    }
+
+    #[test]
+    fn effective_download_cap_uses_remote_len_or_hard_ceiling() {
+        assert_eq!(effective_download_cap(None), MAX_DOWNLOAD_BYTES);
+        assert_eq!(effective_download_cap(Some(0)), MAX_DOWNLOAD_BYTES);
+        assert_eq!(effective_download_cap(Some(1234)), 1234);
+        assert_eq!(effective_download_cap(Some(u64::MAX)), MAX_DOWNLOAD_BYTES);
+        assert!(effective_download_cap(Some(MAX_DOWNLOAD_BYTES + 1)) <= MAX_DOWNLOAD_BYTES);
     }
 
     #[test]
