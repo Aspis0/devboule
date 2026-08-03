@@ -1668,7 +1668,15 @@ fn mini_coder_kill_has_no_vault_unlock_gate() {
     // command's body must not call `ensure_unlocked`, and the only retained gate is
     // the mini-only `mark_kill_requested`. (A behavioral call needs an AppHandle;
     // this guards against a future re-introduction of the lock gate.)
-    let src = include_str!("mini_coder_executor.rs");
+    //
+    // Normalize CRLF -> LF before the structural search: on a checkout with CRLF
+    // line endings (Windows default, e.g. `core.autocrlf=true` on windows-latest
+    // CI), the raw bytes are `\r\n}\r\n`, which does NOT contain the literal `"\n}\n"`
+    // pattern used to locate the function's closing brace — the `.find` returns
+    // `None` and the `.expect` below panics. Normalizing first makes the search
+    // line-ending-agnostic without weakening what it asserts.
+    let src = include_str!("mini_coder_executor.rs").replace("\r\n", "\n");
+    let src = src.as_str();
     let fn_start = src
         .find("pub fn mini_coder_kill(")
         .expect("mini_coder_kill defined");
@@ -2886,11 +2894,23 @@ fn windows_finally_cleans_files_even_when_backend_errors() {
 
 #[cfg(windows)]
 #[test]
-fn build_command_codex_never_adds_mcp_config_flags_even_with_roots() {
-    // MINOR 9: a mini gets NO MCP grant. Even when McpRoots are supplied (the
-    // plumbing is kept for a future read-only oracle scope), build_mini_command_impl
-    // must NOT emit any `-c mcp_servers...` flags — the mini works from front-loaded
-    // context only, never the full mutation-capable devboule server.
+fn build_command_codex_never_adds_user_mcp_config_flags_even_with_roots() {
+    // MINOR 9 -> P3: this test used to assert build_mini_command_impl NEVER emits
+    // any `-c mcp_servers...` flags, even with McpRoots supplied. P3 (commit
+    // c626138) deliberately RELAXED that: with roots, the codex arm now wires the
+    // shared, READ-ONLY Oracle grant ("devboule", narrowed server-side by MCP role
+    // "mini") — see the positive assertion in
+    // `codex_mini_command_wires_mcp_flags_only_with_roots_p3` (macOS) and
+    // `build_mini_command_wires_mcp_when_roots_present_windows` (this file, public
+    // boundary). This old assertion went stale the moment P3 shipped and — because
+    // it is `#[cfg(windows)]` — was never exercised on the (macOS) authoring
+    // machine, so nothing caught the contradiction until Windows CI ran it.
+    //
+    // The half of MINOR 9 that P3 did NOT relax, and that this test now protects:
+    // the mini must NEVER get a USER-declared MCP server. `build_mini_command_impl`
+    // always calls `codex_mcp_config_args` with an EMPTY user_servers slice
+    // (mini-exclusion, design §6), so every `mcp_servers.*` block in the script
+    // must belong to "devboule" (the Oracle) — never to any other server name.
     let root = std::env::temp_dir();
     let result_target = root.join("d1.json");
     let prompt_file = root.join("fake-prompt.txt");
@@ -2910,14 +2930,21 @@ fn build_command_codex_never_adds_mcp_config_flags_even_with_roots() {
     .unwrap()
     .0;
     let script = argv_strings(&cmd).pop().unwrap();
+    // The Oracle's own read-only grant IS expected (P3) ...
     assert!(
-        !script.contains("mcp_servers"),
-        "mini must never get an MCP grant: {script}"
+        script.contains("mcp_servers.devboule.command"),
+        "granted mini should still carry the Oracle-scoped grant: {script}"
     );
-    assert!(
-        !script.contains("'-c'"),
-        "mini must never get a -c flag: {script}"
-    );
+    // ... but no OTHER server name ever rides along (mini-exclusion §6 holds even
+    // with roots supplied).
+    for (idx, _) in script.match_indices("mcp_servers.") {
+        let after = &script[idx + "mcp_servers.".len()..];
+        assert!(
+            after.starts_with("devboule."),
+            "mini must never get a USER MCP grant (only the Oracle's \"devboule\" \
+             entry is allowed): {script}"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -3915,15 +3942,26 @@ fn seatbelt_profile_writes_only_parameterized_paths() {
         .nth(1)
         .and_then(|s| s.split("; exec:").next())
         .expect("a file-write* section exists");
+    // The profile SBPL-escapes every interpolated path (`sbpl_escape`: `\` -> `\\`,
+    // `"` -> `\"`) before embedding it, so on Windows (where canonicalize() paths are
+    // backslash-heavy, e.g. the `\\?\C:\...` extended-length prefix) the RAW
+    // canonicalized string never appears verbatim in the profile — comparing against
+    // it made the "must appear" assertion always fail and the two "must NOT appear"
+    // assertions vacuously (uninformatively) pass. Derive the expected string via the
+    // SAME transform the code under test applies (canonicalize + sbpl_escape) so the
+    // comparison is robust on every platform and genuinely protective again.
+    use crate::backend::sandbox::seatbelt::sbpl_escape;
     let canon_scratch = std::fs::canonicalize(&scratch).unwrap();
+    let canon_scratch_q = sbpl_escape(&canon_scratch.to_string_lossy());
     assert!(
-        write_section.contains(&canon_scratch.to_string_lossy().to_string()),
+        write_section.contains(&canon_scratch_q),
         "the writable path must appear under file-write*: {profile}"
     );
     // An unrelated path is NOT writable anywhere.
     let canon_unrelated = std::fs::canonicalize(&unrelated).unwrap();
+    let canon_unrelated_q = sbpl_escape(&canon_unrelated.to_string_lossy());
     assert!(
-        !profile.contains(&canon_unrelated.to_string_lossy().to_string()),
+        !profile.contains(&canon_unrelated_q),
         "an unrelated path must NOT be in the profile: {profile}"
     );
     // The project root is READ-ONLY. Reads are intentionally BROAD (`(allow file-read*)`
@@ -3934,7 +3972,7 @@ fn seatbelt_profile_writes_only_parameterized_paths() {
     // SECURITY invariant is that it is ABSENT from file-write* (emit-edits path -> Rust
     // writes the project files, the child never does).
     let canon_root = std::fs::canonicalize(&project_root).unwrap();
-    let root_str = canon_root.to_string_lossy().to_string();
+    let root_str = sbpl_escape(&canon_root.to_string_lossy());
     assert!(
         profile.contains("(allow file-read*)"),
         "reads must be broad (a filtered file-read* aborts /bin/sh via dyld): {profile}"
@@ -3957,8 +3995,9 @@ fn seatbelt_profile_writes_only_parameterized_paths() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let canon_tmp = std::fs::canonicalize(&tmpdir).unwrap_or(tmpdir);
+    let canon_tmp_q = sbpl_escape(&canon_tmp.to_string_lossy());
     assert!(
-        write_section.contains(&canon_tmp.to_string_lossy().to_string()),
+        write_section.contains(&canon_tmp_q),
         "the $TMPDIR scratch subpath must be in file-write*: {profile}"
     );
     std::fs::remove_dir_all(&base).ok();

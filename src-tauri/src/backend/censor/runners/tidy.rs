@@ -315,16 +315,18 @@ line 2 column 1 - Warning: <blink> is not approved by W3C
         };
         let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("tidy") {
-            assert!(
-                !findings.is_empty(),
-                "tidy should flag the invalid markup in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "tidy",
+                &format!("tidy should flag the invalid markup in {rel}"),
+                |f| {
+                    assert_eq!(f.category, Category::Correctness);
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "tidy");
-                assert_eq!(f.category, Category::Correctness);
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent tidy must yield an empty Vec");
         }

@@ -5873,16 +5873,44 @@ mod tests {
     // readonly_root field — the preference logic (choose explicit over fallback)
     // lives in spawn_pi_session_inner, but the policy itself must faithfully
     // use whatever root the caller passes.
+    //
+    // Platform split (see the design comment on `pi_sandbox_policy` above): Windows
+    // ACLs cannot express "readonly root + writable exception" (the deny ACE would
+    // win over the writable grant), so the broker intentionally uses an EMPTY
+    // readonly_root on Windows and relies on explicit `writable_paths` grants
+    // instead; macOS keeps the deny-root policy with the explicit project_root.
     #[test]
     fn pi_sandbox_policy_uses_explicit_root_for_deny() {
         let explicit = PathBuf::from("/Users/user/Projects/MyApp");
         let projects = PathBuf::from("/Users/user/Projects/MyApp/projects");
         let management = PathBuf::from("/Users/user/Projects/Devboule");
         let policy = pi_sandbox_policy(&explicit, &projects, &management, NetPolicy::Loopback);
-        assert_eq!(
-            policy.readonly_root, explicit,
-            "readonly_root must be the explicit project_root"
-        );
+        if cfg!(target_os = "windows") {
+            // No deny-root on Windows: readonly_root must stay empty ...
+            assert_eq!(
+                policy.readonly_root,
+                PathBuf::new(),
+                "Windows must use an empty readonly_root (ACLs can't express deny-root + writable exception)"
+            );
+            // ... and the explicit project_root + projects_dir must instead be
+            // granted via writable_paths, since they no longer get an implicit
+            // read-through from a deny-root policy.
+            assert!(
+                policy.writable_paths.contains(&explicit),
+                "Windows must explicitly grant the project root as writable: {:?}",
+                policy.writable_paths
+            );
+            assert!(
+                policy.writable_paths.contains(&projects),
+                "Windows must explicitly grant projects_dir as writable: {:?}",
+                policy.writable_paths
+            );
+        } else {
+            assert_eq!(
+                policy.readonly_root, explicit,
+                "readonly_root must be the explicit project_root"
+            );
+        }
     }
 
     #[test]

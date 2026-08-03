@@ -110,9 +110,35 @@ jobs:
 
       # C6 round-31 hostile review: CI previously ran only `cargo check` for
       # src-tauri — the Windows broker/ACL/AppContainer/ConPTY integration
-      # tests never executed in CI. Run the lib test suite on Windows
-      # (sandbox tests requiring a real host skip themselves on non-elevated
-      # runners by design; the suite is what must be exercised).
+      # tests never executed in CI. Run the lib test suite on Windows.
+      #
+      # Note: windows-latest GitHub runners execute ELEVATED, not
+      # unprivileged. That is the OPPOSITE of a typical dev machine, so the
+      # tests are gated accordingly, not "skip on non-elevated by design":
+      #   - icacls ACL save/restore roundtrip tests (`apply_and_restore_
+      #     path_policy_roundtrip`, `apply_writable_path_and_restore`) need
+      #     SeRestorePrivilege and only RUN here — they are the regression
+      #     net for the icacls /save-relative-to-parent restore-path fix.
+      #     They still skip on a non-elevated dev machine.
+      #   - The Loopback e2e tests (`loopback_policy_allows_localhost_
+      #     connection`, `concurrent_loopback_children_keep_each_others_
+      #     exemption`) and the AppContainer spawn e2e test
+      #     (`preexisting_ledger_and_lock_are_writable_in_sandbox`) instead
+      #     SKIP here: devboule's spec invariant requires an unprivileged
+      #     host (elevated AppContainer children inherit the elevated
+      #     identity, see tauri#13926), so they only run on a non-elevated
+      #     dev machine. `preexisting_ledger_and_lock_are_writable_in_
+      #     sandbox` was dead code on `main` until this gating landed (a
+      #     missing `#[test]` attribute silently dropped it from the suite),
+      #     so it has no elevated-runner track record yet — gated the same
+      #     way as the Loopback tests for deterministic CI green.
+      #
+      # ACCEPTED RISK: because this job is the ONLY leg that runs the
+      # src-tauri test suite and it is always elevated, those three e2e
+      # tests (both Loopback + the AppContainer spawn test) have ZERO
+      # automated CI coverage — they run only on non-elevated dev
+      # machines. Closing that gap needs a non-elevated Windows runner
+      # (self-hosted or a de-elevation step); tracked as a follow-up.
       - name: cargo test (src-tauri, windows)
         if: matrix.os == 'windows-latest'
         shell: bash

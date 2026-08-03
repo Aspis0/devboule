@@ -294,16 +294,18 @@ a.cpp:2:performance:perf:slow construct
         if crate::backend::projects::command_exists("cppcheck") {
             // The toolchain SHOULD flag the null deref; we assert at least one finding
             // and that every finding is well-formed (source + advisory severity cap).
-            assert!(
-                !findings.is_empty(),
-                "cppcheck should flag the null deref in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "cppcheck",
+                &format!("cppcheck should flag the null deref in {rel}"),
+                |f| {
+                    assert_eq!(f.category, Category::Correctness);
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "cppcheck");
-                assert_eq!(f.category, Category::Correctness);
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent cppcheck must yield an empty Vec");
         }

@@ -248,16 +248,18 @@ f.yml:12:4: another real one [rule]
         };
         let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("actionlint") {
-            assert!(
-                !findings.is_empty(),
-                "actionlint should flag the bad workflow in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "actionlint",
+                &format!("actionlint should flag the bad workflow in {rel}"),
+                |f| {
+                    assert_eq!(f.category, Category::Correctness);
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "actionlint");
-                assert_eq!(f.category, Category::Correctness);
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent actionlint must yield an empty Vec");
         }

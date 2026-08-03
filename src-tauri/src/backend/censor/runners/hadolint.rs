@@ -279,15 +279,17 @@ mod tests {
         };
         let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("hadolint") {
-            assert!(
-                !findings.is_empty(),
-                "hadolint should flag the unpinned install / latest tag in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "hadolint",
+                &format!("hadolint should flag the unpinned install / latest tag in {rel}"),
+                |f| {
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "hadolint");
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent hadolint must yield an empty Vec");
         }

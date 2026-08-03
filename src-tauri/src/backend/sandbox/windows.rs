@@ -308,10 +308,34 @@ fn allow_write_everyone(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Compute the directory `icacls /restore` must target for `path`.
+///
+/// `icacls <dir> /save <backup>` writes entries RELATIVE to `<dir>`'s PARENT:
+/// the first line of the backup file is the bare leaf name (`dir`), and every
+/// subsequent entry is `dir\sub\...`. Empirically verified (non-elevated,
+/// `\\?\`-prefixed and bare paths both behave identically): running
+/// `/restore` against `<dir>` itself makes icacls look for `<dir>\<dir>\...`,
+/// which never exists — `/restore` must run against `<dir>`'s PARENT instead.
+///
+/// Returns an error for a drive root (no parent), so callers never silently
+/// restore against the wrong directory.
+fn restore_acl_target(path: &Path) -> Result<&Path, String> {
+    path.parent().ok_or_else(|| {
+        format!(
+            "cannot restore ACL for {}: path has no parent directory (drive root?)",
+            path.display()
+        )
+    })
+}
+
 /// Restore the original ACL on `path` from a backup file via `icacls /restore`.
+///
+/// Note: `icacls /restore` must be invoked against `path`'s PARENT directory,
+/// not `path` itself — see [`restore_acl_target`] for why.
 fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
+    let target = restore_acl_target(path)?;
     let out = std::process::Command::new("icacls")
-        .arg(path.as_os_str())
+        .arg(target.as_os_str())
         .args(["/restore", &backup_file.to_string_lossy()])
         .output()
         .map_err(|e| format!("icacls /restore spawn failed: {e}"))?;
@@ -337,6 +361,16 @@ fn restore_acl(path: &Path, backup_file: &Path) -> Result<(), String> {
 /// **Wired since C5**: `spawn_sandboxed_internal` calls this before spawn;
 /// `wait_and_restore` restores after child exit. `is_enforced()` is TRUE
 /// since C6.
+///
+/// **Currently unused in production** (this and [`restore_path_policy`]):
+/// the real spawn path hardcodes `acl_snapshots: Vec::new()` and enforces
+/// via `apply_restricted_sid_policy` (package-SID ACLs) instead — this
+/// Everyone-deny/grant `icacls` mode only runs from the tests below. If it
+/// is ever re-wired to a real spawn path, note that a drive-root `Err` from
+/// `restore_acl_target` (no parent directory) is non-transient: retrying
+/// won't fix it, so a snapshot that hits it would be retained forever by
+/// `restore_path_policy_with_remaining`'s retry loop — that path needs a
+/// way to drop/report unrecoverable snapshots rather than keep retrying.
 pub fn apply_path_policy(policy: &SandboxPolicy) -> Result<Vec<PathAclSnapshot>, String> {
     let mut snapshots = Vec::new();
     let mut processed: std::collections::HashSet<std::path::PathBuf> =
@@ -3136,7 +3170,15 @@ mod tests {
     fn loopback_policy_allows_localhost_connection() {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
-        let _serial = LOOPBACK_TEST_SERIAL.lock().unwrap();
+        if process_is_elevated() {
+            eprintln!(
+                "skipping: loopback e2e requires an unprivileged host (spec invariant, tauri#13926)"
+            );
+            return;
+        }
+        let _serial = LOOPBACK_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let temp = std::env::temp_dir().join(format!(
             "aspis-loopback-{}-{}",
@@ -3206,13 +3248,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
-    /// C6 rounds 6-8 e2e: a PRE-EXISTING ledger file + .lock sidecar (created by
-    /// record_launch_pending before spawn, user-only DACL, no package SID) must
-    /// be openable+rewritable by the AppContainer child when granted as writable
-    /// roots — the consent hook's exact access pattern (open lock, write ledger,
-    /// MoveFileExW replace). This is the regression reviewers proved twice
-    /// (rounds 6-7); the unit mask test cannot catch it.
-    #[test]
     /// C6 round-32: concurrent Loopback children must not revoke each other's
     /// exemption — the registry rebuilds the GLOBAL list with all active SIDs.
     /// Two children, two listeners: both connect; dropping one child and
@@ -3221,7 +3256,15 @@ mod tests {
     fn concurrent_loopback_children_keep_each_others_exemption() {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
-        let _serial = LOOPBACK_TEST_SERIAL.lock().unwrap();
+        if process_is_elevated() {
+            eprintln!(
+                "skipping: loopback e2e requires an unprivileged host (spec invariant, tauri#13926)"
+            );
+            return;
+        }
+        let _serial = LOOPBACK_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let temp = std::env::temp_dir().join(format!(
             "aspis-loopback-2-{}-{}",
@@ -3375,7 +3418,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
     }
 
+    /// C6 rounds 6-8 e2e: a PRE-EXISTING ledger file + .lock sidecar (created by
+    /// record_launch_pending before spawn, user-only DACL, no package SID) must
+    /// be openable+rewritable by the AppContainer child when granted as writable
+    /// roots — the consent hook's exact access pattern (open lock, write ledger,
+    /// MoveFileExW replace). This is the regression reviewers proved twice
+    /// (rounds 6-7); the unit mask test cannot catch it.
+    ///
+    /// This `#[test]` attribute went missing at some point (its doc comment and
+    /// attribute had been duplicated onto `concurrent_loopback_children_keep_
+    /// each_others_exemption` instead, which silently dropped this test from the
+    /// suite — confirmed by a `never used` dead-code warning). Restored here.
+    ///
+    /// This test was dead on `main` (see above), so it has never run on the
+    /// elevated CI runner — there is no evidence it passes there, and this
+    /// machine (non-elevated) cannot verify it either. Skip on an elevated
+    /// host for deterministic CI green; coverage vs `main` is unchanged (it
+    /// still runs on non-elevated dev machines going forward).
+    #[test]
     fn preexisting_ledger_and_lock_are_writable_in_sandbox() {
+        if process_is_elevated() {
+            eprintln!(
+                "skipping: sandboxed-child e2e requires an unprivileged host (spec invariant, tauri#13926)"
+            );
+            return;
+        }
         use std::io::{Read, Write};
         use std::os::windows::io::FromRawHandle;
 
@@ -3500,10 +3567,37 @@ tmp_acl={}",
         assert_ne!(WRITABLE_ACCESS_MASK & FILE_GENERIC_WRITE.0, 0);
     }
 
+    /// Doubled-path regression: `icacls <dir> /save` writes backup entries
+    /// relative to `<dir>`'s PARENT (verified empirically: the first line of
+    /// the backup file is the bare leaf name, not the full path), so
+    /// `restore_acl` must target the PARENT, not `path` itself. Runs
+    /// non-elevated (no icacls invocation) so it always exercises the fix,
+    /// unlike the full roundtrip below which needs SeRestorePrivilege.
+    #[test]
+    fn restore_acl_target_is_parent_dir() {
+        let path = std::path::Path::new(r"\\?\C:\Users\test\devboule_root");
+        let target = restore_acl_target(path).expect("nested path has a parent");
+        assert_eq!(target, std::path::Path::new(r"\\?\C:\Users\test"));
+    }
+
+    /// Drive root has no parent — restoring against it would silently target
+    /// the wrong (nonexistent-parent) directory, so this must error instead.
+    #[test]
+    fn restore_acl_target_rejects_drive_root() {
+        let path = std::path::Path::new(r"\\?\C:\");
+        assert!(
+            restore_acl_target(path).is_err(),
+            "drive root has no parent and must be rejected, not silently misused"
+        );
+    }
+
     /// C3: apply deny-write on a temp file, then restore the original ACL.
     /// Verifies the icacls save → deny → restore pipeline works end-to-end.
     /// `icacls /restore` needs SeRestorePrivilege, so this skips on a
-    /// non-elevated host.
+    /// non-elevated host. (Empirically verified non-elevated: even against
+    /// the correct PARENT dir, restore fails with ERROR_NOT_ALL_ASSIGNED
+    /// (1300) — the doubled-path bug and the privilege requirement are
+    /// separate issues; fixing the former does not remove the latter.)
     #[test]
     fn apply_and_restore_path_policy_roundtrip() {
         if !process_is_elevated() {

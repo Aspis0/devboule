@@ -241,15 +241,17 @@ a.yaml:12:1: [error] another real one (syntax)
         };
         let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("yamllint") {
-            assert!(
-                !findings.is_empty(),
-                "yamllint should flag the duplicate key in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "yamllint",
+                &format!("yamllint should flag the duplicate key in {rel}"),
+                |f| {
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "yamllint");
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent yamllint must yield an empty Vec");
         }

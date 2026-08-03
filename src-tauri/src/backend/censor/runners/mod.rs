@@ -1076,6 +1076,95 @@ fn join_stderr(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Test-only: true when the current process runs with an elevated (administrator)
+/// token. `windows-latest` GitHub Actions runners execute as `runneradmin`, which
+/// IS elevated — and an elevated parent hands the sandboxed AppContainer child an
+/// elevated identity (broken by design, see `[sandbox/windows] WARNING: ... running
+/// ELEVATED`, spec invariant tauri#13926): the tool spawns fine and runs, but its
+/// output through the sandbox pipe is unreliable, so a per-file runner integration
+/// test cannot assert real findings on such a host.
+///
+/// This is a deliberate LOCAL DUPLICATE of `backend::sandbox::windows`'s private
+/// `process_is_elevated` (that module is owned by another agent and the fn is not
+/// `pub`/`pub(crate)`, so it is not reachable from here) — kept minimal and
+/// test-only so it never affects production behavior.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn host_is_elevated_for_tests() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if ok.is_err() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    let res = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    res.is_ok() && elevation.TokenIsElevated != 0
+}
+
+/// Non-Windows counterpart of [`host_is_elevated_for_tests`]: never elevated in the
+/// AppContainer sense used here (the Windows-only sandbox path isn't taken at all on
+/// unix, so this always returns `false`).
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn host_is_elevated_for_tests() -> bool {
+    false
+}
+
+/// Test-only shared helper for the "tool flags a real finding" half of every
+/// `run_absent_tool_is_empty_present_tool_flags_*` presence-gated integration test
+/// (cppcheck/yamllint/shellcheck/tidy/sqlfluff/hadolint/actionlint/gofmt): the tool IS
+/// present (caller already gated on `command_exists`), so a tiny per-file run SHOULD
+/// produce at least one finding, and every finding produced must be well-formed.
+///
+/// On an ELEVATED Windows host (`windows-latest` CI runs as `runneradmin`), every
+/// runner spawns through the sandboxed AppContainer path (the Windows arm of
+/// `run_capture_*_with_timeout` above), and an elevated parent hands that sandboxed
+/// child an elevated identity — broken by design (spec invariant, tauri#13926; see the
+/// "[sandbox/windows] WARNING: ... running ELEVATED" line CI prints). The tool spawns
+/// and runs, but its output through the sandbox pipe is not reliable there, so the
+/// "flags a real finding" claim is skipped ONLY on that host shape. `check` (source +
+/// severity/category well-formedness) still runs over whatever findings did leak
+/// through, on EVERY host — nothing gets weaker, only the non-empty claim is
+/// conditional.
+///
+/// `tool` is the runner's `source` string (asserted on every finding); `empty_msg` is
+/// the assertion message used for the non-empty claim on a non-elevated host. A
+/// caller whose non-elevated assertion is an EXACT count (gofmt) should NOT route
+/// that part through this helper — inline the elevated-skip via
+/// [`host_is_elevated_for_tests`] instead so the exact count is never weakened to a
+/// mere non-empty check.
+#[cfg(test)]
+pub(crate) fn assert_flags_or_skip_if_elevated(
+    findings: &[RawFinding],
+    tool: &str,
+    empty_msg: &str,
+    check: impl Fn(&RawFinding),
+) {
+    if !host_is_elevated_for_tests() {
+        assert!(!findings.is_empty(), "{empty_msg}");
+    }
+    for f in findings {
+        assert_eq!(f.source, tool, "wrong source: {f:?}");
+        check(f);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

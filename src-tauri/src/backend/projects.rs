@@ -3304,6 +3304,35 @@ pub fn project_working_set(
     Ok(read_project_by_id(app, project_id)?.metadata.working_set)
 }
 
+/// Strip the Windows extended-length (`\\?\`) verbatim prefix that `Path::canonicalize`
+/// prepends on Windows, returning the plain user-facing path form. Without this,
+/// `working_set` entries persist as `\\?\C:\...` / `\\?\UNC\server\share\...`, which (a)
+/// leaks an unfamiliar prefix into stored project frontmatter and (b) fails to compare
+/// against any non-prefixed representation of the same folder. No-op on non-Windows and on
+/// paths that already lack the prefix. Mirrors the identical pattern already used in
+/// `oracle/python_oracle.rs::strip_windows_verbatim_prefix`, `backend/design.rs::strip_verbatim_prefix`
+/// and `backend/project_git.rs::strip_verbatim_prefix` (kept local here — no shared
+/// pub(crate) helper with a matching `&str -> String` signature exists to reuse).
+///   - `\\?\UNC\server\share\...` → `\\server\share\...`
+///   - `\\?\C:\...`               → `C:\...`
+///
+/// ACCEPTED EDGE: a drive-letterless `\\?\Volume{GUID}\...` mount-point form strips down
+/// to a bare `Volume{GUID}\...` string, which is not `Path::is_absolute()` and gets
+/// silently dropped by downstream `.canonicalize().ok()` filters — the same limitation
+/// the sibling `design.rs::strip_verbatim_prefix` accepts.
+///
+/// `pub(crate)` so `project_file.rs`'s frontmatter read path can normalize legacy
+/// verbatim-prefixed `working_set` entries on load (self-healing old project files).
+pub(crate) fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// Normalize a working-set folder path for persistence: canonicalize + validate it's absolute
 /// and non-empty. Returns the canonical absolute path as a string, or Err if the path
 /// does not exist / cannot be canonicalized.
@@ -3322,7 +3351,9 @@ fn normalize_working_set_folder(folder: &str) -> Result<String, String> {
     let canon = p
         .canonicalize()
         .map_err(|e| format!("cannot canonicalize folder: {e}"))?;
-    Ok(canon.to_string_lossy().into_owned())
+    // Windows canonicalize() prepends the `\\?\` verbatim prefix; strip it so persisted
+    // entries and comparisons use the plain path form (see `strip_windows_verbatim_prefix`).
+    Ok(strip_windows_verbatim_prefix(&canon.to_string_lossy()))
 }
 
 /// BLOCKER 2: Normalize a working-set folder path LEXICALLY (no filesystem access).
@@ -3333,28 +3364,49 @@ fn normalize_working_set_folder(folder: &str) -> Result<String, String> {
 /// are already canonicalized absolute paths (added via `normalize_working_set_folder`).
 ///
 /// Rules (no disk access):
-///  - Must be non-empty and absolute.
+///  - Must be non-empty and absolute (platform-aware: a POSIX `/...` root on
+///    macOS/Linux, a drive-letter `C:\...` or UNC `\\server\share\...` root on
+///    Windows — see the WARNING 2 fix note below).
 ///  - Strips trailing slash(es).
 ///  - Resolves `.` segments (never produces `..` — `..` segments in the input are an
 ///    error since stored entries never contain them; we reject rather than guess).
+///
+/// WARNING 2 fix: this used to hardcode a POSIX-only `starts_with('/')` absolute check
+/// and rebuilt the path by re-joining on `/` with a forced leading `/` — on Windows EVERY
+/// stored entry starts with a drive letter (never `/`), so this made folder removal
+/// entirely broken there. Now uses `Path::is_absolute()` (platform-aware) and rebuilds via
+/// `Path::components()`, which already collapses `.` segments and repeated/trailing
+/// separators while preserving the platform root (POSIX `/`, or a Windows drive/UNC
+/// prefix) verbatim — so behavior on macOS/Linux is unchanged (see
+/// `normalize_lexical_strips_trailing_slash_and_dots` / `normalize_lexical_rejects_empty_and_relative`).
+///
+/// Defense-in-depth: strips a leading Windows verbatim `\\?\` prefix before validating,
+/// symmetric with `normalize_working_set_folder` and the parse-time migration
+/// (`project_file.rs`). Unreachable today — the UI only ever echoes back an
+/// already-stripped stored string here — but without it a future caller passing a raw
+/// OS-supplied `\\?\C:\...` path would make removal a SILENT no-op (the `retain` in
+/// `remove_project_working_set_by_path` finds no string match, no error surfaced).
 fn normalize_working_set_folder_lexical(folder: &str) -> Result<String, String> {
     let trimmed = folder.trim();
     if trimmed.is_empty() {
         return Err("folder path must not be empty".to_string());
     }
-    if !trimmed.starts_with('/') {
+    let trimmed = strip_windows_verbatim_prefix(trimmed);
+    let p = std::path::Path::new(&trimmed);
+    if !p.is_absolute() {
         return Err("folder path must be absolute".to_string());
     }
-    // Lexical path normalization: split on `/`, drop empty/`.`, reject `..`.
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in trimmed.split('/') {
-        match seg {
-            "" | "." => continue,
-            ".." => return Err("folder path must not contain '..' segments".to_string()),
-            s => parts.push(s),
+    let mut normalized = std::path::PathBuf::new();
+    for component in p.components() {
+        if component == std::path::Component::ParentDir {
+            return Err("folder path must not contain '..' segments".to_string());
         }
+        // `Path::components()` already normalizes away embedded `.` (CurDir) segments and
+        // repeated/trailing separators; pushing each remaining component (Prefix/RootDir/
+        // Normal) rebuilds the clean absolute path without touching the filesystem.
+        normalized.push(component.as_os_str());
     }
-    Ok(format!("/{}", parts.join("/")))
+    Ok(normalized.to_string_lossy().into_owned())
 }
 
 /// SANDBOX broker Slice 2: add a folder to the project's persistent working set.
@@ -6948,10 +7000,21 @@ mod tests {
 
     /// `normalize_working_set_folder_lexical` must succeed on a non-existent path (no
     /// disk access) — enabling removal of stale/deleted working_set entries.
+    ///
+    /// Unconditional (NOT `#[cfg(unix)]`): `ci.yml` runs `cargo test` for src-tauri ONLY
+    /// on windows-latest (the unix legs run `cargo check` only), so a `#[cfg(unix)]`-gated
+    /// test never actually executes anywhere in CI. Branch the literal per platform via
+    /// `cfg!(windows)` instead, so the POSIX-shaped logic path this test covers stays
+    /// exercised somewhere (locally on macOS/Linux) while the Windows-shaped literal keeps
+    /// running on the one CI leg that actually runs tests.
     #[test]
     fn normalize_lexical_succeeds_on_nonexistent_path() {
-        // An absolute path that does NOT exist on disk.
-        let nonexistent = "/tmp/aspis_deleted_folder_does_not_exist_xyz_blorp";
+        // An absolute path that does NOT exist on disk (platform-appropriate root).
+        let nonexistent = if cfg!(windows) {
+            r"C:\aspis_deleted_folder_does_not_exist_xyz_blorp"
+        } else {
+            "/tmp/aspis_deleted_folder_does_not_exist_xyz_blorp"
+        };
         let result = normalize_working_set_folder_lexical(nonexistent);
         assert!(
             result.is_ok(),
@@ -6964,16 +7027,30 @@ mod tests {
 
     /// Lexical normalization strips trailing slashes and resolves `.` segments without
     /// touching the filesystem.
+    ///
+    /// Unconditional (see the CI-coverage rationale on
+    /// `normalize_lexical_succeeds_on_nonexistent_path` above).
     #[test]
     fn normalize_lexical_strips_trailing_slash_and_dots() {
-        assert_eq!(
-            normalize_working_set_folder_lexical("/tmp/foo/").unwrap(),
-            "/tmp/foo"
-        );
-        assert_eq!(
-            normalize_working_set_folder_lexical("/tmp/foo/./bar/").unwrap(),
-            "/tmp/foo/bar"
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                normalize_working_set_folder_lexical(r"C:\tmp\foo\").unwrap(),
+                r"C:\tmp\foo"
+            );
+            assert_eq!(
+                normalize_working_set_folder_lexical(r"C:\tmp\foo\.\bar\").unwrap(),
+                r"C:\tmp\foo\bar"
+            );
+        } else {
+            assert_eq!(
+                normalize_working_set_folder_lexical("/tmp/foo/").unwrap(),
+                "/tmp/foo"
+            );
+            assert_eq!(
+                normalize_working_set_folder_lexical("/tmp/foo/./bar/").unwrap(),
+                "/tmp/foo/bar"
+            );
+        }
     }
 
     /// Lexical normalization rejects empty paths and relative paths (same gates as
@@ -6982,6 +7059,71 @@ mod tests {
     fn normalize_lexical_rejects_empty_and_relative() {
         assert!(normalize_working_set_folder_lexical("").is_err());
         assert!(normalize_working_set_folder_lexical("relative/path").is_err());
+    }
+
+    /// `strip_windows_verbatim_prefix` — hardcoded input/output pairs, mirroring
+    /// `project_git.rs::strip_verbatim_prefix_removes_windows_extended_length_markers` and
+    /// `design.rs::v1_strip_verbatim_prefix_handles_both_forms`. Pure string logic — no
+    /// `#[cfg(windows)]` gate needed (same posture as those two sibling tests): it must
+    /// behave identically (as a no-op) on every platform for input that never carries the
+    /// Windows verbatim prefix.
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_extended_length_and_unc_markers() {
+        // Drive-letter verbatim form → plain path.
+        assert_eq!(strip_windows_verbatim_prefix(r"\\?\C:\foo"), r"C:\foo");
+        // UNC verbatim form → plain UNC path.
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\x"),
+            r"\\server\share\x"
+        );
+        // Already-plain Windows path and a POSIX path are returned unchanged.
+        assert_eq!(strip_windows_verbatim_prefix(r"C:\foo"), r"C:\foo");
+        assert_eq!(strip_windows_verbatim_prefix("/tmp/x"), "/tmp/x");
+        assert_eq!(strip_windows_verbatim_prefix(""), "");
+    }
+
+    /// WARNING 2 regression guard: `normalize_working_set_folder_lexical` used to hardcode
+    /// a POSIX-only `starts_with('/')` absolute check and re-joined the path with a forced
+    /// leading `/`, which made EVERY `remove_project_working_set_folder` call fail on
+    /// Windows (every stored entry starts with a drive letter or UNC root, never `/`).
+    /// `#[cfg(windows)]`: Windows-style absolute paths (`C:\...`) are only recognized as
+    /// absolute when compiled for Windows — the CI leg that runs `cargo test` for
+    /// src-tauri IS windows-latest (see `ci.yml`), so this test is live there.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_lexical_windows_style_paths() {
+        assert_eq!(
+            normalize_working_set_folder_lexical(r"C:\tmp\foo\").unwrap(),
+            r"C:\tmp\foo"
+        );
+        assert_eq!(
+            normalize_working_set_folder_lexical(r"C:\tmp\foo\.\bar\").unwrap(),
+            r"C:\tmp\foo\bar"
+        );
+        assert_eq!(
+            normalize_working_set_folder_lexical(r"\\server\share\repo\").unwrap(),
+            r"\\server\share\repo"
+        );
+        assert!(normalize_working_set_folder_lexical("relative\\path").is_err());
+        assert!(normalize_working_set_folder_lexical(r"C:\tmp\..\foo").is_err());
+    }
+
+    /// PLAUSIBLE fix (defense-in-depth): `normalize_working_set_folder_lexical` now strips
+    /// a leading Windows verbatim `\\?\` prefix before validating, symmetric with
+    /// `normalize_working_set_folder` and the parse-time migration (`project_file.rs`).
+    /// Without this, a future caller passing a raw OS-supplied `\\?\C:\...` path (today
+    /// unreachable — the UI only ever echoes back an already-stripped stored string) would
+    /// make removal a SILENT no-op: the `retain` in `remove_project_working_set_by_path`
+    /// would find no string match against the (stripped) stored entries, with no error
+    /// surfaced. `#[cfg(windows)]`: the verbatim prefix is a Windows-only concept, and this
+    /// is the CI leg that actually runs `cargo test`.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_lexical_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            normalize_working_set_folder_lexical(r"\\?\C:\tmp\foo").unwrap(),
+            r"C:\tmp\foo"
+        );
     }
 
     /// `remove_project_working_set_folder_by_path` — the internal path-level helper — removes
@@ -12168,6 +12310,21 @@ mod broker_gate_projects {
         // Simulate `add_project_working_set_folder`: normalize + locked write.
         let normalized = normalize_working_set_folder(&canonical_folder)
             .expect("canonical temp folder must normalize successfully");
+
+        // ── Verify 0 (BLOCKER fix): the strip actually happened ────────────────
+        // Every assertion below compares disk/reload state against `normalized` — the
+        // OUTPUT of the function under test. Without this independent check, reverting
+        // the `strip_windows_verbatim_prefix` fix would still make every assertion below
+        // pass (they'd just all agree on the un-stripped `\\?\` form), making the test
+        // vacuous on Windows. Assert directly against the raw `canonicalize()` output that
+        // the prefix is gone.
+        if cfg!(windows) {
+            assert!(
+                !normalized.starts_with(r"\\?\"),
+                "normalize_working_set_folder must strip the Windows verbatim prefix; got: {normalized}"
+            );
+        }
+
         mutate_project_file_latest(&path, |project| {
             if !project.metadata.working_set.contains(&normalized) {
                 project.metadata.working_set.push(normalized.clone());
@@ -12186,12 +12343,23 @@ mod broker_gate_projects {
         );
 
         // ── Verify 2: raw disk bytes contain the actual folder path (serialized) ──
-        // Asserting the canonical folder string (not just the key substring) catches
-        // serialization bugs where working_set appears but holds the wrong value.
+        // Asserting the normalized folder string (not just the key substring) catches
+        // serialization bugs where working_set appears but holds the wrong value. On
+        // Windows `canonical_folder` (built directly from `.canonicalize()`) still carries
+        // the `\\?\` verbatim prefix, but `normalized` (the value actually persisted, via
+        // `normalize_working_set_folder`) has it stripped — compare against `normalized`
+        // so the assertion reflects what must actually land on disk on every platform.
+        // `working_set_frontmatter_line` (project_file.rs) serializes the list via
+        // `serde_json::to_string`, which backslash-escapes Windows paths (`C:\foo` →
+        // `"C:\\foo"` on disk); build the expected substring the same way instead of
+        // comparing the raw path, or this would spuriously fail on Windows.
         let disk = fs::read_to_string(&path).unwrap();
+        let expected_json_fragment =
+            serde_json::to_string(&normalized).expect("normalized path must serialize as JSON");
         assert!(
-            disk.contains(&canonical_folder),
-            "project file on disk must contain the canonical folder path; got disk=…{}…",
+            disk.contains(&expected_json_fragment),
+            "project file on disk must contain the normalized (verbatim-prefix-stripped) \
+             folder path, JSON-escaped; got disk=…{}…",
             &disk[..disk.len().min(200)]
         );
 

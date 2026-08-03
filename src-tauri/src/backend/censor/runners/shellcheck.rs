@@ -260,15 +260,17 @@ a.sh:12:4: error: another real one [SC1073]
         };
         let findings = run(&dir, &target).into_findings();
         if crate::backend::projects::command_exists("shellcheck") {
-            assert!(
-                !findings.is_empty(),
-                "shellcheck should flag the unquoted variable in {rel}"
+            // On an ELEVATED Windows host the non-empty claim is skipped — see
+            // `assert_flags_or_skip_if_elevated`'s doc comment (tauri#13926).
+            super::super::assert_flags_or_skip_if_elevated(
+                &findings,
+                "shellcheck",
+                &format!("shellcheck should flag the unquoted variable in {rel}"),
+                |f| {
+                    // Advisory cap: never High.
+                    assert_ne!(f.severity, Severity::High);
+                },
             );
-            for f in &findings {
-                assert_eq!(f.source, "shellcheck");
-                // Advisory cap: never High.
-                assert_ne!(f.severity, Severity::High);
-            }
         } else {
             assert!(findings.is_empty(), "absent shellcheck must yield an empty Vec");
         }

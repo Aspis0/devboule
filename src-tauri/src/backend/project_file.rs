@@ -3,7 +3,7 @@ use super::projects::{
     clean_milestone_date, clean_required, normalize_project_id, normalize_project_root,
     normalize_project_status, normalize_task_category, normalize_task_status, now,
     project_file_lock, project_file_lock_spin, project_lock_path, read_project_file,
-    validate_task_id, ParsedProject, ProjectFileLock,
+    strip_windows_verbatim_prefix, validate_task_id, ParsedProject, ProjectFileLock,
 };
 const BLOCK_MARKER: &str = "```aspis-project";
 const BLOCK_CLOSE: &str = "```";
@@ -149,10 +149,25 @@ pub(crate) fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMe
             // Missing key → empty (NO-CHURN: a project written before this feature was added
             // has no key and must load with an empty working set). An unparseable value degrades
             // to empty rather than erroring the whole parse (same tolerant posture as sandbox_mode).
+            //
+            // WARNING 3 fix (migration): a project file written BEFORE the verbatim-prefix
+            // strip fix can still hold `\\?\C:\...` entries. Map every entry through
+            // `strip_windows_verbatim_prefix` on READ (cheap, lexical, no filesystem access)
+            // so legacy entries compare equal to freshly-added ones (dedup in
+            // `add_project_working_set_folder`, and the `resolve_working_set` BTreeSet union
+            // in broker/mod.rs) and self-heal to the stripped form the next time this
+            // project is saved. No-op for entries that never carried the prefix (macOS/Linux,
+            // or Windows entries already stripped).
             let working_set: Vec<String> = fields
                 .get("working_set")
                 .or_else(|| fields.get("workingSet"))
-                .and_then(|value| serde_json::from_str(value.trim()).ok())
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value.trim()).ok())
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| strip_windows_verbatim_prefix(&entry))
+                        .collect()
+                })
                 .unwrap_or_default();
             // Slice 5c: read agent_controls — a compact JSON object on a single frontmatter line,
             // e.g. `agent_controls: {"effort":"high"}`. Missing key → default (NO-CHURN: a project
