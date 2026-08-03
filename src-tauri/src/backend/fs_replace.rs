@@ -144,6 +144,13 @@ fn restore_copy(source: &Path, target: &Path) -> Result<u64, std::io::Error> {
     fs::copy(source, target)
 }
 
+/// Non-Windows: plain copy restore (no fault seam needed — the seams exist to
+/// emulate AppContainer behavior, which is Windows-only).
+#[cfg(not(target_os = "windows"))]
+fn restore_copy(source: &Path, target: &Path) -> Result<u64, std::io::Error> {
+    fs::copy(source, target)
+}
+
 /// MoveFileExW wrapper with a test-only fault seam (`arm_move_fault()`): the
 /// seam emulates the AppContainer double-check ACCESS_DENIED (0x80070005)
 /// that real MoveFileExW produces in the sandbox (e2e-proven in
